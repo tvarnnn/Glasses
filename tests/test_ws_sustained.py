@@ -64,7 +64,7 @@ def test_final_session_summary_is_logged_on_disconnect(caplog):
     assert any("[Tower][Session] final summary:" in m for m in messages)
 
 
-def test_transport_seq_gap_is_reflected_in_final_summary_when_a_frame_is_skipped(caplog):
+def test_seq_gap_total_is_reflected_in_final_summary_when_a_frame_is_skipped(caplog):
     caplog.set_level(logging.INFO, logger="tower.routes.ws")
     client = TestClient(create_app())
 
@@ -75,7 +75,7 @@ def test_transport_seq_gap_is_reflected_in_final_summary_when_a_frame_is_skipped
     messages = [record.getMessage() for record in caplog.records]
     final_summary_lines = [m for m in messages if "final summary:" in m]
     assert final_summary_lines
-    assert "'transport_seq_gaps': 1" in final_summary_lines[-1]
+    assert "'seq_gap_total': 1" in final_summary_lines[-1]
     assert "'backpressure_drops': 0" in final_summary_lines[-1]
 
 
@@ -96,4 +96,4 @@ def test_metrics_reset_across_reconnects(caplog):
     final_summary_lines = [m for m in messages if "final summary:" in m]
     assert final_summary_lines
     assert "'frames_received': 1" in final_summary_lines[-1]
-    assert "'transport_seq_gaps': 0" in final_summary_lines[-1]
+    assert "'seq_gap_total': 0" in final_summary_lines[-1]

@@ -29,34 +29,52 @@ def test_effective_fps_reflects_elapsed_time_and_frame_count():
     assert snapshot["effective_fps"] == 1.0
 
 
-def test_transport_seq_gap_is_counted_when_a_sequence_number_is_skipped():
+def test_seq_gap_total_is_counted_when_a_sequence_number_is_skipped():
     clock, _advance = _fake_clock()
     metrics = SessionMetrics(clock=clock)
 
     metrics.record_frame(seq=1, byte_count=100, receive_to_result_ms=1.0, cv_processing_ms=1.0)
     metrics.record_frame(seq=4, byte_count=100, receive_to_result_ms=1.0, cv_processing_ms=1.0)
 
-    assert metrics.snapshot()["transport_seq_gaps"] == 2
+    assert metrics.snapshot()["seq_gap_total"] == 2
 
 
-def test_no_gap_counted_for_consecutive_sequence_numbers():
+def test_no_seq_gap_counted_for_consecutive_sequence_numbers():
     clock, _advance = _fake_clock()
     metrics = SessionMetrics(clock=clock)
 
     metrics.record_frame(seq=1, byte_count=100, receive_to_result_ms=1.0, cv_processing_ms=1.0)
     metrics.record_frame(seq=2, byte_count=100, receive_to_result_ms=1.0, cv_processing_ms=1.0)
 
-    assert metrics.snapshot()["transport_seq_gaps"] == 0
+    assert metrics.snapshot()["seq_gap_total"] == 0
 
 
-def test_backpressure_drops_is_tracked_separately_from_transport_seq_gaps():
+def test_seq_gap_total_is_counted_for_a_known_intentional_sampling_stride():
+    """The iPhone sender currently forwards roughly 1-in-30 DAT frames by
+    design (throttled capture -> transmit branch), so seq arrives as
+    1, 30, 60, ... . seq_gap_total still counts the raw discontinuity --
+    it does not and cannot know this gap was intentional under the current
+    protocol (no source_seq/tx_seq split -- see 07-PLATFORM-CONSTRAINTS.md
+    Limitation 9). This test locks in that seq_gap_total is a raw,
+    causally-neutral count, not a "loss" claim.
+    """
+    metrics = SessionMetrics()
+
+    metrics.record_frame(seq=1, byte_count=100, receive_to_result_ms=1.0, cv_processing_ms=1.0)
+    metrics.record_frame(seq=30, byte_count=100, receive_to_result_ms=1.0, cv_processing_ms=1.0)
+    metrics.record_frame(seq=60, byte_count=100, receive_to_result_ms=1.0, cv_processing_ms=1.0)
+
+    assert metrics.snapshot()["seq_gap_total"] == 57
+
+
+def test_backpressure_drops_is_tracked_separately_from_seq_gap_total():
     metrics = SessionMetrics()
 
     metrics.record_frame(seq=1, byte_count=100, receive_to_result_ms=1.0, cv_processing_ms=1.0)
     metrics.record_frame(seq=3, byte_count=100, receive_to_result_ms=1.0, cv_processing_ms=1.0)
     snapshot = metrics.snapshot()
 
-    assert snapshot["transport_seq_gaps"] == 1
+    assert snapshot["seq_gap_total"] == 1
     assert snapshot["backpressure_drops"] == 0
 
 

@@ -298,6 +298,12 @@ Constraint sources: multi-view geometry, ML monocular depth, known-size object p
 
 This is a requirement statement for the future frame-transport protocol (explicitly out of scope for the current camera-proof milestone), not an implemented mechanism.
 
+**2026-08-19 V0.7 finding — the single `seq` field is already insufficient.** The current wire protocol's `seq` field is, in the deployed iOS sender, the DAT/source capture-frame index (`frameCount` of incoming VideoFrames) — but the sender only forwards roughly 1-in-30 of them (a throttled capture -> transmit branch), so the Tower normally receives `seq` like 1, 30, 60, 90, ... by design. Under the current single-field protocol this is indistinguishable from network/transit loss or a sender-side drop — all three look identical as a gap in `seq`. A future frame-transport protocol revision should carry two distinct fields instead of one:
+- `source_seq`: the original DAT/capture frame index (what `seq` currently is).
+- `tx_seq`: a dense counter incremented once per frame message actually transmitted by the iPhone, independent of `source_seq`.
+
+With that split, gaps in `source_seq` would describe intentional source sampling/selection (expected, not an error), while gaps in `tx_seq` would identify frame messages the phone attempted to send but the Tower never received (genuine transit loss). Not implemented as of V0.7 — V0.7 deliberately made no wire-protocol change; see the Tower's `seq_gap_total` metric, which explicitly cannot attribute cause under the current single-field protocol, and `03-ROADMAP.md` V0.7.
+
 **Classification:** MITIGATES (once implemented) — cannot fully eliminate latency, only make its effect measurable/correctable.
 
 **What it improves (once implemented):** Enables correct temporal ordering and latency-aware reasoning.

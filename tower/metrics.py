@@ -16,14 +16,30 @@ class SessionMetrics:
     continuation of the previous one (07-PLATFORM-CONSTRAINTS.md,
     Limitation 4).
 
-    ``backpressure_drops`` is tracked separately from ``transport_seq_gaps``
-    on purpose (2026-08-19 V0.7 planning decision) -- the two have
-    different causes (network/link loss vs. a Tower-side drop policy) and
-    must never be combined into one number. As of V0.7, no code path
-    increments ``backpressure_drops``: the receive -> process -> ack loop
-    in tower/routes/ws.py is intentionally left unchanged this milestone,
-    so this field will always read 0 until a future milestone adds a real
-    drop mechanism.
+    ``seq_gap_total`` is a RAW, causally-neutral count of discontinuities
+    in the received ``seq`` field. It is deliberately NOT named/labeled as
+    "frames lost in transit". Confirmed 2026-08-19: the current iOS sender
+    assigns ``seq`` from the DAT/source capture-frame index (``frameCount``
+    of incoming VideoFrames), but only forwards roughly 1-in-30 of them
+    (a throttled capture -> transmit branch), so the Tower normally
+    receives seq like 1, 30, 60, 90, ... by design. Under the CURRENT wire
+    protocol (seq, width, height, format, data -- no separate
+    transmission-attempt counter), a gap in ``seq`` cannot be attributed
+    to any single cause: it may be intentional sender-side sampling,
+    a sender-side drop, or genuine network/transit loss, and those look
+    identical on the wire. Do not report this number as network loss.
+    See 07-PLATFORM-CONSTRAINTS.md Limitation 9 for the future
+    source_seq/tx_seq protocol split that would be required to actually
+    distinguish these causes -- not implemented as of V0.7.
+
+    ``backpressure_drops`` is tracked separately from ``seq_gap_total`` on
+    purpose (2026-08-19 V0.7 planning decision) -- the two have different
+    causes (network/link loss or sender sampling vs. a Tower-side drop
+    policy) and must never be combined into one number. As of V0.7, no
+    code path increments ``backpressure_drops``: the receive -> process ->
+    ack loop in tower/routes/ws.py is intentionally left unchanged this
+    milestone, so this field will always read 0 until a future milestone
+    adds a real drop mechanism.
     """
 
     SUMMARY_LOG_FRAME_INTERVAL = 150
@@ -35,7 +51,7 @@ class SessionMetrics:
         self.start_time = clock()
         self.last_seq: int | None = None
         self.frames_received = 0
-        self.transport_seq_gaps = 0
+        self.seq_gap_total = 0
         self.backpressure_drops = 0
         self.bytes_received = 0
         self._receive_to_result_ms: list[float] = []
@@ -49,7 +65,7 @@ class SessionMetrics:
         cv_processing_ms: float,
     ) -> None:
         if self.last_seq is not None and seq > self.last_seq + 1:
-            self.transport_seq_gaps += seq - self.last_seq - 1
+            self.seq_gap_total += seq - self.last_seq - 1
         self.last_seq = seq
         self.frames_received += 1
         self.bytes_received += byte_count
@@ -70,7 +86,7 @@ class SessionMetrics:
             "effective_fps": round(self.frames_received / elapsed_s, 2),
             "bytes_received": self.bytes_received,
             "bandwidth_bps": round(self.bytes_received / elapsed_s, 2),
-            "transport_seq_gaps": self.transport_seq_gaps,
+            "seq_gap_total": self.seq_gap_total,
             "backpressure_drops": self.backpressure_drops,
             "receive_to_result_ms_avg": round(_avg(self._receive_to_result_ms), 3),
             "receive_to_result_ms_max": round(

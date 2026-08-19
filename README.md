@@ -8,8 +8,8 @@ tower exposes a health check and a WebSocket endpoint that supports
 ping/pong and receives JPEG camera frames per message, verifies each,
 runs a minimal deterministic OpenCV operation (grayscale conversion +
 mean intensity) on the decoded pixels, and returns the result, while
-logging per-session streaming measurements (FPS, bandwidth, transport
-sequence gaps, Tower-side drops, processing latency, CPU/RSS). Frames are
+logging per-session streaming measurements (FPS, bandwidth, a raw
+sequence-gap count, Tower-side drops, processing latency, CPU/RSS). Frames are
 processed in memory only and are never written to disk. There is no
 module system, module lifecycle, or CV experiment framework yet — that is
 future roadmap scope (V0.8+).
@@ -181,9 +181,22 @@ The tower's own log output during this should show:
 The tower logs a `[Tower][Session] summary: {...}` line periodically
 during a connection (every 150 frames by default) and a
 `[Tower][Session] final summary: {...}` line when the client disconnects.
-These lines report effective FPS, bandwidth, transport sequence gaps,
-Tower-side backpressure drops, Tower processing latency, and process
-CPU/RSS for that connection — never raw frame data.
+These lines report effective FPS, bandwidth, `seq_gap_total`, Tower-side
+backpressure drops, Tower processing latency, and process CPU/RSS for
+that connection — never raw frame data.
+
+**`seq_gap_total` is a raw, causally-neutral count — not a "frames lost"
+figure.** The iOS sender currently assigns `seq` from the DAT/source
+capture-frame index and only forwards roughly 1-in-30 of them by design
+(a throttled capture -> transmit branch), so the tower normally receives
+`seq` like 1, 30, 60, 90, ... under completely normal operation. Under
+the current wire protocol there is no separate transmission-attempt
+counter, so a gap in `seq` cannot currently be attributed to intentional
+sender-side sampling, a sender-side drop, or genuine network/transit
+loss — they look identical on the wire. Do not interpret `seq_gap_total`
+as network loss. See `guidelines/docs/07-PLATFORM-CONSTRAINTS.md`
+Limitation 9 for the future `source_seq`/`tx_seq` protocol split that
+would be needed to actually distinguish these causes (not implemented).
 
 For local validation without the iPhone, run the soak-test script against
 a running tower:
