@@ -3,9 +3,9 @@ import time
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from tower.frame_processing import process_frame
 from tower.frames import FrameError, parse_and_decode_frame
 from tower.metrics import SessionMetrics
+from tower.modules.base import ModuleUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,17 @@ async def _handle_frame_message(
             frame.decoded_height,
         )
 
-    result = process_frame(frame.raw_bytes)
+    module_container = websocket.app.state.module_container
+    try:
+        result = module_container.process(frame.raw_bytes)
+    except ModuleUnavailableError as exc:
+        logger.warning(
+            "[Tower][Frame] #%s: module unavailable, frame dropped: %s",
+            frame.seq,
+            exc,
+        )
+        return
+
     logger.info(
         "[Tower][Frame] #%s processed: mean_intensity=%.2f",
         frame.seq,
