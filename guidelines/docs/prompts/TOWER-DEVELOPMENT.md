@@ -30,7 +30,8 @@ Core invariants:
 - tower failure must surface as unavailable to iOS;
 - lifecycle operations use bounded timeouts with a defined FAILED transition on timeout;
 - reconnection uses bounded/exponential backoff, not tight retry loops;
-- module data behavior (persistence, retention, purge, transmission) must be declared per `04-MODULE-SYSTEM.md` and follow `06-PRIVACY-DATA.md`.
+- module data behavior (persistence, retention, purge, transmission) must be declared per `04-MODULE-SYSTEM.md` and follow `06-PRIVACY-DATA.md`;
+- GPU acceleration (CUDA, PyTorch CUDA execution, TensorRT, CV-CUDA, DeepStream, etc.) is an optional capability adopted only where profiling justifies it, not a hard dependency — see `01-SYSTEM-ARCHITECTURE.md` — GPU / Acceleration Strategy.
 
 Keep transport, runtime orchestration, and module implementation separated.
 

@@ -100,6 +100,7 @@ Exit criterion: the tower runtime can load, run, and cleanly tear down one modul
 - Prove the complete pipeline: DAT connection -> camera frames in Swift -> tower transport -> Experimental CV Lab -> one bounded CV experiment -> measurements.
 - Use it as the sandbox for course CV experiments.
 - Validate the module lifecycle/descriptor contract against real implementation experience before generalizing it.
+- Where relevant, use these experiments to gather the profiling data that would justify any future GPU-acceleration technology adoption (see `01-SYSTEM-ARCHITECTURE.md` — GPU / Acceleration Strategy, and `docs/modules/EXPERIMENTAL-CV.md` — GPU / Acceleration Benchmarking). Do not adopt TensorRT, CV-CUDA, DeepStream, or similar before this milestone produces the measurements to justify one.
 
 Exit criterion: at least one bounded CV experiment runs end-to-end from glasses/mock device input through to measured results.
 
@@ -124,6 +125,7 @@ Candidates, each with its own specification under `docs/modules/`:
 - Accessibility.
 - Visual Q&A / Reading — comparatively heavy (STT + OCR/CV + multimodal reasoning + TTS); not an early starter module.
 - Environmental / Physical-World Search — highest privacy exposure of the current module set; requires the retention/deletion policy in `06-PRIVACY-DATA.md` to be actually implemented, not just documented, before real data collection begins.
+- Translator — future low-latency conversational translation module; see `docs/modules/TRANSLATOR.md`. Not an early candidate — depends on a streaming ASR/MT/TTS pipeline and the latency-instrumentation work in `01-SYSTEM-ARCHITECTURE.md` that have not been built or measured yet.
 
 ## Future Research
 
@@ -132,6 +134,8 @@ Possible but explicitly outside V1:
 - alternative wearable hardware;
 - deeper sensor fusion;
 - persistent shared world models;
-- custom firmware/reverse engineering.
+- custom firmware/reverse engineering;
+- Tower-optional / heterogeneous compute degradation (see `01-SYSTEM-ARCHITECTURE.md` — Heterogeneous Compute & Graceful Degradation);
+- live world-state visualization for World Build (see `docs/modules/WORLD-BUILD.md` — Live Visualization).
 
 These must not block the supported DAT-based platform.

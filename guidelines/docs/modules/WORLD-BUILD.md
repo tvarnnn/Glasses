@@ -8,6 +8,23 @@ Future module. This is a concept/specification seed, not authorization to implem
 
 Use first-person wearable camera observations to incrementally construct a spatial representation of environments the user traverses.
 
+## Passive Operation Requirement
+
+World Build must not behave like a traditional room-scanning application. Do not instruct the wearer to scan a specific wall, rotate slowly, walk around an object, point the camera somewhere specific, or complete any predefined capture sequence. The wearer uses the glasses normally; World Build incrementally accumulates spatial information from whatever the wearer naturally looks at.
+
+Illustrative behavior:
+
+```text
+enter room                                -> rough structure begins appearing
+look around naturally                     -> additional geometry becomes available
+observe an object again from a new angle  -> existing geometry becomes more
+                                              confident/refined
+return to the room later                  -> the persistent model can continue
+                                              improving
+```
+
+This is a product-integrity requirement, not only a UX preference: a system that requires scanner-operator behavior from the wearer has failed the platform's premise that the glasses are a normal-use device, not a capture tool. Any future capability that depends on the wearer performing a deliberate scan action is not World Build — it is a different feature and must be designed and labeled as one.
+
 ## Intended Inputs
 
 Primary:
@@ -85,12 +102,15 @@ Machine-learning monocular depth estimation is intended to partially compensate 
 
 ## Confidence / Uncertainty
 
-Spatial observations should eventually carry confidence/uncertainty information rather than being presented as uniformly reliable. Illustrative levels:
-- **high confidence**: repeatedly observed geometry supported by multiple viewpoints;
+Spatial observations should eventually carry confidence/uncertainty information rather than being presented as uniformly reliable. Illustrative levels, extended here to include the unmeasured case explicitly rather than treating it as merely "low confidence":
+- **unknown**: never observed; no geometry should be asserted here at all;
+- **low confidence**: single-frame inference, reflective surfaces, low light, motion blur, textureless regions, or conflicting estimates;
 - **medium confidence**: ML depth supported by some geometric constraints;
-- **low confidence**: single-frame inference, reflective surfaces, low light, motion blur, textureless regions, or conflicting estimates.
+- **high confidence**: repeatedly observed geometry supported by multiple viewpoints.
 
-World Build should prefer repeated observations and multi-view consistency over a single-frame depth prediction. The exact confidence representation/schema is not decided here — this section records the requirement that one must exist, not its implementation.
+**Unknown space must remain unknown.** World Build must not use generative AI, or any other technique, to fabricate geometry for a region the camera never observed — even when that geometry is statistically likely (for example, inferring the exact shape of the back of a couch that was never seen). A region with no observation is represented as unknown/unmapped, not filled in with a plausible guess. This is both a technical requirement — an unobserved region is architecturally the same case as `07-PLATFORM-CONSTRAINTS.md` Core Principle 3 (absence of observation ≠ observation of absence), extended here to mean absence of observation is also not license to invent one — and a product-integrity requirement: World Build's value depends on the wearer being able to trust that what it shows was actually seen, not synthesized.
+
+Repeated observations from multiple independent viewpoints raise a region's confidence toward high; a single viewpoint keeps it at low confidence; a region never observed stays unknown until it is actually observed. World Build should prefer repeated observations and multi-view consistency over a single-frame depth prediction. The exact confidence representation/schema is not decided here — this section records the requirement that one must exist, not its implementation.
 
 ## Real-Time vs. Asynchronous Processing
 
@@ -137,6 +157,8 @@ Storage format is intentionally undecided until the implemented pipeline require
 
 Continuous video is highly redundant. World Build may eventually use keyframe/relevance selection so only observations that improve the map receive expensive processing or long-term storage.
 
+This is also the mechanism that reconciles the Passive Operation Requirement (above) with computational cost. The wearer is not asked to slow down, hold still, or scan deliberately — so the system, not the user, is responsible for deciding which ordinary frames are worth the expensive path (SLAM refinement, semantic segmentation, depth estimation) versus lightweight live tracking only. This is a genuine tension worth naming explicitly: "passive" and "always run the full heavy pipeline" are in conflict, and keyframe/relevance selection plus the Real-Time vs. Asynchronous split above is the intended resolution, not a fully general SLAM system running on every frame.
+
 ## Output
 
 Possible outputs:
@@ -146,6 +168,44 @@ Possible outputs:
 - minimal audio/status feedback.
 
 Any output that includes a distance/measurement must be labeled according to the relative / inferred-metric / measured-metric distinction above — never presented as measured when it is inferred.
+
+## Live Visualization (Future)
+
+World Build should eventually support a live PC and/or phone visualization: while the wearer naturally moves through an environment, the reconstructed world progressively appears in a viewer.
+
+```text
+Glasses -> iPhone -> Tower reconstruction -> world-state updates -> PC/phone viewer
+```
+
+Conceptual viewer content, once built:
+- reconstructed geometry;
+- color/texture where available;
+- mapped vs. unmapped areas (see Confidence / Uncertainty, above — an unknown region should render as unknown, never as blank-as-if-absent and never as fabricated);
+- current camera/glasses pose;
+- semantic objects, once semantic understanding is part of the pipeline;
+- confidence/quality information.
+
+Prefer incremental world-state updates/deltas over repeatedly transmitting the complete world representation, consistent with the platform's general preference for bounded, freshness-oriented data flow (`01-SYSTEM-ARCHITECTURE.md` — Reliability Policies).
+
+This is architecture for a future milestone. Do not implement the viewer now — it depends on a working reconstruction pipeline that does not yet exist.
+
+## Relationship to Object Memory / Environmental Memory (Future)
+
+`docs/modules/ENVIRONMENTAL-MEMORY.md` already reserves this relationship as an explicit future architecture evolution, not an assumed dependency ("If World Build later exposes a stable shared spatial service, environmental observations may optionally reference spatial locations."); this section records World Build's side of the same boundary.
+
+Today, Object Memory and Environmental Memory record observations independent of any spatial map (e.g., "keys detected at timestamp X"). If World Build later exposes a stable shared spatial service, an observation could instead be associated with spatial context:
+
+```text
+Object: keys
+Location: spatial coordinate / mapped surface
+Semantic location: kitchen counter
+Last observed: timestamp
+Confidence: value
+```
+
+This could eventually support queries like "where did I leave my keys?" answered from structured spatial-memory association rather than exhaustive replay/search across raw video.
+
+This is future architecture, not a current implementation requirement. It depends on World Build and Object/Environmental Memory each independently reaching a stable, bounded first version before any explicit shared-service design is proposed — do not couple them prematurely, for the same reason `docs/modules/ENVIRONMENTAL-MEMORY.md` gives for not merging Object Memory and Environmental Memory prematurely.
 
 ## Hardware Suitability
 

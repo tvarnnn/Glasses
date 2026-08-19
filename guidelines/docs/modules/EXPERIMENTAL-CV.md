@@ -42,7 +42,8 @@ Examples:
 - image retrieval;
 - clustering;
 - novelty detection;
-- lightweight relevance classification.
+- lightweight relevance classification;
+- a GPU-accelerated variant of an existing experiment, benchmarked against its CPU baseline (see GPU / Acceleration Benchmarking, below).
 
 The list is intentionally broad. Only one experiment needs to be active at a time.
 
@@ -118,6 +119,10 @@ An experiment failure must:
 - release GPU/CPU resources;
 - leave the persistent tower runtime alive;
 - not break module discovery or switching.
+
+## GPU / Acceleration Benchmarking
+
+Experimental CV Lab is the appropriate place to evaluate whether a GPU-acceleration technology is justified for a given workload, following the correctness -> instrument -> profile -> identify bottlenecks -> accelerate philosophy in `01-SYSTEM-ARCHITECTURE.md` — GPU / Acceleration Strategy. Benchmarking a candidate technology (PyTorch CUDA execution, TensorRT, CV-CUDA, or another) against a measured CPU baseline is itself a valid experiment here and should follow the same Success Criteria (hypothesis, baseline, metric, result) as any other experiment in this module. Do not adopt a GPU-acceleration technology platform-wide based on an unmeasured assumption that it will help — that decision is made from this module's measured results, not in the abstract.
 
 ## Model Output vs. Measured Fact
 
