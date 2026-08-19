@@ -5,8 +5,8 @@ from fastapi import FastAPI
 
 from tower.config import get_settings
 from tower.logging_config import configure_logging
-from tower.modules.baseline_cv import BaselineCVModule
 from tower.modules.container import ModuleContainer
+from tower.modules.experimental_cv import ExperimentalCVModule
 from tower.routes import health, ws
 from tower.session import ConnectionTracker
 
@@ -22,7 +22,9 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="Glasses Tower", lifespan=lifespan)
     app.state.session = ConnectionTracker()
-    app.state.module_container = ModuleContainer(BaselineCVModule())
+    app.state.module_container = ModuleContainer(
+        ExperimentalCVModule(get_settings().cv_experiment)
+    )
     # Started here, not in `lifespan` above: TestClient(create_app()) used
     # without `with client:` (every pre-existing test in this repo) never
     # runs ASGI lifespan events, leaving the module UNLOADED forever. See
