@@ -1,8 +1,9 @@
 # Glasses Tower
 
 The Windows tower transport layer for the Glasses platform. Current
-milestone: V0.7 — Sustained Streaming (instrumentation implemented;
-the physical 20-30 minute measurement run has not yet been performed —
+milestone: V0.7 — Sustained Streaming (mock/iPhone validation complete —
+~14.3 minute run, short of the 20-30 minute target, ended cleanly via
+stream_stop; physical-glasses validation is deferred, not yet performed —
 see `guidelines/docs/reports/V0.7-sustained-streaming-report.md`). The
 tower exposes a health check and a WebSocket endpoint that supports
 ping/pong and receives JPEG camera frames per message, verifies each,
