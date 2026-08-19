@@ -57,14 +57,21 @@ async def _handle_frame_message(
         cv_processing_ms=result.processing_ms,
     )
 
-    await websocket.send_json(
-        {
-            "type": "frame_result",
-            "seq": frame.seq,
-            "mean_intensity": result.mean_intensity,
-            "processing_ms": result.processing_ms,
-        }
-    )
+    try:
+        await websocket.send_json(
+            {
+                "type": "frame_result",
+                "seq": frame.seq,
+                "mean_intensity": result.mean_intensity,
+                "processing_ms": result.processing_ms,
+            }
+        )
+    except WebSocketDisconnect:
+        logger.warning(
+            "[Tower][Frame] #%s: could not send result, client disconnected mid-frame",
+            frame.seq,
+        )
+        raise
 
     if metrics.should_log_summary():
         logger.info("[Tower][Session] summary: %s", metrics.snapshot())
