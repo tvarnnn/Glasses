@@ -23,12 +23,10 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Glasses Tower", lifespan=lifespan)
     app.state.session = ConnectionTracker()
     app.state.module_container = ModuleContainer(BaselineCVModule())
-    # Loaded/started here, synchronously, rather than in `lifespan` above:
-    # TestClient(create_app()) used without `with client:` (how every
-    # pre-existing test in this repo uses it) never runs ASGI lifespan
-    # events, which would leave the module UNLOADED forever in tests.
-    # Full rationale: docs/superpowers/specs/2026-08-19-v0.8-module-container-design.md,
-    # "Wiring" section, Amendment.
+    # Started here, not in `lifespan` above: TestClient(create_app()) used
+    # without `with client:` (every pre-existing test in this repo) never
+    # runs ASGI lifespan events, leaving the module UNLOADED forever. See
+    # docs/superpowers/specs/2026-08-19-v0.8-module-container-design.md, "Wiring" Amendment.
     asyncio.run(app.state.module_container.load_and_start())
     app.include_router(health.router)
     app.include_router(ws.router)
