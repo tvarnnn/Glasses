@@ -54,9 +54,10 @@ async def _handle_frame_message(
         return
 
     logger.info(
-        "[Tower][Frame] #%s processed: mean_intensity=%.2f",
+        "[Tower][Frame] #%s processed: %s=%.4f",
         frame.seq,
-        result.mean_intensity,
+        result.result_label,
+        result.result_value,
     )
 
     receive_to_result_ms = (time.perf_counter() - receive_start) * 1000
@@ -66,17 +67,22 @@ async def _handle_frame_message(
             byte_count=frame.byte_count,
             receive_to_result_ms=receive_to_result_ms,
             cv_processing_ms=result.processing_ms,
+            stage_ms=result.stage_ms,
         )
 
+    payload = {
+        "type": "frame_result",
+        "seq": frame.seq,
+        "processing_ms": result.processing_ms,
+        "result_value": result.result_value,
+        "result_label": result.result_label,
+        "stage_ms": result.stage_ms,
+    }
+    if result.mean_intensity is not None:
+        payload["mean_intensity"] = result.mean_intensity
+
     try:
-        await websocket.send_json(
-            {
-                "type": "frame_result",
-                "seq": frame.seq,
-                "mean_intensity": result.mean_intensity,
-                "processing_ms": result.processing_ms,
-            }
-        )
+        await websocket.send_json(payload)
     except WebSocketDisconnect:
         logger.warning(
             "[Tower][Frame] #%s: could not send result, client disconnected mid-frame",

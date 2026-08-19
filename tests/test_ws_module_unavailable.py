@@ -5,7 +5,7 @@ import logging
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from tower.frame_processing import FrameProcessingResult
+from tower.experiments import ExperimentResult
 from tower.main import create_app
 from tower.modules.base import Module, ModuleDataBehavior, ModuleDescriptor, ModuleState
 from tower.modules.container import ModuleContainer
@@ -113,7 +113,13 @@ class _FailsAfterFirstCall(Module):
         self.call_count += 1
         if self.call_count > 1:
             raise RuntimeError("module went bad mid-stream")
-        return FrameProcessingResult(mean_intensity=1.0, processing_ms=1.0)
+        return ExperimentResult(
+            result_value=1.0,
+            result_label="mean_intensity",
+            processing_ms=1.0,
+            stage_ms={"total": 1.0},
+            mean_intensity=1.0,
+        )
 
     async def _do_stop(self) -> None:
         return None
@@ -158,8 +164,11 @@ def test_module_that_fails_mid_stream_is_marked_failed_and_subsequent_frames_are
         assert first == {
             "type": "frame_result",
             "seq": 1,
-            "mean_intensity": 1.0,
             "processing_ms": 1.0,
+            "result_value": 1.0,
+            "result_label": "mean_intensity",
+            "stage_ms": {"total": 1.0},
+            "mean_intensity": 1.0,
         }
 
         second = websocket.receive_json()
