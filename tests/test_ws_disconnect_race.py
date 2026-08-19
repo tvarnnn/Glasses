@@ -38,6 +38,7 @@ def test_disconnect_during_in_flight_frame_is_handled_gracefully(caplog, monkeyp
     client = TestClient(app)
 
     with client.websocket_connect("/ws") as websocket:
+        websocket.send_json({"type": "stream_start"})
         websocket.send_json(
             {
                 "type": "frame",

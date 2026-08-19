@@ -6,6 +6,10 @@ FPS/resolution for a configured duration, then prints a Markdown report
 combining the roadmap's documented targets with what this script observed
 on the *sending* side.
 
+Sends stream_start before the frame loop and stream_stop after it, so the
+Tower's own [Tower][Session] final summary is bounded by this script's
+actual streaming window rather than the WebSocket connection's lifetime.
+
 This script cannot see the Tower's own CPU/RAM/backpressure/receive-side
 metrics -- those are only visible in the Tower process's own log output
 ([Tower][Session] final summary: ...). Copy that log line into the printed
@@ -58,6 +62,7 @@ async def run_soak_test(
     start = time.perf_counter()
 
     async with websockets.connect(uri) as ws:
+        await ws.send(json.dumps({"type": "stream_start"}))
         while (time.perf_counter() - start) < duration_s:
             frame_start = time.perf_counter()
             seq += 1
@@ -83,6 +88,8 @@ async def run_soak_test(
             sleep_for = interval_s - elapsed
             if sleep_for > 0:
                 await asyncio.sleep(sleep_for)
+
+        await ws.send(json.dumps({"type": "stream_stop"}))
 
     elapsed_total = time.perf_counter() - start
     return {

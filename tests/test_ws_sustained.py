@@ -46,6 +46,7 @@ def test_session_summary_is_logged_at_the_configured_frame_interval(caplog, monk
     client = TestClient(create_app())
 
     with client.websocket_connect("/ws") as websocket:
+        websocket.send_json({"type": "stream_start"})
         for seq in range(1, 4):
             _send_frame(websocket, seq)
 
@@ -58,6 +59,7 @@ def test_final_session_summary_is_logged_on_disconnect(caplog):
     client = TestClient(create_app())
 
     with client.websocket_connect("/ws") as websocket:
+        websocket.send_json({"type": "stream_start"})
         _send_frame(websocket, 1)
 
     messages = [record.getMessage() for record in caplog.records]
@@ -69,6 +71,7 @@ def test_seq_gap_total_is_reflected_in_final_summary_when_a_frame_is_skipped(cap
     client = TestClient(create_app())
 
     with client.websocket_connect("/ws") as websocket:
+        websocket.send_json({"type": "stream_start"})
         _send_frame(websocket, 1)
         _send_frame(websocket, 3)  # seq 2 never sent
 
@@ -84,12 +87,14 @@ def test_metrics_reset_across_reconnects(caplog):
     client = TestClient(create_app())
 
     with client.websocket_connect("/ws") as websocket:
+        websocket.send_json({"type": "stream_start"})
         _send_frame(websocket, 1)
         _send_frame(websocket, 2)
 
     caplog.clear()
 
     with client.websocket_connect("/ws") as websocket:
+        websocket.send_json({"type": "stream_start"})
         _send_frame(websocket, 1)
 
     messages = [record.getMessage() for record in caplog.records]

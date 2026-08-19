@@ -176,14 +176,59 @@ The tower's own log output during this should show:
 [Tower][Frame] #1 processed: mean_intensity=130.00
 ```
 
+## Stream Lifecycle Control Messages (V0.7)
+
+The WebSocket connection is persistent — it stays open across the phone's
+own "Start Camera Session" / "Stop Camera Session" actions, and normally
+across many such cycles, so the tower needs an explicit signal for when a
+streaming *measurement window* begins and ends, separate from the
+connection's own lifetime. Two control messages exist for this:
+
+```json
+{"type": "stream_start"}
+```
+Send once, right before the app begins forwarding `frame` messages for a
+streaming session.
+
+```json
+{"type": "stream_stop"}
+```
+Send once, when the camera session/stream stops — no more `frame`
+messages should follow until the next `stream_start`.
+
+Neither message gets a reply (unlike `ping`→`pong` or `frame`→
+`frame_result`) — don't wait on a response for either.
+
+Behavior:
+- `frame` messages are always fully processed and get a `frame_result`
+  regardless of whether a stream measurement window is currently open —
+  `stream_start` is not required for basic frame processing to work.
+- Frames received before any `stream_start` (or after a `stream_stop`)
+  are processed and acknowledged normally, but are not counted in any
+  measurement window.
+- `stream_stop` with no window open logs a warning and is otherwise a
+  no-op — the connection stays fully usable.
+- A `stream_start` received while a window is already open finalizes the
+  existing window first (`end_reason: "superseded_by_stream_start"`),
+  then opens a fresh one — no measurement data is silently dropped.
+- Multiple `stream_start` → frames → `stream_stop` cycles work on one
+  persistent connection.
+
 ## Measuring a Sustained Session (V0.7)
 
 The tower logs a `[Tower][Session] summary: {...}` line periodically
-during a connection (every 150 frames by default) and a
-`[Tower][Session] final summary: {...}` line when the client disconnects.
-These lines report effective FPS, bandwidth, `seq_gap_total`, Tower-side
-backpressure drops, Tower processing latency, and process CPU/RSS for
-that connection — never raw frame data.
+within an open streaming window (every 150 frames by default) and a
+`[Tower][Session] final summary: {...}` line whenever that window closes
+— on `stream_stop`, on a `stream_start` that supersedes it, or on
+disconnect while it's still open (see Stream Lifecycle Control Messages
+above). **A summary is only produced for frames sent between a
+`stream_start` and its corresponding close** — frames sent outside any
+window are still processed and acknowledged, but don't contribute to any
+summary. Each final summary includes an `end_reason` (`"stream_stop"`,
+`"superseded_by_stream_start"`, or `"disconnect"`) alongside effective
+FPS, bandwidth, `seq_gap_total`, Tower-side backpressure drops, Tower
+processing latency, and process CPU/RSS for that window — never raw
+frame data.
 
 **`seq_gap_total` is a raw, causally-neutral count — not a "frames lost"
 figure.** The iOS sender currently assigns `seq` from the DAT/source
