@@ -52,6 +52,7 @@ Configuration is read from environment variables (all optional):
 | `TOWER_HOST`       | `0.0.0.0` | Interface to bind to                       |
 | `TOWER_PORT`       | `8000`    | Port to listen on                          |
 | `TOWER_DEV_MODE`   | `true`    | Enables debug-level logging                |
+| `TOWER_CV_EXPERIMENT` | `baseline` | Active CV experiment (`baseline` or `edge_detection`) |
 
 The server binds to `0.0.0.0` by default so it is reachable from other
 devices on the LAN, not just `localhost`.
