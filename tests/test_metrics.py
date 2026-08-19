@@ -118,3 +118,40 @@ def test_snapshot_includes_separately_labeled_latency_figures():
 
     assert snapshot["receive_to_result_ms_avg"] == 9.0
     assert snapshot["cv_processing_ms_avg"] == 3.0
+
+
+def test_record_frame_with_stage_ms_populates_snapshot_averages():
+    metrics = SessionMetrics()
+
+    metrics.record_frame(
+        seq=1,
+        byte_count=100,
+        receive_to_result_ms=5.0,
+        cv_processing_ms=2.0,
+        stage_ms={"decode": 1.0, "canny": 3.0},
+    )
+    metrics.record_frame(
+        seq=2,
+        byte_count=100,
+        receive_to_result_ms=5.0,
+        cv_processing_ms=2.0,
+        stage_ms={"decode": 3.0, "canny": 5.0},
+    )
+
+    snapshot = metrics.snapshot()
+    assert snapshot["stage_ms_avg"]["decode"] == 2.0
+    assert snapshot["stage_ms_avg"]["canny"] == 4.0
+    assert snapshot["stage_ms_max"]["decode"] == 3.0
+    assert snapshot["stage_ms_max"]["canny"] == 5.0
+
+
+def test_record_frame_without_stage_ms_leaves_stage_ms_snapshot_empty():
+    metrics = SessionMetrics()
+
+    metrics.record_frame(
+        seq=1, byte_count=100, receive_to_result_ms=5.0, cv_processing_ms=2.0
+    )
+
+    snapshot = metrics.snapshot()
+    assert snapshot["stage_ms_avg"] == {}
+    assert snapshot["stage_ms_max"] == {}

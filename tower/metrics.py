@@ -56,6 +56,7 @@ class SessionMetrics:
         self.bytes_received = 0
         self._receive_to_result_ms: list[float] = []
         self._cv_processing_ms: list[float] = []
+        self._stage_ms: dict[str, list[float]] = {}
 
     def record_frame(
         self,
@@ -63,6 +64,7 @@ class SessionMetrics:
         byte_count: int,
         receive_to_result_ms: float,
         cv_processing_ms: float,
+        stage_ms: dict[str, float] | None = None,
     ) -> None:
         if self.last_seq is not None and seq > self.last_seq + 1:
             self.seq_gap_total += seq - self.last_seq - 1
@@ -71,6 +73,9 @@ class SessionMetrics:
         self.bytes_received += byte_count
         self._receive_to_result_ms.append(receive_to_result_ms)
         self._cv_processing_ms.append(cv_processing_ms)
+        if stage_ms:
+            for stage_name, ms in stage_ms.items():
+                self._stage_ms.setdefault(stage_name, []).append(ms)
 
     def should_log_summary(self) -> bool:
         return (
@@ -95,4 +100,6 @@ class SessionMetrics:
             "cv_processing_ms_avg": round(_avg(self._cv_processing_ms), 3),
             "process_cpu_percent": self._process.cpu_percent(interval=None),
             "process_rss_bytes": self._process.memory_info().rss,
+            "stage_ms_avg": {k: round(_avg(v), 3) for k, v in self._stage_ms.items()},
+            "stage_ms_max": {k: round(max(v), 3) for k, v in self._stage_ms.items()},
         }
