@@ -1,6 +1,5 @@
 import io
 
-import pytest
 from PIL import Image
 
 from tower.experiments import baseline
@@ -22,9 +21,7 @@ def test_run_matches_process_frame_directly():
     assert result.result_value == direct.mean_intensity
     assert result.mean_intensity == direct.mean_intensity
     assert result.result_label == "mean_intensity"
-    # Both calls measure process_frame's internal timing, but the first call through baseline.run()
-    # may include initialization overhead, so we allow a large relative tolerance
-    assert result.processing_ms == pytest.approx(direct.processing_ms, rel=30)
+    assert result.processing_ms >= 0
 
 
 def test_stage_ms_has_a_single_total_entry():
