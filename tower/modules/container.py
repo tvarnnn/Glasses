@@ -2,7 +2,7 @@ import asyncio
 import logging
 from typing import Any
 
-from tower.modules.base import Module, ModuleState, ModuleUnavailableError
+from tower.modules.base import Module, ModuleDescriptor, ModuleState, ModuleUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,10 @@ class ModuleContainer:
     @property
     def state(self) -> ModuleState:
         return self._module.state
+
+    @property
+    def descriptor(self) -> "ModuleDescriptor":
+        return self._module.descriptor
 
     async def load_and_start(self) -> None:
         try:
