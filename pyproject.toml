@@ -18,6 +18,10 @@ dev = [
     "httpx>=0.27",
     "websockets>=12.0",
 ]
+ml = [
+    "torch",
+    "torchvision",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
