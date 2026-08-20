@@ -1,7 +1,7 @@
 # Glasses Tower
 
 The Windows tower transport layer for the Glasses platform. Current
-milestone: V0.9.1 — Module System + Experimental CV Lab Baseline. The tower
+milestone: V0.9.3 — World Builder Foundations, Experiments 1–2. The tower
 exposes a persistent runtime with a module container that supports stateful,
 model-backed computer vision experiments. The core transport layer (WebSocket
 health check, frame receive, JPEG validation, per-session measurements) is
@@ -11,7 +11,14 @@ OpenCV (grayscale + mean intensity), while the `depth` experiment uses
 MiDaS-small monocular depth estimation on GPU/CPU. Both log per-session
 streaming measurements (FPS, bandwidth, sequence-gap count, Tower-side drops,
 processing latency, CPU/RSS), plus per-stage timing for module operations.
-Frames are processed in memory only and never written to disk.
+Frames are processed in memory only and never written to disk. Frame-level
+and module-level failures are reported to the connected client via a
+`frame_error` message rather than silently dropping frames.
+
+Two offline research harnesses (`scripts/depth_temporal_consistency.py`,
+`scripts/feature_trackability.py`) analyse World Builder foundations against
+recorded footage; their measured results and validity limits are in
+`guidelines/docs/reports/V0.9.3-world-builder-experiments-1-2-report.md`.
 
 ## Environment Setup
 
@@ -378,13 +385,20 @@ tower/
   routes/
     health.py             GET /health
     ws.py                 WebSocket /ws (ping/pong, frame receive +
-                          module dispatch)
+                          module dispatch, frame_error reporting)
 scripts/
   soak_test_stream.py     Local sustained-load soak-test client (V0.7)
   verify_cuda.py          One-shot PyTorch/CUDA verification spike
                           (V0.9.1)
   depth_benchmark.py      CPU vs GPU depth-experiment benchmark client
                           (V0.9.1)
+  depth_temporal_consistency.py
+                          World Builder Experiment 1: offline
+                          frame-to-frame depth-flicker analysis and
+                          EMA/median smoothing comparison (V0.9.3)
+  feature_trackability.py World Builder Experiment 2: offline ORB
+                          keypoint/match/RANSAC-inlier analysis across
+                          frame gaps; intrinsics-free (V0.9.3)
 tests/
   test_health.py
   test_config.py
@@ -413,6 +427,8 @@ tests/
   test_depth_experiment_integration.py  (opt-in, real model — see below)
   test_soak_script_cli.py
   test_depth_benchmark_cli.py
+  test_ws_malformed_message.py
+  test_world_builder_experiment_clis.py
 ```
 
 The module system (`tower/modules/`) owns the module lifecycle

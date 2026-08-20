@@ -104,6 +104,22 @@ Exit criterion: the tower runtime can load, run, and cleanly tear down one modul
 
 Exit criterion: at least one bounded CV experiment runs end-to-end from glasses/mock device input through to measured results.
 
+### V0.9.2 — Backend Truthfulness & Reliability Hardening (complete)
+- Client-facing `frame_error` WebSocket message on frame-skip and module-unavailable, so a connected client no longer has to poll `GET /health` to learn why `frame_result` messages stopped (closes a standing Rule 3 truthful-state gap).
+- Malformed non-JSON / non-dict WebSocket messages are logged and ignored instead of abruptly ending the connection.
+- `httpx2` replaces `httpx` as the dev/test-client dependency, clearing the `StarletteDeprecationWarning` (note: `httpx` itself must remain installed — `huggingface_hub` requires it).
+
+Two findings from the same audit were deliberately **not** fixed here because both need a product/architecture decision rather than a patch: the lifecycle timeout's inability to bound a *synchronous* blocking `_do_load()` (real today for `torch.hub.load()`), and the no-auth / `0.0.0.0` bind default (already scheduled for Phase 1.5). See `docs/superpowers/research/2026-08-20-testing-reliability-techdebt-audit.md`.
+
+Exit criterion: the Tower reports frame-level and module-level failures to the connected client, and malformed input cannot silently drop a session.
+
+### V0.9.3 — World Builder Foundations, Experiments 1–2 (complete, dataset-based)
+- `depth_temporal_consistency` and `feature_trackability` run as bounded offline experiments per `docs/modules/EXPERIMENTAL-CV.md`'s Success Criteria discipline. See `docs/reports/V0.9.3-world-builder-experiments-1-2-report.md`.
+- **Measured on a public head-mounted dataset clip, not on Ray-Ban Meta glasses.** Results are feasibility evidence only; the report carries a hard acceptance gate requiring both experiments to be re-run on real DAT footage before any conclusion is used as validation.
+- Experiments 3 (`monocular_pose_feasibility`) and 4 (`depth_scale_fusion`) remain **blocked on DAT camera intrinsics**, which exist nowhere in this repository. Resolving that requires a Mac-side `search_dat_docs` session or empirical calibration against a real device.
+
+Exit criterion: both experiments produce measured numbers with their validity scope explicitly bounded.
+
 ### V1.0 — Generalize Module Registry (When Justified)
 - Triggered only once a second production module (a promoted Experimental CV Lab result, or another module such as Object Memory) creates real, concrete requirements.
 - Build dynamic module discovery, the module registry, and descriptor/sensor-profile negotiation generalized from actual usage rather than speculative design.
