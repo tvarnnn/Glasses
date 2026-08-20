@@ -53,6 +53,7 @@ async def _handle_frame_message(
         )
         if metrics is not None:
             metrics.record_frame_processing_error()
+        await _send_frame_error(websocket, frame.seq, "frame_skipped", str(exc))
         return
     except ModuleUnavailableError as exc:
         logger.warning(
@@ -60,6 +61,7 @@ async def _handle_frame_message(
             frame.seq,
             exc,
         )
+        await _send_frame_error(websocket, frame.seq, "module_unavailable", str(exc))
         return
 
     logger.info(
@@ -101,6 +103,26 @@ async def _handle_frame_message(
 
     if metrics is not None and metrics.should_log_summary():
         logger.info("[Tower][Session] summary: %s", metrics.snapshot())
+
+
+async def _send_frame_error(
+    websocket: WebSocket, seq: int, reason: str, message: str
+) -> None:
+    try:
+        await websocket.send_json(
+            {
+                "type": "frame_error",
+                "seq": seq,
+                "reason": reason,
+                "message": message,
+            }
+        )
+    except WebSocketDisconnect:
+        logger.warning(
+            "[Tower][Frame] #%s: could not send frame_error, client disconnected mid-frame",
+            seq,
+        )
+        raise
 
 
 def _finalize_stream_measurement(metrics: SessionMetrics, end_reason: str) -> None:

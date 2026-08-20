@@ -69,9 +69,16 @@ def test_frame_is_dropped_and_connection_stays_alive_when_module_unavailable(cap
                 "data": _make_jpeg_base64(8, 8),
             }
         )
-        # No frame_result will ever arrive for this frame -- confirm the
-        # connection is still alive and usable via ping/pong instead of
-        # trying to receive a frame_result that will never come.
+        # No frame_result will ever arrive for this frame -- a frame_error
+        # message arrives instead, then the connection is still alive and
+        # usable via ping/pong.
+        error = websocket.receive_json()
+        assert error == {
+            "type": "frame_error",
+            "seq": 1,
+            "reason": "module_unavailable",
+            "message": "module broken is ModuleState.FAILED, not ACTIVE",
+        }
         websocket.send_json({"type": "ping"})
         assert websocket.receive_json() == {"type": "pong"}
 
@@ -172,7 +179,23 @@ def test_module_that_fails_mid_stream_is_marked_failed_and_subsequent_frames_are
         }
 
         second = websocket.receive_json()
-        assert second == {"type": "pong"}
+        assert second == {
+            "type": "frame_error",
+            "seq": 2,
+            "reason": "module_unavailable",
+            "message": "module fails-after-first failed while processing",
+        }
+
+        third = websocket.receive_json()
+        assert third == {
+            "type": "frame_error",
+            "seq": 3,
+            "reason": "module_unavailable",
+            "message": "module fails-after-first is ModuleState.FAILED, not ACTIVE",
+        }
+
+        websocket.send_json({"type": "ping"})
+        assert websocket.receive_json() == {"type": "pong"}
 
     # The module's own process() was called exactly twice: once
     # successfully for frame 1, once failingly for frame 2. Frame 3 never

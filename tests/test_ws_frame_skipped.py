@@ -69,9 +69,16 @@ def test_frame_processing_error_drops_frame_keeps_module_active_and_counts_metri
                 "data": _make_jpeg_base64(8, 8),
             }
         )
+        # No frame_result was queued for the bad frame -- a frame_error
+        # message arrives instead, and the module is still ACTIVE afterward.
+        error = websocket.receive_json()
+        assert error == {
+            "type": "frame_error",
+            "seq": 1,
+            "reason": "frame_skipped",
+            "message": "module frame-processing-error could not process this frame",
+        }
         websocket.send_json({"type": "ping"})
-        # No frame_result was queued for the bad frame -- the very next
-        # message is the pong, and the module is still ACTIVE afterward.
         assert websocket.receive_json() == {"type": "pong"}
         websocket.send_json({"type": "stream_stop"})
 
