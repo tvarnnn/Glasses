@@ -8,6 +8,7 @@ class Settings:
     port: int
     dev_mode: bool
     cv_experiment: str
+    cv_device: str
 
 
 def get_settings() -> Settings:
@@ -16,4 +17,5 @@ def get_settings() -> Settings:
         port=int(os.environ.get("TOWER_PORT", "8000")),
         dev_mode=os.environ.get("TOWER_DEV_MODE", "true").lower() in ("1", "true", "yes"),
         cv_experiment=os.environ.get("TOWER_CV_EXPERIMENT", "baseline"),
+        cv_device=os.environ.get("TOWER_CV_DEVICE", "auto"),
     )
