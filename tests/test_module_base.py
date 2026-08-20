@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 import pytest
 
@@ -112,3 +113,101 @@ def test_mark_failed_forces_failed_state_from_any_state():
 
     with pytest.raises(InvalidModuleStateError):
         module.process("frame-bytes")
+
+
+class _ReleaseTrackingModule(Module):
+    descriptor = ModuleDescriptor(
+        id="release-tracking",
+        name="Release Tracking",
+        version="0.0.1",
+        data_behavior=ModuleDataBehavior(
+            persists_data=False,
+            retains_raw_imagery=False,
+            retention="none",
+            supports_purge=False,
+            transmits_externally=False,
+        ),
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release_calls = 0
+
+    async def _do_load(self) -> None:
+        pass
+
+    async def _do_start(self) -> None:
+        pass
+
+    def _do_process(self, observation):
+        return observation
+
+    async def _do_stop(self) -> None:
+        pass
+
+    async def _do_unload(self) -> None:
+        pass
+
+    def _do_release(self) -> None:
+        self.release_calls += 1
+
+
+class _RaisingReleaseModule(Module):
+    descriptor = ModuleDescriptor(
+        id="raising-release",
+        name="Raising Release",
+        version="0.0.1",
+        data_behavior=ModuleDataBehavior(
+            persists_data=False,
+            retains_raw_imagery=False,
+            retention="none",
+            supports_purge=False,
+            transmits_externally=False,
+        ),
+    )
+
+    async def _do_load(self) -> None:
+        pass
+
+    async def _do_start(self) -> None:
+        pass
+
+    def _do_process(self, observation):
+        return observation
+
+    async def _do_stop(self) -> None:
+        pass
+
+    async def _do_unload(self) -> None:
+        pass
+
+    def _do_release(self) -> None:
+        raise RuntimeError("release exploded")
+
+
+def test_default_do_release_is_a_safe_no_op():
+    module = _RecordingModule()
+
+    module.mark_failed()  # must not raise even though _do_release is unimplemented
+
+    assert module.state == ModuleState.FAILED
+
+
+def test_mark_failed_calls_do_release():
+    module = _ReleaseTrackingModule()
+    asyncio.run(module.load())
+    asyncio.run(module.start())
+
+    module.mark_failed()
+
+    assert module.state == ModuleState.FAILED
+    assert module.release_calls == 1
+
+
+def test_mark_failed_swallows_do_release_exception(caplog):
+    caplog.set_level(logging.ERROR, logger="tower.modules.base")
+    module = _RaisingReleaseModule()
+
+    module.mark_failed()  # must not raise
+
+    assert module.state == ModuleState.FAILED

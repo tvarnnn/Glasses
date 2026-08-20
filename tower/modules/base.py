@@ -1,7 +1,10 @@
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class ModuleState(Enum):
@@ -19,6 +22,25 @@ class InvalidModuleStateError(Exception):
 
 class ModuleUnavailableError(Exception):
     """Raised by ModuleContainer.process() when the module cannot accept observations."""
+
+
+class FrameProcessingError(Exception):
+    """Raised by a module's _do_process() to signal a recoverable,
+    frame-scoped failure (e.g. an undecodable frame). ModuleContainer
+    treats this as "drop this one frame" -- it must NOT take the whole
+    module down. Any other exception from _do_process() is still a
+    genuine module failure and still marks the module FAILED.
+    """
+
+
+class FrameSkippedError(ModuleUnavailableError):
+    """A ModuleUnavailableError specifically because one frame failed a
+    recoverable, frame-scoped check -- the module itself is still ACTIVE
+    and will accept the next frame. Callers that only care "was this
+    frame dropped" can keep catching ModuleUnavailableError unchanged;
+    callers that want to distinguish "one bad frame" from "module died"
+    (e.g. metrics) can catch this subtype specifically.
+    """
 
 
 @dataclass(frozen=True)
@@ -91,6 +113,13 @@ class Module(ABC):
 
     def mark_failed(self) -> None:
         self._state = ModuleState.FAILED
+        try:
+            self._do_release()
+        except Exception:
+            logger.exception(
+                "module %s: _do_release() raised during FAILED transition",
+                self.descriptor.id,
+            )
 
     @abstractmethod
     async def _do_load(self) -> None: ...
@@ -106,3 +135,16 @@ class Module(ABC):
 
     @abstractmethod
     async def _do_unload(self) -> None: ...
+
+    def _do_release(self) -> None:
+        """Best-effort synchronous resource release on a FAILED transition.
+
+        Default no-op. Override for a module holding a resource (e.g. a
+        loaded model) that must not survive FAILED, regardless of which
+        lifecycle stage caused it. Must not raise. Must be safe to call
+        even if _do_load() only partially completed. Deliberately
+        synchronous, not async: mark_failed() can be reached from
+        ModuleContainer.process(), a synchronous hot-path method with no
+        running event loop to await against.
+        """
+        return None
