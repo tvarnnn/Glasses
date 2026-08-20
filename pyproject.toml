@@ -21,6 +21,12 @@ dev = [
 ml = [
     "torch",
     "torchvision",
+    # timm: not a Tower dependency directly, but MiDaS's hubconf.py
+    # (intel-isl/MiDaS, loaded via torch.hub in tower/experiments/depth.py)
+    # unconditionally imports a DPT/beit backbone chain that requires it,
+    # even to load the "MiDaS_small" model. Without it, DepthEstimation.load()
+    # fails with ModuleNotFoundError: No module named 'timm'.
+    "timm",
 ]
 
 [build-system]
