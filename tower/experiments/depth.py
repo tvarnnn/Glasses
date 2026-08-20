@@ -25,10 +25,18 @@ class DepthEstimation:
     07-PLATFORM-CONSTRAINTS.md Limitation 1 / Core Principle 2.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, capture_depth_array: bool = False) -> None:
         self._model = None
         self._transform = None
         self._device = None
+        # Opt-in, bounded observability hook for offline research analysis
+        # (World Builder Experiment 1, depth_temporal_consistency): the wire
+        # protocol only carries the scalar mean, but temporal-stability
+        # analysis needs the full per-frame array. Off by default so the
+        # serving path is unchanged; holds only the most recent frame, never
+        # a growing list, so enabling it cannot grow without bound.
+        self.capture_depth_array = capture_depth_array
+        self.last_depth_array = None
 
     def load(self, device: str) -> None:
         import torch  # local import: torch is an optional [ml] extra;
@@ -77,6 +85,7 @@ class DepthEstimation:
         self._model = None
         self._transform = None
         self._device = None
+        self.last_depth_array = None
 
         if is_cuda:
             torch.cuda.empty_cache()
@@ -108,6 +117,8 @@ class DepthEstimation:
         with timer.stage("postprocess"):
             depth = prediction.squeeze().detach().cpu().numpy()
             mean_relative_depth = float(depth.mean())
+            if self.capture_depth_array:
+                self.last_depth_array = depth
 
         return ExperimentResult(
             result_value=mean_relative_depth,
