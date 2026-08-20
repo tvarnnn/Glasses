@@ -36,12 +36,14 @@ class DepthEstimation:
 
         start = time.perf_counter()
         self._device = torch.device(device)
-        self._model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
+        # Pinned: floating on the default branch is a reproducibility risk
+        # for a measured baseline, not theoretical -- see the spec's
+        # 2026-08-20 Amendment for how this was discovered.
+        midas_ref = "intel-isl/MiDaS:454597711a62eabcbf7d1e89f3fb9f569051ac9b"
+        self._model = torch.hub.load(midas_ref, "MiDaS_small")
         self._model.to(self._device)
         self._model.eval()
-        self._transform = torch.hub.load(
-            "intel-isl/MiDaS", "transforms"
-        ).small_transform
+        self._transform = torch.hub.load(midas_ref, "transforms").small_transform
         load_ms = (time.perf_counter() - start) * 1000
 
         if self._device.type == "cuda":
