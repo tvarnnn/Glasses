@@ -2,7 +2,14 @@ import asyncio
 import logging
 from typing import Any
 
-from tower.modules.base import Module, ModuleDescriptor, ModuleState, ModuleUnavailableError
+from tower.modules.base import (
+    FrameProcessingError,
+    FrameSkippedError,
+    Module,
+    ModuleDescriptor,
+    ModuleState,
+    ModuleUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +84,15 @@ class ModuleContainer:
             )
         try:
             return self._module.process(raw_bytes)
+        except FrameProcessingError as exc:
+            logger.warning(
+                "module %s: frame-level failure, module stays ACTIVE: %s",
+                self._module.descriptor.id,
+                exc,
+            )
+            raise FrameSkippedError(
+                f"module {self._module.descriptor.id} could not process this frame"
+            ) from exc
         except Exception as exc:
             logger.exception(
                 "module %s raised during process(); marking FAILED",

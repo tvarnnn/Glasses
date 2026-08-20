@@ -4,6 +4,8 @@ import logging
 import pytest
 
 from tower.modules.base import (
+    FrameProcessingError,
+    FrameSkippedError,
     Module,
     ModuleDataBehavior,
     ModuleDescriptor,
@@ -69,6 +71,10 @@ class _HangingLoadModule(Module):
 class _BrokenProcessModule(Module):
     descriptor = _descriptor("broken-process")
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.release_calls = 0
+
     async def _do_load(self) -> None:
         pass
 
@@ -77,6 +83,33 @@ class _BrokenProcessModule(Module):
 
     def _do_process(self, observation):
         raise RuntimeError("processing exploded")
+
+    async def _do_stop(self) -> None:
+        pass
+
+    async def _do_unload(self) -> None:
+        pass
+
+    def _do_release(self) -> None:
+        self.release_calls += 1
+
+
+class _FrameProcessingErrorModule(Module):
+    descriptor = _descriptor("frame-processing-error")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.process_calls = 0
+
+    async def _do_load(self) -> None:
+        pass
+
+    async def _do_start(self) -> None:
+        pass
+
+    def _do_process(self, observation):
+        self.process_calls += 1
+        raise FrameProcessingError("bad frame")
 
     async def _do_stop(self) -> None:
         pass
@@ -190,3 +223,39 @@ def test_shutdown_unload_timeout_marks_failed_and_does_not_raise():
     asyncio.run(container.shutdown())  # must not raise
 
     assert container.state == ModuleState.FAILED
+
+
+def test_frame_processing_error_raises_frame_skipped_and_module_stays_active():
+    container = ModuleContainer(_FrameProcessingErrorModule())
+    asyncio.run(container.load_and_start())
+
+    with pytest.raises(FrameSkippedError):
+        container.process("frame")
+
+    assert container.state == ModuleState.ACTIVE
+
+    # A second bad frame is handled the same way -- the module was never
+    # marked FAILED, so it keeps accepting frames indefinitely.
+    with pytest.raises(FrameSkippedError):
+        container.process("frame")
+
+    assert container.state == ModuleState.ACTIVE
+
+
+def test_frame_skipped_error_is_a_module_unavailable_error():
+    container = ModuleContainer(_FrameProcessingErrorModule())
+    asyncio.run(container.load_and_start())
+
+    with pytest.raises(ModuleUnavailableError):
+        container.process("frame")
+
+
+def test_process_exception_releases_module_resources():
+    module = _BrokenProcessModule()
+    container = ModuleContainer(module)
+    asyncio.run(container.load_and_start())
+
+    with pytest.raises(ModuleUnavailableError):
+        container.process("frame")
+
+    assert module.release_calls == 1
