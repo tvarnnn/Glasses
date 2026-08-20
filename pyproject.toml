@@ -15,6 +15,12 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    # httpx2, not httpx: starlette.testclient emits a
+    # StarletteDeprecationWarning when the older httpx backs TestClient.
+    # Do NOT `pip uninstall httpx` to "finish" this swap -- huggingface_hub
+    # (a transitive dependency of timm, in the ml extra) genuinely requires
+    # httpx, and removing it breaks `pip check` and MiDaS weight downloads.
+    # The two coexist; this line only governs which client backs TestClient.
     "httpx2>=2.0",
     "websockets>=12.0",
 ]
