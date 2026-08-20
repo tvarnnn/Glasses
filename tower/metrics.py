@@ -53,6 +53,7 @@ class SessionMetrics:
         self.frames_received = 0
         self.seq_gap_total = 0
         self.backpressure_drops = 0
+        self.frame_processing_errors = 0
         self.bytes_received = 0
         self._receive_to_result_ms: list[float] = []
         self._cv_processing_ms: list[float] = []
@@ -77,6 +78,9 @@ class SessionMetrics:
             for stage_name, ms in stage_ms.items():
                 self._stage_ms.setdefault(stage_name, []).append(ms)
 
+    def record_frame_processing_error(self) -> None:
+        self.frame_processing_errors += 1
+
     def should_log_summary(self) -> bool:
         return (
             self.frames_received > 0
@@ -93,6 +97,7 @@ class SessionMetrics:
             "bandwidth_bps": round(self.bytes_received / elapsed_s, 2),
             "seq_gap_total": self.seq_gap_total,
             "backpressure_drops": self.backpressure_drops,
+            "frame_processing_errors": self.frame_processing_errors,
             "receive_to_result_ms_avg": round(_avg(self._receive_to_result_ms), 3),
             "receive_to_result_ms_max": round(
                 max(self._receive_to_result_ms, default=0.0), 3

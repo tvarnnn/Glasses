@@ -155,3 +155,17 @@ def test_record_frame_without_stage_ms_leaves_stage_ms_snapshot_empty():
     snapshot = metrics.snapshot()
     assert snapshot["stage_ms_avg"] == {}
     assert snapshot["stage_ms_max"] == {}
+
+
+def test_frame_processing_errors_starts_at_zero():
+    metrics = SessionMetrics()
+    assert metrics.snapshot()["frame_processing_errors"] == 0
+
+
+def test_record_frame_processing_error_increments_counter():
+    metrics = SessionMetrics()
+
+    metrics.record_frame_processing_error()
+    metrics.record_frame_processing_error()
+
+    assert metrics.snapshot()["frame_processing_errors"] == 2
