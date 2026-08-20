@@ -142,7 +142,21 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     try:
         while True:
-            message = await websocket.receive_json()
+            try:
+                message = await websocket.receive_json()
+            except WebSocketDisconnect:
+                raise
+            except Exception as exc:
+                logger.warning("received malformed WS message, ignoring: %s", exc)
+                continue
+
+            if not isinstance(message, dict):
+                logger.warning(
+                    "received malformed WS message, ignoring: not a JSON object: %r",
+                    message,
+                )
+                continue
+
             message_type = message.get("type")
 
             if message_type == "ping":
