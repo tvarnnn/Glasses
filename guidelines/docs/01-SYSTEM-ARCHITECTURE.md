@@ -45,7 +45,14 @@ Module-specific state should not automatically become global state.
 
 ### Initial Tower Stack
 
-Pinned for the first implementation: Python, FastAPI, WebSockets for real-time frame transport, OpenCV, PyTorch, and CUDA when GPU acceleration is required. Do not introduce gRPC, C++, distributed infrastructure, message brokers, or container orchestration speculatively. Revisit only if measurements expose a real limitation.
+Pinned for the first implementation: Python, FastAPI, WebSockets for
+real-time frame transport, OpenCV, and CUDA when GPU acceleration is
+required. PyTorch is an optional `ml` extra (`pip install -e ".[ml]"`),
+required only by a module that actually selects a model-backed CV
+experiment — the core transport/health/WS runtime has no dependency on
+it. Do not introduce gRPC, C++, distributed infrastructure, message
+brokers, or container orchestration speculatively — revisit only if
+measurements expose a real limitation.
 
 ## Module Switching
 

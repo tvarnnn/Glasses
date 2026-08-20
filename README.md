@@ -1,19 +1,17 @@
 # Glasses Tower
 
 The Windows tower transport layer for the Glasses platform. Current
-milestone: V0.7 — Sustained Streaming (mock/iPhone validation complete —
-~14.3 minute run, short of the 20-30 minute target, ended cleanly via
-stream_stop; physical-glasses validation is deferred, not yet performed —
-see `guidelines/docs/reports/V0.7-sustained-streaming-report.md`). The
-tower exposes a health check and a WebSocket endpoint that supports
-ping/pong and receives JPEG camera frames per message, verifies each,
-runs a minimal deterministic OpenCV operation (grayscale conversion +
-mean intensity) on the decoded pixels, and returns the result, while
-logging per-session streaming measurements (FPS, bandwidth, a raw
-sequence-gap count, Tower-side drops, processing latency, CPU/RSS). Frames are
-processed in memory only and are never written to disk. There is no
-module system, module lifecycle, or CV experiment framework yet — that is
-future roadmap scope (V0.8+).
+milestone: V0.9.1 — Module System + Experimental CV Lab Baseline. The tower
+exposes a persistent runtime with a module container that supports stateful,
+model-backed computer vision experiments. The core transport layer (WebSocket
+health check, frame receive, JPEG validation, per-session measurements) is
+fully decoupled from module implementations; modules register CV experiments
+and handle frame processing. The `baseline` experiment runs deterministic
+OpenCV (grayscale + mean intensity), while the `depth` experiment uses
+MiDaS-small monocular depth estimation on GPU/CPU. Both log per-session
+streaming measurements (FPS, bandwidth, sequence-gap count, Tower-side drops,
+processing latency, CPU/RSS), plus per-stage timing for module operations.
+Frames are processed in memory only and never written to disk.
 
 ## Environment Setup
 
@@ -32,6 +30,54 @@ pip install -e ".[dev]"
 
 This installs FastAPI, Uvicorn, Pillow, OpenCV (headless), NumPy, psutil,
 and the test dependencies (pytest, httpx, websockets).
+
+## Model-Backed Experiments (Optional)
+
+The `depth` experiment (`TOWER_CV_EXPERIMENT=depth`) requires the `ml`
+extra, which includes PyTorch, torchvision, and timm (needed by MiDaS's
+hubconf backbone chain):
+
+```powershell
+pip install -e ".[dev,ml]"
+```
+
+### PyTorch/CUDA Installation
+
+On this Windows machine with CUDA 13.2 support, the verified working install
+command is:
+
+```powershell
+.venv\Scripts\pip.exe install torch torchvision --index-url https://download.pytorch.org/whl/cu132
+```
+
+This uses the `cu132` index, which is the newest stable PyTorch build matching
+the driver-reported CUDA 13.2 support. (Other indexes like `cu128` or `cu129`
+may be stale.) This command installs as part of the broader `pip install -e
+".[dev,ml]"` workflow above.
+
+### MAX_PATH Warning (Windows)
+
+A plain `pip install` of torch/torchvision from a path this deep (e.g., a git
+worktree in `C:\Users\tvllo\Projects\...`) can fail with:
+
+```
+OSError: [WinError 206] The filename or extension is too long
+```
+
+This is Windows' MAX_PATH (260 character) limit, tripped by torch's
+deeply-nested bundled third-party license file tree. **Do not attempt to
+enable Windows' global `LongPathsEnabled` registry setting** as an ad-hoc fix
+(it's a machine-wide policy change outside a normal install's scope). Instead,
+extract the wheel manually to the target site-packages directory using the
+`\\?\` Win32 extended-length path prefix, which bypasses MAX_PATH for file
+APIs without requiring a registry change (always supported by NTFS/Win32).
+
+### MiDaS-small Weight Downloads
+
+The first time the `depth` experiment loads, it downloads MiDaS-small's weights
+(and a nested `rwightman/gen-efficientnet-pytorch` backbone) via `torch.hub`
+— this requires internet access once. Results are cached afterward
+(`~/.cache/torch/hub`) and no further downloads occur on subsequent loads.
 
 ## Running the Tests
 
@@ -52,7 +98,8 @@ Configuration is read from environment variables (all optional):
 | `TOWER_HOST`       | `0.0.0.0` | Interface to bind to                       |
 | `TOWER_PORT`       | `8000`    | Port to listen on                          |
 | `TOWER_DEV_MODE`   | `true`    | Enables debug-level logging                |
-| `TOWER_CV_EXPERIMENT` | `baseline` | Active CV experiment (`baseline` or `edge_detection`) |
+| `TOWER_CV_EXPERIMENT` | `baseline` | Active CV experiment (`baseline` or `edge_detection` or `depth`) |
+| `TOWER_CV_DEVICE`   | `auto`    | Device for model-backed experiments (`auto`, `cpu`, or `cuda`) |
 
 The server binds to `0.0.0.0` by default so it is reachable from other
 devices on the LAN, not just `localhost`.
