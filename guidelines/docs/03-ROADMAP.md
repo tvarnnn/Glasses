@@ -44,7 +44,7 @@ Exit criterion: real or simulated wearable camera frames reach the iOS applicati
 
 ### V0.5 — Minimal Tower Receiver
 - Establish a small server on the Windows tower.
-- Initial stack (pinned): Python, FastAPI, WebSockets for real-time frame transport, OpenCV, PyTorch, and CUDA when GPU acceleration is required. Do not introduce gRPC, C++, distributed infrastructure, message brokers, or container orchestration speculatively — revisit only if measurements expose a real limitation.
+- Initial stack (pinned): Python, FastAPI, WebSockets for real-time frame transport, and OpenCV; PyTorch is an optional `ml` extra required only by a model-backed CV experiment, and CUDA is used only when GPU acceleration is required. Do not introduce gRPC, C++, distributed infrastructure, message brokers, or container orchestration speculatively — revisit only if measurements expose a real limitation.
 - LAN-only. No remote/internet exposure at this milestone — see Phase 1.5 for remote access.
 - Secure development transport appropriate for a trusted local network (exact mechanism decided during implementation).
 - iPhone discovers/connects to configured tower.

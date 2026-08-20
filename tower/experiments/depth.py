@@ -40,10 +40,12 @@ class DepthEstimation:
         # for a measured baseline, not theoretical -- see the spec's
         # 2026-08-20 Amendment for how this was discovered.
         midas_ref = "intel-isl/MiDaS:454597711a62eabcbf7d1e89f3fb9f569051ac9b"
-        self._model = torch.hub.load(midas_ref, "MiDaS_small")
+        self._model = torch.hub.load(midas_ref, "MiDaS_small", trust_repo=True)
         self._model.to(self._device)
         self._model.eval()
-        self._transform = torch.hub.load(midas_ref, "transforms").small_transform
+        self._transform = torch.hub.load(
+            midas_ref, "transforms", trust_repo=True
+        ).small_transform
         load_ms = (time.perf_counter() - start) * 1000
 
         if self._device.type == "cuda":
@@ -66,18 +68,22 @@ class DepthEstimation:
             )
 
     def release(self) -> None:
-        if self._device is not None and self._device.type == "cuda":
+        is_cuda = self._device is not None and self._device.type == "cuda"
+        if is_cuda:
             import torch
 
             peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+        self._model = None
+        self._transform = None
+        self._device = None
+
+        if is_cuda:
+            torch.cuda.empty_cache()
             logger.info(
                 "[Tower][Module] depth experiment released; peak cuda allocation %.1fMB",
                 peak_mb,
             )
-            torch.cuda.empty_cache()
-        self._model = None
-        self._transform = None
-        self._device = None
 
     def run(self, raw_bytes: bytes) -> ExperimentResult:
         timer = StageTimer()

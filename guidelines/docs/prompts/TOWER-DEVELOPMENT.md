@@ -5,7 +5,7 @@ Work on the Glasses persistent tower runtime.
 
 First read docs/prompts/START-HERE.md and follow it.
 
-Initial tower stack is pinned: Python, FastAPI, WebSockets, OpenCV, PyTorch, CUDA when needed. Do not introduce gRPC, C++, distributed infrastructure, message brokers, or orchestration platforms speculatively — see `01-SYSTEM-ARCHITECTURE.md`.
+Initial tower stack is pinned: Python, FastAPI, WebSockets, OpenCV; PyTorch is an optional extra required only for model-backed CV experiments, CUDA used when needed. Do not introduce gRPC, C++, distributed infrastructure, message brokers, or orchestration platforms speculatively — see `01-SYSTEM-ARCHITECTURE.md`.
 
 The tower is the primary compute environment. It will eventually own:
 - authenticated transport from iPhone;

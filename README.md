@@ -35,11 +35,36 @@ and the test dependencies (pytest, httpx, websockets).
 
 The `depth` experiment (`TOWER_CV_EXPERIMENT=depth`) requires the `ml`
 extra, which includes PyTorch, torchvision, and timm (needed by MiDaS's
-hubconf backbone chain):
+hubconf backbone chain).
+
+**Install order matters here.** `pyproject.toml`'s `ml` extra declares an
+unconstrained `"torch"`/`"torchvision"` requirement (no CUDA-specific index
+pin), so if you run `pip install -e ".[dev,ml]"` first, pip will resolve
+torch/torchvision from plain PyPI — which is very likely a **CPU-only**
+wheel. Once that's installed, it already satisfies the unconstrained
+requirement, so a later `pip install -e ".[dev,ml]"` will **not**
+force-replace it, and even running the `--index-url` command below
+afterward can report "already satisfied" without actually giving you a CUDA
+build. The practical symptom: `TOWER_CV_DEVICE=cuda` fails with a
+`RuntimeError` from `_resolve_device()` (`tower/modules/depth_cv.py`)
+because CUDA isn't actually available to torch, and `TOWER_CV_DEVICE=auto`
+silently falls back to CPU with no error at all.
+
+If you plan to use `TOWER_CV_DEVICE=cuda` (i.e. you want the GPU baseline,
+not just a CPU-only `depth` experiment), install the CUDA-indexed
+torch/torchvision build **first**, before the extras:
 
 ```powershell
+.venv\Scripts\pip.exe install torch torchvision --index-url https://download.pytorch.org/whl/cu132
 pip install -e ".[dev,ml]"
 ```
+
+The second command then only needs to add `timm` and the `dev` extras —
+torch/torchvision are already installed and already satisfy the
+unconstrained requirement, so pip leaves them alone.
+
+If you only need the `depth` experiment on CPU (no CUDA), plain
+`pip install -e ".[dev,ml]"` on its own is fine.
 
 ### PyTorch/CUDA Installation
 
@@ -52,8 +77,8 @@ command is:
 
 This uses the `cu132` index, which is the newest stable PyTorch build matching
 the driver-reported CUDA 13.2 support. (Other indexes like `cu128` or `cu129`
-may be stale.) This command installs as part of the broader `pip install -e
-".[dev,ml]"` workflow above.
+may be stale.) Run this **before** `pip install -e ".[dev,ml]"` — see the
+install-order warning above; it is not automatically part of that workflow.
 
 ### MAX_PATH Warning (Windows)
 
@@ -210,10 +235,12 @@ async def main():
 asyncio.run(main())
 ```
 
-Expected output (values vary by image):
+Expected output (values vary by image and by the active `TOWER_CV_EXPERIMENT`;
+`mean_intensity` is only present for the `baseline` experiment — see
+`tower/routes/ws.py`):
 
 ```text
-{"type":"frame_result","seq":1,"mean_intensity":130.0,"processing_ms":4.1}
+{"type":"frame_result","seq":1,"processing_ms":4.1,"result_value":130.0,"result_label":"mean_intensity","stage_ms":{"total":4.1},"mean_intensity":130.0}
 ```
 
 The tower's own log output during this should show:
@@ -315,30 +342,87 @@ real-world V0.7 figures — see `07-PLATFORM-CONSTRAINTS.md` Limitation 12.
 
 ```text
 tower/
-  main.py               FastAPI app factory + ASGI entrypoint
-  config.py              Environment-based settings (host/port/dev mode)
-  logging_config.py      Structured logging setup
-  session.py             Minimal single-client connection tracking
-  frames.py               Frame message validation/decoding (transport-level)
-  frame_processing.py     Minimal deterministic OpenCV operation on decoded pixels
-  metrics.py               Per-connection sustained-streaming measurements
+  main.py                 FastAPI app factory + ASGI entrypoint; builds
+                          the one active module via TOWER_CV_EXPERIMENT
+  config.py               Environment-based settings (host/port/dev
+                          mode/CV experiment/CV device)
+  logging_config.py       Structured logging setup
+  session.py              Minimal single-client connection tracking
+  frames.py               Frame message validation/decoding
+                          (transport-level)
+  frame_processing.py     Minimal deterministic OpenCV operation
+                          (grayscale + mean intensity); used by the
+                          `baseline` experiment below
+  metrics.py              Per-connection sustained-streaming
+                          measurements
+  instrumentation.py      StageTimer: per-stage timing shared by
+                          module experiments
+  experiments/
+    __init__.py           Stateless EXPERIMENTS registry (baseline,
+                          edge_detection) + ExperimentResult
+    baseline.py           Grayscale + mean-intensity OpenCV experiment
+    edge_detection.py     Canny edge-detection OpenCV experiment
+    depth.py              Stateful MiDaS-small monocular depth
+                          experiment (holds a loaded model; not in the
+                          stateless registry above)
+  modules/
+    base.py               Module ABC, lifecycle states,
+                          FrameProcessingError/FrameSkippedError/
+                          ModuleUnavailableError
+    container.py          ModuleContainer: lifecycle orchestration for
+                          the one active module slot
+    experimental_cv.py    Module wrapping the stateless EXPERIMENTS
+                          registry (baseline/edge_detection)
+    depth_cv.py           Module wrapping the stateful depth experiment
+                          (TOWER_CV_EXPERIMENT=depth)
   routes/
     health.py             GET /health
-    ws.py                  WebSocket /ws (ping/pong, frame receive + processing)
+    ws.py                 WebSocket /ws (ping/pong, frame receive +
+                          module dispatch)
 scripts/
   soak_test_stream.py     Local sustained-load soak-test client (V0.7)
+  verify_cuda.py          One-shot PyTorch/CUDA verification spike
+                          (V0.9.1)
+  depth_benchmark.py      CPU vs GPU depth-experiment benchmark client
+                          (V0.9.1)
 tests/
   test_health.py
+  test_config.py
   test_ws.py
   test_ws_frames.py
+  test_ws_disconnect_race.py
+  test_ws_stream_lifecycle.py
+  test_ws_sustained.py
+  test_ws_module_unavailable.py
+  test_ws_frame_skipped.py
+  test_ws_experiment_fields.py
   test_frame_processing.py
   test_metrics.py
-  test_ws_sustained.py
+  test_instrumentation.py
+  test_experiment_result.py
+  test_experiments_registry.py
+  test_experiments_baseline.py
+  test_experiments_edge_detection.py
+  test_experiments_depth.py
+  test_module_base.py
+  test_module_container.py
+  test_module_container_wiring.py
+  test_main_module_factory.py
+  test_experimental_cv_module.py
+  test_depth_cv_module.py
+  test_depth_experiment_integration.py  (opt-in, real model — see below)
   test_soak_script_cli.py
+  test_depth_benchmark_cli.py
 ```
 
-`frame_processing.py` contains the only OpenCV usage in the codebase. There
-is no module system, module lifecycle, or CV experiment framework yet —
-that is future roadmap scope. `frames.py`/`routes/ws.py` remain transport
-infrastructure; frame pixel processing is isolated to a single file so it
-can be lifted behind a proper module boundary later without a rewrite.
+The module system (`tower/modules/`) owns the module lifecycle
+(UNLOADED -> LOADING -> READY -> ACTIVE -> STOPPING/FAILED) and dispatches
+each decoded frame to whichever experiment is currently selected via
+`TOWER_CV_EXPERIMENT`. `frame_processing.py` no longer contains the only
+OpenCV usage in the codebase — `tower/experiments/edge_detection.py` and
+`tower/experiments/depth.py` also call into OpenCV (the latter only for
+JPEG decode/color conversion ahead of model inference); `frame_processing.py`
+remains the one OpenCV call site the `baseline` experiment itself uses.
+`frames.py`/`routes/ws.py` remain transport infrastructure — frame
+transport/decoding is fully decoupled from whichever module/experiment
+processes the resulting pixels.

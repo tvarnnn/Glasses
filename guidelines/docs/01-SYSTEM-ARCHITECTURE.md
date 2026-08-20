@@ -162,7 +162,7 @@ Do not adopt a GPU-acceleration technology because it is available or because th
 
 **Candidate technologies** — evaluate each on its own merits; this is not a commitment to use all of them:
 - **CUDA** — baseline GPU compute; already pinned as available "when GPU acceleration is required" (see Initial Tower Stack, above).
-- **PyTorch CUDA execution** — the natural first step once a model-based bottleneck is identified, since PyTorch is already the pinned ML framework; lowest integration cost of this list.
+- **PyTorch CUDA execution** — the natural first step once a model-based bottleneck is identified, since PyTorch is already the ML framework used by the optional `ml` extra (see Initial Tower Stack, above); lowest integration cost of this list.
 - **TensorRT** — inference-graph optimization/compilation; justified once a specific PyTorch model is profiled as the bottleneck and its inference time, not data movement or preprocessing, dominates.
 - **CV-CUDA** — GPU-accelerated classical CV/preprocessing operations; justified only if profiling shows CPU-side OpenCV preprocessing, not model inference, is the bottleneck.
 - **DeepStream** — a multi-stream video-analytics pipeline framework built for many concurrent camera feeds (e.g., NVR/edge-analytics deployments on Jetson-class hardware). The current architecture processes one glasses stream through one active module on one desktop Tower. DeepStream's pipeline/plugin model, GStreamer dependency, and multi-stream orchestration are unlikely to earn their integration and operational cost at this scale. **This is the weakest candidate on this list** — do not adopt it without a specific, measured multi-stream requirement that CUDA/PyTorch CUDA/TensorRT cannot satisfy.
