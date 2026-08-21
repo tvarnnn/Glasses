@@ -279,16 +279,40 @@ streaming session.
 Send once, when the camera session/stream stops — no more `frame`
 messages should follow until the next `stream_start`.
 
-Neither message gets a reply (unlike `ping`→`pong` or `frame`→
-`frame_result`) — don't wait on a response for either.
+Neither message gets a reply (unlike `ping`→`pong`, or `frame`→
+`frame_result`/`frame_error`) — don't wait on a response for either.
+
+### `frame_error` (Tower → app)
+
+A `frame` message is answered by **either** `frame_result` **or**
+`frame_error` — never both, never neither. Clients must handle both.
+
+```json
+{"type": "frame_error", "seq": 30, "reason": "frame_skipped",
+ "message": "module experimental-cv could not process this frame"}
+```
+
+`reason` is one of:
+
+| `reason` | Meaning | Module state after |
+|---|---|---|
+| `invalid_frame` | The message failed transport-level validation (missing field, bad base64, unsupported format, undecodable JPEG). The module was never invoked. | unchanged |
+| `frame_skipped` | The module rejected this one frame but is still healthy and will accept the next. | still `active` |
+| `module_unavailable` | The module is not `active` — it failed while processing this frame, or was already failed/unloaded. Subsequent frames will also fail until the Tower is restarted. | `failed` |
+
+`seq` is `null` when the message failed validation before `seq` could be
+read. `message` is a human-readable diagnostic — log it, don't parse it.
 
 Behavior:
-- `frame` messages are always fully processed and get a `frame_result`
-  regardless of whether a stream measurement window is currently open —
-  `stream_start` is not required for basic frame processing to work.
+- Every `frame` message gets exactly one reply, `frame_result` or
+  `frame_error`, regardless of whether a stream measurement window is
+  currently open — `stream_start` is not required for frame processing.
 - Frames received before any `stream_start` (or after a `stream_stop`)
-  are processed and acknowledged normally, but are not counted in any
+  are processed and answered normally, but are not counted in any
   measurement window.
+- A malformed message that isn't frame-shaped at all (invalid JSON, or a
+  JSON value that isn't an object) is logged and ignored; the connection
+  stays open and no reply is sent.
 - `stream_stop` with no window open logs a warning and is otherwise a
   no-op — the connection stays fully usable.
 - A `stream_start` received while a window is already open finalizes the

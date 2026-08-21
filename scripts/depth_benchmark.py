@@ -43,6 +43,7 @@ def _make_jpeg_base64(width: int, height: int) -> str:
 async def run_benchmark(uri: str, width: int, height: int, frame_count: int) -> dict:
     frame_data_b64 = _make_jpeg_base64(width, height)
     round_trip_ms: list[float] = []
+    frame_errors: list[dict] = []
 
     async with websockets.connect(uri) as ws:
         await ws.send(json.dumps({"type": "stream_start"}))
@@ -60,7 +61,15 @@ async def run_benchmark(uri: str, width: int, height: int, frame_count: int) -> 
             frame_start = time.perf_counter()
             await ws.send(payload)
             response = json.loads(await ws.recv())
-            round_trip_ms.append((time.perf_counter() - frame_start) * 1000)
+            elapsed_ms = (time.perf_counter() - frame_start) * 1000
+            # frame_error is a legitimate reply (added V0.9.2): a skipped
+            # frame or an unavailable module answers with it instead of
+            # frame_result. Count it rather than crashing, and keep it out
+            # of the latency stats -- it did not complete the CV path.
+            if response.get("type") == "frame_error":
+                frame_errors.append(response)
+                continue
+            round_trip_ms.append(elapsed_ms)
             if response.get("type") != "frame_result":
                 raise RuntimeError(f"expected frame_result, got: {response}")
         await ws.send(json.dumps({"type": "stream_stop"}))
@@ -68,9 +77,19 @@ async def run_benchmark(uri: str, width: int, height: int, frame_count: int) -> 
     # First frame excluded from the average: CUDA context first-init is a
     # documented one-time warmup cost, not representative steady-state
     # latency (see 2026-08-20-v0.9.1-depth-cv-baseline-design.md).
+    if not round_trip_ms:
+        raise RuntimeError(
+            f"no frame_result received; {len(frame_errors)} frame_error replies, "
+            f"first: {frame_errors[0] if frame_errors else 'none'}"
+        )
+
     steady_state = round_trip_ms[1:] if len(round_trip_ms) > 1 else round_trip_ms
     return {
         "frame_count": frame_count,
+        "frames_answered_with_result": len(round_trip_ms),
+        # Non-zero invalidates the run as a clean latency baseline -- some
+        # frames never completed the CV path.
+        "frames_answered_with_error": len(frame_errors),
         "first_frame_round_trip_ms": round(round_trip_ms[0], 2),
         "round_trip_ms_avg": round(sum(steady_state) / len(steady_state), 2),
         "round_trip_ms_max": round(max(steady_state), 2),
