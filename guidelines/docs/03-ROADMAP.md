@@ -66,6 +66,8 @@ Measure actual FPS, dropped frames, latency, bandwidth, disconnects, battery beh
 
 Do not claim targets as achieved until measured.
 
+**2026-08-21 status — the ~15 FPS target is blocked in iOS, not in the Tower.** Measured received rate is 0.8 fps over LAN (2026-08-19) and 0.8 fps over a remote Tailscale path (2026-08-21), because the iOS sender forwards only ~1-in-30 DAT capture frames. The Tower sustains 33–40 fps on synthetic load with the heavier depth module and was >99.8% idle during the physical run, so no Tower-side work (queue, drop policy, adaptive streaming) is warranted by current measurements. The fix and its acceptance criteria are specified in `docs/superpowers/handoffs/2026-08-21-ios-observation-rate.md`.
+
 Backpressure policy: the pipeline must not accumulate an unbounded frame queue. Freshness generally matters more than processing every frame — when the tower/module cannot keep up, stale frames should normally be dropped rather than accumulating latency. Exact queue/drop mechanics are an implementation decision informed by these measurements, not a fixed constant.
 
 Adaptive streaming (IDLE / TRACKING / HIGH_RATE style frame-rate adjustment, as originally sketched in the project brainstorm doc) is a candidate future optimization once V0.7 measurements exist. Do not implement adaptive streaming before this milestone produces real data to design it from.
@@ -83,6 +85,8 @@ Glasses -> iPhone -> cellular/remote network -> private secure connection -> hom
 Preferred approach: a private overlay/tunnel (e.g., Tailscale or WireGuard) rather than exposing the tower directly to the public internet.
 
 Exit criterion (future): tower reachable from outside the LAN through an authenticated, encrypted, non-public-facing connection, with the same truthful online/unavailable state contract as local access.
+
+**2026-08-21 status — partially exercised, exit criterion NOT met.** The first physical-glasses run reached the Tower over Tailscale from roughly two hours away, proving the transport shape above works end to end on real hardware (`guidelines/docs/reports/2026-08-21-first-physical-glasses-remote-baseline.md`). Two of the three exit conditions are still outstanding: the connection was **plaintext `ws://` with no authentication**, permitted only by a deliberately narrow iOS ATS development exception. That exception must stay narrow, and authentication/encryption remain required before this milestone can be claimed. What the run did establish is that remote operation does **not** degrade the observation rate — the same 0.8 fps was measured over LAN and over the remote path, because the limit is a sender-side sampling stride rather than the link (`07-PLATFORM-CONSTRAINTS.md` Limitation 9).
 
 ## Phase 2 — Module Runtime
 

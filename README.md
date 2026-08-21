@@ -337,6 +337,11 @@ FPS, bandwidth, `seq_gap_total`, Tower-side backpressure drops, Tower
 processing latency, and process CPU/RSS for that window — never raw
 frame data.
 
+**`bandwidth_bps` is BYTES per second, not bits.** It is computed as
+`bytes_received / elapsed_s`. The name is kept for backward compatibility
+with existing report templates and log consumers, but read it as B/s —
+mistaking it for bits/s understates throughput by 8x.
+
 **`seq_gap_total` is a raw, causally-neutral count — not a "frames lost"
 figure.** The iOS sender currently assigns `seq` from the DAT/source
 capture-frame index and only forwards roughly 1-in-30 of them by design
@@ -349,6 +354,56 @@ loss — they look identical on the wire. Do not interpret `seq_gap_total`
 as network loss. See `guidelines/docs/07-PLATFORM-CONSTRAINTS.md`
 Limitation 9 for the future `source_seq`/`tx_seq` protocol split that
 would be needed to actually distinguish these causes (not implemented).
+
+**`source_fps_estimate` and `sampling_stride_avg` name the sender's
+throttle directly**, so the situation above no longer has to be inferred
+from a large `seq_gap_total`. Both are derived from `source_seq` (the
+DAT/capture frame index, which falls back to `seq` for every sender that
+exists today), alongside the raw `source_seq_span` they are computed from:
+
+| Field | Meaning |
+|---|---|
+| `source_seq_span` | Capture-index range observed (last minus first). |
+| `source_frame_span_s` | Seconds between the first and last frame received. |
+| `sampling_stride_avg` | Capture frames elapsed per frame recorded — ~30 for the current sender, 1.0 for a sender forwarding everything. Equals `source_seq_span / (frames_received - 1)`. |
+| `source_fps_estimate` | The upstream capture rate that stride is sampling. Equals `source_seq_span / source_frame_span_s`. |
+
+Read together with `effective_fps`, these state the pipeline's behavior
+outright: the 2026-08-21 first physical-glasses remote run would have
+reported a `source_fps_estimate` of ~23.5 and a `sampling_stride_avg` of
+~29.98 behind its `effective_fps` of 0.8 — a ~24 fps capture stream
+decimated 1-in-30. See
+`guidelines/docs/reports/2026-08-21-first-physical-glasses-remote-baseline.md`.
+
+These are **estimates**, labeled as such. Two specific traps:
+
+- **`source_fps_estimate` and `effective_fps` do not share a
+  denominator.** The former divides by `source_frame_span_s` (first to
+  last frame *received*); the latter divides by `session_duration_s` (the
+  whole `stream_start`-bounded window). A burst of frames followed by a
+  long silence yields a high `source_fps_estimate` and a low
+  `effective_fps` with no contradiction. Both spans are reported so the
+  arithmetic is checkable rather than taken on trust.
+- **`sampling_stride_avg` is only trustworthy when `frames_rejected` is
+  0.** Its denominator counts frames actually recorded, so intermittent
+  Tower-side rejection inflates it — a sender forwarding *every* frame,
+  with every other frame answered `invalid_frame`, reports a stride of
+  ~2.0. That is a Tower-side loss masquerading as a sender throttle, and
+  it cannot be corrected from inside the metric (a rejected frame has no
+  trustworthy capture index), so check `frames_rejected` before believing
+  the stride.
+
+Each reports `null` rather than `0` when fewer than two frames have
+arrived, or when the capture index did not advance (a sender restart can
+make it regress); an unmeasurable rate is not a rate of zero.
+
+**`frames_rejected`** counts every frame that arrived and was answered
+with a `frame_error` — `invalid_frame`, `frame_skipped`, or
+`module_unavailable` — and so contributed to no other figure in the
+summary. It overlaps `frame_processing_errors` (which counts only the
+`frame_skipped` subset) deliberately: the two answer different questions,
+namely "how many frames did the module fail on" versus "how many arriving
+frames are missing from these numbers".
 
 For local validation without the iPhone, run the soak-test script against
 a running tower:
@@ -453,6 +508,11 @@ tests/
   test_depth_benchmark_cli.py
   test_ws_malformed_message.py
   test_frames_seq_split.py
+  test_metrics_upstream_rate.py
+  test_metrics_rejected_frames.py
+  test_ws_upstream_rate.py
+  test_ws_finalize_robustness.py
+  test_frames_field_types.py
   test_world_builder_experiment_clis.py
 ```
 
