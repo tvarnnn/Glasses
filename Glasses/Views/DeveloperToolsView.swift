@@ -22,12 +22,14 @@ struct DeveloperToolsView: View {
     @ObservedObject var glasses: GlassesConnection
     @ObservedObject var tower: TowerClient
     @ObservedObject var stream: StreamManager
+    @ObservedObject var senderMetrics: SenderMetrics
 
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             List {
+                senderSection
                 mockDeviceSection
                 rawStateSection
                 towerSection
@@ -59,6 +61,71 @@ struct DeveloperToolsView: View {
                 Text(glasses.errorMessage ?? "")
             }
         }
+    }
+
+    // MARK: Sender pipeline
+
+    /// One row per place a frame can stop travelling, so a rate below target
+    /// can be attributed instead of guessed at. Reads a snapshot republished
+    /// at 2 Hz rather than the live counters, so opening this sheet does not
+    /// re-diff the `List` at the capture rate.
+    private var senderSection: some View {
+        let s = senderMetrics.snapshot
+        return Section {
+            LabeledContent("Session", value: Self.seconds(s.duration))
+
+            LabeledContent("Captured", value: "\(s.framesCaptured)  \(Self.fps(s.captureFPS))")
+            LabeledContent("Selected", value: "\(s.framesSelected)  \(Self.fps(s.selectedFPS))")
+            LabeledContent("Skipped by gate", value: "\(s.framesSkipped)")
+            LabeledContent("Send attempts", value: "\(s.sendAttempts)  \(Self.fps(s.sendAttemptFPS))")
+            LabeledContent("Sent OK", value: "\(s.sendSuccesses)  \(Self.fps(s.successfulSendFPS))")
+            LabeledContent("Tower replies", value: "\(s.frameResults)  \(Self.fps(s.towerResultFPS))")
+
+            LabeledContent("Send-window drops", value: "\(s.sendWindowDrops)")
+            LabeledContent("Session-gate drops", value: "\(s.sessionGateDrops)")
+            LabeledContent("Decode failures", value: "\(s.decodeFailures)")
+            LabeledContent("Encode failures", value: "\(s.encodeFailures)")
+            LabeledContent("Send failures", value: "\(s.sendFailures)")
+            LabeledContent("Abandoned by teardown", value: "\(s.sendAbandoned)")
+
+            LabeledContent("Encode ms", value: "\(Self.ms(s.encodeMsAverage)) avg / \(Self.ms(s.encodeMsMax)) max")
+            LabeledContent("Uplink", value: Self.bytesPerSecond(s.wireBytesPerSecond))
+            LabeledContent("Delivered", value: Self.percent(s.deliveredFraction))
+
+            // Health checks rather than measurements. "Backlog" is a count,
+            // not a verdict: a small steady number is the main-queue hop plus
+            // the send window; a climbing one is queue growth.
+            LabeledContent("Backlog", value: "\(s.framesUnaccounted)")
+            LabeledContent("Sequence 1:1", value: s.sequenceInvariantHolds ? "yes" : "NO")
+        } header: {
+            Text("Sender Pipeline")
+        } footer: {
+            Text("Counts and rates for one camera session, from DAT callback to Tower reply. Target send rate is \(String(format: "%.0f", FrameRateGate.towerTargetFPS)) fps. Debug build with per-frame logging — treat rates as a floor.")
+        }
+    }
+
+    private static func fps(_ value: Double?) -> String {
+        guard let value else { return "—" }
+        return String(format: "%.1f/s", value)
+    }
+
+    private static func ms(_ value: Double?) -> String {
+        guard let value else { return "—" }
+        return String(format: "%.2f", value)
+    }
+
+    private static func seconds(_ value: TimeInterval) -> String {
+        String(format: "%.1fs", value)
+    }
+
+    private static func percent(_ value: Double?) -> String {
+        guard let value else { return "—" }
+        return String(format: "%.1f%%", value * 100)
+    }
+
+    private static func bytesPerSecond(_ value: Double?) -> String {
+        guard let value else { return "—" }
+        return String(format: "%.0f KB/s", value / 1024)
     }
 
     // MARK: Mock Device Kit

@@ -12,10 +12,15 @@ import SwiftUI
 
 /// Shows the most recent frame decoded from the glasses.
 ///
-/// This renders `GlassesConnection.latestCapturedFrame`, which is already
-/// throttled by the model to roughly one frame per second. It deliberately
-/// does not open its own camera feed or change that cadence — the throttle is
-/// the app's only backpressure mechanism.
+/// This renders `GlassesConnection.latestCapturedFrame`, which the model
+/// samples down to `FrameRateGate.towerTargetFPS` — the same frames that go to
+/// the Tower, so what you see is what was sent. It deliberately does not open
+/// its own camera feed or change that cadence.
+///
+/// A new `UIImage` identity per frame defeats SwiftUI's image caching, so each
+/// update is a fresh decode composited under two `.ultraThinMaterial`
+/// overlays. That is ordinary video-preview cost at this rate, but it is the
+/// first thing to simplify if the send rate is raised much further.
 struct ViewfinderCard: View {
     let frame: CapturedFrame?
     let isStreaming: Bool

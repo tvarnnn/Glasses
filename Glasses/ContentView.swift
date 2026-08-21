@@ -38,7 +38,8 @@ struct ContentView: View {
         NavigationStack {
             SessionView(
                 glasses: project.glassesConnection,
-                tower: project.towerClient
+                tower: project.towerClient,
+                senderMetrics: project.senderMetrics
             )
             .navigationTitle("Glasses")
             .toolbar {
@@ -72,7 +73,8 @@ struct ContentView: View {
                     DeveloperToolsView(
                         glasses: project.glassesConnection,
                         tower: project.towerClient,
-                        stream: project.streamManager
+                        stream: project.streamManager,
+                        senderMetrics: project.senderMetrics
                     )
                 #endif
                 }

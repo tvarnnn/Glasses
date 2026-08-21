@@ -20,6 +20,9 @@ import MWDATCamera
 struct SessionView: View {
     @ObservedObject var glasses: GlassesConnection
     @ObservedObject var tower: TowerClient
+    /// Publishes at 2 Hz regardless of the frame rate, so observing it here
+    /// does not tie the product screen's refresh rate to the send rate.
+    @ObservedObject var senderMetrics: SenderMetrics
 
     @State private var isConfirmingUnregister = false
 
@@ -207,6 +210,13 @@ struct SessionView: View {
 #if DEBUG
 private extension SessionView {
 
+    /// Renders an optional rate. A `nil` rate means "not measurable yet", not
+    /// "zero", so it must not render as 0.0 — see `SenderMetricsSnapshot.rate`.
+    static func fps(_ value: Double?) -> String {
+        guard let value else { return "—" }
+        return String(format: "%.1f", value)
+    }
+
     var cameraLevel: StatusLevel {
         switch glasses.cameraStreamState {
         case .streaming: return .ok
@@ -278,6 +288,14 @@ private extension SessionView {
                 MetricTile(
                     caption: "Frames from glasses",
                     value: glasses.frameCount.formatted()
+                )
+                // The rate actually reaching the Tower — the number this
+                // pipeline is measured on. Shows "—" rather than 0.0 until
+                // there is enough elapsed time to divide by.
+                MetricTile(
+                    caption: "Sent to Tower",
+                    value: SessionView.fps(senderMetrics.snapshot.successfulSendFPS),
+                    footnote: "frames per second"
                 )
                 MetricTile(
                     caption: "Tower replies",

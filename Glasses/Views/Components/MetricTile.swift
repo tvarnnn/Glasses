@@ -45,7 +45,7 @@ struct MetricTile: View {
 #Preview {
     LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
         MetricTile(caption: "Frames from glasses", value: "4,271")
-        MetricTile(caption: "Sent to Tower", value: "142", footnote: "1 in 30")
+        MetricTile(caption: "Sent to Tower", value: "11.9", footnote: "frames per second")
     }
     .padding()
 }
