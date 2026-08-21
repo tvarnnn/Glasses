@@ -22,6 +22,13 @@ class DecodedFrame:
     decoded_height: int
     byte_count: int
     raw_bytes: bytes
+    # Additive protocol prep (07-PLATFORM-CONSTRAINTS.md Limitation 9).
+    # source_seq is the DAT/capture frame index -- what `seq` has always
+    # been -- and falls back to `seq` for any sender that doesn't send it.
+    # tx_seq is a dense per-transmitted-message counter; None means the
+    # sender does not provide it, which is NOT the same as zero gaps.
+    source_seq: int = 0
+    tx_seq: int | None = None
 
     @property
     def dimensions_match(self) -> bool:
@@ -64,4 +71,6 @@ def parse_and_decode_frame(message: dict) -> DecodedFrame:
         decoded_height=decoded_height,
         byte_count=len(raw_bytes),
         raw_bytes=raw_bytes,
+        source_seq=message.get("source_seq", seq),
+        tx_seq=message.get("tx_seq"),
     )

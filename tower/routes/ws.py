@@ -79,6 +79,7 @@ async def _handle_frame_message(
             receive_to_result_ms=receive_to_result_ms,
             cv_processing_ms=result.processing_ms,
             stage_ms=result.stage_ms,
+            tx_seq=frame.tx_seq,
         )
 
     payload = {

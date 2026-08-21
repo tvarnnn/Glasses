@@ -50,8 +50,12 @@ class SessionMetrics:
         self._process.cpu_percent(interval=None)  # prime the internal baseline
         self.start_time = clock()
         self.last_seq: int | None = None
+        self.last_tx_seq: int | None = None
         self.frames_received = 0
         self.seq_gap_total = 0
+        # Counted only for senders that actually provide tx_seq. Stays
+        # None otherwise -- see snapshot() and Rule 3.
+        self.tx_seq_gap_total: int | None = None
         self.backpressure_drops = 0
         self.frame_processing_errors = 0
         self.bytes_received = 0
@@ -66,10 +70,22 @@ class SessionMetrics:
         receive_to_result_ms: float,
         cv_processing_ms: float,
         stage_ms: dict[str, float] | None = None,
+        tx_seq: int | None = None,
     ) -> None:
         if self.last_seq is not None and seq > self.last_seq + 1:
             self.seq_gap_total += seq - self.last_seq - 1
         self.last_seq = seq
+
+        if tx_seq is not None:
+            # First tx_seq-bearing frame establishes the counter at 0 gaps;
+            # from then on a jump means messages the sender transmitted and
+            # the Tower never received -- genuine transit loss, unlike a
+            # seq gap, which cannot be attributed to any single cause.
+            if self.tx_seq_gap_total is None:
+                self.tx_seq_gap_total = 0
+            elif self.last_tx_seq is not None and tx_seq > self.last_tx_seq + 1:
+                self.tx_seq_gap_total += tx_seq - self.last_tx_seq - 1
+            self.last_tx_seq = tx_seq
         self.frames_received += 1
         self.bytes_received += byte_count
         self._receive_to_result_ms.append(receive_to_result_ms)
@@ -96,6 +112,9 @@ class SessionMetrics:
             "bytes_received": self.bytes_received,
             "bandwidth_bps": round(self.bytes_received / elapsed_s, 2),
             "seq_gap_total": self.seq_gap_total,
+            # None (not 0) when the sender doesn't send tx_seq: "we cannot
+            # tell" must not be reported as "no loss occurred" (Rule 3).
+            "tx_seq_gap_total": self.tx_seq_gap_total,
             "backpressure_drops": self.backpressure_drops,
             "frame_processing_errors": self.frame_processing_errors,
             "receive_to_result_ms_avg": round(_avg(self._receive_to_result_ms), 3),
