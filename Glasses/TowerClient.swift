@@ -33,15 +33,22 @@ final class TowerClient: NSObject, ObservableObject {
     @Published private(set) var status: TowerStatus = .offline
 
     #if DEBUG
-    /// Test/debug observability only: how many `frame_result` messages the
-    /// receive loop has processed. Not surfaced in the UI.
-    private(set) var frameResultCount = 0
+    /// How many `frame_result` messages the receive loop has processed — the
+    /// only end-to-end proof that the Tower received a frame and replied.
+    /// `@Published` so the dashboard can show it live; it is otherwise
+    /// unchanged, and nothing reads it to make a decision. Note the render
+    /// cost is bounded by the 1-in-30 frame throttle in `GlassesConnection`:
+    /// if that throttle is ever relaxed, this invalidates the view tree at the
+    /// full frame rate rather than ~1 Hz.
+    @Published private(set) var frameResultCount = 0
 
     /// True between a sent `stream_start` and the matching `stream_stop`.
     /// `sendFrame` will not forward anything while this is false, so a frame
     /// captured in the brief window after `stopCameraSession()` fires (but
     /// before DAT actually tears the stream down) can never reach the Tower.
-    private(set) var isStreamingToTower = false
+    /// `@Published` for the developer surface only — the send path still reads
+    /// the stored value directly and its semantics are unchanged.
+    @Published private(set) var isStreamingToTower = false
     #endif
 
     private var session: URLSession?

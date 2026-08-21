@@ -12,6 +12,7 @@
 		3BFF591BCC38E53334D7805F /* MockTowerServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7687C89BFB8192F1673EBEB1 /* MockTowerServer.swift */; };
 		9991A422AB42B22E2459E23D /* MWDATCore in Frameworks */ = {isa = PBXBuildFile; productRef = BC6D1772D314E7BCB789B652 /* MWDATCore */; };
 		D7881F007A369AE591F6453D /* TowerClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3014A185D2A01699D4E7400 /* TowerClientTests.swift */; };
+		D7881F017A369AE591F6453E /* ProductShellTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3014A195D2A01699D4E7401 /* ProductShellTests.swift */; };
 		DAC121D4D405EEA501D3CE47 /* MWDATMockDevice in Frameworks */ = {isa = PBXBuildFile; productRef = AA6211B5720FCB42F8A57614 /* MWDATMockDevice */; };
 /* End PBXBuildFile section */
 
@@ -31,6 +32,7 @@
 		9D934BA2F3095D85C74F7364 /* GlassesTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GlassesTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		B1FC178F43D5AD1315AFD45C /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
 		E3014A185D2A01699D4E7400 /* TowerClientTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TowerClientTests.swift; sourceTree = "<group>"; };
+		E3014A195D2A01699D4E7401 /* ProductShellTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ProductShellTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -107,9 +109,9 @@
 			isa = PBXGroup;
 			children = (
 				7687C89BFB8192F1673EBEB1 /* MockTowerServer.swift */,
+				E3014A195D2A01699D4E7401 /* ProductShellTests.swift */,
 				E3014A185D2A01699D4E7400 /* TowerClientTests.swift */,
 			);
-			name = GlassesTests;
 			path = GlassesTests;
 			sourceTree = "<group>";
 		};
@@ -238,6 +240,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				3BFF591BCC38E53334D7805F /* MockTowerServer.swift in Sources */,
+				D7881F017A369AE591F6453E /* ProductShellTests.swift in Sources */,
 				D7881F007A369AE591F6453D /* TowerClientTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

@@ -7,109 +7,76 @@
 
 import SwiftUI
 
+/// Root view and owner of the app's object graph.
+///
+/// `project` stays a `@StateObject` here, on a view that is always in the
+/// hierarchy, and deliberately not on `GlassesApp`. A stored property on the
+/// `App` struct would be initialised before `GlassesApp.init()` runs
+/// `Wearables.configure()`, so `GlassesConnection` would touch the DAT SDK
+/// before it is configured. Everything else — the cartridge tray, the
+/// developer tools — is presented *over* this view rather than replacing it,
+/// so the graph is never torn down. `GlassesConnection.deinit` stops the
+/// camera and the device session, which would kill a live stream.
 struct ContentView: View {
     @StateObject private var project = ProjectManager()
 
+    /// One sheet state rather than two `isPresented` booleans. Stacking two
+    /// `.sheet(isPresented:)` modifiers on the same view is unreliable — only
+    /// one of them presents.
+    private enum Destination: Int, Identifiable {
+        case cartridges
+        #if DEBUG
+        case developer
+        #endif
+
+        var id: Int { rawValue }
+    }
+
+    @State private var destination: Destination?
+
     var body: some View {
         NavigationStack {
-            List {
-                Section("Glasses") {
-                    StatusRow(
-                        label: "Registration",
-                        value: "\(project.glassesConnection.registrationState)"
-                    )
-                    StatusRow(
-                        label: "Devices",
-                        value: "\(project.glassesConnection.devices.count)"
-                    )
-                    StatusRow(
-                        label: "Camera Permission",
-                        value: project.glassesConnection.cameraPermissionStatus.map { "\($0)" } ?? "Unknown"
-                    )
-
-                    Button("Connect") {
-                        project.glassesConnection.connect()
+            SessionView(
+                glasses: project.glassesConnection,
+                tower: project.towerClient
+            )
+            .navigationTitle("Glasses")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        destination = .cartridges
+                    } label: {
+                        Label("Cartridges", systemImage: "square.grid.2x2")
                     }
-                    Button("Disconnect") {
-                        project.glassesConnection.disconnect()
-                    }
-                    Button("Check Camera Permission") {
-                        project.glassesConnection.checkCameraPermission()
-                    }
-                    Button("Request Camera Permission") {
-                        project.glassesConnection.requestCameraPermission()
-                    }
-
-                    #if DEBUG
-                    Button(
-                        project.glassesConnection.mockDeviceKitEnabled
-                            ? "Disable Mock Device Kit"
-                            : "Enable Mock Device Kit"
-                    ) {
-                        project.glassesConnection.toggleMockDeviceKit()
-                    }
-                    Button("Pair Mock Glasses") {
-                        project.glassesConnection.pairMockGlasses()
-                    }
-                    StatusRow(
-                        label: "Mock Device Paired",
-                        value: project.glassesConnection.isMockDevicePaired ? "Yes" : "No"
-                    )
-
-                    Button("Configure Mock Camera Feed") {
-                        project.glassesConnection.configureMockCameraFeed()
-                    }
-                    StatusRow(
-                        label: "Active Device",
-                        value: project.glassesConnection.hasActiveDevice ? "Yes" : "No"
-                    )
-                    Button("Start Camera Session") {
-                        project.glassesConnection.startCameraSession()
-                    }
-                    .disabled(!project.glassesConnection.hasActiveDevice)
-                    Button("Stop Camera Session") {
-                        project.glassesConnection.stopCameraSession()
-                    }
-                    StatusRow(
-                        label: "Device Session",
-                        value: "\(project.glassesConnection.deviceSessionState)"
-                    )
-                    StatusRow(
-                        label: "Camera Stream",
-                        value: "\(project.glassesConnection.cameraStreamState)"
-                    )
-                    StatusRow(
-                        label: "Frames Received",
-                        value: "\(project.glassesConnection.frameCount)"
-                    )
-                    #endif
+                    .accessibilityLabel("Cartridges")
                 }
 
-                Section("Tower") {
-                    StatusRow(
-                        label: "Status",
-                        value: project.towerClient.status.displayText
-                    )
-                    Button("Connect Tower") {
-                        project.towerClient.connect()
+                #if DEBUG
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        destination = .developer
+                    } label: {
+                        Label("Developer", systemImage: "wrench.and.screwdriver")
                     }
-                    Button("Disconnect Tower") {
-                        project.towerClient.disconnect()
-                    }
+                    .accessibilityLabel("Developer tools")
                 }
-
-                Section("Stream") {
-                    StatusRow(
-                        label: "State",
-                        value: project.streamManager.state.displayText
+                #endif
+            }
+            .sheet(item: $destination) { destination in
+                switch destination {
+                case .cartridges:
+                    CartridgeDrawerView()
+                        .presentationDetents([.medium, .large])
+                #if DEBUG
+                case .developer:
+                    DeveloperToolsView(
+                        glasses: project.glassesConnection,
+                        tower: project.towerClient,
+                        stream: project.streamManager
                     )
-                    StatusRow(
-                        label: "Metrics",
-                        value: project.streamManager.metrics?.displayText ?? "Unavailable"
-                    )
+                #endif
                 }
             }
-            .navigationTitle("Dashboard")
             .alert(
                 "Something went wrong",
                 isPresented: Binding(
@@ -124,47 +91,6 @@ struct ContentView: View {
                 Text(project.glassesConnection.errorMessage ?? "")
             }
         }
-    }
-}
-
-private struct StatusRow: View {
-    let label: String
-    let value: String
-
-    var body: some View {
-        HStack {
-            Text(label)
-            Spacer()
-            Text(value)
-                .foregroundStyle(.secondary)
-        }
-    }
-}
-
-private extension TowerStatus {
-    var displayText: String {
-        switch self {
-        case .offline: return "Offline"
-        case .connecting: return "Connecting…"
-        case .online: return "Online"
-        case .failed(let message): return "Error: \(message)"
-        }
-    }
-}
-
-private extension StreamState {
-    var displayText: String {
-        switch self {
-        case .stopped: return "Stopped"
-        case .starting: return "Starting…"
-        case .streaming: return "Streaming"
-        }
-    }
-}
-
-private extension StreamMetrics {
-    var displayText: String {
-        "\(framesReceived) frames @ \(String(format: "%.1f", frameRate)) fps"
     }
 }
 
