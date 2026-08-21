@@ -32,10 +32,17 @@ class ObservationStore:
         with self._path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(observation.to_json_dict()) + "\n")
 
-    def all_observations(self) -> list[ObjectObservation]:
+    def _read(self) -> tuple[list[ObjectObservation], int]:
+        """Read observations and count unparseable lines.
+
+        Returns:
+            (observations, skipped_count) where skipped_count is the number
+            of lines that could not be parsed.
+        """
         if not self._path.exists():
-            return []
+            return [], 0
         observations = []
+        skipped = 0
         with self._path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
                 line = line.strip()
@@ -54,6 +61,11 @@ class ObservationStore:
                         self._path,
                         line_number,
                     )
+                    skipped += 1
+        return observations, skipped
+
+    def all_observations(self) -> list[ObjectObservation]:
+        observations, _ = self._read()
         return observations
 
     def last_seen(self, object_class: str) -> ObjectObservation | None:
@@ -65,6 +77,12 @@ class ObservationStore:
         return max(matching, key=lambda o: o.observed_at)
 
     def purge(self) -> int:
+        """Delete all observations and the backing file.
+
+        Returns the count of parseable observations removed. This may be fewer
+        than the number of lines the file contained if there are unparseable
+        lines. The entire file is deleted regardless.
+        """
         count = len(self.all_observations())
         if self._path.exists():
             self._path.unlink()
@@ -73,7 +91,7 @@ class ObservationStore:
     def prune_expired(self, now: float) -> int:
         if self._retention_seconds is None:
             return 0
-        observations = self.all_observations()
+        observations, skipped = self._read()
         cutoff = now - self._retention_seconds
         # recorded_at, not observed_at: retention is about how long WE
         # have held the data, which is the privacy-relevant clock. They
@@ -81,8 +99,14 @@ class ObservationStore:
         # timestamp is threaded through.
         kept = [o for o in observations if o.recorded_at >= cutoff]
         removed = len(observations) - len(kept)
-        if removed:
+        # Rewrite if valid records expired OR if unparseable lines exist.
+        # An unparseable line cannot be shown to be within retention, so
+        # letting it survive would mean retention silently fails to cover
+        # data still at rest.
+        if removed or skipped:
             self._rewrite(kept)
+        # Return count of removed observations only, not unparseable lines:
+        # corrupt lines were never observations, just data to clean up.
         return removed
 
     def _rewrite(self, observations: list[ObjectObservation]) -> None:

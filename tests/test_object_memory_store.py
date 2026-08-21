@@ -80,3 +80,75 @@ def test_store_survives_a_corrupt_line_without_losing_good_records(tmp_path):
         handle.write("{not json\n")
 
     assert len(store.all_observations()) == 1
+
+
+def test_purge_returns_count_of_observations_not_corrupt_lines(tmp_path):
+    # Finding 1: purge() returns count of parseable observations,
+    # not total lines in the file. A corrupt line doesn't count.
+    store = ObservationStore(tmp_path, retention_seconds=None)
+    store.append(_observation())
+    with (tmp_path / "observations.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write("{not json\n")
+
+    deleted = store.purge()
+
+    assert deleted == 1  # Only the parseable observation counts
+    assert store.all_observations() == []
+    assert not any(tmp_path.iterdir())  # File is completely deleted
+
+
+def test_prune_expired_cleans_corrupt_lines_even_when_nothing_expires(tmp_path):
+    # Finding 2: with retention configured, corrupt lines are rewritten away
+    # even if no valid records have expired.
+    store = ObservationStore(tmp_path, retention_seconds=100.0)
+    store.append(_observation("fresh", observed_at=950.0))
+    with (tmp_path / "observations.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write("{not json\n")
+
+    removed = store.prune_expired(now=1000.0)
+
+    assert removed == 0  # No valid observations removed
+    assert [o.object_class for o in store.all_observations()] == ["fresh"]
+    # Corrupt line is gone
+    with (tmp_path / "observations.jsonl").open("r", encoding="utf-8") as handle:
+        content = handle.read()
+    assert "{not json" not in content
+
+
+def test_prune_expired_removes_both_expired_obs_and_corrupt_lines(tmp_path):
+    # Finding 2: when valid records expire, corrupt lines are also removed.
+    store = ObservationStore(tmp_path, retention_seconds=100.0)
+    store.append(_observation("old", observed_at=0.0))
+    store.append(_observation("fresh", observed_at=950.0))
+    with (tmp_path / "observations.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write("{not json\n")
+
+    removed = store.prune_expired(now=1000.0)
+
+    assert removed == 1  # Only the expired valid observation
+    assert [o.object_class for o in store.all_observations()] == ["fresh"]
+    with (tmp_path / "observations.jsonl").open("r", encoding="utf-8") as handle:
+        content = handle.read()
+    assert "{not json" not in content
+
+
+def test_prune_expired_with_none_retention_leaves_everything_untouched(tmp_path):
+    # Finding 2: retention_seconds=None means "keep forever", so nothing
+    # is touched, including corrupt lines.
+    store = ObservationStore(tmp_path, retention_seconds=None)
+    store.append(_observation("old", observed_at=0.0))
+    with (tmp_path / "observations.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write("{not json\n")
+
+    # Read original file content
+    with (tmp_path / "observations.jsonl").open("r", encoding="utf-8") as handle:
+        original_content = handle.read()
+
+    removed = store.prune_expired(now=1000.0)
+
+    # File is untouched byte-for-byte
+    with (tmp_path / "observations.jsonl").open("r", encoding="utf-8") as handle:
+        new_content = handle.read()
+    assert new_content == original_content
+    assert removed == 0
+    assert "{not json" in new_content
