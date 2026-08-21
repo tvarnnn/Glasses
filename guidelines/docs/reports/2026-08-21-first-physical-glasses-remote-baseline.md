@@ -216,6 +216,73 @@ CV per frame and 0.8 frames/s, roughly 0.07% of wall-clock time was spent
 in CV. Tower compute is not the constraint, and no Tower-side backpressure
 or drop policy is warranted by this data.
 
+## Tower capacity — measured 2026-08-21, same day
+
+Because the physical run leaves the Tower 99.8% idle, its headroom had to
+be established separately before the target rate could be called safe.
+Measured with `scripts/soak_test_stream.py` over loopback at the **same
+360x640** resolution the glasses actually produced, baseline CV module,
+30 s per run, `--source synthetic-script`.
+
+| Target fps | Achieved send fps | Tower `effective_fps` | sent/acked | rx→result avg/max (ms) | cv avg (ms) | cpu% | RSS |
+|---|---|---|---|---|---|---|---|
+| 15 | 12.94 | 12.95 | 389 / 389 | 1.649 / 10.055 | 0.560 | 2.3 | 68.7 MB |
+| 30 | 21.58 | 21.59 | 648 / 648 | 1.531 / 6.110 | 0.537 | 3.4 | 70.6 MB |
+| 60 | 32.88 | 32.90 | 987 / 987 | 1.670 / 4.252 | 0.638 | 3.5 | 70.6 MB |
+| 120 | 64.97 | 65.01 | 1950 / 1950 | 1.355 / 6.274 | 0.522 | — | 71.3 MB |
+| unthrottled | 781.94 | 782.56 | 23460 / 23460 | 0.974 / 6.055 | 0.464 | 80.1 | 72.8 MB |
+
+Every run: `seq_gap_total: 0`, `backpressure_drops: 0`,
+`frame_processing_errors: 0`, and `frames_sent == frames_acked` exactly.
+
+**Sustained ceiling: ~736 fps as shipped** (mean of three unthrottled
+reps), rising to **~1065 fps** with per-frame logging suppressed. That is
+roughly **49x the 15 fps roadmap target** and **900x the 0.8 fps observed
+physically**. At the 10–15 fps target the Tower uses **2.3% of one core
+and 69 MB RSS**.
+
+Latency does not degrade under load — it *improves*: 1.65 ms average at 13
+fps versus 0.97 ms at 782 fps (warm caches, amortized event-loop
+wakeups). `cv_processing_ms_avg` is flat at 0.46–0.64 ms across the entire
+13→782 fps range, so CV is not load-sensitive. No queue growth, no latency
+knee, no drops anywhere. Saturation is a clean single-core CPU limit (the
+receive→process→ack loop is single-threaded; one core of 20 pegs), not a
+backpressure or memory failure.
+
+**Conclusion: no Tower-side mechanism could produce 0.8 fps, and the
+10–15 fps target has ~50x margin.** Headroom is verified, not assumed.
+
+### Three measurement caveats found while doing this
+
+1. **`--fps N` in the soak client never reaches N on Windows, and the
+   shortfall is the client's.** `asyncio.sleep()` quantizes to the ~15.4 ms
+   Windows timer tick, so achievable send periods are integer multiples of
+   it (measured 77.3 / 46.3 / 30.4 / 15.4 ms for targets 15 / 30 / 60 /
+   120). `--fps 120` therefore saturated nothing — it just landed on a
+   one-tick sleep. Always quote `achieved_send_fps`, never the requested
+   `--fps`. Documented in the script.
+2. **`TOWER_DEV_MODE=false` does not quiet per-frame logging.** The four
+   `[Tower][Frame]` lines per frame are INFO, and `TOWER_DEV_MODE` only
+   switches DEBUG↔INFO. Verified: 2 DEBUG lines against 109,736
+   `[Tower][Frame]` lines. Per-frame logging costs ~45% of peak throughput
+   and ~24 MB per 30 s at saturation, but is being kept — it is the primary
+   diagnostic surface for physical runs and costs 2.3% of a core at the
+   target rate.
+3. **`process_cpu_percent` was not a session average, and is now.** It came
+   from `psutil.cpu_percent(interval=None)`, which measures only since its
+   own previous call — and `snapshot()` also runs periodically every 150
+   frames. So the *final* summary reported CPU for the sliver since the
+   last periodic summary; the 120 fps row above read `0.0` for that reason,
+   and two back-to-back snapshots of one busy session measured 95.9 then
+   0.0. Fixed to cumulative CPU time over the session.
+
+   **This did not affect the physical baseline's `0.3`**: that run received
+   63 frames, below the 150-frame periodic-summary interval, so `snapshot()`
+   ran exactly once and its window *was* the whole session. But it would
+   have corrupted the next run — at 12 fps a periodic summary fires every
+   ~12.5 s, so the headroom figure this work exists to verify would have
+   been measured over a fraction of a second.
+
 ## Conclusion
 
 The physical pipeline **works end to end, remotely, on real hardware.**

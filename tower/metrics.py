@@ -84,7 +84,14 @@ class SessionMetrics:
     def __init__(self, clock: Callable[[], float] = time.perf_counter) -> None:
         self._clock = clock
         self._process = psutil.Process()
-        self._process.cpu_percent(interval=None)  # prime the internal baseline
+        # Cumulative CPU time at session start. Deliberately NOT
+        # cpu_percent(interval=None), which measures only since its own
+        # previous call on this object: snapshot() is called periodically
+        # as well as at finalize, so that would make the final summary's
+        # CPU figure describe the sliver since the last periodic summary
+        # rather than the session. Measured 2026-08-21: two back-to-back
+        # snapshots of one busy session reported 95.9 then 0.0.
+        self._cpu_times_at_start = self._process.cpu_times()
         self.start_time = clock()
         self.last_seq: int | None = None
         self.last_tx_seq: int | None = None
@@ -175,6 +182,18 @@ class SessionMetrics:
             and self.frames_received % self.SUMMARY_LOG_FRAME_INTERVAL == 0
         )
 
+    def _session_cpu_percent(self, elapsed_s: float) -> float:
+        """Average CPU use across the whole session, as percent of one core.
+
+        Not clamped to 100: a multi-core process legitimately exceeds it,
+        matching psutil's own convention.
+        """
+        now = self._process.cpu_times()
+        cpu_seconds = (now.user - self._cpu_times_at_start.user) + (
+            now.system - self._cpu_times_at_start.system
+        )
+        return round(cpu_seconds / elapsed_s * 100, 2)
+
     def _upstream_rate_fields(self) -> dict:
         """Estimate the upstream capture rate and the sender's sampling stride.
 
@@ -245,7 +264,9 @@ class SessionMetrics:
                 max(self._receive_to_result_ms, default=0.0), 3
             ),
             "cv_processing_ms_avg": round(_avg(self._cv_processing_ms), 3),
-            "process_cpu_percent": self._process.cpu_percent(interval=None),
+            # Session average, not an instantaneous sample -- see
+            # _session_cpu_percent().
+            "process_cpu_percent": self._session_cpu_percent(elapsed_s),
             "process_rss_bytes": self._process.memory_info().rss,
             "stage_ms_avg": {k: round(_avg(v), 3) for k, v in self._stage_ms.items()},
             "stage_ms_max": {k: round(max(v), 3) for k, v in self._stage_ms.items()},

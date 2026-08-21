@@ -42,9 +42,11 @@ The evidence chain:
    bounded by capture rate, not by bandwidth.
 4. **The Tower is exonerated by measurement.** CV processing averaged
    0.82 ms and receive-to-result 1.98 ms, i.e. the Tower was idle >99.8%
-   of the session. Synthetic soaks previously sustained 32.9 fps (CPU) and
-   40.0 fps (GPU) with the *heavier* depth module
-   (`V0.9.1-depth-cv-baseline-report.md:78,102`).
+   of the session. Measured the same day at the same 360x640 resolution,
+   the Tower sustains **~736 fps** as shipped — roughly 900x the observed
+   rate and ~50x the target — using 2.3% of one core at 12 fps, with
+   latency that *falls* rather than rises under load and no drops at any
+   rate. Full table in the baseline report.
 
 **Not** the cause: Tailscale, ATS, packet loss, JPEG decode, Tower CV,
 Tower backpressure (`backpressure_drops` was 0 and no code path can
@@ -209,8 +211,11 @@ arrived or the capture index has not advanced (Rule 3).
    than `null`, proving the new rate is not being paid for with transit
    loss.
 5. `receive_to_result_ms_avg` stays in single-digit milliseconds and
-   `process_cpu_percent` stays modest — confirming Tower headroom holds at
-   the higher rate.
+   `process_cpu_percent` stays modest — expect roughly 1–2 ms and ~2–3%
+   of one core at 12 fps, per the measured capacity table. (That field is
+   now a true session average; before 2026-08-21 it silently measured only
+   the time since the last periodic summary and would have been
+   meaningless for a run this long.)
 6. Memory on both sides is flat across a 20–30 minute run: latest-wins
    must not have become a queue.
 7. Unit test: a capture callback arriving inside the cadence interval does

@@ -337,6 +337,26 @@ FPS, bandwidth, `seq_gap_total`, Tower-side backpressure drops, Tower
 processing latency, and process CPU/RSS for that window — never raw
 frame data.
 
+**`process_cpu_percent` is a session average, as percent of one core.** It
+is cumulative CPU time over `session_duration_s`, so it is directly
+comparable between a periodic summary and the final summary, and is not
+clamped to 100 (a multi-core process legitimately exceeds it). It is
+deliberately *not* `psutil.cpu_percent(interval=None)`, which measures
+only since its own previous call — that made the final summary describe
+the sliver of time since the last periodic summary rather than the
+session, and could read `0.0` with a core pegged.
+
+**Per-frame logging is at INFO, and `TOWER_DEV_MODE` does not control
+it.** `TOWER_DEV_MODE` only switches the root level between DEBUG and
+INFO, so setting it to `false` does **not** quiet the four
+`[Tower][Frame]` lines emitted per frame. Measured 2026-08-21 at 360x640:
+suppressing those lines raises the Tower's saturation ceiling from ~736 to
+~1065 fps (about 45% of peak throughput, ~0.4 ms of receive-to-result) and
+avoids ~24 MB of log per 30 s at saturation. They are kept on by default
+anyway: at the 10–15 fps target the Tower uses ~2.3% of one core, and
+these lines are the primary diagnostic surface for physical runs. Revisit
+only if the Tower is ever actually throughput-bound.
+
 **`bandwidth_bps` is BYTES per second, not bits.** It is computed as
 `bytes_received / elapsed_s`. The name is kept for backward compatibility
 with existing report templates and log consumers, but read it as B/s —
@@ -510,6 +530,7 @@ tests/
   test_frames_seq_split.py
   test_metrics_upstream_rate.py
   test_metrics_rejected_frames.py
+  test_metrics_cpu_average.py
   test_ws_upstream_rate.py
   test_ws_finalize_robustness.py
   test_frames_field_types.py

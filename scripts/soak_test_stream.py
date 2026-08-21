@@ -15,6 +15,27 @@ metrics -- those are only visible in the Tower process's own log output
 ([Tower][Session] final summary: ...). Copy that log line into the printed
 report's "Tower-side measured" section by hand.
 
+TWO MEASUREMENT CAVEATS, both confirmed 2026-08-21 -- read before quoting
+any number this script prints:
+
+1. `--fps` is an upper bound that is usually NOT reached, and the shortfall
+   is this client's, not the Tower's. `asyncio.sleep()` quantizes to the
+   Windows timer tick (~15.4 ms), so the achievable send periods are
+   integer multiples of it: `--fps 15` measured 12.94, `--fps 30` measured
+   21.58, `--fps 60` measured 32.88, `--fps 120` measured 64.97. Rates
+   between those steps cannot be expressed at all on Windows. Always
+   report `achieved_send_fps`, never the `--fps` you asked for. To find a
+   real ceiling, pass an fps high enough that `sleep_for <= 0` (e.g.
+   `--fps 100000`) so the loop becomes purely closed-loop.
+
+2. This client is strictly request/response -- it awaits each
+   `frame_result` before sending the next frame -- so its throughput is
+   bounded by round-trip time. That is fine against loopback and
+   deliberately mirrors the Tower's own loop, but it means a run over a
+   remote link measures RTT as much as capacity, and it is NOT a model
+   for how the iOS sender should behave. See
+   docs/superpowers/handoffs/2026-08-21-ios-observation-rate.md.
+
 Requires the `dev` extra: pip install -e ".[dev]"
 """
 import argparse
