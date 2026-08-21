@@ -5,6 +5,15 @@
 > superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
+> **Revision 2 (2026-08-20):** revised after a plan review found two
+> blocking defects (the plan as first written would not have run), three
+> rule/privacy violations, and a materially incomplete decision-gate
+> analysis. All are corrected inline below. The most important changes:
+> device resolution was missing entirely (Task 6), `observed_at` was
+> documented as capture time but populated with processing time (Task 1),
+> `retention="configurable"` was declared but never honored (Tasks 3/6),
+> and Task 4's recommended option had two unstated costs (Task 4).
+
 > ## ⛔ THIS PLAN IS NOT AUTHORIZED TO EXECUTE YET
 >
 > It was written during the 2026-08-20 weekend autonomous run as the
@@ -59,10 +68,17 @@ Every task's requirements implicitly include this section.
   be local to the functions that need them (follow
   `tower/experiments/depth.py`'s pattern exactly), so a Tower running
   `baseline` still starts with no torch installed.
-- **Pin the detector weights enum explicitly** (e.g.
-  `SSDLite320_MobileNet_V3_Large_Weights.COCO_V1`), never a string alias or
-  a default that can float. Direct precedent: the V0.9.1 MiDaS `torch.hub`
-  ref pin.
+- **Pin the detector weights enum explicitly** — write
+  `SSDLite320_MobileNet_V3_Large_Weights.COCO_V1` as a direct attribute
+  reference, never a `getattr(..., "COCO_V1")` string lookup and never a
+  default that can float. A string alias defers the failure to load time
+  as an `AttributeError`; a direct reference fails at import. Direct
+  precedent: the V0.9.1 MiDaS `torch.hub` ref pin.
+- **Resolve the device before using it.** `TOWER_CV_DEVICE` defaults to
+  `"auto"`, and `torch.device("auto")` raises. The depth path handles this
+  in `_resolve_device()` (`tower/modules/depth_cv.py:56-67`), called by the
+  *module* before the experiment ever sees the string. Object Memory must
+  do the same — see Task 6.
 - **Rule 3 / Rule 16 (truthful state):** an observation is evidence, not
   fact. Never record or return "object is at X". Only "object was last
   observed at time T with confidence C". Absence of observation is never
@@ -74,8 +90,12 @@ Every task's requirements implicitly include this section.
   image crops, no raw frames, no embeddings are written to disk in this
   slice.** Retention must be configurable, not hardcoded-forever. Purge
   must be real deletion, not hiding.
-- **Every task ends green:** `python -m pytest -q` must pass. Baseline
-  before this plan starts: `113 passed, 3 skipped`.
+- **Every task ends green:** `python -m pytest -q` must pass, and **every
+  task must include a full-suite step**, not just its own file's tests.
+  Baseline before this plan starts: **`130 passed, 3 skipped`** (verified
+  2026-08-20 at commit `594acc5`). Re-verify before starting — the
+  per-task counts below are derived from it and will drift if other work
+  lands first.
 - **Model-dependent tests are opt-in**, gated behind
   `TOWER_RUN_MODEL_TESTS=1`, exactly like
   `tests/test_depth_experiment_integration.py`.
@@ -154,12 +174,31 @@ cost, but avoids a migration later if a real cross-module need appears.
     and classmethod `from_score(score: float | None) -> "Confidence"`.
   - `@dataclass(frozen=True) class ObjectObservation` with fields:
     `object_class: str`, `detector_score: float | None`,
-    `confidence: Confidence`, `observed_at: float` (epoch seconds, capture
-    time), `recorded_at: float` (epoch seconds, record-created time),
-    `source: str`, `module_id: str`, `session_id: str | None`,
-    `frame_seq: int | None`, `bounding_box: tuple[float, float, float, float] | None`,
+    `confidence: Confidence`, `observed_at: float`,
+    `time_basis: str`, `recorded_at: float` (epoch seconds,
+    record-created time), `source: str`, `module_id: str`,
+    `session_id: str | None`, `frame_seq: int | None`,
+    `bounding_box: tuple[float, float, float, float] | None`,
     `retention_tag: str`, `privacy_tags: tuple[str, ...]`,
-    `spatial_ref: None`, `external_refs: tuple[()]`, `deleted: bool = False`.
+    `spatial_ref: None`, `external_refs: tuple[()]`.
+
+> **`observed_at` is NOT capture time, and the record must say so.**
+> Rule 16 forbids conflating capture time, network arrival time, and
+> processing time. No capture timestamp exists on the wire at all —
+> `tower/frames.py`'s `REQUIRED_FIELDS` carries no time field — so this
+> slice cannot know when the glasses actually saw the object. The
+> `time_basis` field makes that explicit rather than letting a consumer
+> assume: this slice always writes `"tower-receipt"`. If a capture
+> timestamp is threaded through later (see Known Gaps and the
+> `source_seq`/`tx_seq` handoff), new records write `"capture"` and old
+> records remain correctly labelled. **Do not remove `time_basis` as
+> redundant** — it is the only thing preventing a silent truthfulness
+> failure the moment a second time source exists.
+>
+> **There is deliberately no `deleted` flag.** A soft-delete marker is
+> exactly the "hiding data from a query interface" that
+> `06-PRIVACY-DATA.md` forbids as a substitute for deletion. Purge and
+> prune hard-delete.
   - `ObjectObservation.to_json_dict(self) -> dict`
   - `object_observation_from_json_dict(data: dict) -> ObjectObservation`
 
@@ -167,6 +206,8 @@ cost, but avoids a migration later if a real cross-module need appears.
 
 ```python
 # tests/test_object_memory_records.py
+import dataclasses
+
 import pytest
 
 from tower.object_memory.records import (
@@ -182,6 +223,7 @@ def _observation(**overrides) -> ObjectObservation:
         detector_score=0.91,
         confidence=Confidence.HIGH,
         observed_at=1000.0,
+        time_basis="tower-receipt",
         recorded_at=1000.5,
         source="glasses-camera",
         module_id="object-memory",
@@ -222,6 +264,14 @@ def test_observed_at_and_recorded_at_are_distinct_fields():
     assert data["recorded_at"] == 99.0
 
 
+def test_time_basis_is_recorded_so_observed_at_cannot_be_misread():
+    # No capture timestamp exists on the wire; observed_at is tower
+    # receipt time and the record must say so (Rule 16).
+    data = _observation(time_basis="tower-receipt").to_json_dict()
+
+    assert data["time_basis"] == "tower-receipt"
+
+
 def test_confidence_survives_serialization_as_a_label_not_a_number():
     # Rule 16: confidence must survive persistence.
     data = _observation(confidence=Confidence.UNKNOWN).to_json_dict()
@@ -232,7 +282,7 @@ def test_confidence_survives_serialization_as_a_label_not_a_number():
 def test_observation_is_immutable():
     observation = _observation()
 
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         observation.object_class = "mutated"
 ```
 
@@ -287,6 +337,11 @@ class ObjectObservation:
     a specific instance ("my keys" vs "keys"). See 07-PLATFORM-CONSTRAINTS.md
     Core Principle 3 and OBJECT-MEMORY.md's Identity vs. Category section.
 
+    observed_at is qualified by time_basis: this slice can only know
+    tower-receipt time, never on-glasses capture time (Rule 16 -- these
+    must not be conflated). There is no soft-delete flag by design;
+    06-PRIVACY-DATA.md requires real deletion.
+
     spatial_ref and external_refs are reserved-but-unused: they are carried
     so a later cross-module need does not require rewriting already-persisted
     records (see 2026-08-20-canonical-memory-architecture.md).
@@ -296,6 +351,7 @@ class ObjectObservation:
     detector_score: float | None
     confidence: Confidence
     observed_at: float
+    time_basis: str
     recorded_at: float
     source: str
     module_id: str
@@ -306,7 +362,6 @@ class ObjectObservation:
     privacy_tags: tuple[str, ...]
     spatial_ref: None
     external_refs: tuple[()]
-    deleted: bool = False
 
     def to_json_dict(self) -> dict:
         return {
@@ -314,6 +369,7 @@ class ObjectObservation:
             "detector_score": self.detector_score,
             "confidence": self.confidence.value,
             "observed_at": self.observed_at,
+            "time_basis": self.time_basis,
             "recorded_at": self.recorded_at,
             "source": self.source,
             "module_id": self.module_id,
@@ -324,7 +380,6 @@ class ObjectObservation:
             "privacy_tags": list(self.privacy_tags),
             "spatial_ref": self.spatial_ref,
             "external_refs": list(self.external_refs),
-            "deleted": self.deleted,
         }
 
 
@@ -335,6 +390,7 @@ def object_observation_from_json_dict(data: dict) -> ObjectObservation:
         detector_score=data["detector_score"],
         confidence=Confidence(data["confidence"]),
         observed_at=data["observed_at"],
+        time_basis=data["time_basis"],
         recorded_at=data["recorded_at"],
         source=data["source"],
         module_id=data["module_id"],
@@ -345,7 +401,6 @@ def object_observation_from_json_dict(data: dict) -> ObjectObservation:
         privacy_tags=tuple(data["privacy_tags"]),
         spatial_ref=None,
         external_refs=(),
-        deleted=data.get("deleted", False),
     )
 ```
 
@@ -357,7 +412,7 @@ Expected: PASS (5 passed)
 - [ ] **Step 5: Run the full suite unmodified**
 
 Run: `python -m pytest -q`
-Expected: `118 passed, 3 skipped`
+Expected: `136 passed, 3 skipped`  (130 baseline + 6 new)
 
 - [ ] **Step 6: Commit**
 
@@ -494,6 +549,11 @@ class RelevanceFilter:
 Run: `python -m pytest tests/test_object_memory_relevance.py -q`
 Expected: PASS (5 passed)
 
+- [ ] **Step 4b: Run the full suite**
+
+Run: `python -m pytest -q`
+Expected: `141 passed, 3 skipped`
+
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -539,6 +599,7 @@ def _observation(object_class="keys", observed_at=1000.0) -> ObjectObservation:
         detector_score=0.9,
         confidence=Confidence.HIGH,
         observed_at=observed_at,
+        time_basis="tower-receipt",
         recorded_at=observed_at,
         source="glasses-camera",
         module_id="object-memory",
@@ -602,7 +663,12 @@ def test_prune_expired_removes_only_observations_past_retention(tmp_path):
 def test_store_survives_a_corrupt_line_without_losing_good_records(tmp_path):
     store = ObservationStore(tmp_path, retention_seconds=None)
     store.append(_observation())
-    (tmp_path / "observations.jsonl").open("a", encoding="utf-8").write("{not json\n")
+    # with-block, not a bare .open(...).write(...): the latter only
+    # flushes because CPython refcounting closes the temporary
+    # immediately, which is an implementation detail and emits a
+    # ResourceWarning that would fail under filterwarnings=error.
+    with (tmp_path / "observations.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write("{not json\n")
 
     assert len(store.all_observations()) == 1
 ```
@@ -693,7 +759,11 @@ class ObservationStore:
             return 0
         observations = self.all_observations()
         cutoff = now - self._retention_seconds
-        kept = [o for o in observations if o.observed_at >= cutoff]
+        # recorded_at, not observed_at: retention is about how long WE
+        # have held the data, which is the privacy-relevant clock. They
+        # are equal today, but diverge the moment a real capture
+        # timestamp is threaded through.
+        kept = [o for o in observations if o.recorded_at >= cutoff]
         removed = len(observations) - len(kept)
         if removed:
             self._rewrite(kept)
@@ -716,7 +786,7 @@ Expected: PASS (6 passed)
 - [ ] **Step 5: Run the full suite**
 
 Run: `python -m pytest -q`
-Expected: `129 passed, 3 skipped`
+Expected: `147 passed, 3 skipped`  (136 + 5 from Task 2 + 6 from Task 3)
 
 - [ ] **Step 6: Commit**
 
@@ -754,20 +824,46 @@ item per §22, not a silent copy of the existing gap." The fix changes the
 lifecycle contract's *execution model*, which is an architecture decision,
 not a bugfix.
 
+**Two consequences that are easy to miss, and that change the ranking:**
+
+1. **Enforcing the timeout makes first run fail, deterministically.**
+   `LIFECYCLE_TIMEOUT_S = 10.0` (`container.py:16`). On a cold machine the
+   first load downloads SSDLite weights over the network *inside* that
+   budget. Any option that makes the timeout real converts "hangs once,
+   then works forever" into "**fails every first run** until someone
+   pre-warms the cache." That is a real regression, not a detail.
+2. **`asyncio.to_thread` + `mark_failed()` leaks the model.** On timeout,
+   `load_and_start` calls `mark_failed()` → `_do_release()` →
+   `detector.release()`, which sets `_model = None`. But the orphaned
+   thread is still inside `load()`, and *afterwards* assigns
+   `self._model = ...` and moves it to the device. The FAILED module ends
+   up holding a fully-loaded model — and on CUDA, GPU memory — that
+   nothing will ever release, because release already ran. This is an
+   *ordering* bug, not a partial-state bug; no implementation of
+   `release()` alone can fix it (Rule 8, resource discipline).
+   **Mitigation if A or B is chosen:** give the detector a
+   load-invalidation token — `release()` sets `self._invalidated = True`;
+   `load()` checks it before assigning `self._model` and immediately
+   releases if it was invalidated mid-load.
+
 **Options for the user:**
 
 | Option | What it means | Cost / risk |
 |---|---|---|
-| **A. `asyncio.to_thread` in this module only** | `await asyncio.to_thread(self._detector.load, device)` — makes the load genuinely awaitable, so `wait_for` can actually bound it. | Smallest change; real timeout enforcement. But the module is then cancelled while a thread keeps running — the orphaned thread finishes the download and is discarded. Needs `_do_release()` to be safe against a partially-loaded detector. Leaves `DepthEstimationModule` inconsistent with it. |
-| **B. Fix the contract centrally** | Make `Module.load()` (or `ModuleContainer`) run `_do_load` via `to_thread` for all modules. | Consistent; fixes depth too. Larger blast radius — touches the shared lifecycle contract every module depends on, and `V1.1` is the milestone that owns lifecycle hardening. |
-| **C. Pre-provision weights, accept the gap** | Document that weights must be downloaded before first run; leave loading synchronous. | Zero architectural change. Does not fix anything — just moves the hazard to an operational precondition. |
-| **D. Defer Object Memory** | Do V1.1 lifecycle hardening first, then build this module on the fixed contract. | Cleanest ordering; costs the most schedule time. |
+| **A. `asyncio.to_thread` in this module only** | `await asyncio.to_thread(self._detector.load, device)` — makes the load genuinely awaitable, so `wait_for` can actually bound it. | Smallest change; real timeout enforcement. **But:** triggers consequence 1 (first run fails within 10s) and consequence 2 (needs the invalidation token). Leaves `DepthEstimationModule` inconsistent. |
+| **B. Fix the contract centrally** | Make `Module.load()`/`ModuleContainer` run `_do_load` via `to_thread` for all modules. | Consistent; fixes depth too. Same consequences 1 and 2, now for every module. Largest blast radius — touches the shared contract every module depends on, and V1.1 is the milestone that owns lifecycle hardening. |
+| **C. Pre-provision weights, accept the gap** | Document that weights must be downloaded before first run; leave loading synchronous. | Zero architectural change, and **the only option under which first run succeeds unattended**. Does not fix the hang hazard — moves it to an operational precondition. Less unreasonable than it first looks. |
+| **D. Defer Object Memory** | Do V1.1 lifecycle hardening first, then build on the fixed contract. | Cleanest ordering; costs the most schedule time. |
+| **E. Separate, longer load timeout** | `ModuleContainer.__init__` *already* accepts `lifecycle_timeout_s` (`container.py:26-30`) and `main.py:34` never passes it. Give load its own generous bound (e.g. 120s) distinct from stop/unload. | Cheap, touches no execution model, and **composes with A or B** — it is the piece that makes consequence 1 survivable. Not a substitute for A/B: alone it still cannot interrupt a synchronous call. |
 
-**Recommendation (not a decision):** **A** for this slice, with a code
-comment pointing at this gate and at the techdebt audit, because it is
-local, reversible, and does not touch the shared contract mid-milestone —
-then **B** as part of V1.1 where lifecycle hardening actually belongs. But
-this is the user's call.
+**Recommendation (not a decision):** **E + A** — a longer, explicit load
+timeout so a cold-cache first run can legitimately finish, plus
+`to_thread` *in this module only* with the invalidation token, so the
+bound is actually enforceable. Then **B** at V1.1, where lifecycle
+hardening belongs and where depth can be migrated alongside. **C** is a
+defensible fallback if the user would rather ship the module now and
+treat weight pre-provisioning as a documented operational step. This is
+the user's call.
 
 - [ ] **Step 1: Obtain and record the user's ruling** in this file, with
       date and reasoning, before proceeding.
@@ -793,9 +889,12 @@ chooses otherwise.
     returning `(coco_label, score, (x1, y1, x2, y2))`
   - `release(self) -> None`
 
-Mirror `tower/experiments/depth.py` exactly for: local torch import,
-`StageTimer` usage, `FrameProcessingError` on an undecodable frame, CUDA
-memory logging, and `release()` being safe after a partial load.
+Mirror `tower/experiments/depth.py` for: local torch import,
+`FrameProcessingError` on an undecodable frame, CUDA memory logging on
+release, and `release()` being safe after a partial load. **Stage timing
+is deliberately NOT here** — `run()` returns a plain list, and the
+`StageTimer` lives in the module's `_do_process` (Task 6), which is what
+builds the `ExperimentResult`.
 
 - [ ] **Step 1: Write the failing opt-in integration test**
 
@@ -860,10 +959,10 @@ from tower.modules.base import FrameProcessingError
 
 logger = logging.getLogger(__name__)
 
-# Pinned explicitly rather than via a default/alias: a floating weights
-# selection is a reproducibility risk for any measured result, exactly as
-# the V0.9.1 MiDaS torch.hub ref pin established.
-WEIGHTS_NAME = "COCO_V1"
+# Pinned by direct enum reference, not a string alias resolved at
+# runtime: a floating weights selection is a reproducibility risk for any
+# measured result, exactly as the V0.9.1 MiDaS torch.hub ref pin
+# established, and a direct reference fails at import rather than at load.
 
 
 class ObjectDetector:
@@ -888,7 +987,7 @@ class ObjectDetector:
 
         start = time.perf_counter()
         self._device = torch.device(device)
-        self._weights = getattr(SSDLite320_MobileNet_V3_Large_Weights, WEIGHTS_NAME)
+        self._weights = SSDLite320_MobileNet_V3_Large_Weights.COCO_V1
         self._model = ssdlite320_mobilenet_v3_large(weights=self._weights)
         self._model.to(self._device)
         self._model.eval()
@@ -952,7 +1051,7 @@ Expected: PASS (2 passed)
 - [ ] **Step 5: Confirm the default suite still skips it**
 
 Run: `python -m pytest -q`
-Expected: `129 passed, 5 skipped` (the 3 existing depth skips + 2 new)
+Expected: `147 passed, 5 skipped` — `passed` is UNCHANGED from Task 3 because both new tests are opt-in; only `skipped` moves (3 existing depth skips + 2 new)
 
 - [ ] **Step 6: Commit**
 
@@ -1096,6 +1195,7 @@ import time
 from tower.experiments import ExperimentResult
 from tower.instrumentation import StageTimer
 from tower.modules.base import Module, ModuleDataBehavior, ModuleDescriptor
+from tower.modules.depth_cv import _resolve_device
 from tower.object_memory.detector import ObjectDetector
 from tower.object_memory.records import Confidence, ObjectObservation
 from tower.object_memory.relevance import RelevanceFilter
@@ -1114,7 +1214,7 @@ DESCRIPTOR = ModuleDescriptor(
     ),
 )
 
-SOURCE = "glasses-camera"
+DEFAULT_SOURCE = "glasses-camera"
 
 
 class ObjectMemoryModule(Module):
@@ -1133,19 +1233,30 @@ class ObjectMemoryModule(Module):
         store: ObservationStore,
         relevance: RelevanceFilter,
         detector: ObjectDetector | None = None,
+        source: str = DEFAULT_SOURCE,
     ) -> None:
         super().__init__()
         self._device = device
         self._store = store
         self._relevance = relevance
         self._detector = detector if detector is not None else ObjectDetector()
+        # Overridable so a benchmark run against recorded video does not
+        # record observations claiming they came from the glasses (Rule 3).
+        self._source = source
 
     async def _do_load(self) -> None:
         # See docs/superpowers/plans/2026-08-20-object-memory-first-slice.md
         # Task 4 (DECISION GATE) for why this is not a bare synchronous call.
         import asyncio
 
-        await asyncio.to_thread(self._detector.load, self._device)
+        # _resolve_device, not the raw setting: TOWER_CV_DEVICE defaults to
+        # "auto", and torch.device("auto") raises.
+        await asyncio.to_thread(self._detector.load, _resolve_device(self._device))
+        # Honor the declared retention on startup. Without this,
+        # descriptor.retention="configurable" would be a false claim
+        # (Rule 3) and 06-PRIVACY-DATA.md's "must implement working
+        # retention before collecting real data" would be unmet.
+        self._store.prune_expired(time.time())
 
     async def _do_start(self) -> None:
         return None
@@ -1167,8 +1278,9 @@ class ObjectMemoryModule(Module):
                         detector_score=score,
                         confidence=Confidence.from_score(score),
                         observed_at=now,
+                        time_basis="tower-receipt",
                         recorded_at=time.time(),
-                        source=SOURCE,
+                        source=self._source,
                         module_id=DESCRIPTOR.id,
                         session_id=None,
                         frame_seq=None,
@@ -1210,6 +1322,11 @@ class ObjectMemoryModule(Module):
 Run: `python -m pytest tests/test_object_memory_module.py -q`
 Expected: PASS (5 passed)
 
+- [ ] **Step 4b: Run the full suite**
+
+Run: `python -m pytest -q`
+Expected: `152 passed, 5 skipped`
+
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -1222,8 +1339,21 @@ git commit -m "feat: add ObjectMemoryModule with persistence and purge"
 ### Task 7: Wiring and query/purge endpoints
 
 **Files:**
-- Modify: `tower/config.py`
+- Modify: `tower/config.py` (three new fields, **with defaults** — see B1)
 - Modify: `tower/main.py:15-20`
+- Modify: `tower/modules/container.py` — add a public `module` property;
+  the route must not reach into `_module`
+- Modify: `tests/test_main_module_factory.py` — constructs `Settings(...)`
+  positionally and will break otherwise; add a case asserting
+  `module="object-memory"` builds an `ObjectMemoryModule`
+- Modify: `tests/test_config.py` — default/override tests for the three
+  new settings, including `TOWER_OBJECT_MEMORY_RETENTION_S=0`, which the
+  truthiness check turns into `None` rather than `0.0`
+- Modify: `tests/conftest.py` — clear the new env vars
+- Modify: `.gitignore` — add `data/`; the default store path is relative,
+  so an observation history ("what objects were in the user's home, when")
+  would otherwise land in the repo root, one `git add -A` from being
+  committed
 - Create: `tower/routes/object_memory.py`
 - Test: `tests/test_object_memory_routes.py`
 
@@ -1291,7 +1421,12 @@ def test_health_reports_the_object_memory_descriptor(monkeypatch, tmp_path):
     monkeypatch.setenv("TOWER_OBJECT_MEMORY_DIR", str(tmp_path))
     client = TestClient(create_app())
 
-    assert client.get("/health").json()["module_id"] == "object-memory"
+    health = client.get("/health").json()
+    assert health["module_id"] == "object-memory"
+    # Without this the whole task's tests pass on a module that failed to
+    # load: load_and_start swallows every exception and marks FAILED, and
+    # module_id is a class attribute that survives it.
+    assert health["module_state"] == "active"
 ```
 
 > **Note for the executor:** these tests construct the real module, so with
@@ -1308,10 +1443,14 @@ Expected: FAIL — 404 on both endpoints (routes not registered)
 - [ ] **Step 3: Extend settings**
 
 ```python
-# tower/config.py -- add to Settings and get_settings
-    module: str
-    object_memory_dir: str
-    object_memory_retention_s: float | None
+# tower/config.py -- add to Settings and get_settings.
+# DEFAULTS ARE REQUIRED: Settings is a frozen dataclass with no defaults
+# today, and tests/test_main_module_factory.py constructs it positionally
+# with exactly the five existing fields. Adding required fields breaks
+# those tests with "missing 3 required positional arguments".
+    module: str = "experimental-cv"
+    object_memory_dir: str = "data/object_memory"
+    object_memory_retention_s: float | None = None
 ```
 
 ```python
@@ -1332,14 +1471,26 @@ Expected: FAIL — 404 on both endpoints (routes not registered)
 # tower/routes/object_memory.py
 from fastapi import APIRouter, HTTPException, Request
 
+from tower.modules.base import ModuleState
+
 router = APIRouter(prefix="/object-memory")
 
 
 def _module(request: Request):
-    module = request.app.state.module_container._module
-    if module.descriptor.id != "object-memory":
-        raise HTTPException(status_code=404, detail="object memory module is not active")
-    return module
+    container = request.app.state.module_container
+    if container.descriptor.id != "object-memory":
+        raise HTTPException(
+            status_code=404, detail="object memory module is not active"
+        )
+    # Gate on real state, not just descriptor id: the id is a class
+    # attribute and is unaffected by the module having FAILED, so checking
+    # it alone would happily serve queries from a dead module (Rule 3).
+    if container.state != ModuleState.ACTIVE:
+        raise HTTPException(
+            status_code=503,
+            detail=f"object memory module is {container.state.value}, not active",
+        )
+    return container.module
 
 
 @router.get("/last-seen/{object_class}")
@@ -1356,6 +1507,14 @@ def last_seen(object_class: str, request: Request) -> dict:
 @router.post("/purge")
 def purge(request: Request) -> dict:
     return {"deleted": _module(request).purge()}
+```
+
+- [ ] **Step 4b: Add the public accessor to `ModuleContainer`**
+
+```python
+    @property
+    def module(self) -> Module:
+        return self._module
 ```
 
 - [ ] **Step 5: Wire it up in `main.py`**
@@ -1432,6 +1591,11 @@ without real numbers.
       World Builder harnesses use.
 
 - [ ] **Step 2: Run it on CPU and CUDA**, capturing real numbers for:
+      **Note:** the current venv has `torch 2.13.0+cpu` — CUDA is not
+      available as provisioned. The CUDA half is contingent on the
+      separate cu132-index install in `README.md`; if that is not done,
+      report the CPU run and say the CUDA run was not performed, rather
+      than shipping an unmeasured half.
       detect/persist stage times, end-to-end per-frame cost, observations
       persisted per minute, store size growth, peak GPU memory.
 
@@ -1475,6 +1639,32 @@ without real numbers.
 | First-Version Success Criteria 1–4 | Tasks 5–7 |
 | First-Version Success Criteria 5–6 | Task 8 |
 
+**Test-design requirements carried over from the plan review** (fold into
+the tasks they belong to, don't treat as optional polish):
+
+- **`test_release_is_safe_without_a_successful_load` must NOT sit behind
+  `TOWER_RUN_MODEL_TESTS`.** It constructs `ObjectDetector()` and calls
+  `release()` with no model and no torch, and it is the single guard
+  against the Task 4 Option-A partial-load hazard — gating it means it
+  never runs. Move it to a non-gated file, or use a per-test marker rather
+  than a module-level `pytestmark`.
+- **Add a container-level timeout test.** Every Task 6 test either calls
+  `module.load()` directly (bypassing `asyncio.wait_for` entirely) or uses
+  a fake detector that returns instantly, so *nothing* exercises the
+  timeout path the entire Task 4 gate exists to resolve. Use
+  `ModuleContainer(module, lifecycle_timeout_s=0.05)` with a deliberately
+  slow fake load, and assert the module ends FAILED **and the detector was
+  released exactly once** — that is the test that catches the
+  release-then-resurrect leak.
+- **Task 7's route tests leak a loaded detector.** `TestClient(create_app())`
+  without `with client:` never runs ASGI lifespan, so `shutdown()` →
+  `_do_unload` → `release()` never fires; three real models would stay
+  resident. Either gate those tests behind `TOWER_RUN_MODEL_TESTS=1` or
+  inject a fake detector through a seam rather than through `create_app`.
+- **Guard `"N/A"` COCO labels.** 11 of the 91 category entries are the
+  literal string `"N/A"`; persisting `object_class="N/A"` would be junk
+  data. Cheap to skip at the detector boundary.
+
 **Known gaps a reviewer should weigh in on:**
 1. **Sensor Profile** has no home in the current architecture — correctly
    V1.0 work, but it means this module cannot request 5–15 FPS or a
@@ -1484,10 +1674,19 @@ without real numbers.
    frame metadata. Threading it through is a real (small) contract change
    and is intentionally *not* smuggled into this plan. It connects directly
    to the Master Guide §7 item 3 `source_seq`/`tx_seq` work.
-3. **Retention pruning is never called** by any task — `prune_expired`
-   exists and is tested, but nothing schedules it. Wiring it (on load? on
-   append? on a timer?) is a real design choice deferred to review rather
-   than guessed.
+3. **Retention pruning now runs on load only** (Task 6 `_do_load`). That
+   is enough to make `retention="configurable"` a truthful descriptor
+   claim and to cover the restart case, but a long-running session will
+   not prune until it restarts. Whether that needs a timer, or pruning on
+   append, is a real design choice left open — but shipping with *no*
+   pruning at all would have made the descriptor false, which is why the
+   load-time call is in the plan rather than deferred.
+4. **`Confidence.LOW` and `UNKNOWN` are unreachable for persisted
+   records**, because `RelevancePolicy.min_score` (0.5) equals
+   `LOW_CONFIDENCE_MAX` (0.5) and `_do_process` never passes `None`. The
+   enum is still correct at the record layer, but only half of it is
+   exercised end to end, and the two constants are silently coupled — if
+   `min_score` ever drops, `LOW` starts appearing.
 
 **Placeholder scan:** none — every code step contains runnable code, and
 Task 4's "gate" is a deliberate decision point with concrete options, not a
