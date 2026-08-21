@@ -254,6 +254,13 @@ final class TowerClientTests: XCTestCase {
         let becameOnline = await waitUntil { client.status == .online }
         XCTAssertTrue(becameOnline)
 
+        // The stream bracket has to be opened *before* the drop, or sendFrame
+        // returns at the isStreamingToTower guard and never reaches
+        // `task.send` — in which case this test would pass on the receive
+        // loop alone and prove nothing about the send path it is named for.
+        client.sendStreamStart()
+        XCTAssertTrue(client.isStreamingToTower, "stream_start must succeed while online")
+
         server.dropConnection()
         server.stop()
 
@@ -382,6 +389,246 @@ final class TowerClientTests: XCTestCase {
         XCTAssertEqual(stops, 3, "expected 3 stream_stop messages across 3 cycles, got \(stops)")
         // Same connection throughout — no reconnect was ever triggered.
         XCTAssertEqual(client.status, .online)
+
+        client.disconnect()
+    }
+
+    // MARK: - 13. The bounded send window drops the newest frame when full
+
+    /// The window exists so a slow uplink sheds frames instead of queueing
+    /// them. Driven synchronously: `sendFrame` hands the message to
+    /// URLSession and the completion hops back through
+    /// `Task { @MainActor }`, so consecutive calls with no suspension point
+    /// between them cannot have had a completion processed yet. That makes the
+    /// drop deterministic rather than timing-dependent.
+    func testSendWindowDropsFramesWhileEarlierSendsAreStillInFlight() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = attachRecorder(server)
+        defer { server.stop() }
+
+        let metrics = SenderMetrics()
+        let client = TowerClient(metrics: metrics, maxFramesInFlight: 2)
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        metrics.begin()
+        client.sendStreamStart()
+
+        // Five frames, no await between them.
+        let image = makeTestImage()
+        for sequence in 1...5 {
+            client.sendFrame(image, width: 2, height: 2, sequence: sequence)
+        }
+
+        XCTAssertEqual(
+            metrics.currentSnapshot.sendAttempts,
+            2,
+            "only the window's worth of frames may be handed to the socket"
+        )
+        XCTAssertEqual(
+            metrics.currentSnapshot.sendWindowDrops,
+            3,
+            "the three frames past the window must be dropped, not queued"
+        )
+        // Dropped frames must not have been encoded — the drop check comes
+        // first precisely so a doomed frame costs nothing.
+        XCTAssertEqual(metrics.currentSnapshot.framesEncoded, 2)
+
+        let arrived = await waitUntil {
+            recorder.all.compactMap(self.decode).filter { $0["type"] as? String == "frame" }.count == 2
+        }
+        XCTAssertTrue(arrived, "exactly the two admitted frames must reach the server")
+
+        client.disconnect()
+    }
+
+    /// Once earlier sends complete the window must reopen, or the pipeline
+    /// would send `maxFramesInFlight` frames and then stop forever.
+    func testSendWindowReopensAfterSendsComplete() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = attachRecorder(server)
+        defer { server.stop() }
+
+        let metrics = SenderMetrics()
+        let client = TowerClient(metrics: metrics, maxFramesInFlight: 1)
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        metrics.begin()
+        client.sendStreamStart()
+
+        let image = makeTestImage()
+        func frameCount() -> Int {
+            recorder.all.compactMap(decode).filter { $0["type"] as? String == "frame" }.count
+        }
+
+        for sequence in 1...4 {
+            client.sendFrame(image, width: 2, height: 2, sequence: sequence)
+            let delivered = await waitUntil { metrics.currentSnapshot.sendSuccesses == sequence }
+            XCTAssertTrue(delivered, "send \(sequence) never completed, so the window never reopened")
+        }
+
+        XCTAssertEqual(metrics.currentSnapshot.sendWindowDrops, 0, "no drop should occur when sends are awaited")
+        let allArrived = await waitUntil { frameCount() == 4 }
+        XCTAssertTrue(allArrived)
+
+        client.disconnect()
+    }
+
+    /// A dropped connection leaves completion handlers pending. If teardown
+    /// did not clear the window, those slots would never be returned and the
+    /// next connection could never send anything.
+    func testSendWindowIsClearedByReconnectSoSendingResumes() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = attachRecorder(server)
+        defer { server.stop() }
+
+        let metrics = SenderMetrics()
+        let client = TowerClient(metrics: metrics, maxFramesInFlight: 1)
+        client.connect(to: url(port: port))
+        var becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        metrics.begin()
+        client.sendStreamStart()
+        // Fill the window, then tear the connection down before the send can
+        // complete, so a slot is outstanding at teardown time.
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 1)
+        // Without this the test would pass even if sendStreamStart() had
+        // silently failed and the frame never occupied a window slot at all —
+        // proving nothing about the leak it is named for.
+        XCTAssertEqual(
+            metrics.currentSnapshot.sendAttempts,
+            1,
+            "frame 1 must actually have consumed the only window slot"
+        )
+        client.disconnect()
+
+        client.connect(to: url(port: port))
+        becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        client.sendStreamStart()
+        let before = metrics.currentSnapshot.sendWindowDrops
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 2)
+        XCTAssertEqual(
+            metrics.currentSnapshot.sendWindowDrops,
+            before,
+            "the window was still full after reconnect — a leaked in-flight slot"
+        )
+
+        let arrived = await waitUntil {
+            recorder.all.compactMap(self.decode)
+                .contains { $0["type"] as? String == "frame" && $0["seq"] as? Int == 2 }
+        }
+        XCTAssertTrue(arrived, "the frame after reconnect never reached the server")
+
+        client.disconnect()
+    }
+
+    // MARK: - 14. Stream bracket truthfulness
+
+    /// `isStreamingToTower` claims a `stream_start` is outstanding. A start
+    /// attempted while offline reaches no socket, so claiming it would let a
+    /// whole session's frames be forwarded outside any bracket.
+    func testStreamStartWhileOfflineDoesNotClaimToBeStreaming() {
+        let client = TowerClient()
+        XCTAssertEqual(client.status, .offline)
+
+        client.sendStreamStart()
+
+        XCTAssertFalse(
+            client.isStreamingToTower,
+            "a stream_start that reached no socket must not mark the stream open"
+        )
+    }
+
+    /// No `stream_start` survives a socket, so the flag must not either —
+    /// otherwise frames flow onto a connection the Tower never saw a start on.
+    func testDisconnectClearsTheStreamBracket() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        client.sendStreamStart()
+        XCTAssertTrue(client.isStreamingToTower)
+
+        client.disconnect()
+        XCTAssertFalse(client.isStreamingToTower, "the stream bracket outlived the socket it was opened on")
+    }
+
+    /// Clearing the bracket on teardown is only safe because it can be
+    /// reopened: `ProjectManager` re-sends `stream_start` when the Tower comes
+    /// back online during a live camera stream. If a fresh `stream_start`
+    /// could not restore frame flow after a reconnect, a single mid-session
+    /// network blip would silently discard every remaining frame.
+    func testStreamBracketCanBeReopenedAfterAReconnect() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = attachRecorder(server)
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        var becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        client.sendStreamStart()
+        client.disconnect()
+        XCTAssertFalse(client.isStreamingToTower)
+
+        // What ProjectManager now does when status returns to .online.
+        client.connect(to: url(port: port))
+        becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+        client.sendStreamStart()
+        XCTAssertTrue(client.isStreamingToTower, "the bracket must be reopenable on the new socket")
+
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 7)
+        let arrived = await waitUntil {
+            recorder.all.compactMap(self.decode)
+                .contains { $0["type"] as? String == "frame" && $0["seq"] as? Int == 7 }
+        }
+        XCTAssertTrue(arrived, "frames must flow again after the bracket is reopened")
+
+        client.disconnect()
+    }
+
+    /// The counter sits beside the per-session `frameCount` on the dashboard,
+    /// so it has to reset on the same boundary rather than accumulating for
+    /// the app's lifetime.
+    func testFrameResultCountResetsPerStreamBracket() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        client.sendStreamStart()
+        for seq in 1...2 {
+            server.send(text: #"{"type":"frame_result","seq":\#(seq),"mean_intensity":0.1,"processing_ms":1.0}"#)
+        }
+        let counted = await waitUntil { client.frameResultCount == 2 }
+        XCTAssertTrue(counted, "expected 2 replies, got \(client.frameResultCount)")
+
+        client.sendStreamStop()
+        client.sendStreamStart()
+        XCTAssertEqual(client.frameResultCount, 0, "a new stream bracket must start from zero replies")
 
         client.disconnect()
     }

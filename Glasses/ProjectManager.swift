@@ -8,6 +8,12 @@
 import Combine
 import Foundation
 
+#if DEBUG
+// For `MWDATCamera.StreamState`, read when deciding whether a returning Tower
+// connection needs its stream bracket reopened.
+import MWDATCamera
+#endif
+
 /// Root app-level state container. Owns the connection, stream, and tower
 /// managers so the dashboard has a single source of truth to observe.
 @MainActor
@@ -16,6 +22,12 @@ final class ProjectManager: ObservableObject {
     let streamManager: StreamManager
     let towerClient: TowerClient
 
+    /// Sender-side instrumentation for the whole capture → transmit path.
+    /// `ProjectManager` owns it and hands the same instance to both halves,
+    /// which is what makes end-to-end counts (captured vs. selected vs. sent
+    /// vs. replied) comparable within one session.
+    let senderMetrics: SenderMetrics
+
     /// Retains the subscriptions that forward each child's `objectWillChange`
     /// into this object's own publisher. Without this, `@StateObject`/
     /// `@ObservedObject` callers observing `ProjectManager` never re-render
@@ -23,14 +35,19 @@ final class ProjectManager: ObservableObject {
     /// itself has no `@Published` properties to trigger its own publisher.
     private var cancellables: Set<AnyCancellable> = []
 
+    /// Injected children keep whatever `SenderMetrics` instance they were
+    /// built with, so a test can wire its own; the default graph shares one.
     init(
         glassesConnection: GlassesConnection? = nil,
         streamManager: StreamManager? = nil,
-        towerClient: TowerClient? = nil
+        towerClient: TowerClient? = nil,
+        senderMetrics: SenderMetrics? = nil
     ) {
-        self.glassesConnection = glassesConnection ?? GlassesConnection()
+        let metrics = senderMetrics ?? SenderMetrics()
+        self.senderMetrics = metrics
+        self.glassesConnection = glassesConnection ?? GlassesConnection(metrics: metrics)
         self.streamManager = streamManager ?? StreamManager()
-        self.towerClient = towerClient ?? TowerClient()
+        self.towerClient = towerClient ?? TowerClient(metrics: metrics)
 
         for child in [self.glassesConnection.objectWillChange.eraseToAnyPublisher(),
                       self.streamManager.objectWillChange.eraseToAnyPublisher(),
@@ -71,6 +88,26 @@ final class ProjectManager: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.towerClient.sendStreamStop()
+            }
+            .store(in: &cancellables)
+
+        // Re-opens the stream bracket after the Tower connection is replaced.
+        //
+        // `cameraStreamDidStart` fires once per *camera* session, but the
+        // Tower socket has a shorter life: a drop tears it down and
+        // `stream_start` does not survive it. Without this, a single
+        // mid-session blip — the expected case on a remote Tailscale path —
+        // would leave the Tower pill green while every remaining frame was
+        // silently discarded for want of a bracket, recoverable only by
+        // stopping and restarting the camera. `sendStreamStart()` is a no-op
+        // when a bracket is already open, so an ordinary connect during an
+        // idle camera is unaffected.
+        self.towerClient.$status
+            .filter { $0 == .online }
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self, self.glassesConnection.cameraStreamState == .streaming else { return }
+                self.towerClient.sendStreamStart()
             }
             .store(in: &cancellables)
         #endif

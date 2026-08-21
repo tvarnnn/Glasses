@@ -36,10 +36,9 @@ final class TowerClient: NSObject, ObservableObject {
     /// How many `frame_result` messages the receive loop has processed — the
     /// only end-to-end proof that the Tower received a frame and replied.
     /// `@Published` so the dashboard can show it live; it is otherwise
-    /// unchanged, and nothing reads it to make a decision. Note the render
-    /// cost is bounded by the 1-in-30 frame throttle in `GlassesConnection`:
-    /// if that throttle is ever relaxed, this invalidates the view tree at the
-    /// full frame rate rather than ~1 Hz.
+    /// unchanged, and nothing reads it to make a decision. It now invalidates
+    /// the view tree at the Tower's reply rate (target ~12 Hz), which is the
+    /// same order as `GlassesConnection.frameCount` has always done at 24 Hz.
     @Published private(set) var frameResultCount = 0
 
     /// True between a sent `stream_start` and the matching `stream_stop`.
@@ -51,12 +50,61 @@ final class TowerClient: NSObject, ObservableObject {
     @Published private(set) var isStreamingToTower = false
     #endif
 
+    /// How many frame sends may be outstanding on the socket at once.
+    ///
+    /// This is *not* an ACK window. `URLSessionWebSocketTask.send` reports
+    /// completion when the message has been written out, not when the Tower
+    /// has processed it, so the send path is not round-trip bound and does not
+    /// need to be: `frame_result` messages are observed independently by the
+    /// receive loop and never gate a send.
+    ///
+    /// What it does bound is the *local* outbound backlog. Without it, a
+    /// pipeline running at the target rate hands URLSession an unbounded
+    /// number of ~20 KB messages whenever the uplink cannot keep up, growing
+    /// memory and latency without ever dropping anything — the failure mode
+    /// docs/03-ROADMAP.md V0.7 explicitly forbids.
+    ///
+    /// 2 leaves enough headroom that a send completing in well under one
+    /// frame interval never blocks the next frame, and is small enough that
+    /// whatever is queued is always near-fresh. When the window is full the
+    /// *new* frame is dropped rather than an older queued one: a WebSocket
+    /// stream cannot be reordered, so declining to add to the queue is the
+    /// only way to keep latency bounded.
+    let maxFramesInFlight: Int
+    private var framesInFlight = 0
+
+    /// Per-frame logging cadence, in send calls. At the target rate this path
+    /// runs ~12 times a second and `print` with string interpolation is not
+    /// free, so routine success and routine drops are decimated. The
+    /// authoritative per-stage counts live in `metrics`.
+    private static let frameLogStride = 12
+    private var frameLogCounter = 0
+    /// Separate budget from `frameLogCounter` so the outbound and inbound
+    /// lines cannot crowd each other out — each stays at ~1 Hz.
+    private var resultLogCounter = 0
+
+    /// Sender-side instrumentation. Shared with `GlassesConnection` via
+    /// `ProjectManager`, which owns both.
+    private let metrics: SenderMetrics
+
     private var session: URLSession?
     private var webSocketTask: URLSessionWebSocketTask?
     private var validationTask: Task<Void, Never>?
     private var receiveTask: Task<Void, Never>?
 
     override init() {
+        self.metrics = SenderMetrics()
+        self.maxFramesInFlight = 2
+        super.init()
+    }
+
+    /// - Parameters:
+    ///   - metrics: Shared sender instrumentation.
+    ///   - maxFramesInFlight: Overridable so tests can drive the bounded send
+    ///     window deterministically.
+    init(metrics: SenderMetrics, maxFramesInFlight: Int = 2) {
+        self.metrics = metrics
+        self.maxFramesInFlight = max(1, maxFramesInFlight)
         super.init()
     }
 
@@ -104,19 +152,39 @@ final class TowerClient: NSObject, ObservableObject {
     /// a time. Not batching, not compressing beyond a fixed JPEG quality, not
     /// adapting rate — see docs/03-ROADMAP.md V0.7 for where that belongs.
     func sendFrame(_ image: UIImage, width: Int, height: Int, sequence: Int) {
+        frameLogCounter += 1
+        let shouldLog = frameLogCounter % Self.frameLogStride == 1
+
         guard status == .online, let task = webSocketTask else {
-            log("frame #\(sequence) not sent — Tower not online (status=\(status))")
+            metrics.recordSessionGateDrop()
+            if shouldLog {
+                log("frame #\(sequence) not sent — Tower not online (status=\(status))")
+            }
             return
         }
         guard isStreamingToTower else {
-            log("frame #\(sequence) not sent — no stream_start sent yet (or stream_stop already sent)")
+            metrics.recordSessionGateDrop()
+            if shouldLog {
+                log("frame #\(sequence) not sent — no stream_start sent yet (or stream_stop already sent)")
+            }
             return
         }
+        // Checked before encoding, so a frame we are going to drop never costs
+        // a JPEG encode.
+        guard framesInFlight < maxFramesInFlight else {
+            metrics.recordSendWindowDrop()
+            if shouldLog {
+                log("frame #\(sequence) dropped — \(framesInFlight) sends already in flight (window \(maxFramesInFlight))")
+            }
+            return
+        }
+
+        let encodeStart = MonotonicClock.now
         guard let jpegData = image.jpegData(compressionQuality: 0.5) else {
+            metrics.recordEncodeFailure()
             log("frame #\(sequence) failed to encode as JPEG")
             return
         }
-        log("frame #\(sequence) encoded (\(jpegData.count) bytes, \(width)x\(height))")
 
         let payload: [String: Any] = [
             "type": "frame",
@@ -131,18 +199,43 @@ final class TowerClient: NSObject, ObservableObject {
             let jsonData = try? JSONSerialization.data(withJSONObject: payload),
             let jsonText = String(data: jsonData, encoding: .utf8)
         else {
+            metrics.recordEncodeFailure()
             log("frame #\(sequence) failed to serialize JSON payload")
             return
+        }
+        metrics.recordEncode(seconds: MonotonicClock.now - encodeStart)
+
+        framesInFlight += 1
+        metrics.recordSendAttempt(wireBytes: jsonData.count)
+        if shouldLog {
+            log("frame #\(sequence) sending \(jsonData.count) bytes (\(width)x\(height), jpeg \(jpegData.count) bytes)")
         }
 
         task.send(.string(jsonText)) { [weak self] error in
             Task { @MainActor in
                 guard let self else { return }
+                // A completion for a socket this client no longer owns:
+                // `framesInFlight` was already zeroed by teardown, so
+                // decrementing here would drive it negative and permanently
+                // widen the window. The outcome is also not this connection's
+                // to report — but it still has to be *recorded*, or the frame
+                // would look permanently in flight and the accounting
+                // invariant would false-alarm after every disconnect.
+                guard self.isCurrent(task) else {
+                    self.metrics.recordSendAbandoned()
+                    return
+                }
+                self.framesInFlight -= 1
+
                 if let error {
+                    self.metrics.recordSendFailure()
                     self.log("frame #\(sequence) send failed: \(error.localizedDescription)")
                     self.fail("Send failed: \(error.localizedDescription)", task: task)
                 } else {
-                    self.log("frame #\(sequence) sent (\(jsonText.utf8.count) bytes over the wire)")
+                    self.metrics.recordSendSuccess()
+                    if shouldLog {
+                        self.log("frame #\(sequence) sent")
+                    }
                 }
             }
         }
@@ -158,8 +251,20 @@ final class TowerClient: NSObject, ObservableObject {
             log("stream_start suppressed — already streaming")
             return
         }
+        // The flag is set only if the marker actually reached a socket.
+        // Setting it first meant a start attempted while the Tower was
+        // offline left `isStreamingToTower == true` with the Tower never
+        // having been told, so every frame of that session was forwarded
+        // outside any stream bracket and the eventual `stream_stop` was
+        // unmatched.
+        guard sendLifecycleMarker(type: "stream_start") else { return }
         isStreamingToTower = true
-        sendLifecycleMarker(type: "stream_start")
+        // Scoped to one stream bracket so it reads as "replies this session",
+        // matching `GlassesConnection.frameCount` next to it on the dashboard.
+        // A lifetime-cumulative counter shown beside a per-session one
+        // diverges by tens of thousands over a long run and invites reading
+        // the pair as a delivery ratio.
+        frameResultCount = 0
     }
 
     /// Marks the stream as inactive and sends `{"type":"stream_stop"}` once.
@@ -171,23 +276,29 @@ final class TowerClient: NSObject, ObservableObject {
             return
         }
         isStreamingToTower = false
-        sendLifecycleMarker(type: "stream_stop")
+        _ = sendLifecycleMarker(type: "stream_stop")
     }
 
     /// Shared send path for the two stream lifecycle markers — same
     /// WebSocket, same fire-and-forget `send` used by `sendFrame`, no new
-    /// connection, no reply awaited.
-    private func sendLifecycleMarker(type: String) {
+    /// connection, no reply awaited. Deliberately bypasses the frame send
+    /// window: markers are two-byte payloads that define session boundaries,
+    /// and delaying or dropping one corrupts every frame count on either side
+    /// of it.
+    ///
+    /// - Returns: whether the marker was handed to a socket. Not whether the
+    ///   Tower received it — that is still fire-and-forget.
+    private func sendLifecycleMarker(type: String) -> Bool {
         guard status == .online, let task = webSocketTask else {
             log("\(type) not sent — Tower not online (status=\(status))")
-            return
+            return false
         }
         guard
             let jsonData = try? JSONSerialization.data(withJSONObject: ["type": type]),
             let jsonText = String(data: jsonData, encoding: .utf8)
         else {
             log("\(type) failed to serialize JSON payload")
-            return
+            return false
         }
         task.send(.string(jsonText)) { [weak self] error in
             Task { @MainActor in
@@ -200,6 +311,7 @@ final class TowerClient: NSObject, ObservableObject {
                 }
             }
         }
+        return true
     }
     #endif
 
@@ -293,17 +405,26 @@ final class TowerClient: NSObject, ObservableObject {
 
         switch type {
         case "frame_result":
-            let seq = json["seq"] as? Int
-            let meanIntensity = json["mean_intensity"] as? Double
-            let processingMs = json["processing_ms"] as? Double
-            log(
-                "frame_result received: seq=\(seq.map(String.init) ?? "?")"
-                    + " mean_intensity=\(meanIntensity.map { String($0) } ?? "?")"
-                    + " processing_ms=\(processingMs.map { String($0) } ?? "?")"
-            )
+            // Decimated on the same 1-in-`frameLogStride` cadence as the send
+            // path. This arrives once per delivered frame, so at the target
+            // rate an unguarded line here is ~12 prints a second — and the
+            // string builds two `Optional.map` allocations before `print` even
+            // takes its lock. `metrics.frameResults` is the real count.
+            resultLogCounter += 1
+            if resultLogCounter % Self.frameLogStride == 1 {
+                let seq = json["seq"] as? Int
+                let meanIntensity = json["mean_intensity"] as? Double
+                let processingMs = json["processing_ms"] as? Double
+                log(
+                    "frame_result received: seq=\(seq.map(String.init) ?? "?")"
+                        + " mean_intensity=\(meanIntensity.map { String($0) } ?? "?")"
+                        + " processing_ms=\(processingMs.map { String($0) } ?? "?")"
+                )
+            }
             #if DEBUG
             frameResultCount += 1
             #endif
+            metrics.recordFrameResult()
         default:
             log("unknown message type: \(type)")
         }
@@ -343,6 +464,23 @@ final class TowerClient: NSObject, ObservableObject {
         webSocketTask?.cancel(with: closeCode, reason: nil)
         webSocketTask = nil
         session = nil
+
+        // The send window belongs to one socket. Any completion handlers still
+        // pending for the old task are ignored by their `isCurrent` guard, so
+        // zeroing here is the only thing that reopens the window for the next
+        // connection — otherwise a dropped connection would permanently leak
+        // window slots and eventually stop sending altogether.
+        framesInFlight = 0
+
+        #if DEBUG
+        // `isStreamingToTower` means "a stream_start has been sent and not yet
+        // matched by a stream_stop". No stream_start survives a socket, so
+        // leaving this true across a teardown would be a lie, and would let
+        // frames flow to a Tower that never received a start for the
+        // connection they arrive on. Set directly rather than via
+        // `sendStreamStop()`: there is no socket left to send on.
+        isStreamingToTower = false
+        #endif
     }
 
     private func log(_ message: String) {

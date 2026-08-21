@@ -61,9 +61,9 @@ final class GlassesConnection: ObservableObject {
     // shadow MWDATCamera's type of the same name.
     @Published private(set) var cameraStreamState: MWDATCamera.StreamState = .stopped
     @Published private(set) var frameCount: Int = 0
-    /// The most recent frame decoded for Tower transmission, throttled to
-    /// the same cadence as frame-count logging (not every frame — see
-    /// docs/07-PLATFORM-CONSTRAINTS.md Limitation 3, frame drops/backpressure).
+    /// The most recent frame decoded for Tower transmission, sampled down to
+    /// `FrameRateGate.towerTargetFPS` by `frameRateGate` — not every frame,
+    /// per the backpressure policy in docs/03-ROADMAP.md V0.7.
     /// `ProjectManager` observes this and forwards it to `TowerClient`;
     /// `GlassesConnection` never talks to `TowerClient` directly, preserving
     /// the boundary in docs/02-DEVELOPMENT-RULES.md Rule 1.
@@ -95,14 +95,46 @@ final class GlassesConnection: ObservableObject {
     private var activeDeviceTask: Task<Void, Never>?
     private let sessionTokenBag = ListenerTokenBag()
     private let streamTokenBag = ListenerTokenBag()
+
+    /// Decides which captured frames are forwarded for transmission. Reset at
+    /// the start of every session so cadence never carries across sessions.
+    private var frameRateGate = FrameRateGate(targetFPS: FrameRateGate.towerTargetFPS)
+
+    /// Console-logging cadence, independent of transmission: until this task
+    /// the same `% 30` condition governed both, which is what held Tower
+    /// delivery at 24/30 ≈ 0.8 fps. Logging stays at ~1 Hz per category
+    /// because `print` on the main actor is not free at 24 Hz; the
+    /// authoritative per-stage counts live in `metrics`.
+    ///
+    /// Time-based rather than every Nth sequence number, because a sequence
+    /// stride aliases against the rate gate. At a 24 fps source the gate
+    /// admits every other frame, so sequences 1, 3, 5, … are selected and
+    /// 2, 4, 6, … are skipped — and an even stride like the old 30 therefore
+    /// lands *only* on skipped frames. The selected-frame line, the one
+    /// carrying the frame dimensions that proved the physical path works,
+    /// would never print again after frame #1.
+    private static let logInterval: TimeInterval = 1.0
+    private var lastSelectedLogAt: TimeInterval = -.infinity
+    private var lastSkippedLogAt: TimeInterval = -.infinity
     #endif
 
     private let wearables: WearablesInterface
+    /// Sender-side instrumentation. Shared with `TowerClient` via
+    /// `ProjectManager`, which owns both.
+    private let metrics: SenderMetrics
     private var registrationTask: Task<Void, Never>?
     private var deviceStreamTask: Task<Void, Never>?
 
-    init(wearables: WearablesInterface = Wearables.shared) {
+    /// - Parameter metrics: Shared sender instrumentation. Defaults to a
+    ///   private instance so callers that don't care (tests, previews) need not
+    ///   supply one. Built in the body rather than as a default argument
+    ///   because default arguments are evaluated outside this type's actor.
+    init(
+        wearables: WearablesInterface = Wearables.shared,
+        metrics: SenderMetrics? = nil
+    ) {
         self.wearables = wearables
+        self.metrics = metrics ?? SenderMetrics()
         self.registrationState = wearables.registrationState
         self.devices = wearables.devices
 
@@ -306,6 +338,16 @@ final class GlassesConnection: ObservableObject {
         }
 
         frameCount = 0
+        // Otherwise the viewfinder and the "Latest frame #N" tile keep showing
+        // the previous session's image and sequence, while `frameCount` has
+        // already restarted at 0 — two contradictory claims on screen at once.
+        latestCapturedFrame = nil
+        frameRateGate.reset()
+        // So the first frame of every session logs, even one started within a
+        // second of the last one ending.
+        lastSelectedLogAt = -.infinity
+        lastSkippedLogAt = -.infinity
+        metrics.begin()
         print("[Glasses][Camera] creating session via AutoDeviceSelector (active device confirmed)")
 
         do {
@@ -332,6 +374,9 @@ final class GlassesConnection: ObservableObject {
             cameraStreamState = .stopping
             camera.stop()
             cameraStreamDidStop.send(())
+            // Freezes the session's final counters so they stay readable
+            // after Stop rather than being wiped or left mid-interval.
+            metrics.finish()
         }
         if let deviceSession {
             deviceSessionState = .stopping
@@ -411,29 +456,62 @@ final class GlassesConnection: ObservableObject {
         stream.videoFramePublisher.listen { [weak self] frame in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.frameCount += 1
-                // Throttled: only the first frame, then every 30th (~once/sec
-                // at 24fps), so the console isn't flooded and we don't push
-                // every frame to the Tower — see Limitation 3 in
-                // docs/07-PLATFORM-CONSTRAINTS.md.
-                if self.frameCount == 1 || self.frameCount % 30 == 0 {
-                    guard let dimensions = Self.pixelDimensions(for: frame) else {
-                        print("[Glasses][Camera] frame received #\(self.frameCount) dimensions=unknown")
-                        return
-                    }
-                    print("[Glasses][Camera] frame received #\(self.frameCount) dimensions=\(dimensions.width)x\(dimensions.height)")
+                // One clock read serves both the gate and the log budgets.
+                let now = MonotonicClock.now
 
-                    guard let image = frame.makeUIImage() else {
-                        print("[Glasses][Camera] frame #\(self.frameCount) makeUIImage() returned nil")
-                        return
+                // Sequence numbers are DAT callback ordinals: every delivered
+                // frame gets one, whether or not it is transmitted. That is
+                // what lets the Tower compute the source rate from `seq` gaps,
+                // and it is deliberately unchanged.
+                self.frameCount += 1
+                let sequence = self.frameCount
+                self.metrics.recordCapture(sequence: sequence)
+
+                guard self.frameRateGate.shouldSelect(at: now) else {
+                    self.metrics.recordSkip()
+                    if now - self.lastSkippedLogAt >= Self.logInterval {
+                        self.lastSkippedLogAt = now
+                        print("[Glasses][Camera] frame #\(sequence) skipped by the \(FrameRateGate.towerTargetFPS) fps gate")
                     }
-                    self.latestCapturedFrame = CapturedFrame(
-                        image: image,
-                        sequence: self.frameCount,
-                        width: dimensions.width,
-                        height: dimensions.height
-                    )
+                    return
                 }
+                self.metrics.recordSelection()
+
+                // Selected frames get their own budget, so this line cannot be
+                // crowded out by the skipped-frame line above.
+                let shouldLog = now - self.lastSelectedLogAt >= Self.logInterval
+                if shouldLog { self.lastSelectedLogAt = now }
+
+                // Both conversions happen only for selected frames, so the
+                // cost scales with the send rate rather than the capture rate.
+                guard let dimensions = Self.pixelDimensions(for: frame) else {
+                    self.metrics.recordDecodeFailure()
+                    // Failures are counted unconditionally but logged on the
+                    // same cadence as everything else: at the target rate an
+                    // unguarded print here would flood the console 12 times a
+                    // second. `metrics.decodeFailures` is the real record.
+                    if shouldLog {
+                        print("[Glasses][Camera] frame received #\(sequence) dimensions=unknown")
+                    }
+                    return
+                }
+                guard let image = frame.makeUIImage() else {
+                    self.metrics.recordDecodeFailure()
+                    if shouldLog {
+                        print("[Glasses][Camera] frame #\(sequence) makeUIImage() returned nil")
+                    }
+                    return
+                }
+                if shouldLog {
+                    print("[Glasses][Camera] frame received #\(sequence) dimensions=\(dimensions.width)x\(dimensions.height)")
+                }
+
+                self.latestCapturedFrame = CapturedFrame(
+                    image: image,
+                    sequence: sequence,
+                    width: dimensions.width,
+                    height: dimensions.height
+                )
             }
         }.store(in: streamTokenBag)
 
@@ -447,10 +525,30 @@ final class GlassesConnection: ObservableObject {
 
     private func cleanupCameraSession() {
         print("[Glasses][Camera] session cleanup")
+        let hadCamera = camera != nil
         sessionTokenBag.clear()
         streamTokenBag.clear()
         deviceSession = nil
         camera = nil
+
+        // A DAT-initiated stop — glasses folded or doffed, Bluetooth lost, a
+        // stream error — arrives here without ever passing through
+        // `stopCameraSession()`, which until now was the only place
+        // `cameraStreamDidStop` fired. That left the Tower's stream bracket
+        // open, which then suppressed the *next* session's `stream_start`
+        // while `frameCount` restarted at 0 — the Tower would see sequence
+        // numbers rewind inside what it still considered one session, making
+        // its own seq-gap and FPS figures unreadable. `sendStreamStop()` is
+        // idempotent, so the ordinary Stop path reaching here second is a
+        // no-op.
+        if hadCamera {
+            cameraStreamDidStop.send(())
+        }
+        // A session that ends without stopCameraSession() (a device drop, an
+        // error) must still leave truthful final counters, and must not leave
+        // the gate mid-cadence for the next session.
+        metrics.finish()
+        frameRateGate.reset()
         // deviceSelector is intentionally NOT cleared here — it's created
         // once in init() and must keep observing activeDeviceStream() for
         // the object's lifetime, independent of individual session cycles.
