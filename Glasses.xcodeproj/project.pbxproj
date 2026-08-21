@@ -6,13 +6,49 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		208C315C24B46F6FEC34B682 /* MWDATCamera in Frameworks */ = {isa = PBXBuildFile; productRef = 69A44D66C3F5ABDE23B6FE2C /* MWDATCamera */; };
+		241A00E73BC38F81C53AD3EE /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B1FC178F43D5AD1315AFD45C /* Foundation.framework */; };
+		3BFF591BCC38E53334D7805F /* MockTowerServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7687C89BFB8192F1673EBEB1 /* MockTowerServer.swift */; };
+		9991A422AB42B22E2459E23D /* MWDATCore in Frameworks */ = {isa = PBXBuildFile; productRef = BC6D1772D314E7BCB789B652 /* MWDATCore */; };
+		D7881F007A369AE591F6453D /* TowerClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3014A185D2A01699D4E7400 /* TowerClientTests.swift */; };
+		DAC121D4D405EEA501D3CE47 /* MWDATMockDevice in Frameworks */ = {isa = PBXBuildFile; productRef = AA6211B5720FCB42F8A57614 /* MWDATMockDevice */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		4CE54B4704135E0AF44DFA7B /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 6A04FA2D303507A5001B7C01 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 6A04FA34303507A5001B7C01;
+			remoteInfo = Glasses;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		6A04FA35303507A5001B7C01 /* Glasses.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Glasses.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		7687C89BFB8192F1673EBEB1 /* MockTowerServer.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MockTowerServer.swift; sourceTree = "<group>"; };
+		9D934BA2F3095D85C74F7364 /* GlassesTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GlassesTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		B1FC178F43D5AD1315AFD45C /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
+		E3014A185D2A01699D4E7400 /* TowerClientTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TowerClientTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		BD2C4678A21A301655E03FE7 /* Exceptions for "Glasses" folder in "Glasses" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 6A04FA34303507A5001B7C01 /* Glasses */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		6A04FA37303507A5001B7C01 /* Glasses */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				BD2C4678A21A301655E03FE7 /* Exceptions for "Glasses" folder in "Glasses" target */,
+			);
 			path = Glasses;
 			sourceTree = "<group>";
 		};
@@ -23,6 +59,17 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				9991A422AB42B22E2459E23D /* MWDATCore in Frameworks */,
+				DAC121D4D405EEA501D3CE47 /* MWDATMockDevice in Frameworks */,
+				208C315C24B46F6FEC34B682 /* MWDATCamera in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		9A4F5EB81CC1F177E77F1430 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				241A00E73BC38F81C53AD3EE /* Foundation.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -34,6 +81,8 @@
 			children = (
 				6A04FA37303507A5001B7C01 /* Glasses */,
 				6A04FA36303507A5001B7C01 /* Products */,
+				EED23FC97EE879DA66A17A20 /* Frameworks */,
+				BF558549FCFE219E486A30BD /* GlassesTests */,
 			);
 			sourceTree = "<group>";
 		};
@@ -41,13 +90,58 @@
 			isa = PBXGroup;
 			children = (
 				6A04FA35303507A5001B7C01 /* Glasses.app */,
+				9D934BA2F3095D85C74F7364 /* GlassesTests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		B2C6765B9F1AA15D86784BC1 /* iOS */ = {
+			isa = PBXGroup;
+			children = (
+				B1FC178F43D5AD1315AFD45C /* Foundation.framework */,
+			);
+			name = iOS;
+			sourceTree = "<group>";
+		};
+		BF558549FCFE219E486A30BD /* GlassesTests */ = {
+			isa = PBXGroup;
+			children = (
+				7687C89BFB8192F1673EBEB1 /* MockTowerServer.swift */,
+				E3014A185D2A01699D4E7400 /* TowerClientTests.swift */,
+			);
+			name = GlassesTests;
+			path = GlassesTests;
+			sourceTree = "<group>";
+		};
+		EED23FC97EE879DA66A17A20 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				B2C6765B9F1AA15D86784BC1 /* iOS */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		5B393CE65BE51C1C375C789E /* GlassesTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 15E004AC9375D08057A53BDF /* Build configuration list for PBXNativeTarget "GlassesTests" */;
+			buildPhases = (
+				D0A8AF63EB81CBB213DEBDFD /* Sources */,
+				9A4F5EB81CC1F177E77F1430 /* Frameworks */,
+				1B0093428A1848630FC0E603 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				A9E654BED931301422EF0C4E /* PBXTargetDependency */,
+			);
+			name = GlassesTests;
+			productName = GlassesTests;
+			productReference = 9D934BA2F3095D85C74F7364 /* GlassesTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		6A04FA34303507A5001B7C01 /* Glasses */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 6A04FA40303507A7001B7C01 /* Build configuration list for PBXNativeTarget "Glasses" */;
@@ -65,6 +159,9 @@
 			);
 			name = Glasses;
 			packageProductDependencies = (
+				BC6D1772D314E7BCB789B652 /* MWDATCore */,
+				AA6211B5720FCB42F8A57614 /* MWDATMockDevice */,
+				69A44D66C3F5ABDE23B6FE2C /* MWDATCamera */,
 			);
 			productName = Glasses;
 			productReference = 6A04FA35303507A5001B7C01 /* Glasses.app */;
@@ -78,8 +175,11 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 2660;
-				LastUpgradeCheck = 2660;
+				LastUpgradeCheck = 2700;
 				TargetAttributes = {
+					5B393CE65BE51C1C375C789E = {
+						TestTargetID = 6A04FA34303507A5001B7C01;
+					};
 					6A04FA34303507A5001B7C01 = {
 						CreatedOnToolsVersion = 26.6;
 					};
@@ -94,17 +194,28 @@
 			);
 			mainGroup = 6A04FA2C303507A5001B7C01;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				47E2DCADDDEC821ADD89F30C /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 6A04FA36303507A5001B7C01 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
 				6A04FA34303507A5001B7C01 /* Glasses */,
+				5B393CE65BE51C1C375C789E /* GlassesTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		1B0093428A1848630FC0E603 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		6A04FA33303507A5001B7C01 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -122,7 +233,25 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D0A8AF63EB81CBB213DEBDFD /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				3BFF591BCC38E53334D7805F /* MockTowerServer.swift in Sources */,
+				D7881F007A369AE591F6453D /* TowerClientTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		A9E654BED931301422EF0C4E /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = Glasses;
+			target = 6A04FA34303507A5001B7C01 /* Glasses */;
+			targetProxy = 4CE54B4704135E0AF44DFA7B /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		6A04FA3E303507A7001B7C01 /* Debug */ = {
@@ -159,7 +288,9 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = 5W593MH533;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -181,6 +312,7 @@
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
@@ -220,7 +352,9 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = 5W593MH533;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -235,6 +369,7 @@
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 			};
 			name = Release;
@@ -246,10 +381,12 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Glasses/Info.plist;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -265,7 +402,7 @@
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "tv.lloyd-icloud.com.Glasses";
+				PRODUCT_BUNDLE_IDENTIFIER = com.tristanvarner.Glasses;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
@@ -288,10 +425,12 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Glasses/Info.plist;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -307,7 +446,7 @@
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "tv.lloyd-icloud.com.Glasses";
+				PRODUCT_BUNDLE_IDENTIFIER = com.tristanvarner.Glasses;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
@@ -323,9 +462,55 @@
 			};
 			name = Release;
 		};
+		94CE76F3E0D6025B77283446 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tristanvarner.GlassesTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Glasses.app/Glasses";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		AA96CE0E7F3ADAE00FBCB810 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tristanvarner.GlassesTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Glasses.app/Glasses";
+			};
+			name = Debug;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		15E004AC9375D08057A53BDF /* Build configuration list for PBXNativeTarget "GlassesTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				94CE76F3E0D6025B77283446 /* Release */,
+				AA96CE0E7F3ADAE00FBCB810 /* Debug */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		6A04FA30303507A5001B7C01 /* Build configuration list for PBXProject "Glasses" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -345,6 +530,35 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		47E2DCADDDEC821ADD89F30C /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/facebook/meta-wearables-dat-ios";
+			requirement = {
+				kind = exactVersion;
+				version = 0.9.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		69A44D66C3F5ABDE23B6FE2C /* MWDATCamera */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 47E2DCADDDEC821ADD89F30C /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
+			productName = MWDATCamera;
+		};
+		AA6211B5720FCB42F8A57614 /* MWDATMockDevice */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 47E2DCADDDEC821ADD89F30C /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
+			productName = MWDATMockDevice;
+		};
+		BC6D1772D314E7BCB789B652 /* MWDATCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 47E2DCADDDEC821ADD89F30C /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
+			productName = MWDATCore;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 6A04FA2D303507A5001B7C01 /* Project object */;
 }
