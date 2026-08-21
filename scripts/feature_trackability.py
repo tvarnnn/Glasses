@@ -42,6 +42,12 @@ ORB_FEATURES = 1000
 LOWE_RATIO = 0.75
 RANSAC_REPROJ_THRESHOLD = 3.0
 
+# ORB-SLAM's homography-vs-fundamental model-selection threshold. Above
+# this, the homography explains the pair well enough to indicate near-pure
+# rotation or a dominant plane -- geometrically degenerate for
+# triangulation even when match counts look healthy.
+R_H_THRESHOLD = 0.45
+
 # Frame gaps to test. k=1 is "consecutive frames as the Tower sees them";
 # larger k probes how fast shared structure decays -- the thing that
 # actually determines whether multi-view geometry has anything to work with.
@@ -58,24 +64,31 @@ def _resize_to_platform_budget(frame: np.ndarray) -> np.ndarray:
     return cv2.resize(frame, target, interpolation=cv2.INTER_AREA)
 
 
-def _match_pair(
-    detector, descriptors_a, descriptors_b, keypoints_a, keypoints_b
-) -> dict:
+_EMPTY_PAIR = {
+    "matches": 0,
+    "inliers": 0,
+    "inlier_ratio": 0.0,
+    "homography_inliers": 0,
+    "r_h": None,
+}
+
+
+def _match_pair(matcher, descriptors_a, descriptors_b, keypoints_a, keypoints_b) -> dict:
     """Ratio-test match + RANSAC fundamental-matrix verification."""
     if descriptors_a is None or descriptors_b is None:
-        return {"matches": 0, "inliers": 0, "inlier_ratio": 0.0, "homography_inliers": 0}
+        return dict(_EMPTY_PAIR)
 
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
     knn = matcher.knnMatch(descriptors_a, descriptors_b, k=2)
-    good = [m for pair in knn if len(pair) == 2 for m, n in [pair] if m.distance < LOWE_RATIO * n.distance]
+    good = []
+    for pair in knn:
+        if len(pair) != 2:
+            continue
+        nearest, second = pair
+        if nearest.distance < LOWE_RATIO * second.distance:
+            good.append(nearest)
 
     if len(good) < 8:  # 8-point algorithm minimum for the fundamental matrix
-        return {
-            "matches": len(good),
-            "inliers": 0,
-            "inlier_ratio": 0.0,
-            "homography_inliers": 0,
-        }
+        return {**_EMPTY_PAIR, "matches": len(good)}
 
     points_a = np.float32([keypoints_a[m.queryIdx].pt for m in good])
     points_b = np.float32([keypoints_b[m.trainIdx].pt for m in good])
@@ -85,20 +98,29 @@ def _match_pair(
     )
     inliers = int(mask.sum()) if mask is not None else 0
 
-    # Homography cross-check: a pair explained better by a homography than
-    # by a fundamental matrix indicates near-pure rotation or a dominant
-    # plane -- geometrically degenerate for triangulation even when the
-    # match count looks healthy. Worth reporting, not just the raw inliers.
     _, h_mask = cv2.findHomography(
         points_a, points_b, cv2.RANSAC, RANSAC_REPROJ_THRESHOLD
     )
     homography_inliers = int(h_mask.sum()) if h_mask is not None else 0
 
+    # ORB-SLAM's model-selection heuristic: R_H = S_H / (S_H + S_F).
+    # Raw H-vs-F inlier counts are NOT directly comparable -- the
+    # fundamental-matrix residual is point-to-epipolar-LINE (a 1-D
+    # constraint) while the homography residual is point-to-POINT (2-D),
+    # so F is strictly the weaker test and H <= F almost always,
+    # regardless of scene geometry. R_H with an explicit threshold
+    # (ORB-SLAM uses ~0.45, above which it selects the homography model,
+    # indicating near-pure rotation or a dominant plane) is the
+    # established comparison; a bare H/F ratio is not.
+    denominator = homography_inliers + inliers
+    r_h = round(homography_inliers / denominator, 4) if denominator else None
+
     return {
         "matches": len(good),
         "inliers": inliers,
-        "inlier_ratio": round(inliers / len(good), 4) if good else 0.0,
+        "inlier_ratio": round(inliers / len(good), 4),
         "homography_inliers": homography_inliers,
+        "r_h": r_h,
     }
 
 
@@ -137,8 +159,12 @@ def run(video_path: str, frame_count: int, target_fps: float) -> dict:
                 continue
             source_index += 1
 
-            gray = cv2.cvtColor(_resize_to_platform_budget(frame), cv2.COLOR_BGR2GRAY)
+            # Timer spans resize + grayscale + detectAndCompute, i.e. all
+            # per-frame CV work this experiment performs. Timing only
+            # detectAndCompute would not be comparable to the depth
+            # experiment's figure, which includes its own decode/preprocess.
             started = time.perf_counter()
+            gray = cv2.cvtColor(_resize_to_platform_budget(frame), cv2.COLOR_BGR2GRAY)
             keypoints, descriptors = detector.detectAndCompute(gray, None)
             detect_ms.append((time.perf_counter() - started) * 1000)
             grays.append(gray)
@@ -152,13 +178,18 @@ def run(video_path: str, frame_count: int, target_fps: float) -> dict:
 
     keypoint_counts = [len(k) for k in keypoints_all]
 
+    # Constructed once, outside the timed region: rebuilding it per pair
+    # inflated the reported match cost.
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+
     by_gap = {}
     for gap in FRAME_GAPS:
         matches, inliers, ratios, homography_inliers, pair_ms = [], [], [], [], []
+        r_h_values = []
         for index in range(len(grays) - gap):
             started = time.perf_counter()
             stats = _match_pair(
-                detector,
+                matcher,
                 descriptors_all[index],
                 descriptors_all[index + gap],
                 keypoints_all[index],
@@ -169,18 +200,27 @@ def run(video_path: str, frame_count: int, target_fps: float) -> dict:
             inliers.append(stats["inliers"])
             ratios.append(stats["inlier_ratio"])
             homography_inliers.append(stats["homography_inliers"])
+            if stats["r_h"] is not None:
+                r_h_values.append(stats["r_h"])
 
         # A pair needs enough verified inliers to constrain geometry at all.
         # 30 is a commonly used practical floor for a usable two-view
         # relationship; reported as a fraction of pairs clearing it rather
         # than as a pass/fail claim about the platform.
         usable = sum(1 for value in inliers if value >= 30)
+        rotation_dominant = sum(1 for value in r_h_values if value >= R_H_THRESHOLD)
         by_gap[f"k={gap}"] = {
             "pairs": len(inliers),
             "matches": _summarize(matches),
             "verified_inliers": _summarize(inliers),
             "inlier_ratio": _summarize(ratios, precision=4),
             "homography_inliers": _summarize(homography_inliers),
+            "r_h": _summarize(r_h_values, precision=4) if r_h_values else None,
+            "pairs_rotation_dominant_pct": (
+                round(100.0 * rotation_dominant / len(r_h_values), 2)
+                if r_h_values
+                else None
+            ),
             "pairs_with_ge_30_inliers_pct": round(100.0 * usable / len(inliers), 2),
             "match_ms": _summarize(pair_ms),
         }
@@ -195,6 +235,10 @@ def run(video_path: str, frame_count: int, target_fps: float) -> dict:
         "orb_nfeatures": ORB_FEATURES,
         "keypoints_per_frame": _summarize(keypoint_counts),
         "detect_ms_per_frame": _summarize(detect_ms),
+        # Excludes the first frame, matching the depth harness's warm-up
+        # convention so the two experiments' cost figures are comparable.
+        "detect_ms_per_frame_excluding_warmup": _summarize(detect_ms[1:]),
+        "detect_ms_scope": "resize + grayscale + ORB detectAndCompute",
         "by_frame_gap": by_gap,
     }
 
@@ -204,9 +248,16 @@ def main() -> None:
     parser.add_argument("--video", required=True)
     parser.add_argument("--frames", type=int, default=150)
     parser.add_argument("--target-fps", type=float, default=15.0)
+    parser.add_argument("--out", help="write JSON here instead of stdout")
     args = parser.parse_args()
 
-    print(json.dumps(run(args.video, args.frames, args.target_fps), indent=2))
+    payload = json.dumps(run(args.video, args.frames, args.target_fps), indent=2)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as handle:
+            handle.write(payload + "\n")
+        print(f"wrote {args.out}")
+    else:
+        print(payload)
 
 
 if __name__ == "__main__":
