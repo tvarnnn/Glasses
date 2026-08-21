@@ -13,6 +13,27 @@ class FrameError(Exception):
     """Raised when a frame message fails validation or decoding."""
 
 
+def _validate_int(field: str, value: object) -> int:
+    """Reject a non-integer sequence field at the wire boundary.
+
+    These fields feed arithmetic in SessionMetrics (gap counting and the
+    upstream rate estimates), and one of those callers runs from the WS
+    endpoint's `finally` block -- so a stringified integer that slips
+    through here fails far away from its cause and takes session cleanup
+    with it. A wrong type is a protocol error like any other and belongs
+    in an `invalid_frame` reply.
+
+    `bool` is excluded deliberately: it is an int subclass in Python, so
+    `"seq": true` would otherwise be accepted as 1.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise FrameError(
+            f"frame field {field!r} must be an integer, "
+            f"got {type(value).__name__}: {value!r}"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class DecodedFrame:
     seq: int
@@ -43,7 +64,7 @@ def parse_and_decode_frame(message: dict) -> DecodedFrame:
     if missing:
         raise FrameError(f"malformed frame message, missing fields: {missing}")
 
-    seq = message["seq"]
+    seq = _validate_int("seq", message["seq"])
     declared_width = message["width"]
     declared_height = message["height"]
     frame_format = message["format"]
@@ -63,6 +84,11 @@ def parse_and_decode_frame(message: dict) -> DecodedFrame:
     except (UnidentifiedImageError, OSError) as exc:
         raise FrameError(f"frame #{seq} failed to decode JPEG: {exc}") from exc
 
+    # An explicitly-null optional field means "this sender does not
+    # provide it", which is the same as omitting it -- not a type error.
+    raw_source_seq = message.get("source_seq")
+    raw_tx_seq = message.get("tx_seq")
+
     return DecodedFrame(
         seq=seq,
         declared_width=declared_width,
@@ -71,6 +97,12 @@ def parse_and_decode_frame(message: dict) -> DecodedFrame:
         decoded_height=decoded_height,
         byte_count=len(raw_bytes),
         raw_bytes=raw_bytes,
-        source_seq=message.get("source_seq", seq),
-        tx_seq=message.get("tx_seq"),
+        source_seq=(
+            seq
+            if raw_source_seq is None
+            else _validate_int("source_seq", raw_source_seq)
+        ),
+        tx_seq=(
+            None if raw_tx_seq is None else _validate_int("tx_seq", raw_tx_seq)
+        ),
     )

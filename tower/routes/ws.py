@@ -20,6 +20,8 @@ async def _handle_frame_message(
         frame = parse_and_decode_frame(message)
     except FrameError as exc:
         logger.warning("%s", exc)
+        if metrics is not None:
+            metrics.record_frame_rejected()
         # seq may legitimately be absent -- a frame message can fail
         # validation before seq is known. Report null rather than
         # inventing one (Rule 3: unknown stays unknown).
@@ -59,6 +61,7 @@ async def _handle_frame_message(
         )
         if metrics is not None:
             metrics.record_frame_processing_error()
+            metrics.record_frame_rejected()
         await _send_frame_error(websocket, frame.seq, "frame_skipped", str(exc))
         return
     except ModuleUnavailableError as exc:
@@ -67,6 +70,8 @@ async def _handle_frame_message(
             frame.seq,
             exc,
         )
+        if metrics is not None:
+            metrics.record_frame_rejected()
         await _send_frame_error(websocket, frame.seq, "module_unavailable", str(exc))
         return
 
@@ -86,6 +91,7 @@ async def _handle_frame_message(
             cv_processing_ms=result.processing_ms,
             stage_ms=result.stage_ms,
             tx_seq=frame.tx_seq,
+            source_seq=frame.source_seq,
         )
 
     payload = {
@@ -133,9 +139,26 @@ async def _send_frame_error(
 
 
 def _finalize_stream_measurement(metrics: SessionMetrics, end_reason: str) -> None:
+    try:
+        snapshot = metrics.snapshot()
+    except Exception:
+        # Deliberately broad, unlike the receive loop's narrow handler:
+        # this is a one-shot diagnostics call, and one of its call sites
+        # is the endpoint's `finally` block, immediately before
+        # session.client_disconnected(). Letting it propagate would skip
+        # that cleanup and leave the tracker asserting a client is still
+        # connected forever -- a measurement failure must never corrupt
+        # connection state (Rule 3) or leak lifecycle (Rule 15). Logged
+        # with a traceback rather than swallowed.
+        logger.exception(
+            "[Tower][Session] could not finalize measurement "
+            "(end_reason=%s); connection cleanup continues",
+            end_reason,
+        )
+        return
     logger.info(
         "[Tower][Session] final summary: %s",
-        {**metrics.snapshot(), "end_reason": end_reason},
+        {**snapshot, "end_reason": end_reason},
     )
 
 

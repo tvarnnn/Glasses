@@ -32,6 +32,43 @@ class SessionMetrics:
     source_seq/tx_seq protocol split that would be required to actually
     distinguish these causes -- not implemented as of V0.7.
 
+    ``source_fps_estimate`` and ``sampling_stride_avg`` exist so that the
+    sender behavior described above no longer has to be inferred by hand.
+    Both are derived from ``source_seq`` (the DAT/capture frame index,
+    which falls back to ``seq`` for every sender that exists today):
+    ``sampling_stride_avg`` is how many capture frames pass per frame the
+    Tower actually receives (~30 for the current sender, 1.0 for a sender
+    forwarding everything), and ``source_fps_estimate`` is the upstream
+    capture rate that stride is sampling. Added 2026-08-21 after the first
+    physical-glasses remote run required hand arithmetic over log lines to
+    establish that its 0.8 received fps was a ~24 fps capture stream
+    decimated 1-in-30, rather than transit loss. They are estimates
+    labeled as such: they assume ``source_seq`` advances monotonically,
+    once per captured frame, at a roughly steady rate, and they say
+    nothing about *why* frames were not forwarded -- only how many were
+    skipped. Both are computed from the first and last capture index
+    observed, so a mid-window sender restart that resets the index
+    understates them; a restart that resets it below the first index
+    observed makes them unavailable rather than negative.
+
+    Two further limits on ``sampling_stride_avg``, both deliberate:
+
+    * Its denominator is frames actually RECORDED, so intermittent
+      Tower-side rejection inflates it. A sender forwarding every capture
+      frame, with every other frame answered ``invalid_frame``, reports a
+      stride of ~2.0 -- a Tower-side loss misattributed to the sender.
+      This is not fixable from inside the metric (rejected frames have no
+      trustworthy capture index), so ``frames_rejected`` is reported
+      alongside to make the condition visible. **Read the stride as
+      trustworthy only when ``frames_rejected`` is 0.**
+    * ``source_fps_estimate`` spans the first-to-last RECEIVED FRAME
+      (reported as ``source_frame_span_s``), whereas ``effective_fps``
+      spans the whole ``stream_start``-bounded window
+      (``session_duration_s``). They are not two views of one interval: a
+      burst of frames followed by a long silence gives a high
+      ``source_fps_estimate`` and a low ``effective_fps`` with no
+      contradiction between them.
+
     ``backpressure_drops`` is tracked separately from ``seq_gap_total`` on
     purpose (2026-08-19 V0.7 planning decision) -- the two have different
     causes (network/link loss or sender sampling vs. a Tower-side drop
@@ -58,7 +95,18 @@ class SessionMetrics:
         self.tx_seq_gap_total: int | None = None
         self.backpressure_drops = 0
         self.frame_processing_errors = 0
+        # Frames that arrived but never reached record_frame, so they are
+        # absent from every other figure here -- see snapshot().
+        self.frames_rejected = 0
         self.bytes_received = 0
+        # First/last observed capture index and the wall-clock span between
+        # them -- the two endpoints are all that is needed for the upstream
+        # rate estimates, so this stays O(1) in memory regardless of
+        # session length.
+        self._first_source_seq: int | None = None
+        self._last_source_seq: int | None = None
+        self._first_frame_time: float | None = None
+        self._last_frame_time: float | None = None
         self._receive_to_result_ms: list[float] = []
         self._cv_processing_ms: list[float] = []
         self._stage_ms: dict[str, list[float]] = {}
@@ -71,7 +119,19 @@ class SessionMetrics:
         cv_processing_ms: float,
         stage_ms: dict[str, float] | None = None,
         tx_seq: int | None = None,
+        source_seq: int | None = None,
     ) -> None:
+        # Legacy callers pass only `seq`, which *is* the capture index for
+        # every sender that exists today (tower/frames.py applies the same
+        # fallback on the wire side).
+        capture_index = seq if source_seq is None else source_seq
+        now = self._clock()
+        if self._first_source_seq is None:
+            self._first_source_seq = capture_index
+            self._first_frame_time = now
+        self._last_source_seq = capture_index
+        self._last_frame_time = now
+
         if self.last_seq is not None and seq > self.last_seq + 1:
             self.seq_gap_total += seq - self.last_seq - 1
         self.last_seq = seq
@@ -97,11 +157,63 @@ class SessionMetrics:
     def record_frame_processing_error(self) -> None:
         self.frame_processing_errors += 1
 
+    def record_frame_rejected(self) -> None:
+        """Count a frame that arrived but was never recorded.
+
+        Every frame answered with a `frame_error` -- invalid_frame,
+        frame_skipped, or module_unavailable -- lands here. Distinct from
+        ``frame_processing_errors``, which counts only the module-level
+        subset: this one answers "how many arriving frames are missing
+        from the numbers below", which is what makes an inflated
+        ``sampling_stride_avg`` detectable.
+        """
+        self.frames_rejected += 1
+
     def should_log_summary(self) -> bool:
         return (
             self.frames_received > 0
             and self.frames_received % self.SUMMARY_LOG_FRAME_INTERVAL == 0
         )
+
+    def _upstream_rate_fields(self) -> dict:
+        """Estimate the upstream capture rate and the sender's sampling stride.
+
+        All three fields stay None unless at least two frames have been
+        received AND the capture index actually advanced between them. One
+        frame cannot establish a rate, and a sender restart can make the
+        index regress -- neither is a zero, so neither may be reported as
+        one (Rule 3: unknown stays unknown).
+        """
+        unavailable = {
+            "source_seq_span": None,
+            "source_frame_span_s": None,
+            "sampling_stride_avg": None,
+            "source_fps_estimate": None,
+        }
+        if (
+            self.frames_received < 2
+            or self._first_source_seq is None
+            or self._last_source_seq is None
+        ):
+            return unavailable
+
+        span = self._last_source_seq - self._first_source_seq
+        if span <= 0:
+            return unavailable
+
+        frame_span_s = (self._last_frame_time or 0.0) - (self._first_frame_time or 0.0)
+        fields = {
+            "source_seq_span": span,
+            # Reported so source_fps_estimate is auditable rather than
+            # trust-me: it is exactly source_seq_span / source_frame_span_s.
+            # Note this is a DIFFERENT window from session_duration_s.
+            "source_frame_span_s": round(frame_span_s, 3),
+            "sampling_stride_avg": round(span / (self.frames_received - 1), 2),
+            "source_fps_estimate": None,
+        }
+        if frame_span_s > 0:
+            fields["source_fps_estimate"] = round(span / frame_span_s, 2)
+        return fields
 
     def snapshot(self) -> dict:
         elapsed_s = max(self._clock() - self.start_time, 1e-9)
@@ -109,7 +221,15 @@ class SessionMetrics:
             "session_duration_s": round(elapsed_s, 3),
             "frames_received": self.frames_received,
             "effective_fps": round(self.frames_received / elapsed_s, 2),
+            # Sit next to effective_fps deliberately: read together they
+            # say "capture ran at X fps, the sender forwarded 1-in-Y, so
+            # the Tower observed Z fps" without any hand arithmetic.
+            **self._upstream_rate_fields(),
             "bytes_received": self.bytes_received,
+            # BYTES per second, not bits -- the name predates the
+            # observation and is kept for backward compatibility with
+            # existing report templates. Documented in README.md;
+            # misreading it as bits/s understates throughput 8x.
             "bandwidth_bps": round(self.bytes_received / elapsed_s, 2),
             "seq_gap_total": self.seq_gap_total,
             # None (not 0) when the sender doesn't send tx_seq: "we cannot
@@ -117,6 +237,9 @@ class SessionMetrics:
             "tx_seq_gap_total": self.tx_seq_gap_total,
             "backpressure_drops": self.backpressure_drops,
             "frame_processing_errors": self.frame_processing_errors,
+            # Non-zero means figures above understate what arrived, and in
+            # particular that sampling_stride_avg may be overstated.
+            "frames_rejected": self.frames_rejected,
             "receive_to_result_ms_avg": round(_avg(self._receive_to_result_ms), 3),
             "receive_to_result_ms_max": round(
                 max(self._receive_to_result_ms, default=0.0), 3
