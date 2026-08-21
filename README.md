@@ -452,6 +452,7 @@ tests/
   test_soak_script_cli.py
   test_depth_benchmark_cli.py
   test_ws_malformed_message.py
+  test_frames_seq_split.py
   test_world_builder_experiment_clis.py
 ```
 
