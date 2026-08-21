@@ -22,6 +22,9 @@ htmlcov/
 Thumbs.db
 Desktop.ini
 
+# Agent scratch (subagent-driven-development ledger, briefs, review packages)
+.superpowers/
+
 # Local run artifacts
 # Tower/soak runs are routinely captured to a log file (see the soak-test
 # section in README.md). Those logs carry per-frame observation metadata
