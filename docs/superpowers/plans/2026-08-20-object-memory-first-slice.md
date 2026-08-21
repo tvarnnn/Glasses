@@ -14,15 +14,37 @@
 > `retention="configurable"` was declared but never honored (Tasks 3/6),
 > and Task 4's recommended option had two unstated costs (Task 4).
 
-> ## ⛔ THIS PLAN IS NOT AUTHORIZED TO EXECUTE YET
+> ## Execution status — Tasks 1–3 DONE, Task 4 onward STILL BLOCKED
 >
-> It was written during the 2026-08-20 weekend autonomous run as the
-> Master Guide §17 **SHOULD item 5** deliverable ("design/spec review only
-> … write an implementation plan for review"). **Task 4 contains a hard
-> DECISION GATE that requires an explicit user ruling** before any code in
-> Task 4 or later is written — see that task. Tasks 1–3 are
-> autonomous-safe, but the Master Guide directs that Object Memory
-> implementation not begin until the plan itself has been reviewed.
+> **2026-08-21:** Tasks 1–3 are implemented, reviewed and merged to master
+> (`records.py`, `relevance.py`, `store.py` under `tower/object_memory/`).
+> The plan-review gate this banner originally described was satisfied by
+> Revision 2. **Task 4's DECISION GATE is still open and still requires an
+> explicit user ruling** — no ruling exists in this repo. Tasks 4–8 remain
+> unwritten.
+>
+> Two items surfaced by the Tasks 1–3 whole-branch review are **hard
+> prerequisites for Task 6** and are the user's call, not an executor's:
+>
+> 1. **Bystander/`person` observations.** COCO's label set includes
+>    `person`. Task 6 as written would persist an observation record for
+>    every bystander in view. `06-PRIVACY-DATA.md` (Sensitive Visual
+>    Information) and `OBJECT-MEMORY.md`'s Privacy section both bear on
+>    this. The relevance filter is the natural home for a class allow/deny
+>    policy, but *whether* to persist `person` is a privacy/product
+>    decision — Master Guide §23 names that a stop condition. **Decide
+>    before Task 6 writes any record.** Nothing is exposed today: no
+>    wiring exists.
+> 2. **Retention is enforced only at prune time, not at read time.**
+>    `all_observations()`/`last_seen()` do not apply the cutoff, and the
+>    plan calls `prune_expired` only from `_do_load`. On a tower that stays
+>    up for days with a one-day retention, queries keep returning expired
+>    observations. Read-time filtering was deliberately NOT implemented,
+>    because it requires injecting a clock into a store that is currently
+>    clock-free and deterministic to test (`prune_expired(now)` takes time
+>    as a parameter). **Task 6 must prune on a cadence, not only in
+>    `_do_load`**, or the retention claim is not honoured in a long
+>    session.
 
 **Goal:** Build the smallest honest Object Memory that persists
 "what object was seen, when, with what confidence" and can answer "when did
@@ -92,10 +114,14 @@ Every task's requirements implicitly include this section.
   must be real deletion, not hiding.
 - **Every task ends green:** `python -m pytest -q` must pass, and **every
   task must include a full-suite step**, not just its own file's tests.
-  Baseline before this plan starts: **`130 passed, 3 skipped`** (verified
-  2026-08-20 at commit `594acc5`). Re-verify before starting — the
-  per-task counts below are derived from it and will drift if other work
-  lands first.
+  ~~Baseline before this plan starts: `130 passed, 3 skipped` (verified
+  2026-08-20 at commit `594acc5`).~~ **CORRECTED 2026-08-21: that figure
+  is void, and so is every absolute per-task count below (136/141/147/152).**
+  Later work landed +47 tests before this plan executed, and Tasks 1–3
+  then added 33 more. Actual state after Tasks 1–3: **`210 passed,
+  3 skipped`**. Do not treat a count mismatch as a failure — re-verify the
+  baseline at the commit you actually start from and require only that the
+  full suite ends green.
 - **Model-dependent tests are opt-in**, gated behind
   `TOWER_RUN_MODEL_TESTS=1`, exactly like
   `tests/test_depth_experiment_integration.py`.
@@ -155,7 +181,7 @@ module tests run without torch installed.
 
 ---
 
-### Task 1: Observation record shape
+### Task 1: Observation record shape — ✅ DONE (2026-08-21, commit c522d43)
 
 Adopts the shared conceptual record from
 `docs/superpowers/research/2026-08-20-canonical-memory-architecture.md`
@@ -423,7 +449,7 @@ git commit -m "feat: add Object Memory observation record shape"
 
 ---
 
-### Task 2: Relevance filter
+### Task 2: Relevance filter — ✅ DONE (2026-08-21, commit 1cbe457)
 
 Implements OBJECT-MEMORY.md's "should not save every detection from every
 frame" requirement. Pure logic, no I/O, no torch — so it is fully testable
@@ -563,7 +589,7 @@ git commit -m "feat: add Object Memory relevance filter"
 
 ---
 
-### Task 3: JSONL store with retention and real purge
+### Task 3: JSONL store with retention and real purge — ✅ DONE (2026-08-21, commits 10915bc, 56ac41b, fe3a645, 039993d)
 
 `06-PRIVACY-DATA.md` makes a working purge a **hard prerequisite**, not a
 nice-to-have. Storage technology is JSONL per
