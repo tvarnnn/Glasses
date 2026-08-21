@@ -20,6 +20,14 @@ def _assert_connection_still_alive(websocket) -> None:
     assert websocket.receive_json() == {"type": "pong"}
 
 
+def _receive_frame_error(websocket, seq) -> dict:
+    message = websocket.receive_json()
+    assert message["type"] == "frame_error"
+    assert message["seq"] == seq
+    assert message["reason"] == "invalid_frame"
+    return message
+
+
 def _receive_frame_result(websocket) -> dict:
     message = websocket.receive_json()
     assert message["type"] == "frame_result"
@@ -94,6 +102,8 @@ def test_invalid_base64_frame_does_not_crash_socket(caplog):
                 "data": "%%%not-valid-base64%%%",
             }
         )
+        error = _receive_frame_error(websocket, seq=32)
+        assert "base64" in error["message"].lower()
         _assert_connection_still_alive(websocket)
 
     messages = [record.getMessage() for record in caplog.records]
@@ -115,6 +125,8 @@ def test_unsupported_frame_format_is_rejected_cleanly(caplog):
                 "data": _make_jpeg_base64(48, 64),
             }
         )
+        error = _receive_frame_error(websocket, seq=33)
+        assert "format" in error["message"].lower()
         _assert_connection_still_alive(websocket)
 
     messages = [record.getMessage() for record in caplog.records]
@@ -127,10 +139,29 @@ def test_malformed_frame_message_missing_fields_does_not_crash(caplog):
 
     with client.websocket_connect("/ws") as websocket:
         websocket.send_json({"type": "frame", "seq": 34, "width": 48})
+        error = _receive_frame_error(websocket, seq=34)
+        assert "missing" in error["message"].lower()
         _assert_connection_still_alive(websocket)
 
     messages = [record.getMessage() for record in caplog.records]
     assert any("malformed" in m.lower() for m in messages)
+
+
+def test_frame_error_reports_null_seq_when_the_message_has_no_seq(caplog):
+    # A frame message can fail validation before seq is even known. The
+    # client still needs to be told -- with seq null rather than a
+    # fabricated value (Rule 3: unknown stays unknown).
+    caplog.set_level(logging.WARNING, logger="tower.routes.ws")
+    client = TestClient(create_app())
+
+    with client.websocket_connect("/ws") as websocket:
+        websocket.send_json({"type": "frame", "width": 48, "height": 64})
+        error = websocket.receive_json()
+        _assert_connection_still_alive(websocket)
+
+    assert error["type"] == "frame_error"
+    assert error["seq"] is None
+    assert error["reason"] == "invalid_frame"
 
 
 def test_ping_still_works_interleaved_with_frame_messages():

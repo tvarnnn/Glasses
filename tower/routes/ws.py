@@ -20,6 +20,12 @@ async def _handle_frame_message(
         frame = parse_and_decode_frame(message)
     except FrameError as exc:
         logger.warning("%s", exc)
+        # seq may legitimately be absent -- a frame message can fail
+        # validation before seq is known. Report null rather than
+        # inventing one (Rule 3: unknown stays unknown).
+        await _send_frame_error(
+            websocket, message.get("seq"), "invalid_frame", str(exc)
+        )
         return
 
     logger.info("[Tower][Frame] #%s received: %s bytes", frame.seq, frame.byte_count)
@@ -107,7 +113,7 @@ async def _handle_frame_message(
 
 
 async def _send_frame_error(
-    websocket: WebSocket, seq: int, reason: str, message: str
+    websocket: WebSocket, seq: int | None, reason: str, message: str
 ) -> None:
     try:
         await websocket.send_json(
@@ -147,13 +153,23 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 message = await websocket.receive_json()
             except WebSocketDisconnect:
                 raise
-            except Exception as exc:
+            except (ValueError, KeyError, UnicodeDecodeError) as exc:
+                # Payload-level failures only: JSONDecodeError subclasses
+                # ValueError, and a binary frame makes Starlette's
+                # message["text"] raise KeyError. Deliberately NOT a bare
+                # `except Exception` -- Starlette raises RuntimeError for
+                # invalid *state* (socket not connected / already
+                # disconnected) from a synchronous check with no await
+                # point, so swallowing it and continuing would spin this
+                # loop at full CPU with nothing able to cancel it
+                # (Rule 15: no tight retry loops). State errors must
+                # propagate and end the connection.
                 logger.warning("received malformed WS message, ignoring: %s", exc)
                 continue
 
             if not isinstance(message, dict):
                 logger.warning(
-                    "received malformed WS message, ignoring: not a JSON object: %r",
+                    "received malformed WS message, ignoring: not a JSON object: %.200r",
                     message,
                 )
                 continue

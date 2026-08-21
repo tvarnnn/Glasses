@@ -77,7 +77,7 @@ def test_frame_is_dropped_and_connection_stays_alive_when_module_unavailable(cap
             "type": "frame_error",
             "seq": 1,
             "reason": "module_unavailable",
-            "message": "module broken is ModuleState.FAILED, not ACTIVE",
+            "message": "module broken is failed, not ACTIVE",
         }
         websocket.send_json({"type": "ping"})
         assert websocket.receive_json() == {"type": "pong"}
@@ -191,7 +191,7 @@ def test_module_that_fails_mid_stream_is_marked_failed_and_subsequent_frames_are
             "type": "frame_error",
             "seq": 3,
             "reason": "module_unavailable",
-            "message": "module fails-after-first is ModuleState.FAILED, not ACTIVE",
+            "message": "module fails-after-first is failed, not ACTIVE",
         }
 
         websocket.send_json({"type": "ping"})

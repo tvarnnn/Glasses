@@ -79,8 +79,13 @@ class ModuleContainer:
 
     def process(self, raw_bytes: bytes) -> Any:
         if self._module.state != ModuleState.ACTIVE:
+            # state.value, not the enum: this string reaches the WS client
+            # in a frame_error message, so it should carry the protocol's
+            # own vocabulary ("failed") rather than a Python repr
+            # ("ModuleState.FAILED").
             raise ModuleUnavailableError(
-                f"module {self._module.descriptor.id} is {self._module.state}, not ACTIVE"
+                f"module {self._module.descriptor.id} is "
+                f"{self._module.state.value}, not ACTIVE"
             )
         try:
             return self._module.process(raw_bytes)
