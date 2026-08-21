@@ -72,7 +72,9 @@ class ObjectObservation:
             "module_id": self.module_id,
             "session_id": self.session_id,
             "frame_seq": self.frame_seq,
-            "bounding_box": list(self.bounding_box) if self.bounding_box else None,
+            "bounding_box": (
+                list(self.bounding_box) if self.bounding_box is not None else None
+            ),
             "retention_tag": self.retention_tag,
             "privacy_tags": list(self.privacy_tags),
             "spatial_ref": self.spatial_ref,
@@ -91,9 +93,12 @@ def object_observation_from_json_dict(data: dict) -> ObjectObservation:
         recorded_at=data["recorded_at"],
         source=data["source"],
         module_id=data["module_id"],
-        session_id=data.get("session_id"),
-        frame_seq=data.get("frame_seq"),
-        bounding_box=tuple(box) if box else None,
+        # Required-key access, not .get(): to_json_dict always writes
+        # these keys, so a missing key means a malformed record, not a
+        # None value -- matching detector_score above.
+        session_id=data["session_id"],
+        frame_seq=data["frame_seq"],
+        bounding_box=tuple(box) if box is not None else None,
         retention_tag=data["retention_tag"],
         privacy_tags=tuple(data["privacy_tags"]),
         spatial_ref=None,

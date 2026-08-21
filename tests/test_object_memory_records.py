@@ -38,6 +38,13 @@ def test_confidence_from_score_buckets_by_threshold():
     assert Confidence.from_score(0.95) is Confidence.HIGH
 
 
+def test_confidence_from_score_boundaries_are_inclusive_on_the_upper_bucket():
+    # Pins the exact boundary comparisons: flipping either `<` to `<=`
+    # in Confidence.from_score passes every other test in the suite.
+    assert Confidence.from_score(0.5) is Confidence.MEDIUM
+    assert Confidence.from_score(0.8) is Confidence.HIGH
+
+
 def test_observation_round_trips_through_json_dict():
     original = _observation()
 

@@ -39,6 +39,15 @@ def test_suppression_is_per_class_not_global():
     assert relevance.should_record("backpack", score=0.80, now=101.0) is True
 
 
+def test_repeat_sighting_exactly_at_resample_boundary_is_recorded():
+    # elapsed == resample_seconds is treated as due, not suppressed --
+    # pins the >= in should_record against an off-by-boundary flip.
+    relevance = _filter(min_score=0.5, resample_seconds=30.0)
+    relevance.note_recorded("keys", now=100.0)
+
+    assert relevance.should_record("keys", score=0.80, now=130.0) is True
+
+
 def test_default_min_score_means_persisted_confidence_is_never_low():
     # The default min_score (0.5) is exactly equal to LOW_CONFIDENCE_MAX (0.5).
     # This means every detection that passes this filter buckets to MEDIUM or HIGH.
