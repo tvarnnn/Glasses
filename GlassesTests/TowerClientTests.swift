@@ -1136,6 +1136,178 @@ final class TowerClientTests: XCTestCase {
 
         client.disconnect()
     }
+
+    // MARK: - Cartridge integration: runtime ownership
+
+    /// Building and discarding every cartridge view model must not disturb the
+    /// runtime.
+    ///
+    /// ## What this proves, and — precisely — what it does not
+    ///
+    /// A workspace's `@StateObject` view model is destroyed when the cartridge
+    /// changes. If one of them held the `TowerClient` or the `GlassesConnection`,
+    /// destroying it could close the socket or stop the camera — and a stream
+    /// bracket that closes mid-session silently discards every frame after it.
+    ///
+    /// So this constructs and releases all four view models repeatedly while a
+    /// real socket is open with a live stream bracket, then asserts the
+    /// connection is untouched and nothing new reached the wire. It would fail
+    /// if any view model retained a runtime object, opened one, or sent
+    /// anything.
+    ///
+    /// **It does not switch cartridges.** No workspace is installed, no view is
+    /// mounted, and `ContentView` is not involved — this is a unit test of what
+    /// the view models own, which is the half of a cartridge switch that can be
+    /// tested without a view hierarchy. The other half (SwiftUI actually tearing
+    /// a workspace down, and the camera surviving it) needs DAT and a device,
+    /// and no mock `WearablesInterface` exists. The structural argument stands
+    /// in for it — no view model is handed a `GlassesConnection`, and
+    /// `ContentView` passes one to World Builder only — and it is a
+    /// Simulator/device check.
+    func testDiscardingCartridgeViewModelsDoesNotDisturbALiveStream() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = attachRecorder(server)
+        defer { server.stop() }
+
+        let metrics = SenderMetrics()
+        let client = TowerClient(metrics: metrics)
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        client.sendStreamStart()
+        XCTAssertTrue(client.isStreamingToTower, "the test needs a live bracket to be meaningful")
+
+        // Wait for the bracket to actually reach the server before snapshotting
+        // the wire. Counting before it lands would make the later "nothing new
+        // was sent" assertion race against this send rather than against the
+        // view models.
+        let bracketLanded = await waitUntil {
+            recorder.all.compactMap(self.decode).contains { $0["type"] as? String == "stream_start" }
+        }
+        XCTAssertTrue(bracketLanded)
+
+        let baseline = recorder.all.count
+
+        // Three rounds of constructing and releasing every cartridge view
+        // model — the object-lifetime half of what a cartridge switch does to
+        // them.
+        for _ in 0..<3 {
+            _ = WorldBuilderViewModel(client: UnavailableWorldBuilderClient())
+            _ = ExperimentalCVViewModel(client: UnavailableExperimentalCVClient())
+            _ = DocumentMemoryViewModel(client: UnavailableDocumentMemoryClient())
+            _ = SceneUnderstandingViewModel(client: UnavailableSceneUnderstandingClient())
+        }
+
+        XCTAssertEqual(client.status, .online, "a workspace teardown closed the Tower connection")
+        XCTAssertTrue(
+            client.isStreamingToTower,
+            "a workspace teardown closed the stream bracket; every later frame would be dropped"
+        )
+        XCTAssertEqual(
+            recorder.all.count,
+            baseline,
+            "a cartridge view model put something on the wire"
+        )
+
+        // The bracket still works after all that, which is the property a
+        // silently-closed socket would break without changing `status`.
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 1)
+        let frameArrived = await waitUntil {
+            recorder.all.compactMap(self.decode).contains { $0["type"] as? String == "frame" }
+        }
+        XCTAssertTrue(frameArrived, "the sender stopped working after cartridge switching")
+
+        client.sendStreamStop()
+        client.disconnect()
+    }
+
+    /// A cartridge view model must not be able to reach the Tower at all.
+    ///
+    /// Constructing every one of them against a live, idle connection and then
+    /// asserting the wire is silent is the observable form of "these hold no
+    /// runtime references": a view model that opened its own socket, sent a
+    /// module-selection message, or asked the Tower anything would show up here.
+    ///
+    /// `docs/08-IOS-CARTRIDGE-SHELL.md` forbids inventing a module-selection
+    /// message. This is that prohibition as a test rather than as a promise.
+    func testCartridgeViewModelsSendNothingToTheTower() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = attachRecorder(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        XCTAssertTrue(await waitUntil { client.status == .online })
+
+        let baseline = recorder.all.count
+
+        let world = WorldBuilderViewModel(client: UnavailableWorldBuilderClient())
+        let lab = ExperimentalCVViewModel(client: UnavailableExperimentalCVClient())
+        let memory = DocumentMemoryViewModel(client: UnavailableDocumentMemoryClient())
+        let scene = SceneUnderstandingViewModel(client: UnavailableSceneUnderstandingClient())
+
+        // Every request surface any of them exposes, exercised. Each must be
+        // refused locally rather than reaching the socket.
+        lab.run(CVExperiment(id: "anything", name: "Anything"))
+        memory.queryText = "anything"
+        memory.submitTypedQuery()
+        memory.submit(.recent(limit: 3), origin: .externalIntent)
+
+        // Give anything asynchronous a chance to have escaped to the wire.
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertEqual(
+            recorder.all.count,
+            baseline,
+            "a cartridge view model sent a message the Tower protocol does not contain"
+        )
+        XCTAssertFalse(client.isStreamingToTower, "a view model opened a stream bracket")
+        XCTAssertEqual(client.status, .online)
+
+        // And each of them still reports the truth rather than a state invented
+        // from a request that went nowhere.
+        XCTAssertEqual(world.phase(isTowerReachable: true), .unsupported)
+        XCTAssertEqual(lab.phase(isTowerReachable: true), .unsupported)
+        XCTAssertEqual(memory.phase(isTowerReachable: true), .unsupported)
+        XCTAssertEqual(scene.phase(isTowerReachable: true), .unsupported)
+        XCTAssertNotNil(lab.lastRequestFailure, "the refusal was swallowed instead of surfaced")
+        XCTAssertNotNil(memory.lastRequestFailure)
+
+        client.disconnect()
+    }
+
+    /// A connected Tower does not make any cartridge available.
+    ///
+    /// The counterpart to `testNoCartridgeIsAvailableWhetherOrNotTheTowerIsReachable`
+    /// in `ProductShellTests`, asserted against a genuinely open socket rather
+    /// than a boolean — because "reachable" being passed as a parameter is
+    /// exactly the sort of thing that can be wired to the wrong value.
+    func testAnOnlineTowerStillDeclaresNoCartridgeContracts() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        XCTAssertTrue(await waitUntil { client.status == .online })
+
+        let isReachable = client.status == .online
+        XCTAssertTrue(isReachable)
+
+        for cartridge in Cartridge.catalog {
+            XCTAssertEqual(
+                TowerCapabilities.availability(for: cartridge.id, isTowerReachable: isReachable),
+                .noContract,
+                "\(cartridge.name) became available merely because the socket opened"
+            )
+        }
+
+        client.disconnect()
+    }
 }
 
 /// Thread-safe capture of every text message a MockTowerServer receives, so
