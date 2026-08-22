@@ -16,7 +16,7 @@ A fresh Mac Claude should be able to continue from this document alone.
 ```bash
 git fetch origin
 git checkout ios/cartridge-integration
-git log --oneline -6      # expect 4 commits on top of 6a2d114
+git log --oneline -10     # expect 8 commits on top of 6a2d114
 ```
 
 Then, in order:

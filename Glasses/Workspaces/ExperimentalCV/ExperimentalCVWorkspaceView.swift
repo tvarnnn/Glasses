@@ -193,9 +193,12 @@ struct CVRunSummaryView: View {
                 row("Frames processed", "\(frames)")
             }
             if let processing = run.timings.processingMs {
-                // The Tower measuring its own work. The only timing here,
-                // because it is the only one with an unambiguous meaning —
-                // see `CVTimings`.
+                // The Tower measuring its own work — the only timing here,
+                // because it is the only one with an unambiguous meaning (see
+                // `CVTimings`). And "ms" is not an invented unit, unlike the
+                // metres `ReportedFigure` exists to prevent: the field is named
+                // `processing_ms` on the wire, so milliseconds is the Tower's
+                // own declaration rather than this app's assumption.
                 row("Tower processing", "\(CVMetric.format(processing)) ms")
             }
 
