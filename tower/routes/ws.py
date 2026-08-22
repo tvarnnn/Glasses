@@ -50,6 +50,8 @@ async def _handle_frame_message(
             frame.decoded_height,
         )
 
+    _record_capture(websocket, frame)
+
     module_container = websocket.app.state.module_container
     try:
         result = module_container.process(frame.raw_bytes)
@@ -118,6 +120,35 @@ async def _handle_frame_message(
         logger.info("[Tower][Session] summary: %s", metrics.snapshot())
 
 
+def _record_capture(websocket, frame) -> None:
+    """Persist one raw frame if dataset recording is switched on.
+
+    Off by default: `capture_recorder` is None unless an operator started
+    a recording, so the normal frame path is byte-for-byte unchanged.
+
+    Deliberately swallows every failure. Recording is a side errand; a
+    full disk or a permission error must never cost the client its
+    frame_result, and must never take down a session. It is logged and
+    the pipeline continues.
+    """
+    recorder = getattr(websocket.app.state, "capture_recorder", None)
+    if recorder is None or not recorder.is_recording:
+        return
+    try:
+        recorder.write_frame(
+            frame.raw_bytes,
+            source_seq=frame.source_seq,
+            wire_seq=frame.seq,
+            tx_seq=frame.tx_seq,
+            width=frame.decoded_width,
+            height=frame.decoded_height,
+        )
+    except Exception:
+        logger.exception(
+            "[Tower][Capture] frame #%s not recorded; continuing", frame.seq
+        )
+
+
 async def _send_frame_error(
     websocket: WebSocket, seq: int | None, reason: str, message: str
 ) -> None:
@@ -160,6 +191,38 @@ def _finalize_stream_measurement(metrics: SessionMetrics, end_reason: str) -> No
         "[Tower][Session] final summary: %s",
         {**snapshot, "end_reason": end_reason},
     )
+
+
+def _start_capture(websocket) -> None:
+    """Bound a dataset recording to the existing stream window.
+
+    Reuses stream_start/stream_stop rather than adding a message type:
+    the session boundary already exists on the wire, and V1 deliberately
+    makes no protocol change.
+    """
+    recorder = getattr(websocket.app.state, "capture_recorder", None)
+    if recorder is None or recorder.is_recording:
+        return
+    try:
+        capture_id = recorder.start()
+        logger.info("[Tower][Capture] recording started: %s", capture_id)
+    except Exception:
+        logger.exception("[Tower][Capture] could not start recording")
+
+
+def _stop_capture(websocket) -> None:
+    recorder = getattr(websocket.app.state, "capture_recorder", None)
+    if recorder is None or not recorder.is_recording:
+        return
+    try:
+        status = recorder.stop()
+        logger.info(
+            "[Tower][Capture] recording stopped: %s frames, %s bytes",
+            status.frames_written,
+            status.bytes_written,
+        )
+    except Exception:
+        logger.exception("[Tower][Capture] could not stop recording cleanly")
 
 
 @router.websocket("/ws")
@@ -212,6 +275,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 logger.info(
                     "[Tower][Session] stream_start: measurement window opened"
                 )
+                _start_capture(websocket)
             elif message_type == "stream_stop":
                 if active_measurement is not None:
                     _finalize_stream_measurement(
@@ -223,6 +287,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "[Tower][Session] stream_stop received with no active "
                         "measurement window"
                     )
+                _stop_capture(websocket)
             else:
                 logger.warning("received unknown message type: %s", message_type)
     except WebSocketDisconnect:
