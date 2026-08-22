@@ -195,6 +195,7 @@ class WorldView:
                 "allows_metres": self._world.scale.allows_metres,
             },
             "images_purged": self._world.images_purged,
+            "storage_bytes": self._store.world_bytes(self.world_id),
             "sessions": sessions,
         }
 
@@ -246,6 +247,16 @@ def render_text(report: dict) -> str:
         lines.append(
             "note            internally consistent, arbitrary unit -- NOT metric"
         )
+
+    storage = report["storage_bytes"]
+    lines += [
+        "",
+        "=== Storage ===",
+        f"total           {storage['total'] / 1e6:.2f} MB",
+        f"  images        {storage['images'] / 1e6:.2f} MB  (authoritative)",
+        f"  journals      {storage['journals'] / 1e6:.2f} MB  (authoritative)",
+        f"  derived       {storage['derived'] / 1e6:.2f} MB  (reclaimable)",
+    ]
 
     for session in report["sessions"]:
         lines += [

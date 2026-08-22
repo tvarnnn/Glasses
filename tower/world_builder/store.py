@@ -421,6 +421,35 @@ class WorldStore:
             and manifest.get("input_digest") == input_digest
         )
 
+    def world_bytes(self, world_id: str) -> dict:
+        """On-disk size of one world, split by tier.
+
+        Reported rather than capped. A hard cap that stopped mapping
+        mid-session would trade a storage problem for a silently truncated
+        world, which is worse: the operator would get an incomplete map
+        with no obvious sign it was cut short. Making growth visible lets
+        retention be decided deliberately -- and the derived figure is the
+        reclaimable half, since every byte under derived/ is rebuildable.
+        """
+        directory = self.world_dir(world_id)
+        if not directory.exists():
+            return {"total": 0, "images": 0, "derived": 0, "journals": 0}
+
+        totals = {"total": 0, "images": 0, "derived": 0, "journals": 0}
+        derived_root = self.derived_dir(world_id)
+        for path in directory.rglob("*"):
+            if not path.is_file():
+                continue
+            size = path.stat().st_size
+            totals["total"] += size
+            if path.suffix == ".jpg":
+                totals["images"] += size
+            elif derived_root in path.parents:
+                totals["derived"] += size
+            elif path.suffix in (".jsonl", ".json"):
+                totals["journals"] += size
+        return totals
+
     # -- locking -------------------------------------------------------
 
     def acquire_writer_lock(self, world_id: str) -> None:

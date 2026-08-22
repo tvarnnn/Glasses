@@ -385,3 +385,48 @@ class TestPrivacyPosture:
 
         assert report.complete
         assert not store.world_dir(world_id).exists()
+
+
+class TestStorageObservability:
+    """Growth must be observable even though it is not capped.
+
+    A hard cap that stopped mapping mid-session would trade a storage
+    problem for a silently truncated world, which is worse -- an
+    incomplete map with no sign it was cut short.
+    """
+
+    def test_world_bytes_reports_by_tier(self, tmp_path, walk_jpegs, intrinsics):
+        store = WorldStore(tmp_path)
+        engine, world_id, session_id, _ = _map_session(
+            store, walk_jpegs, intrinsics
+        )
+        engine.build(world_id, session_id)
+
+        totals = store.world_bytes(world_id)
+
+        assert totals["images"] > 0
+        assert totals["journals"] > 0
+        assert totals["derived"] > 0
+        assert totals["total"] >= (
+            totals["images"] + totals["journals"] + totals["derived"]
+        )
+
+    def test_the_derived_tier_is_the_reclaimable_half(
+        self, tmp_path, walk_jpegs, intrinsics
+    ):
+        store = WorldStore(tmp_path)
+        engine, world_id, session_id, _ = _map_session(
+            store, walk_jpegs, intrinsics
+        )
+        engine.build(world_id, session_id)
+        before = store.world_bytes(world_id)
+
+        store.clear_derived(world_id)
+        after = store.world_bytes(world_id)
+
+        assert after["derived"] == 0
+        assert after["images"] == before["images"]
+        assert after["total"] < before["total"]
+
+    def test_a_missing_world_reports_zero_rather_than_raising(self, tmp_path):
+        assert WorldStore(tmp_path).world_bytes("nope")["total"] == 0
