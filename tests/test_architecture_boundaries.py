@@ -261,3 +261,119 @@ def test_shared_code_does_not_import_document_memory():
                 offenders.append(f"{path} -> {name}")
 
     assert offenders == []
+
+
+def test_scene_understanding_does_not_import_another_cartridge():
+    """Scene Understanding must not import the Lab, World Builder or Object Memory.
+
+    The Lab measured the exact detector this cartridge uses, which is what
+    the promotion path is for -- but the Lab's `ExperimentResult` is
+    scalars and a name->number bag and cannot carry a box. The two want
+    different things from the same weights: the Lab wants swappable models
+    with timings, this wants stable structured output. Importing would
+    couple a sandbox that may be thrown away to a production consumer.
+    """
+    offenders = []
+    for path in (TOWER / "scene").rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        for name in _imports(path):
+            if any(
+                cartridge in name
+                for cartridge in ("world_builder", "object_memory", "document_memory")
+            ):
+                offenders.append(f"{path} -> {name}")
+            if name.startswith("tower.experiments"):
+                offenders.append(f"{path} -> {name}")
+
+    assert offenders == []
+
+
+def test_scene_understanding_persists_nothing():
+    """Its strongest privacy property, enforced rather than intended.
+
+    A cartridge answering "what is around me NOW" has no reason to write
+    to disk, and doing so would import all of Environmental Memory's
+    retention and purge surface for no gain. There is no store here, and
+    there must not become one by accident.
+    """
+    forbidden = (
+        "write_json_atomic",
+        "append_jsonl",
+        "WorldStore",
+        "ObservationStore",
+        "DocumentStore",
+        "open",
+    )
+    offenders = []
+    for path in (TOWER / "scene").rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                called = getattr(node.func, "id", None) or getattr(
+                    node.func, "attr", None
+                )
+                if called in forbidden:
+                    offenders.append(f"{path.name} calls {called}()")
+
+    assert offenders == []
+
+
+def test_scene_understanding_is_not_registered_as_a_production_module():
+    main = (TOWER / "main.py").read_text(encoding="utf-8")
+
+    assert "tower.scene" not in main
+    assert not (TOWER / "modules" / "scene.py").exists()
+
+
+def test_shared_code_does_not_import_scene_understanding():
+    offenders = []
+    for path in _modules_outside("scene"):
+        for name in _imports(path):
+            if name.startswith("tower.scene"):
+                offenders.append(f"{path} -> {name}")
+
+    assert offenders == []
+
+
+def test_no_cartridge_claims_gaze_or_persistent_identity():
+    """Two words the platform may never use about a person.
+
+    `07-PLATFORM-CONSTRAINTS.md` Limitation 8: the camera cannot establish
+    that anyone looked at anything, so "gaze" and "looking_at" are claims
+    no sensor here supports. Persistent identity is forbidden outright by
+    the cartridge brief.
+
+    A grep-shaped test, deliberately: this is about the vocabulary that
+    reaches a consumer, and vocabulary is exactly what drifts.
+    """
+    banned = ("looking_at", "gaze_direction", "is_looking", "face_id", "person_id")
+    offenders = []
+    for package in ("scene", "document_memory", "object_memory", "world_builder"):
+        for path in (TOWER / package).rglob("*.py"):
+            if "__pycache__" in path.parts:
+                continue
+            source = path.read_text(encoding="utf-8")
+            # Strip comments and docstrings crudely: the ban is on
+            # identifiers a consumer sees, not on prose explaining it.
+            tree = ast.parse(source)
+            names = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    names.add(node.id)
+                elif isinstance(node, ast.Attribute):
+                    names.add(node.attr)
+                elif isinstance(node, ast.arg):
+                    names.add(node.arg)
+                elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                    names.add(node.name)
+                elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    if node.value in banned:
+                        names.add(node.value)
+            for word in banned:
+                if word in names:
+                    offenders.append(f"{path} uses {word!r}")
+
+    assert offenders == []
