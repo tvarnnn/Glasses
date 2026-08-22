@@ -798,6 +798,7 @@ branch is a strict addition on top of it.
 ## 18. Final Git state
 
 - Branch: `ios/send-window-investigation`
+- Commit: `76d3810` "Size the Tower send window to a latency budget and detect stalls"
 - Base: `ui/product-shell` @ `d9e513d` (unmodified)
 - `main` unmodified
 - `project.pbxproj` unmodified
