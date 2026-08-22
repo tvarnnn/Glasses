@@ -59,22 +59,27 @@ enum RedactionState: String, Equatable, Sendable, CaseIterable {
     /// The single decision this type exists to make, so no view re-derives it.
     var isDisplayableWhenPersisted: Bool { self == .redacted }
 
-    /// Short label for a badge over an image.
-    var badge: String {
-        switch self {
-        case .redacted: return "Redacted"
-        case .rawEphemeral: return "Live"
-        case .unknown: return "Untreated"
-        }
-    }
-
-    /// What a person needs to know about the badge above.
+    /// What a person needs to know about how this image was treated.
+    ///
+    /// ## Why `redacted` describes the claim rather than the result
+    ///
+    /// It would read better as "people in this image were obscured". It would
+    /// also be an invention: no Tower contract defines what redaction *does*.
+    /// It could be face masking, text masking, a box drawn over nothing, or the
+    /// producer's own definition of the word. Telling a person specifically
+    /// what was removed turns an opaque flag into a checkable privacy
+    /// guarantee — which is the "switch the Tower cannot honour" this type's
+    /// own doc comment says is worse than no switch.
+    ///
+    /// So the sentence says who claimed what, and stops there.
     var explanation: String {
         switch self {
         case .redacted:
-            return "People in this image were obscured before it was stored."
+            return "The producer states this image was redacted before it was stored. What that removed is the producer's definition."
         case .rawEphemeral:
-            return "A live view. It is not stored."
+            // "It is not stored" would be a guarantee this enum cannot enforce
+            // about the Tower. What this app knows is what *this app* does.
+            return "A live view. This app does not store it."
         case .unknown:
             return "The Tower did not say whether this image was redacted, so it is not shown."
         }

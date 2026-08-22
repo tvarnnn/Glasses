@@ -56,12 +56,19 @@ extension Cartridge {
     /// here is aspirational copy — if a module's spec says "future", it says
     /// "future".
     static let catalog: [Cartridge] = [
+        // Module #1 on the roadmap, and now also a workspace. Its `status`
+        // stays `.next` — the workspace is a screen this app ships, and the
+        // Tower still has neither the module container (V0.8) nor the module
+        // (V0.9). `CartridgeWorkspaceTests` pins every status in this catalog
+        // against the roadmap precisely so that gaining a screen cannot drift
+        // one of them.
         Cartridge(
             id: "experimental-cv",
             name: "Experimental CV Lab",
             summary: "A sandbox for running and comparing vision models on the glasses feed.",
             status: .next,
-            specPath: "docs/modules/EXPERIMENTAL-CV.md"
+            specPath: "docs/modules/EXPERIMENTAL-CV.md",
+            workspace: .experimentalCV
         ),
         Cartridge(
             id: "object-memory",
@@ -73,11 +80,11 @@ extension Cartridge {
         Cartridge(
             id: "visual-qa",
             name: "Visual Q&A",
-            summary: "Answers questions about what you are looking at, including reading text.",
+            summary: "Answers questions about what the camera can see, including reading text.",
             status: .planned,
             specPath: "docs/modules/VISUAL-QA.md"
         ),
-        // The only cartridge with a workspace today. `status` stays `.future`
+        // `status` stays `.future` even though this app ships a workspace,
         // because that is still where the *module* sits on the Tower roadmap —
         // the spec file is a concept seed and no Tower module runtime exists.
         // Having a workspace does not promote it, and the badge must keep
@@ -108,6 +115,36 @@ extension Cartridge {
             summary: "Search the physical world you have already walked through.",
             status: .future,
             specPath: "docs/modules/ENVIRONMENTAL-MEMORY.md"
+        ),
+        // The two entries below are narrower first versions of modules already
+        // in this catalog, not new ambitions. Environmental Memory's own spec
+        // asks a first version to "choose one constrained memory type, such as
+        // […] searchable OCR history", and Object Memory's pipeline produces
+        // the live tracks Scene Understanding reads. Each cites its own concept
+        // seed, which says what it takes from its parent and what it leaves
+        // behind.
+        //
+        // Both are `.future`, like the modules they narrow: **the Tower has not
+        // adopted either scope.** They exist in this catalog because this app
+        // ships a workspace for each, which is a fact about the phone — the
+        // same two-axis rule that lets World Builder be openable while its
+        // badge reads "Future". docs/agent-handoffs/IOS-TO-TOWER.md is where
+        // that distinction is put to the Tower explicitly.
+        Cartridge(
+            id: "document-memory",
+            name: "Document Memory",
+            summary: "Documents you passed, kept as text and summaries rather than as pictures.",
+            status: .future,
+            specPath: "docs/modules/DOCUMENT-MEMORY.md",
+            workspace: .documentMemory
+        ),
+        Cartridge(
+            id: "scene-understanding",
+            name: "Scene Understanding",
+            summary: "An anonymous read of how many people and objects the camera can see, and roughly where.",
+            status: .future,
+            specPath: "docs/modules/SCENE-UNDERSTANDING.md",
+            workspace: .sceneUnderstanding
         ),
     ]
 }

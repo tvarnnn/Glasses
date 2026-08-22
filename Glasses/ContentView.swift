@@ -144,8 +144,51 @@ struct ContentView: View {
             case .worldBuilder:
                 WorldBuilderWorkspaceView(
                     glasses: project.glassesConnection,
-                    tower: project.towerClient
+                    tower: project.towerClient,
+                    client: project.cartridgeClients.worldBuilder
                 )
+            // The three workspaces below receive neither `glasses` nor `tower`,
+            // and both omissions are load-bearing rather than incidental.
+            //
+            // **No `glasses`.** World Builder shows the live viewfinder and
+            // owns one of the app's two capture buttons, so it needs the
+            // connection. These three show what the Tower knows; none has a
+            // session control, and none is handed the object that could start
+            // one. The set of places that can reach `startCameraSession()` is
+            // therefore still exactly two, and it stayed two while the number
+            // of screens went from two to five.
+            //
+            // **No `tower`.** They need one fact from it — is it reachable —
+            // and observing a `TowerClient` to read that would invalidate the
+            // subtree at the Tower's ~12 Hz reply rate, on the main actor, for
+            // a value that changes almost never. `TowerReachabilityReader` is
+            // the smallest thing that has to observe, and it passes the fact
+            // down. See its doc comment.
+            //
+            // The client comes from `project.cartridgeClients` so it outlives
+            // the workspace's `@StateObject`, which a cartridge switch
+            // destroys.
+            case .experimentalCV:
+                TowerReachabilityReader(tower: project.towerClient) { isTowerReachable in
+                    ExperimentalCVWorkspaceView(
+                        isTowerReachable: isTowerReachable,
+                        client: project.cartridgeClients.experimentalCV
+                    )
+                }
+            case .documentMemory:
+                TowerReachabilityReader(tower: project.towerClient) { isTowerReachable in
+                    DocumentMemoryWorkspaceView(
+                        isTowerReachable: isTowerReachable,
+                        client: project.cartridgeClients.documentMemory
+                    )
+                }
+            case .sceneUnderstanding:
+                TowerReachabilityReader(tower: project.towerClient) { isTowerReachable in
+                    SceneUnderstandingWorkspaceView(
+                        isTowerReachable: isTowerReachable,
+                        client: project.cartridgeClients.sceneUnderstanding
+                    )
+                }
             }
         } else {
             HomeWorkspaceView(

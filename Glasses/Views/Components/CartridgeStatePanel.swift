@@ -88,6 +88,13 @@ struct CartridgeStatePanel: View {
     private var headline: String {
         switch phase {
         case .unsupported: return "Nothing yet"
+        // Different words and a different glyph from `.unsupported`, because
+        // they are different situations calling for opposite responses — one
+        // waits for a Tower that may never do this, the other waits for a
+        // connection. The explanation string always distinguished them; the
+        // headline and the icon are what a person actually reads first, and
+        // they used to say the same thing for both.
+        case .disconnected: return "Not connected"
         case .idle: return "Not started"
         case .waiting: return "Waiting"
         case .live: return "Working"
@@ -98,10 +105,11 @@ struct CartridgeStatePanel: View {
 
     private var symbol: String {
         switch phase {
-        // Deliberately the same outline glyph for every state without data.
-        // A distinct icon per empty state suggests the states differ in a way
-        // the user can act on, and today they do not.
+        // Deliberately the same outline glyph for `.unsupported` and `.idle`.
+        // A distinct icon per empty state suggests they differ in a way the
+        // user can act on, and those two do not.
         case .unsupported, .idle: return "circle.dashed"
+        case .disconnected: return "wifi.slash"
         case .waiting: return "clock"
         case .live: return "dot.radiowaves.left.and.right"
         case .settled: return "checkmark.circle"

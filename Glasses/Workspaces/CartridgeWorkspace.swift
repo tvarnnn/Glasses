@@ -29,8 +29,34 @@ import Foundation
 /// inventing a module-selection message, and none is invented.
 ///
 /// A cartridge with no workspace stays exactly as it was: an informational row.
-enum CartridgeWorkspace: String, Equatable, Sendable {
+///
+/// ## Four cases, and still an enum
+///
+/// Product Shell V2 had one case and argued that a `switch` beat a workspace
+/// registry. Four is the number at which that argument is usually abandoned in
+/// favour of a protocol and a lookup table, so it is worth restating why it
+/// holds better now than it did then, not worse:
+///
+/// - the set is still **closed and compiled in**. A workspace is a SwiftUI view
+///   in this binary; there is no dynamic module list to render
+///   (`docs/04-MODULE-SYSTEM.md` forbids building one before V1.0), so nothing
+///   can appear here that was not compiled;
+/// - exhaustiveness is the feature. Adding a case makes the compiler demand the
+///   arm in `ContentView`, where a registry would silently fall back to Home;
+/// - the anti-pattern the roadmap warns about is per-cartridge *conditionals
+///   scattered through one enormous view*. There is exactly one `switch`, in
+///   one place, whose arms are one-line constructor calls into separate files.
+///
+/// What did change is that the four workspaces now share a *client* layer —
+/// `CartridgeClient`, `CartridgeAvailability`, `CartridgePhase` — because that
+/// is where the genuine commonality turned out to be. The screens have almost
+/// nothing in common; the question "may this be used, and why not" is identical
+/// for all four.
+enum CartridgeWorkspace: String, Equatable, Sendable, CaseIterable {
     case worldBuilder
+    case experimentalCV
+    case documentMemory
+    case sceneUnderstanding
 }
 
 extension Cartridge {

@@ -53,7 +53,7 @@ struct WorldBuilderWorkspaceView: View {
     @ObservedObject var glasses: GlassesConnection
     @ObservedObject var tower: TowerClient
 
-    /// The world-model boundary. `UnavailableWorldModelSource` is the only
+    /// The world-model boundary. `UnavailableWorldBuilderClient` is the only
     /// implementation that exists, and it reports exactly one thing: the Tower
     /// cannot do this yet.
     ///
@@ -62,7 +62,31 @@ struct WorldBuilderWorkspaceView: View {
     /// no socket, no DAT reference — so losing it when the cartridge is
     /// deselected loses nothing real. Anything that must outlive the workspace
     /// belongs on `ProjectManager`, not here.
-    @StateObject private var worldSource = ObservableWorldModelSource()
+    @StateObject private var world: WorldBuilderViewModel
+
+    /// The client is injected rather than constructed here, and owned by
+    /// `ProjectManager`. See `CartridgeClients` for why: this `@StateObject` is
+    /// destroyed on every cartridge switch, and a Tower-backed client holding a
+    /// subscription and a partly-built world must not be.
+    init(glasses: GlassesConnection, tower: TowerClient, client: any WorldBuilderClient) {
+        self.glasses = glasses
+        self.tower = tower
+        _world = StateObject(wrappedValue: WorldBuilderViewModel(client: client))
+    }
+
+    /// Connectivity reaches the view model as a value, never as an object.
+    ///
+    /// This view genuinely needs `tower`: the capture control warns when the
+    /// Tower is offline, because a `stream_start` sent while it is down is
+    /// dropped and every frame after it is then suppressed for the whole
+    /// session. So the observation is not a dead dependency here, and reading
+    /// the status costs nothing extra — passing the *fact* rather than the
+    /// client is what keeps the view model free of a reference it could act on.
+    ///
+    /// The three cartridge workspaces that have no capture control receive this
+    /// `Bool` from `TowerReachabilityReader` instead, and do not observe the
+    /// connection at all.
+    private var isTowerReachable: Bool { tower.status == .online }
 
     var body: some View {
         VStack(spacing: 16) {
@@ -72,7 +96,12 @@ struct WorldBuilderWorkspaceView: View {
             glassesPanel
             #endif
 
-            WorldCanvasView(state: worldSource.state)
+            WorldCanvasView(
+                state: world.state,
+                availability: world.availability(isTowerReachable: isTowerReachable),
+                explanation: world.unavailableExplanation(isTowerReachable: isTowerReachable),
+                inspection: world.inspection
+            )
 
             #if DEBUG
             captureControl
@@ -186,25 +215,3 @@ private extension WorldBuilderWorkspaceView {
     }
 }
 #endif
-
-/// Wraps a `WorldModelSource` so SwiftUI can observe it.
-///
-/// Separate from the protocol because the protocol describes *supplying* state,
-/// while this describes *publishing* it. When a Tower-backed source exists it
-/// will replace the stored source here, and this type will start republishing
-/// real updates without any view changing.
-@MainActor
-final class ObservableWorldModelSource: ObservableObject {
-    /// `@Published`, but nothing republishes it yet: the only source reports a
-    /// constant. It is declared this way so that wiring a Tower-backed source
-    /// is an assignment rather than a change of shape — not because updates
-    /// currently flow.
-    @Published private(set) var state: WorldModelState
-
-    private let source: any WorldModelSource
-
-    init(source: any WorldModelSource = UnavailableWorldModelSource()) {
-        self.source = source
-        self.state = source.state
-    }
-}

@@ -104,6 +104,35 @@ enum WorldScaleSemantics: Equatable, Sendable, CaseIterable {
     }
 }
 
+// MARK: - Figures
+
+/// Renders a number the Tower reported, with the unit the Tower named — and
+/// bare when it named none.
+///
+/// ## Why this exists rather than a format string at each call site
+///
+/// Because `String(format: "%.1f m", value)` is how "metric" silently becomes
+/// "metres". `WorldScaleSemantics.inferredMetric` says a figure is metric *in
+/// kind*; it says nothing about what unit it counts in, and the Tower has named
+/// none. `CVMetric` already took this position — *"the Tower's unit string, if
+/// any. Never assumed"* — and two spatial screens were quietly doing the
+/// opposite until this was extracted.
+///
+/// A bare number is not a worse answer than an invented unit. It is the honest
+/// rendering of an unlabelled quantity.
+enum ReportedFigure {
+    static func format(_ value: Double, unit: String?) -> String {
+        let number: String
+        if value == value.rounded() && abs(value) < 1e9 {
+            number = String(Int(value))
+        } else {
+            number = String(format: "%.1f", value)
+        }
+        guard let unit, !unit.isEmpty else { return number }
+        return number + " " + unit
+    }
+}
+
 // MARK: - Inference provenance
 
 /// Whether a value the Tower reported was measured or inferred, and with what

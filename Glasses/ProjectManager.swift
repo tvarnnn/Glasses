@@ -28,6 +28,20 @@ final class ProjectManager: ObservableObject {
     /// vs. replied) comparable within one session.
     let senderMetrics: SenderMetrics
 
+    /// The four cartridge clients.
+    ///
+    /// Owned here rather than in the workspace views because a workspace's
+    /// `@StateObject` is destroyed on every cartridge switch, and a
+    /// Tower-backed client will hold a subscription and whatever it has
+    /// accumulated. See `CartridgeClients` for the full argument, and the
+    /// Product Shell V2 handoff §11 for the rule it follows.
+    ///
+    /// **This adds no runtime ownership.** The clients that exist today are
+    /// stateless constants that connect to nothing; the container is here so
+    /// the correct wiring is already the only wiring available on the day a
+    /// real client needs it.
+    let cartridgeClients: CartridgeClients
+
     /// iPhone-side thermal, power and battery telemetry, so a rate that decays
     /// over a long run can be attributed to the device throttling rather than
     /// only to the network. The glasses' own thermal level comes from
@@ -70,10 +84,12 @@ final class ProjectManager: ObservableObject {
         glassesConnection: GlassesConnection? = nil,
         streamManager: StreamManager? = nil,
         towerClient: TowerClient? = nil,
-        senderMetrics: SenderMetrics? = nil
+        senderMetrics: SenderMetrics? = nil,
+        cartridgeClients: CartridgeClients? = nil
     ) {
         let metrics = senderMetrics ?? SenderMetrics()
         self.senderMetrics = metrics
+        self.cartridgeClients = cartridgeClients ?? CartridgeClients()
         self.glassesConnection = glassesConnection ?? GlassesConnection(metrics: metrics)
         self.streamManager = streamManager ?? StreamManager()
         // `autoReconnect` is opted into here rather than defaulted on inside

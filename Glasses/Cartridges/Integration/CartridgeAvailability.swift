@@ -113,8 +113,36 @@ enum CartridgeAvailability: Equatable, Sendable {
     /// as `idle`, which would invite a user to press a button that cannot work.
     var forcedPhase: CartridgePhase? {
         switch self {
-        case .noContract, .unsupportedContract, .towerUnreachable: return .unsupported
+        case .noContract, .unsupportedContract: return .unsupported
+        // Not `.unsupported`. A Tower that is merely unreachable may well be
+        // able to do this, and drawing it with the same headline and glyph as
+        // "will never do this" is the half of the distinction a person actually
+        // reads — the explanation string was carrying it alone.
+        case .towerUnreachable: return .disconnected
         case .available: return nil
+        }
+    }
+
+    /// The unavailable explanation, joined with whatever the cartridge's own
+    /// client had to add.
+    ///
+    /// Extracted because all four workspaces were restating the same join —
+    /// which of the two sentences comes first, and what happens when either is
+    /// absent. The per-cartridge part (which of its own states yields a reason)
+    /// stays in the cartridge, where it belongs; the ordering is a shared
+    /// invariant and belongs here.
+    ///
+    /// Joined rather than concatenated: a stray blank paragraph in a panel
+    /// reads as a missing string, which is how a reader starts to distrust the
+    /// rest of it.
+    func explanation(cartridgeName: String, clientReason: String?) -> String {
+        let shared = explanation(cartridgeName: cartridgeName)
+        let client = (clientReason?.isEmpty ?? true) ? nil : clientReason
+        switch (shared, client) {
+        case (nil, nil): return ""
+        case (let shared?, nil): return shared
+        case (nil, let client?): return client
+        case (let shared?, let client?): return shared + "\n\n" + client
         }
     }
 
@@ -159,6 +187,15 @@ enum CartridgeAvailability: Equatable, Sendable {
 /// render success and emptiness will render a failure as emptiness.
 struct CartridgeFailure: Equatable, Sendable, Error {
     enum Kind: String, Equatable, Sendable, CaseIterable {
+        /// This app refused locally, because the Tower has no contract for the
+        /// thing being asked for.
+        ///
+        /// Deliberately **not** `towerReportedFailure`. The Tower reported
+        /// nothing — there may not even be a socket open — and attributing a
+        /// local refusal to the other machine is a fabricated claim about it
+        /// (Rule 3), which is exactly what a later log or telemetry consumer
+        /// would read back as fact.
+        case notSupported
         /// The Tower reported that the module itself failed
         /// (docs/04-MODULE-SYSTEM.md — Failure).
         case towerReportedFailure
@@ -185,5 +222,17 @@ struct CartridgeFailure: Equatable, Sendable, Error {
         // the kind is worse than prose but strictly better than nothing, and it
         // keeps the type's guarantee absolute rather than by convention.
         self.message = message.isEmpty ? "The \(kind.rawValue) step failed." : message
+    }
+
+    /// Wraps an arbitrary error, passing a `CartridgeFailure` through unchanged.
+    ///
+    /// The two clients that accept a request were each restating this ladder;
+    /// deciding once means a future third cannot decide differently. An error
+    /// that is not already a cartridge failure is `.transport` — it came from
+    /// somewhere below this layer, and that is the only honest attribution
+    /// available without knowing where.
+    static func wrapping(_ error: Error) -> CartridgeFailure {
+        if let failure = error as? CartridgeFailure { return failure }
+        return CartridgeFailure(kind: .transport, message: error.localizedDescription)
     }
 }

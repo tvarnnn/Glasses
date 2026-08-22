@@ -45,6 +45,15 @@ enum CartridgePhase: String, Equatable, Sendable, CaseIterable {
     /// contract for this cartridge. Today this is the only reachable phase for
     /// every cartridge in the app.
     case unsupported
+    /// The capability exists but the Tower cannot be reached right now.
+    ///
+    /// Separate from `unsupported` because the two call for opposite responses
+    /// — one waits for a Tower that may never do this, the other waits for a
+    /// connection — and a shell that draws them identically tells a user to
+    /// reconnect when reconnecting cannot help, or the reverse. The explanation
+    /// strings distinguished them before this case existed; the headline and
+    /// the glyph did not, which is most of what a person actually reads.
+    case disconnected
     /// The capability exists but nothing has been asked of it yet.
     case idle
     /// Something is genuinely in flight and the Tower has not answered.
@@ -69,14 +78,9 @@ enum CartridgePhase: String, Equatable, Sendable, CaseIterable {
     var mayCarryData: Bool {
         switch self {
         case .live, .settled: return true
-        case .unsupported, .idle, .waiting, .failed: return false
+        case .unsupported, .disconnected, .idle, .waiting, .failed: return false
         }
     }
-
-    /// Whether the Tower is doing work right now. Gates every "live" affordance
-    /// in the UI — a badge, an animation, a moving counter. False in `waiting`
-    /// on purpose: waiting is *our* side hoping, not the Tower's side working.
-    var isLive: Bool { self == .live }
 
     /// Whether a progress indicator is truthful. A spinner in any other phase
     /// claims work is underway when none is.
