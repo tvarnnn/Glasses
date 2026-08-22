@@ -273,9 +273,31 @@ class WorldStore:
                 self.events_path(world_id, session_id), event.to_json_dict()
             )
 
-    def read_events(self, world_id: str, session_id: str) -> list[dict]:
+    def read_events(
+        self, world_id: str, session_id: str, after_event_id: int | None = None
+    ) -> list[dict]:
+        """Every event, or only those strictly newer than a cursor.
+
+        The cursor is what turns this journal from an archive into a live
+        stream: a reader keeps the last `event_id` it saw and asks for
+        what came after. Because `event_id` is dense within a session, a
+        gap in what comes back means an event was genuinely dropped -- so
+        a viewer can tell it missed something rather than quietly showing
+        an incomplete world.
+
+        A record with no `event_id` is skipped when a cursor is given.
+        There is no way to advance past it, so returning it would hand it
+        back on every poll forever.
+        """
         raw_records, _ = read_raw_jsonl(self.events_path(world_id, session_id))
-        return raw_records
+        if after_event_id is None:
+            return raw_records
+        return [
+            record
+            for record in raw_records
+            if isinstance(record.get("event_id"), int)
+            and record["event_id"] > after_event_id
+        ]
 
     # -- images --------------------------------------------------------
 

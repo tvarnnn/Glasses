@@ -31,8 +31,9 @@ frame stream and make its own decisions about which frames matter.
 | Real `purge()` that reports what it could NOT delete | both stores | `06-PRIVACY-DATA.md` requires real deletion; a false claim of deletion is worse than an honest failure |
 | Single choke point for persisted pixels | `world_builder/store.write_keyframe_image`, `capture.write_frame` | Any future redaction or filtering policy becomes a change to one function |
 | `time_basis` on every timestamp | both modules | There is no capture timestamp on the wire. Every cartridge inherits that and must say which clock it means |
-| Explicit Dataset-Recording Session pattern | `tower/world_builder/capture.py` | Off by default, bounded in seconds and bytes, purgeable, manifest declares posture |
+| Explicit Dataset-Recording Session pattern | `tower/capture.py` | Off by default, bounded in seconds and bytes, purgeable, manifest declares posture |
 | Synthetic ground-truth harness | `tests/synthetic_scene.py` | Exact poses, exact intrinsics, deterministic. Any cartridge doing geometry can assert real answers instead of eyeballing plausible ones |
+| Tailing a capture as it is written | `capture.CaptureFollower` | A cartridge can process a dataset session live, in its own process, reading the journal so `source_seq`/`tx_seq`/receipt time survive. Bounded, so a crashed recorder ends the follow rather than hanging it |
 | Calibration record + harness | `records.CameraIntrinsics`, `scripts/calibrate_charuco.py` | Intrinsics are a **platform** property, not a World Builder property. Every geometric cartridge needs them and none should re-derive them |
 
 ---
@@ -114,15 +115,51 @@ These are World Builder's, and they are wrong for other cartridges.
 - **Missing:** the shared spatial service, which depends on the Object
   Memory contract above.
 
+### Experimental CV Lab (the one cartridge that already exists)
+
+- **Reuses:** `Confidence`, the capture recorder and its follower, the
+  synthetic ground-truth harness, `StageTimer`.
+- **Camera pattern:** whatever the experiment under test needs. This is
+  the one cartridge with no single camera posture, and that is its point.
+- **Must not inherit:** any World Builder gate. Its job is to *measure*
+  gates like blur rejection and parallax, so a Lab that silently applied
+  them could not evaluate them.
+- **Owns the constraint everyone else is waiting on:** `ExperimentResult`
+  is five scalars, and it is the Lab's type. Every other cartridge's
+  "there is no non-scalar result channel" problem is a change to a file
+  the Lab owns.
+- **Must not mutate authoritative state.** The Lab may read a world; it
+  must never write one.
+
+### Translator
+
+- **Reuses:** almost nothing shipped so far. Audio is a different sensor
+  path entirely (`07-PLATFORM-CONSTRAINTS.md` Limitation 13), and none of
+  the camera, keyframe, geometry or calibration work applies.
+- **Sensor pattern:** continuous microphone, not camera. It is the first
+  planned cartridge whose primary input is not a frame.
+- **Must not inherit:** the frame-shaped assumptions in every row above.
+  A "sensor observation" in this codebase means a JPEG today; Translator
+  is the cartridge that proves that is a transport detail, not a law.
+- **Missing:** an audio path of any kind. There is no audio transport, no
+  audio recorder, no streaming primitive and no output routing. Its first
+  prototype is deliberately specified to run on Tower-local microphone and
+  speakers, entirely outside the glasses path, precisely because none of
+  that exists yet.
+
 ---
 
 ## 5. Infrastructure still missing
 
 Named so nobody assumes it exists.
 
-1. **Multi-consumer frame distribution.** Exactly one
-   `app.state.capture_recorder` exists, and `ModuleContainer` is a
-   registry of one. Two cartridges cannot receive frames simultaneously.
+1. **Multi-consumer frame distribution.** `ModuleContainer` is a
+   registry of one, so two cartridges cannot both be the active module.
+   `app.state.frame_observers` *is* a real list and is now populated in
+   production (`TOWER_CAPTURE_ROOT`), but it is a side-errand channel: an
+   observer returns no result to the client. It is not a second module
+   slot, and using it as one would spend the architecture decision the
+   roadmap is protecting.
 2. **Frame metadata into modules.** `Module.process()` takes only `bytes`.
    `received_at`, `source_seq` and `tx_seq` are unavailable to a module,
    which is why World Builder's engine is driven offline.

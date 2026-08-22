@@ -170,6 +170,18 @@ class WorldView:
             )
         return trajectory
 
+    def events(
+        self, session_id: str, after_event_id: int | None = None
+    ) -> list[dict]:
+        """The incremental update stream, optionally from a cursor.
+
+        Works on a session that has not stopped. This is the read half of
+        live viewing: the journal is written as the walk happens, so a
+        second process can follow along without any push channel, any
+        subscription lifecycle, or any change to the module contract.
+        """
+        return self._store.read_events(self.world_id, session_id, after_event_id)
+
     def points(self, session_id: str) -> list[list[float]]:
         derived = self._store.read_derived(self.world_id, session_id)
         return [] if derived is None else derived["points"]

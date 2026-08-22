@@ -19,6 +19,7 @@ both render as 0 the difference is gone.
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -57,6 +58,78 @@ def verify(store: WorldStore, view: WorldView) -> tuple[list[str], list[str]]:
     return missing, orphans
 
 
+def follow(
+    view: WorldView,
+    *,
+    session_id: str | None,
+    as_json: bool,
+    poll_seconds: float,
+    max_idle_polls: int | None,
+    sleep=time.sleep,
+    out=None,
+) -> int:
+    """Print a session's events as they are appended.
+
+    This is the read half of live viewing, and it needs nothing the
+    persistence design did not already have: the journal is written while
+    the walk happens, `event_id` is dense so a gap means a genuinely
+    dropped event, and a cursor turns an archive into a stream. No socket,
+    no subscription lifecycle, no backpressure policy, no risk of an
+    unbounded queue.
+
+    The writer is a different process and this reader never touches its
+    state, which is exactly why following a live session cannot perturb
+    the world being built.
+    """
+    stream = out if out is not None else sys.stdout
+    session_ids = view.session_ids()
+    if not session_ids:
+        print(f"world {view.world_id} has no sessions", file=sys.stderr)
+        return 2
+    if session_id is None:
+        session_id = session_ids[-1]
+    elif session_id not in session_ids:
+        print(f"no session {session_id!r} in world {view.world_id}", file=sys.stderr)
+        return 2
+
+    if not as_json:
+        print(f"=== Following {view.world_id} / {session_id} ===", file=stream)
+
+    cursor = None
+    idle_polls = 0
+    try:
+        while True:
+            events = view.events(session_id, after_event_id=cursor)
+            for event in events:
+                cursor = event["event_id"]
+                if as_json:
+                    print(json.dumps(event), file=stream, flush=True)
+                else:
+                    payload = " ".join(
+                        f"{key}={value}"
+                        for key, value in sorted(event.get("payload", {}).items())
+                    )
+                    print(
+                        f"  [{event['event_id']:>4}] {event['kind']:<18} {payload}",
+                        file=stream,
+                        flush=True,
+                    )
+                if event["kind"] == "session_stopped":
+                    return 0
+
+            if events:
+                idle_polls = 0
+            else:
+                idle_polls += 1
+                if max_idle_polls is not None and idle_polls >= max_idle_polls:
+                    return 0
+            sleep(poll_seconds)
+    except KeyboardInterrupt:
+        # Walking away from a viewer is a normal way to end it, not a
+        # crash, and it must never look like the session failed.
+        return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Inspect a saved World Builder world (read-only)."
@@ -76,6 +149,35 @@ def main(argv=None) -> int:
         "--verify",
         action="store_true",
         help="Check every keyframe image referenced by a journal exists.",
+    )
+    parser.add_argument(
+        "--follow",
+        action="store_true",
+        help=(
+            "Tail a session's event journal, printing each update as it "
+            "happens. Works on a session that is still open."
+        ),
+    )
+    parser.add_argument(
+        "--session",
+        default=None,
+        help="Which session to follow. Defaults to the most recent one.",
+    )
+    parser.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=0.25,
+        help="How often --follow checks for new events.",
+    )
+    parser.add_argument(
+        "--max-idle-polls",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Stop --follow after N quiet polls. Unset follows until the "
+            "session reports that it stopped."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -97,6 +199,16 @@ def main(argv=None) -> int:
         return 2
 
     view = WorldView(store, args.world)
+
+    if args.follow:
+        return follow(
+            view,
+            session_id=args.session,
+            as_json=args.format == "json",
+            poll_seconds=args.poll_seconds,
+            max_idle_polls=args.max_idle_polls,
+        )
+
     report = view.to_report()
 
     if args.trajectory:

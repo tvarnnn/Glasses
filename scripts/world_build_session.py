@@ -14,6 +14,19 @@ Frame sources:
   --synthetic      render a synthetic walk instead. SYNTHETIC, NOT
                    PHYSICAL -- for exercising the pipeline with no
                    hardware, never for any claim about the real camera.
+  --follow-capture DIR
+                   tail a capture directory the Tower is writing RIGHT NOW,
+                   observing each frame as it lands. This is the live path:
+                   arm the recorder (TOWER_CAPTURE_ROOT), walk the room,
+                   and the world builds while you walk. It runs in a
+                   SEPARATE PROCESS from the Tower on purpose -- the frame
+                   path never pays for reconstruction, which is why an
+                   expensive rebuild can run repeatedly mid-session.
+
+                   Unlike --frames, this reads the JOURNAL, so source_seq,
+                   tx_seq and receipt time survive. A directory glob would
+                   throw them away and with them any ability to reason
+                   about dropped frames.
 
 Intrinsics are unknown unless --intrinsics is given, and unknown
 intrinsics mean the engine honestly produces no poses. There is no flag
@@ -27,10 +40,12 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tower.capture import CaptureFollower  # noqa: E402
 from tower.world_builder.backends import BACKEND_AUTO, BACKEND_NAMES  # noqa: E402
 from tower.world_builder.engine import WorldBuilderEngine  # noqa: E402
 from tower.world_builder.records import (  # noqa: E402
@@ -42,11 +57,46 @@ from tower.world_builder.store import WorldStore  # noqa: E402
 DEFAULT_ROOT = Path("data/world_builder")
 
 
-def load_frames(directory: Path) -> list[bytes]:
+@dataclass(frozen=True)
+class ObservedFrame:
+    """One frame plus whatever the wire actually told us about it.
+
+    `received_at` is None for a source that has no recorded timestamp --
+    a directory of loose jpegs. None means unknown and the engine stamps
+    its own receipt time; inventing one here would fabricate a clock
+    (Rule 3).
+    """
+
+    payload: bytes
+    source_seq: int
+    wire_seq: int | None = None
+    tx_seq: int | None = None
+    received_at: float | None = None
+
+
+def load_frames(directory: Path) -> list[ObservedFrame]:
     paths = sorted(directory.glob("*.jpg"))
     if not paths:
         raise SystemExit(f"no .jpg frames found under {directory}")
-    return [path.read_bytes() for path in paths]
+    return [
+        ObservedFrame(payload=path.read_bytes(), source_seq=index, wire_seq=index)
+        for index, path in enumerate(paths)
+    ]
+
+
+def follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls):
+    """Yield frames from a capture directory as the Tower writes them."""
+    if not directory.exists():
+        raise SystemExit(f"no capture directory at {directory}")
+    follower = CaptureFollower(directory, poll_seconds=poll_seconds)
+    for frame in follower.follow(max_idle_polls=max_idle_polls):
+        yield ObservedFrame(
+            payload=frame.raw_bytes,
+            source_seq=frame.source_seq,
+            wire_seq=frame.wire_seq,
+            tx_seq=frame.tx_seq,
+            received_at=frame.received_at,
+        )
 
 
 def synthetic_frames(count: int, width: int, height: int):
@@ -72,7 +122,11 @@ def synthetic_frames(count: int, width: int, height: int):
         calibrated_width=width,
         calibrated_height=height,
     )
-    return [ss.encode_jpeg(image) for image in images], intrinsics
+    frames = [
+        ObservedFrame(payload=ss.encode_jpeg(image), source_seq=index, wire_seq=index)
+        for index, image in enumerate(images)
+    ]
+    return frames, intrinsics
 
 
 def main(argv=None) -> int:
@@ -98,12 +152,67 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--backend", choices=BACKEND_NAMES, default=BACKEND_AUTO)
     parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument(
+        "--follow-capture",
+        type=Path,
+        default=None,
+        help="Tail a capture directory the Tower is writing, building live.",
+    )
+    parser.add_argument(
+        "--rebuild-every",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Rebuild derived geometry after every N accepted keyframes so a "
+            "viewer sees the world grow. 0 (default) builds once at the end."
+        ),
+    )
+    parser.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=0.25,
+        help="How often to check a followed capture for new frames.",
+    )
+    parser.add_argument(
+        "--max-idle-polls",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Give up after N quiet polls on a capture that never closes. "
+            "Unset waits for the recorder to close it."
+        ),
+    )
     args = parser.parse_args(argv)
 
-    if bool(args.frames) == bool(args.synthetic):
-        parser.error("exactly one of --frames or --synthetic is required")
+    chosen = [
+        name
+        for name, value in (
+            ("--frames", args.frames),
+            ("--synthetic", args.synthetic),
+            ("--follow-capture", args.follow_capture),
+        )
+        if value
+    ]
+    if len(chosen) != 1:
+        parser.error(
+            "exactly one of --frames, --synthetic or --follow-capture is required"
+        )
+    if args.rebuild_every < 0:
+        parser.error("--rebuild-every must not be negative")
 
-    if args.synthetic:
+    capture_id = None
+    if args.follow_capture:
+        frames = follow_capture(
+            args.follow_capture,
+            poll_seconds=args.poll_seconds,
+            max_idle_polls=args.max_idle_polls,
+        )
+        intrinsics = CameraIntrinsics.unknown()
+        frame_source = "live-capture"
+        capture_id = args.follow_capture.name
+    elif args.synthetic:
         frames, intrinsics = synthetic_frames(
             args.synthetic_frames, args.width, args.height
         )
@@ -127,11 +236,32 @@ def main(argv=None) -> int:
         intrinsics=intrinsics,
         frame_source=frame_source,
         declared_size=(args.width, args.height),
+        capture_id=capture_id,
     )
 
     started = time.perf_counter()
-    for index, payload in enumerate(frames):
-        engine.observe(payload, source_seq=index, wire_seq=index)
+    rebuilds = 0
+    since_rebuild = 0
+    accepted = 0
+    for frame in frames:
+        outcome = engine.observe(
+            frame.payload,
+            received_at=frame.received_at,
+            source_seq=frame.source_seq,
+            wire_seq=frame.wire_seq,
+            tx_seq=frame.tx_seq,
+        )
+        if outcome.keyframe_id is None:
+            continue
+        accepted += 1
+        since_rebuild += 1
+        # Two keyframes is the minimum a two-view backend can say anything
+        # about. Rebuilding on one would burn a build to produce an anchor
+        # pose and nothing else.
+        if args.rebuild_every and since_rebuild >= args.rebuild_every and accepted >= 2:
+            engine.build(world_id, session_id)
+            rebuilds += 1
+            since_rebuild = 0
     observe_seconds = time.perf_counter() - started
     summary = engine.stop_session()
 
@@ -147,6 +277,7 @@ def main(argv=None) -> int:
         "keyframes_accepted": summary.keyframes_accepted,
         "rejected_by_reason": summary.rejected_by_reason,
         "segments": summary.segments,
+        "rebuilds": rebuilds,
         "backend_id": result.backend_id,
         "downgraded_from": result.downgraded_from,
         "poses_solved": result.poses_solved,
@@ -154,7 +285,7 @@ def main(argv=None) -> int:
         "points": result.points,
         "scale_state": result.scale_state,
         "observe_ms_per_frame": round(
-            observe_seconds * 1000 / max(len(frames), 1), 3
+            observe_seconds * 1000 / max(summary.frames_observed, 1), 3
         ),
         "build_seconds": round(build_seconds, 3),
     }

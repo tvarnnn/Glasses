@@ -31,7 +31,13 @@ import logging
 import time
 from dataclasses import dataclass, field
 
-from tower.storage import append_jsonl, new_id, read_raw_jsonl, write_json_atomic
+from tower.storage import (
+    append_jsonl,
+    new_id,
+    read_json_closed,
+    read_raw_jsonl,
+    write_json_atomic,
+)
 
 # This module's own schema version and clock label. Deliberately NOT
 # imported from a cartridge: a recording made by shared transport must not
@@ -226,6 +232,13 @@ class CaptureRecorder:
             retained += 1
         return removed, retained
 
+    def manifest(self, capture_id: str) -> dict | None:
+        """The recorded manifest, or None if this capture was never started."""
+        path = self.capture_dir(capture_id) / CAPTURE_FILENAME
+        if not path.exists():
+            return None
+        return read_json_closed(path)
+
     def _manifest(self, status: CaptureStatus) -> dict:
         return {
             "schema_version": CAPTURE_SCHEMA_VERSION,
@@ -242,3 +255,122 @@ class CaptureRecorder:
             "redaction": "none",
             "privacy_tags": ["raw-imagery", "first-person", "dataset-recording"],
         }
+
+
+@dataclass(frozen=True)
+class FollowedFrame:
+    """One recorded frame, handed back with the metadata the wire carried."""
+
+    source_seq: int
+    received_at: float
+    raw_bytes: bytes
+    relpath: str
+    wire_seq: int | None = None
+    tx_seq: int | None = None
+    width: int | None = None
+    height: int | None = None
+
+
+class CaptureFollower:
+    """Yields a capture's frames, including ones not written yet.
+
+    A capture directory is an append-only journal beside a directory of
+    images, and the recorder fsyncs each image BEFORE appending its line.
+    That ordering is the whole reason this is safe: a line that exists
+    always points at a complete file, so a reader never sees a half-written
+    JPEG and needs no lock, no handshake and no shared memory with the
+    writer.
+
+    This is what makes live processing possible today without touching the
+    module lifecycle. The recorder runs on the Tower event loop; whoever
+    consumes the frames runs in a separate process and can take as long as
+    it likes, because falling behind costs the frame path nothing.
+
+    Bounded by construction (Rule 15): a capture whose manifest never
+    closes -- a crashed recorder -- ends the follow after `max_idle_polls`
+    quiet polls rather than waiting forever.
+    """
+
+    def __init__(self, directory, *, poll_seconds: float = 0.25, sleep=time.sleep):
+        from pathlib import Path
+
+        self._directory = Path(directory)
+        self._poll_seconds = poll_seconds
+        self._sleep = sleep
+
+    @property
+    def directory(self):
+        return self._directory
+
+    def is_closed(self) -> bool:
+        """True once the recorder has written an end reason."""
+        path = self._directory / CAPTURE_FILENAME
+        if not path.exists():
+            return False
+        try:
+            return read_json_closed(path).get("ended_at") is not None
+        except (OSError, ValueError):
+            # A manifest caught mid-replace is not an ended capture. Say
+            # "still open" and re-read next poll rather than truncating
+            # the session on a transient read.
+            return False
+
+    def follow(self, *, max_idle_polls: int | None = None):
+        journal = self._directory / FRAMES_FILENAME
+        yielded = 0
+        idle_polls = 0
+
+        while True:
+            records, _ = read_raw_jsonl(journal)
+            fresh = records[yielded:]
+            yielded = len(records)
+
+            for record in fresh:
+                frame = self._load(record)
+                if frame is not None:
+                    yield frame
+
+            # Journal first, manifest second, then ONE more journal read.
+            # The recorder appends a line and only later rewrites the
+            # manifest, so a follower that stopped the instant it saw an
+            # end reason would drop whatever landed in between.
+            if self.is_closed():
+                final, _ = read_raw_jsonl(journal)
+                for record in final[yielded:]:
+                    frame = self._load(record)
+                    if frame is not None:
+                        yield frame
+                return
+
+            if fresh:
+                idle_polls = 0
+            else:
+                idle_polls += 1
+                if max_idle_polls is not None and idle_polls >= max_idle_polls:
+                    return
+
+            self._sleep(self._poll_seconds)
+
+    def _load(self, record: dict) -> FollowedFrame | None:
+        relpath = record.get("relpath")
+        if not relpath:
+            return None
+        path = self._directory / relpath
+        try:
+            raw_bytes = path.read_bytes()
+        except OSError:
+            # Should be impossible given the write ordering. A reader that
+            # trusted the invariant absolutely would turn one deleted file
+            # into a crash mid-session.
+            logger.warning("capture: journal references missing image %s", path)
+            return None
+        return FollowedFrame(
+            source_seq=record["source_seq"],
+            received_at=record["received_at"],
+            raw_bytes=raw_bytes,
+            relpath=relpath,
+            wire_seq=record.get("wire_seq"),
+            tx_seq=record.get("tx_seq"),
+            width=record.get("width"),
+            height=record.get("height"),
+        )

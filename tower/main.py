@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from tower.capture import CaptureRecorder
 from tower.config import Settings, get_settings
 from tower.logging_config import configure_logging
 from tower.modules.base import Module
@@ -20,6 +21,24 @@ def _build_cv_module(settings: Settings) -> Module:
     return ExperimentalCVModule(settings.cv_experiment)
 
 
+def _build_frame_observers(settings: Settings) -> list:
+    """Register the dataset recorder, or nothing at all.
+
+    A LIST because ws.py reads a list -- more than one consumer may
+    eventually want raw frames, and a singleton would force the second
+    one to displace the first.
+
+    Arming is not recording. A configured root creates no directory and
+    writes no byte until a `stream_start` arrives, so this stays an
+    Explicit Dataset-Recording Session under 06-PRIVACY-DATA.md rather
+    than becoming incidental capture. Unset by default, which is why
+    every Tower that has ever run recorded nothing.
+    """
+    if settings.capture_root is None:
+        return []
+    return [CaptureRecorder(settings.capture_root)]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
@@ -31,7 +50,9 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="Glasses Tower", lifespan=lifespan)
     app.state.session = ConnectionTracker()
-    app.state.module_container = ModuleContainer(_build_cv_module(get_settings()))
+    settings = get_settings()
+    app.state.module_container = ModuleContainer(_build_cv_module(settings))
+    app.state.frame_observers = _build_frame_observers(settings)
     # Started here, not in `lifespan` above: TestClient(create_app()) used
     # without `with client:` (every pre-existing test in this repo) never
     # runs ASGI lifespan events, leaving the module UNLOADED forever. See
