@@ -188,3 +188,76 @@ def test_importing_the_lab_does_not_import_torch():
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("[]"), result.stdout
+
+
+def test_document_memory_does_not_import_another_cartridge():
+    """Document Memory must not reach into World Builder or Object Memory.
+
+    Two reasons, and the first is the sharper one. World Builder's blur
+    and motion gates would reject exactly the frames this cartridge wants:
+    a held-still, high-detail view of a page has near-zero parallax and is
+    `insufficient_motion` to a mapper. Document Memory INVERTS World
+    Builder's signal, so sharing that code would mean sharing an
+    assumption that is wrong here.
+
+    Second: the brief forbids fabricating spatial anchors. If this module
+    could see a world, someone would eventually derive one instead of
+    requiring a caller to supply it.
+    """
+    offenders = []
+    for path in (TOWER / "document_memory").rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        for name in _imports(path):
+            if "world_builder" in name or "object_memory" in name:
+                offenders.append(f"{path} -> {name}")
+
+    assert offenders == []
+
+
+def test_document_memory_is_not_registered_as_a_production_module():
+    """The same integration boundary World Builder stops at.
+
+    The module contract is a registry of one with a scalar-shaped result,
+    and OCR costs ~1.2s per page -- it could not sit on the event loop
+    even if a slot were free. If this test ever fails, someone crossed the
+    V1.0/V1.1 boundary, which may be correct but must be deliberate.
+    """
+    main = (TOWER / "main.py").read_text(encoding="utf-8")
+
+    assert "document_memory" not in main
+    assert not (TOWER / "modules" / "document_memory.py").exists()
+
+
+def test_the_ocr_dependency_is_not_imported_at_module_load():
+    """easyocr is an optional [ocr] extra; the Tower must start without it.
+
+    Checked in a subprocess: an in-process assertion would pass merely
+    because some earlier test had already imported it.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys, tower.main, tower.document_memory.engine, "
+        "tower.document_memory.ocr, tower.document_memory.retrieval; "
+        "print([m for m in ('easyocr','torch','scipy','skimage') "
+        "if m in sys.modules])"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("[]"), result.stdout
+
+
+def test_shared_code_does_not_import_document_memory():
+    """Transport and the module system must not know this cartridge exists."""
+    offenders = []
+    for path in _modules_outside("document_memory"):
+        for name in _imports(path):
+            if "document_memory" in name:
+                offenders.append(f"{path} -> {name}")
+
+    assert offenders == []

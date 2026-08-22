@@ -40,6 +40,18 @@ ml = [
     # fails with ModuleNotFoundError: No module named 'timm'.
     "timm",
 ]
+ocr = [
+    # Document Memory's text recognition. Chosen after a pip dry-run
+    # showed rapidocr_onnxruntime would install `opencv-python` ALONGSIDE
+    # this project's `opencv-python-headless` -- two cv2 distributions in
+    # one environment is a known breakage. pytesseract needs a system
+    # binary pip cannot install and which is not present here. easyocr
+    # adds no cv2 and reuses the torch already in the `ml` extra.
+    #
+    # Adds: scipy, scikit-image, imageio, tifffile, lazy-loader, ninja,
+    # pyclipper, python-bidi, shapely. `pip check` clean before and after.
+    "easyocr",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

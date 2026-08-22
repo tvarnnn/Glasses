@@ -59,8 +59,29 @@ def read_json_closed(path: Path) -> dict:
 
 
 def append_jsonl(path: Path, payload: dict) -> None:
+    """Append one record, and heal a torn line rather than compounding it.
+
+    The newline check is not defensive noise. An interrupted write leaves a
+    partial line with NO trailing newline, and a plain append then glues
+    the next record onto the end of it -- so ONE crash destroys TWO
+    records: the torn one, which is expected, and the next good one, which
+    is not. `read_raw_jsonl` drops the fused line as corrupt, and the
+    caller never learns the second record existed.
+
+    Starting the new record on its own line confines the damage to the
+    write that was actually interrupted. Two opens instead of one; an
+    append is never the hot loop in this codebase, since even the capture
+    recorder does one per delivered frame.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    needs_newline = False
+    if path.exists() and path.stat().st_size > 0:
+        with path.open("rb") as handle:
+            handle.seek(-1, os.SEEK_END)
+            needs_newline = handle.read(1) != b"\n"
     with path.open("a", encoding="utf-8") as handle:
+        if needs_newline:
+            handle.write("\n")
         handle.write(json.dumps(payload) + "\n")
 
 
