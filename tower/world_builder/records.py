@@ -419,7 +419,6 @@ class Keyframe:
     feature_count: int | None = None
     selection_reason: str = "unknown"
     median_parallax_px: float | None = None
-    parallax_frac: float | None = None
     overlap_ratio: float | None = None
     survival_ratio: float | None = None
     tracked_count: int | None = None
@@ -459,7 +458,6 @@ class Keyframe:
             "feature_count": self.feature_count,
             "selection_reason": self.selection_reason,
             "median_parallax_px": self.median_parallax_px,
-            "parallax_frac": self.parallax_frac,
             "overlap_ratio": self.overlap_ratio,
             "survival_ratio": self.survival_ratio,
             "tracked_count": self.tracked_count,
@@ -490,7 +488,6 @@ def keyframe_from_json_dict(data: dict) -> Keyframe:
         feature_count=data["feature_count"],
         selection_reason=data["selection_reason"],
         median_parallax_px=data["median_parallax_px"],
-        parallax_frac=data["parallax_frac"],
         overlap_ratio=data["overlap_ratio"],
         survival_ratio=data["survival_ratio"],
         tracked_count=data["tracked_count"],

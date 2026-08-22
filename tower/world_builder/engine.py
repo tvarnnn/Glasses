@@ -503,14 +503,10 @@ class WorldBuilderEngine:
             median_parallax_px=(
                 motion.median_displacement_px if motion else None
             ),
-            parallax_frac=(
-                (motion.median_displacement_px / quality.diagonal_px)
-                if motion and motion.median_displacement_px is not None
-                else None
-            ),
             overlap_ratio=motion.overlap_ratio if motion else None,
             survival_ratio=motion.survival_ratio if motion else None,
             tracked_count=motion.tracked_count if motion else None,
+            feature_count=motion.seeded_count if motion else None,
             homography_residual_px=(
                 motion.homography_residual_px if motion else None
             ),
