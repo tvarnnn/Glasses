@@ -523,3 +523,86 @@ The review also correctly notes `capture.py` has no operator-facing arming
 path — it is reachable only by setting `app.state.frame_observers`. That
 is a real gap and is listed in §8's physical-test procedure as a step the
 operator must perform, not as something the code does for them.
+
+### 10.5 Correctness review — findings and fixes
+
+A third reviewer attacked geometry, persistence and concurrency with
+runnable probes. Its critical findings were real.
+
+**The accumulated map was thrown away every step.** `_extend` recorded
+only *newly* triangulated features against the current frame, never the
+re-observed ones. A landmark seen in frame N−1 and re-seen in frame N
+could not be found from frame N, so step N→N+1 re-triangulated the same
+physical structure instead of reusing it. Measured drift against ground
+truth:
+
+| keyframes | before | after |
+|---|---|---|
+| 8 | 7.59% | **1.06%** |
+| 12 | 32.81% | **1.97%** |
+| 16 | 39.53% | **21.61%** |
+
+The point count roughly halved — the duplicates were the same structure
+counted repeatedly, which is the number `BuildResult` reports as "points
+mapped". This shipped because the only multi-frame test stopped at **four**
+keyframes with a bound 7.6× looser than its own recorded measurement,
+while `build()` passes an entire segment — hundreds in a real session.
+
+Same site: `knnMatch` guarantees one entry per `queryIdx`, not per
+`trainIdx`, so ~5% of associations silently bound a landmark to the wrong
+feature when a later match overwrote an earlier one.
+
+**Calibration emitted confidently wrong intrinsics, and reprojection RMS
+pointed the wrong way.** Ten byte-identical views recovered `fx` with
+**287% error**; ten fronto-parallel views with **3787% error**. Both
+returned `source="self_calibrated"`, `is_known=True` — and both scored a
+**better** RMS (0.158, 0.217 px) than a correct calibration (0.253 px),
+because RMS measures fit to the views supplied and degenerate views are
+trivially easy to fit. The module docstring told operators to check RMS;
+on this failure mode RMS endorses the wrong answer.
+
+`MIN_VIEWS` counted views, not viewpoints. There is now a diversity gate
+on viewpoint separation and perspective tilt. Worth recording how the tilt
+threshold was set: my first value was `8e-4`, which is an **order of
+magnitude below the noise floor** — a fronto-parallel board does not
+measure zero tilt, corner-detection noise puts a floor near 0.009. It let
+the fronto-parallel case straight through until I measured the actual
+distribution (fronto-parallel max 0.0092; ~9° tilt median 0.051) and set
+the threshold from data.
+
+Relatedly, `is_known` only checked "is not None", so `fx=0`, `fx=-500` and
+`fx=NaN` all routed to the calibrated backend and produced confident
+reconstructions from impossible cameras.
+
+**Other findings fixed:** a multi-segment world merged incompatible frames
+and units into one cloud and called it `relative` (segments measured **4×**
+apart in unit); `build()` destroyed a measured scale's `meters_per_unit`,
+method, confidence and history; every rebuild duplicated every edge;
+`write_derived` ran outside the lock `purge_world` holds, so an in-flight
+build could resurrect a world purge had reported completely deleted — into
+a directory `list_world_ids()` no longer returns; and a `rotation_only`
+pose was persisted with **both** fields null, discarding the rotation the
+degeneracy path exists to preserve.
+
+**The reviewer also cleared what it could not break:** the
+`keep_mask`/`surviving_pairs` index alignment in `_estimate_pair`
+(verified by reprojecting each landmark onto the feature its pair names —
+median 0.004 px, against 110 px for a deliberate off-by-one), and the
+store's lock ordering (no reentrancy hazard; the gaps were coverage, not
+ordering).
+
+### 10.6 Test-quality findings
+
+The review named eleven tests that would pass while the code was broken.
+The pattern worth carrying forward: **every one of them asserted against
+something the code itself produced, rather than against an independent
+truth.** `test_the_first_pose_is_the_anchor` compared a persisted value to
+a hard-coded literal in the writer. `test_calibrated_intrinsics_unlock_the_classical_backend`
+is true for *any* `is_known` intrinsics, including `fx=0`. Both torn-line
+tests tore the **last** line, which is the benign case — a mid-journal
+tear silently changes the reconstruction.
+
+That is why the fixes above are paired with tests comparing against
+ground-truth camera positions, ground-truth focal length, and
+deliberately degenerate inputs, rather than against the pipeline's own
+output.
