@@ -209,3 +209,121 @@ class TestCli:
         result = self._run("--frames", str(tmp_path))
 
         assert result.returncode != 0
+
+
+class TestCalibrationRefusesDegenerateViewpoints:
+    """View COUNT is not evidence, and reprojection RMS is not either.
+
+    Measured before this guard existed: ten byte-identical views recovered
+    fx with 287% error, ten fronto-parallel views with 3787% error, and
+    BOTH scored a better reprojection RMS than a correct calibration --
+    because RMS measures fit to the views supplied, and degenerate views
+    are trivially easy to fit. The module docstring told the operator to
+    check RMS; on this failure mode RMS endorses the wrong answer.
+    """
+
+    def _posed_views(self, count, rotation_scale, z_jitter, xy_jitter, seed=3):
+        board = make_board()
+        board_image = board.generateImage((700, 500))
+        source = np.float32(
+            [[0, 0], [699, 0], [699, 499], [0, 499]]
+        )
+        camera_matrix = _camera_matrix()
+        corners = np.array(
+            [
+                [-0.14, -0.10, 0.0],
+                [0.14, -0.10, 0.0],
+                [0.14, 0.10, 0.0],
+                [-0.14, 0.10, 0.0],
+            ]
+        )
+        rng = np.random.default_rng(seed)
+        views = []
+        for _ in range(count):
+            rotation, _ = cv2.Rodrigues(
+                rng.uniform(-rotation_scale, rotation_scale, 3)
+            )
+            translation = np.array(
+                [
+                    rng.uniform(-xy_jitter, xy_jitter),
+                    rng.uniform(-xy_jitter, xy_jitter),
+                    0.6 + rng.uniform(-z_jitter, z_jitter),
+                ]
+            )
+            projected = (rotation @ corners.T).T + translation
+            uv = projected @ camera_matrix.T
+            uv = np.float32(uv[:, :2] / uv[:, 2:3])
+            homography = cv2.getPerspectiveTransform(source, uv)
+            views.append(
+                cv2.warpPerspective(
+                    board_image,
+                    homography,
+                    (WIDTH, HEIGHT),
+                    borderValue=(255, 255, 255),
+                )
+            )
+        return views
+
+    def test_identical_views_are_refused_however_many_there_are(self):
+        views = self._posed_views(1, 0.4, 0.0, 0.0) * 10
+
+        with pytest.raises(ValueError, match="distinct viewpoints"):
+            calibrate(views)
+
+    def test_fronto_parallel_views_are_refused(self):
+        """A board held square to the sensor cannot pin down focal length.
+
+        Perspective foreshortening is what separates focal length from
+        distance; without tilt the views are nearly affine and fx is
+        almost unidentifiable no matter how many are collected.
+        """
+        views = self._posed_views(10, 0.0, 0.0, 0.06)
+
+        with pytest.raises(ValueError, match="perspective"):
+            calibrate(views)
+
+    def test_varied_poses_still_calibrate_accurately(self):
+        """The guard must not reject a genuinely good capture."""
+        views = self._posed_views(12, 0.45, 0.12, 0.06)
+
+        result = calibrate(views)
+
+        assert result.fx == pytest.approx(TRUE_FX, rel=0.02)
+
+
+class TestIntrinsicsMustBePhysical:
+    """is_known gates the calibrated backend, so it must mean something.
+
+    A bare presence check let fx=0, fx=-500 and fx=NaN through to a
+    backend that then produced a confident reconstruction from an
+    impossible camera.
+    """
+
+    @pytest.mark.parametrize("focal", [0.0, -500.0, float("nan")])
+    def test_non_physical_focal_lengths_are_not_known(self, focal):
+        from tower.world_builder.records import CameraIntrinsics
+
+        intrinsics = CameraIntrinsics(
+            source=INTRINSICS_SOURCE_SELF_CALIBRATED,
+            fx=focal,
+            fy=300.0,
+            cx=180.0,
+            cy=320.0,
+        )
+
+        assert not intrinsics.is_known
+        assert intrinsics.camera_matrix() is None
+
+    def test_a_principal_point_outside_the_image_is_still_valid(self):
+        """It can legitimately sit off-frame on a cropped sensor."""
+        from tower.world_builder.records import CameraIntrinsics
+
+        intrinsics = CameraIntrinsics(
+            source=INTRINSICS_SOURCE_SELF_CALIBRATED,
+            fx=300.0,
+            fy=300.0,
+            cx=-40.0,
+            cy=900.0,
+        )
+
+        assert intrinsics.is_known

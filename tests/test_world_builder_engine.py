@@ -5,6 +5,8 @@ SYNTHETIC, NOT PHYSICAL.
 
 import json
 
+import numpy as np
+
 import pytest
 
 from tests import synthetic_scene as ss
@@ -498,3 +500,133 @@ class TestPersistedPoseConvention:
         )
 
         assert residual.max() / path_length < 0.15
+
+
+class TestRebuildIsIdempotent:
+    """A rebuild must recompute derived state, not accumulate it."""
+
+    def test_rebuilding_does_not_duplicate_edges(
+        self, tmp_path, walk_jpegs, intrinsics
+    ):
+        """Edges are recomputed from keyframes, so they are derived.
+
+        Appending without clearing doubled the edge count on every
+        rebuild, and the inspector reported the inflated number.
+        """
+        store = WorldStore(tmp_path)
+        engine, world_id, session_id, _ = _map_session(
+            store, walk_jpegs, intrinsics
+        )
+
+        engine.build(world_id, session_id)
+        first = len(store.read_edges(world_id, session_id))
+        engine.build(world_id, session_id)
+        second = len(store.read_edges(world_id, session_id))
+
+        assert first > 0
+        assert second == first
+
+    def test_rebuilding_preserves_a_measured_scale(
+        self, tmp_path, walk_jpegs, intrinsics
+    ):
+        """A rebuild must not discard a scale it did not earn.
+
+        ScaleState promises superseded estimates are appended, never
+        overwritten. A rebuild that reconstructs a fresh ScaleState throws
+        away meters_per_unit, method, confidence and history -- so a world
+        that could print metres silently reverts to world units with no
+        record a measured scale ever existed.
+        """
+        from dataclasses import replace
+
+        from tower.confidence import Confidence
+        from tower.world_builder.records import ScaleState
+        from tower.world_builder.schema import SCALE_MEASURED
+
+        store = WorldStore(tmp_path)
+        engine, world_id, session_id, _ = _map_session(
+            store, walk_jpegs, intrinsics
+        )
+        measured = ScaleState(
+            state=SCALE_MEASURED,
+            meters_per_unit=0.37,
+            method="tape measure",
+            confidence=Confidence.HIGH,
+            history=({"note": "earlier estimate"},),
+        )
+        store.write_world(replace(store.read_world(world_id), scale=measured))
+
+        engine.build(world_id, session_id)
+
+        scale = store.read_world(world_id).scale
+        assert scale.state == SCALE_MEASURED
+        assert scale.meters_per_unit == 0.37
+        assert scale.method == "tape measure"
+        assert scale.history
+
+
+class TestMultiSegmentHonesty:
+    """Segments do not share a coordinate frame or a unit."""
+
+    def _two_segment_world(self, tmp_path, scene, camera_matrix, intrinsics):
+        """Map, break tracking hard, then map again at a different speed."""
+        near = ss.render_sequence(
+            scene, ss.strafe(8, step=0.06), camera_matrix, WIDTH, HEIGHT
+        )
+        far = ss.render_sequence(
+            scene, ss.strafe(8, step=0.30, start=(-2.0, -1.6, 2.4)),
+            camera_matrix, WIDTH, HEIGHT,
+        )
+        noise = [
+            np.random.default_rng(seed).integers(
+                0, 255, (HEIGHT, WIDTH, 3), dtype=np.uint8
+            )
+            for seed in range(4)
+        ]
+        frames = [ss.encode_jpeg(image) for image in [*near, *noise, *far]]
+
+        store = WorldStore(tmp_path)
+        engine = WorldBuilderEngine(store)
+        world_id = engine.create_world()
+        session_id = engine.start_session(
+            world_id, intrinsics=intrinsics, declared_size=(WIDTH, HEIGHT)
+        )
+        for index, payload in enumerate(frames):
+            engine.observe(payload, source_seq=index)
+        engine.stop_session()
+        return store, engine, world_id, session_id
+
+    def test_a_multi_segment_world_does_not_claim_relative_scale(
+        self, tmp_path, scene, camera_matrix, intrinsics
+    ):
+        """"Relative" asserts internal consistency the world does not have.
+
+        Each segment is solved in its own window, so each carries its own
+        arbitrary unit -- measured 4x apart across two segments of one
+        session. Claiming a single relative scale would be a fiction.
+        """
+        store, engine, world_id, session_id = self._two_segment_world(
+            tmp_path, scene, camera_matrix, intrinsics
+        )
+
+        result = engine.build(world_id, session_id)
+
+        if result.segments > 1:
+            assert result.scale_state == SCALE_UNKNOWN
+            assert not store.read_world(world_id).scale.allows_metres
+
+    def test_points_carry_the_segment_that_produced_them(
+        self, tmp_path, scene, camera_matrix, intrinsics
+    ):
+        """Untagged concatenation merges incompatible geometry into one blob."""
+        store, engine, world_id, session_id = self._two_segment_world(
+            tmp_path, scene, camera_matrix, intrinsics
+        )
+        engine.build(world_id, session_id)
+
+        derived = store.read_derived(world_id, session_id)
+
+        assert derived["points"]
+        for point in derived["points"]:
+            assert "segment_index" in point
+            assert len(point["xyz"]) == 3

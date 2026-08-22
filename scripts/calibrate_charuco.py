@@ -70,6 +70,38 @@ MIN_VIEWS = 8
 # Corners per view below which the view carries too little constraint.
 MIN_CORNERS_PER_VIEW = 8
 
+# View COUNT alone is not sufficient, and the gap is not subtle. Ten
+# byte-identical board views recover fx with 287% error; ten
+# fronto-parallel views at a single distance recover it with 3787% error.
+# Both come back source="self_calibrated", is_known=True.
+#
+# Worse, both score a BETTER reprojection RMS (0.158 and 0.217 px) than a
+# correct calibration (0.253 px) -- because RMS measures fit to the views
+# you supplied, and degenerate views are trivially easy to fit. So a low
+# RMS here is not reassurance; on this failure mode it is actively
+# misleading, and it cannot be the quality gate.
+#
+# Viewpoint DIVERSITY is the gate. Focal length is constrained by
+# perspective foreshortening, so a board held parallel to the sensor
+# contributes almost nothing toward pinning it down no matter how many
+# times it is photographed.
+# Measured tilt of the board-to-image homography's perspective row,
+# normalised by board extent, across board orientations:
+#
+#     fronto-parallel (0 deg)   median 0.0067   max 0.0092
+#     barely tilted   (~3 deg)  median 0.0152
+#     mildly tilted   (~9 deg)  median 0.0511
+#     well tilted     (~26 deg) median 0.1417
+#
+# A fronto-parallel view does NOT measure zero -- corner-detection noise
+# puts a floor around 0.009. The threshold sits above that floor and above
+# a 3-degree tilt, which is still too little to separate focal length from
+# distance. Roughly: the board must be visibly angled, not merely held
+# imperfectly.
+MIN_TILTED_VIEWS = 4
+MIN_VIEW_TILT = 0.03
+MIN_VIEW_SEPARATION_PX = 8.0
+
 
 def make_board():
     dictionary = cv2.aruco.getPredefinedDictionary(DICTIONARY)
@@ -113,6 +145,71 @@ def detect_views(images, board):
     return object_points, image_points, size, corner_counts
 
 
+def _view_tilt(object_points, image_points) -> float:
+    """How much perspective a single view carries.
+
+    The board is planar, so model-to-image is a homography. Its bottom row
+    is precisely what makes that map projective rather than affine: near
+    zero means the board faced the sensor squarely, and an affine view
+    cannot separate focal length from distance.
+
+    Normalised by board extent so the measure does not depend on the
+    board's size in metres or on how large it appears in frame.
+    """
+    model = np.asarray(object_points, dtype=np.float64).reshape(-1, 3)[:, :2]
+    image = np.asarray(image_points, dtype=np.float64).reshape(-1, 2)
+    if len(model) < 4:
+        return 0.0
+    homography, _ = cv2.findHomography(model, image, 0)
+    if homography is None or abs(homography[2, 2]) < 1e-12:
+        return 0.0
+    homography = homography / homography[2, 2]
+    extent = float(np.linalg.norm(model.max(axis=0) - model.min(axis=0)))
+    return float(
+        np.hypot(homography[2, 0], homography[2, 1]) * max(extent, 1e-9)
+    )
+
+
+def _assess_diversity(object_points, image_points) -> str | None:
+    """Why these views cannot constrain a calibration, or None if they can.
+
+    Guards the two failure modes that view count and reprojection RMS both
+    miss and that yield confidently wrong intrinsics.
+    """
+    centres = [
+        np.asarray(points, dtype=np.float64).reshape(-1, 2).mean(axis=0)
+        for points in image_points
+    ]
+    distinct: list[np.ndarray] = []
+    for centre in centres:
+        if all(
+            float(np.linalg.norm(centre - kept)) >= MIN_VIEW_SEPARATION_PX
+            for kept in distinct
+        ):
+            distinct.append(centre)
+    if len(distinct) < MIN_VIEWS:
+        return (
+            f"only {len(distinct)} sufficiently distinct viewpoints among "
+            f"{len(image_points)} views (need {MIN_VIEWS}) -- the board "
+            "barely moved between shots, so the extra views add no "
+            "constraint"
+        )
+
+    tilts = [
+        _view_tilt(model, image)
+        for model, image in zip(object_points, image_points)
+    ]
+    tilted = sum(1 for tilt in tilts if tilt >= MIN_VIEW_TILT)
+    if tilted < MIN_TILTED_VIEWS:
+        return (
+            f"only {tilted} of {len(tilts)} views carry meaningful "
+            f"perspective (need {MIN_TILTED_VIEWS}) -- the board was held "
+            "nearly parallel to the sensor throughout, which leaves focal "
+            "length almost unidentifiable. Tilt the board between shots"
+        )
+    return None
+
+
 def calibrate(images) -> CameraIntrinsics:
     """Solve intrinsics, or raise if the evidence is too thin.
 
@@ -128,6 +225,14 @@ def calibrate(images) -> CameraIntrinsics:
             f"only {len(object_points)} usable views of the board "
             f"(need {MIN_VIEWS}); per-view corner counts {corner_counts}. "
             "Refusing to emit intrinsics from insufficient evidence."
+        )
+
+    problem = _assess_diversity(object_points, image_points)
+    if problem is not None:
+        raise ValueError(
+            f"refusing to emit intrinsics: {problem}. Note that reprojection "
+            "error cannot catch this -- degenerate views fit BETTER than "
+            "good ones, so a low RMS here would be actively misleading."
         )
 
     rms, camera_matrix, dist_coeffs, _, _ = cv2.calibrateCamera(

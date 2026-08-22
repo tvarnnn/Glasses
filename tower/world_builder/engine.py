@@ -44,6 +44,7 @@ from tower.world_builder.schema import (
     END_REASON_STOP,
     POSE_STATUS_ANCHOR,
     POSE_STATUS_SOLVED,
+    SCALE_MEASURED,
     SCALE_RELATIVE,
     SCALE_UNKNOWN,
 )
@@ -320,6 +321,12 @@ class WorldBuilderEngine:
                 )
             )
 
+        # Edges are recomputed from the keyframes on every build, so they
+        # are derived output despite living in a journal. Without this,
+        # each rebuild appends a duplicate set and the reported edge count
+        # doubles, triples, and so on.
+        self._store.clear_edges(world_id, session_id)
+
         poses_solved = poses_refused = 0
         total_points = 0
         segments = sorted({keyframe.segment_index for keyframe in keyframes})
@@ -373,7 +380,14 @@ class WorldBuilderEngine:
                 )
 
             if estimate.points is not None:
-                point_rows.extend(estimate.points.xyz.tolist())
+                # Tagged with the segment that produced them. Segments do
+                # NOT share a coordinate frame or a unit, so concatenating
+                # them untagged produces one cloud that silently merges
+                # incompatible geometry.
+                point_rows.extend(
+                    {"segment_index": segment, "xyz": xyz}
+                    for xyz in estimate.points.xyz.tolist()
+                )
                 total_points += len(estimate.points)
 
         backend.release()
@@ -381,13 +395,33 @@ class WorldBuilderEngine:
         # Scale becomes "relative" only once something actually solved:
         # an internally consistent world with an arbitrary unit. Without a
         # solved pose there is no unit at all, so it stays "unknown".
-        scale_state = SCALE_RELATIVE if poses_solved else SCALE_UNKNOWN
+        #
+        # A world with MORE THAN ONE segment is not internally consistent
+        # either. Each segment is solved in its own window, so each has its
+        # own arbitrary unit -- measured 4x apart between two segments of
+        # one session. Calling that "relative" would assert a coherence
+        # the reconstruction does not have.
+        if not poses_solved:
+            scale_state = SCALE_UNKNOWN
+        elif len(segments) > 1:
+            scale_state = SCALE_UNKNOWN
+        else:
+            scale_state = SCALE_RELATIVE
+
+        # Never clobber a scale this build did not earn. A measured scale
+        # carries meters_per_unit, method, confidence and history that a
+        # rebuild has no business discarding -- ScaleState promises
+        # superseded estimates are appended, never overwritten.
+        existing = world.scale
+        if existing.state == SCALE_MEASURED:
+            scale = existing
+        elif existing.state == scale_state:
+            scale = existing
+        else:
+            scale = ScaleState(state=scale_state)
+
         self._store.write_world(
-            replace(
-                world,
-                updated_at=self._clock(),
-                scale=ScaleState(state=scale_state),
-            )
+            replace(world, updated_at=self._clock(), scale=scale)
         )
         self._store.write_derived(
             world_id,
@@ -461,13 +495,19 @@ class WorldBuilderEngine:
         if pose.status == POSE_STATUS_ANCHOR:
             row["rotation"] = [1.0, 0.0, 0.0, 0.0]
             row["translation"] = [0.0, 0.0, 0.0]
-        elif pose.rotation is not None and pose.translation is not None:
+        elif pose.rotation is not None:
             rotation = np.asarray(pose.rotation, dtype=np.float64)
-            translation = np.asarray(pose.translation, dtype=np.float64).reshape(3)
             row["rotation"] = _rotation_to_quaternion_wxyz(rotation.T)
-            row["translation"] = [
-                float(v) for v in (-rotation.T @ translation)
-            ]
+            if pose.translation is not None:
+                translation = np.asarray(
+                    pose.translation, dtype=np.float64
+                ).reshape(3)
+                row["translation"] = [
+                    float(v) for v in (-rotation.T @ translation)
+                ]
+            # A rotation_only pose keeps its rotation and leaves
+            # translation null. Discarding both would throw away the real
+            # information the degeneracy path exists to preserve.
         return row
 
     def _load_gray(self, world_id, session_id, keyframe):

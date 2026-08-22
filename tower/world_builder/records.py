@@ -134,10 +134,29 @@ class CameraIntrinsics:
 
     @property
     def is_known(self) -> bool:
-        return (
-            self.source != INTRINSICS_SOURCE_UNKNOWN
-            and None not in (self.fx, self.fy, self.cx, self.cy)
-        )
+        """Known AND physically possible.
+
+        A presence check alone is not enough. fx=0, fx=-500 and fx=NaN all
+        satisfy "is not None", all report is_known, and all route straight
+        to the calibrated backend, which then builds a confident
+        reconstruction from an impossible camera.
+
+        Focal lengths must be finite and positive. The principal point
+        need only be finite -- it can legitimately fall outside the image
+        on a cropped or off-centre sensor.
+        """
+        import math
+
+        if self.source == INTRINSICS_SOURCE_UNKNOWN:
+            return False
+        if None in (self.fx, self.fy, self.cx, self.cy):
+            return False
+        if not all(
+            math.isfinite(value)
+            for value in (self.fx, self.fy, self.cx, self.cy)
+        ):
+            return False
+        return self.fx > 0.0 and self.fy > 0.0
 
     def camera_matrix(self):
         """3x3 K, or None when intrinsics are unknown.

@@ -246,6 +246,17 @@ class WorldStore:
         raw_records, _ = read_raw_jsonl(self.keyframes_path(world_id, session_id))
         return _parse_all(raw_records, keyframe_from_json_dict, "keyframe")
 
+    def clear_edges(self, world_id: str, session_id: str) -> None:
+        """Drop the edge journal before a rebuild recomputes it.
+
+        Edges between keyframes are recomputed from the keyframes on every
+        build, so despite living in an append-only journal they are
+        derived. Appending without clearing duplicates the whole set per
+        rebuild.
+        """
+        with self._lock:
+            self.edges_path(world_id, session_id).unlink(missing_ok=True)
+
     def append_edge(
         self, world_id: str, session_id: str, edge: KeyframeEdge
     ) -> None:
@@ -335,10 +346,15 @@ class WorldStore:
         the same "small enough that rewriting wholesale is fine" reasoning
         object memory's store already documents for itself.
         """
-        derived = self.derived_dir(world_id) / session_id
-        write_json_atomic(derived / "poses.json", {"poses": poses})
-        write_json_atomic(derived / "points.json", {"points": points})
-        self.write_derived_manifest(world_id, manifest)
+        # Under the same lock as purge_world. Without it an in-flight
+        # build can recreate a world directory that purge has just
+        # reported as completely deleted -- and the resurrected tree is
+        # then invisible to list_world_ids(), so no later purge targets it.
+        with self._lock:
+            derived = self.derived_dir(world_id) / session_id
+            write_json_atomic(derived / "poses.json", {"poses": poses})
+            write_json_atomic(derived / "points.json", {"points": points})
+            write_json_atomic(self.derived_manifest_path(world_id), manifest)
 
     def read_derived(
         self, world_id: str, session_id: str, *, verify: bool = True
