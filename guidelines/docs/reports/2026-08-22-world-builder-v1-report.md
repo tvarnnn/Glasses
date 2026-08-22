@@ -323,3 +323,121 @@ Nothing below can be answered without real glasses.
 residual on a closed walk. If drift exceeds a few percent of path length,
 that is the measured trigger for `pycolmap` bundle adjustment — the
 decision the V1 architecture deliberately left open.
+
+---
+
+## 9. The late additions — decisions and follow-up plan
+
+Four requirements were added after implementation began, gated behind
+"core correctness wins" and required to be independently challenged. They
+were challenged; the verdicts and their evidence are below.
+
+### 9.1 Calibration / fiducials — **calibration BUILT, markers DROPPED**
+
+**ChArUco calibration is built** and is the highest-value item on the
+list: it is the switch from "no poses" to "poses". It was also arguably
+mis-filed as a stretch goal — it is core, and it is the only addition that
+changes what the product *is*.
+
+**Environmental markers (AprilTag/ArUco) were dropped.** `cv2.aruco` is
+available, so capability was not the constraint. Three reasons:
+
+1. **Their non-evaluation value is a V2 value.** A marker is a repeatable
+   cross-session 6-DoF anchor — genuinely useful for relocalisation and
+   loop closure, neither of which V1 has. Building an anchor before its
+   consumer is speculation.
+2. **The proposed guard has a hole.** The plan's rule — keep relative
+   geometry, hold scale separately with confidence, never mutate the
+   graph — is right, and it validates only the *marker observation*.
+   `meters_per_unit` is (metric distance to marker) ÷ (world-unit distance
+   to marker), and the **denominator comes from the drifting
+   reconstruction**. Multiple nearby observations agree with each other
+   *because they share the same local drift*, so "cross-frame
+   consistency" is the failure mode wearing the costume of the check.
+   Marker distance error also tracks focal-length error roughly 1:1, so a
+   "metric" lock is only as metric as the calibration behind it.
+3. **A simpler option already exists.** The ChArUco board is itself a
+   known-size fiducial. Photograph it in the room and you have intrinsics
+   *and* a metric reference, with no second subsystem. The plan treated
+   ChArUco and ArUco as two work items; they are one.
+
+*Follow-up when wanted:* implement marker detection against
+`solvePnPGeneric` + `SOLVEPNP_IPPE_SQUARE` — note
+`cv2.aruco.estimatePoseSingleMarkers` **does not exist in OpenCV 5**. Use
+markers first for evaluation only, and require the scale estimate to be
+validated against a *second, independent* reconstruction region before it
+is ever recorded.
+
+### 9.2 Face redaction — **DROPPED; provenance field BUILT**
+
+Verified directly on this install: `cv2.CascadeClassifier` **does not
+exist** in OpenCV 5, `cv2.data.haarcascades` contains **zero** `.xml`
+files, there are **zero** `.onnx` models in the venv, `FaceDetectorYN`
+requires a model file it does not have, and the upstream model URL returns
+a **Git-LFS pointer** rather than a model. Independently, there are **zero
+images of any kind** anywhere in this repository, so a detector could not
+be validated even if one were obtained.
+
+Two further findings that change the shape of the eventual work:
+
+- **Redaction is a net positive for geometry, not a cost.** Measured on a
+  110×130 px region: blurring destroyed the features inside it (116 → 1)
+  but ORB's `nfeatures` cap held the total at 1500 either way — the budget
+  was *reallocated*. And the destroyed features were on a moving person,
+  which is outlier poison for static-scene epipolar geometry anyway.
+- **The real hazard is that redaction CREATES features.** After blurring,
+  **100%** of surviving near-region keypoints sat on the redaction
+  boundary; after a solid fill, 112 of 116. Those artifacts track the
+  *person*, not the scene, and match cleanly between frames — producing
+  consistent-looking, entirely wrong geometry. A hard-edged box is the
+  worst possible redaction shape; feathering, or passing the region as
+  ORB's `mask` argument, is materially better.
+
+There is also an **architectural conflict to resolve before any code**:
+plan B's ordering is raw → geometry → redact → persist, but this engine
+computes geometry **from the persisted keyframes** during `build()`.
+Redacting before persistence means geometry runs on redacted pixels.
+Persisting both raw and redacted doubles the imagery and defeats the
+purpose. **That is a product decision, not an engineering one.**
+
+*Built instead:* `Session.redaction = "none"`, the one un-retrofittable
+piece. Without it, the day redaction ships there is no way to tell whether
+an older session's imagery was filtered, so every historical session must
+be assumed unredacted forever.
+
+*Follow-up:* resolve the ordering conflict; obtain YuNet via the LFS media
+endpoint as a vendored dependency with its own licence review; feather the
+mask; validate on real footage against real faces before trusting any
+threshold.
+
+### 9.3 Recorded-path first-person replay — **PERSISTENCE BUILT, no viewer**
+
+The Tower needs **no feature** for this. `inspect.trajectory()` already
+returns ordered keyframes with their solved poses, segment index, and
+image paths — everything a viewer needs to show the path and step into the
+wearer's original view at any point. Refused poses come back as
+`pose: None` with their degeneracy reason so a viewer shows the gap
+honestly rather than interpolating across it.
+
+`WORLD-BUILD.md` says not to build the viewer yet, and building "for a
+viewer that does not exist" is the speculative half.
+
+*Worth noting:* a keyframe contact-sheet with `pose_status` beside each
+thumbnail delivers most of the user value ("see what the wearer saw here")
+and stays honest even where the pose was refused. That is probably the
+right first viewer, not a 3-D camera.
+
+### 9.4 Free-roam — **DROPPED**
+
+It would be a fake, for three nameable reasons: there is no single
+coherent global frame (segment breaks are explicitly *not* in a common
+frame, and drift is uncorrected); ORB yields a sparse point set and finds
+**nothing** on the blank wall a free-roam camera most needs; and
+`WORLD-BUILD.md` requires unknown space to stay unknown, so an honest
+free-roam camera spends most of its time looking at nothing.
+
+*Gate before revisiting, to be met on real footage:* loop-closure residual
+below ~2% of loop length, and wall planarity RMS below ~2% of room extent.
+Neither is producible without physical capture. Until then, orbit around
+the point cloud is the honest substitute — an external view never implies
+occupancy or that the camera is standing anywhere real.
