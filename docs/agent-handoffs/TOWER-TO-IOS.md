@@ -672,7 +672,48 @@ the real DAT configuration model is known via `search_dat_docs`. This
 section states the requirement and the measurement; the mechanism is a
 Mac-side question.
 
-### 6.9 A way to arm capture from iOS — **MISSING**
+### 6.9 A structured result channel — **BLOCKED, with a concrete case**
+
+§1.4 says `frame_result` cannot carry a structured object. Scene
+Understanding is what that costs, stated concretely rather than in the
+abstract.
+
+It produces, per frame: a list of tracks (each with an id, a class, a
+box, an age and a facing estimate), a list of relations between them, and
+a set of counts. **None of it can reach iOS.** `metrics` is
+`name -> number`, so a count could cross — `{"person": 2}` — but a box, a
+track id, a relation or a refusal could not, and a count without the
+refusal beside it is the more dangerous half.
+
+Specifically: *"how many people appear to be facing my direction"* has
+**three** possible answers — a number, "none", and **"we never
+measured"** — and only the first two fit in a number. A wire that can
+carry `0` but not `answered: false` would turn a refusal into a
+confident, wrong zero at the boundary. Whatever eventually carries this
+must be able to carry a refusal.
+
+### 6.10 Resolution: what Scene Understanding does NOT need
+
+Worth recording next to §6.8 so the two are not confused, because they
+pull in opposite directions.
+
+`ssdlite320_mobilenet_v3_large` resizes internally to 320, and its cost
+is essentially flat across input resolution:
+
+| Resolution | Detection |
+|---|---|
+| 640×360 | 33.1 ms |
+| 896×504 | 36.8 ms |
+| 1280×720 | 34.4 ms |
+
+So **object detection gains nothing from a higher-resolution frame** —
+the extra pixels are discarded by the model and cost only decode time.
+Document Memory's request in §6.8 is for the frames it OCRs, one or two
+per document, and not for the stream in general. Raising the whole
+stream's resolution would pay Document Memory's cost for every cartridge
+and buy this one nothing.
+
+### 6.11 A way to arm capture from iOS — **MISSING**
 
 `TOWER_CAPTURE_ROOT` arms the recorder at Tower start-up, and
 `stream_start`/`stream_stop` bound each recording. There is no way for
