@@ -498,6 +498,12 @@ scripts/
   feature_trackability.py World Builder Experiment 2: offline ORB
                           keypoint/match/RANSAC-inlier analysis across
                           frame gaps; intrinsics-free (V0.9.3)
+  world_builder_env_check.py
+                          Read-only World Builder readiness diagnostic:
+                          GPU visibility vs. torch's ability to reach it,
+                          OpenCV geometry/calibration coverage, optional
+                          library inventory. Installs nothing, writes
+                          nothing, exits 0 unless --strict
 tests/
   test_health.py
   test_config.py
