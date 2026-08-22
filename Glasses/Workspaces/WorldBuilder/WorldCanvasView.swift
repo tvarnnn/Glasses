@@ -36,15 +36,22 @@ import SwiftUI
 struct WorldCanvasView: View {
     let state: WorldModelState
     let availability: CartridgeAvailability
-    /// Composed by `WorldBuilderViewModel`, not here.
+    /// Composed by `WorldBuilderViewModel`, not here — so the shared layer owns
+    /// the ordering of the two sentences and all four cartridges join them the
+    /// same way.
     ///
-    /// This view sits under `WorldBuilderWorkspaceView`, which observes
-    /// `GlassesConnection` because it draws the viewfinder — so its body runs
-    /// at the 24 Hz capture rate during a session. Building the explanation
-    /// string here would put that allocation on the main actor at that rate,
-    /// and the main actor is where the sender releases its send-window slots.
-    /// A presentation convenience paid out of the sender's throughput budget is
-    /// the exact regression Product Shell V2 section 12 was written about.
+    /// **This is not a performance fix, and it should not be read as one.** This
+    /// view sits under `WorldBuilderWorkspaceView`, which observes
+    /// `GlassesConnection` because it draws the viewfinder, so that body runs at
+    /// the 24 Hz capture rate during a session — and it evaluates this argument
+    /// on every one of those. The composition moved up a level; it did not
+    /// disappear. Two small string allocations per body, against frame encoding
+    /// happening in the same window, is not obviously worth caching, but it is
+    /// worth *measuring* on the Mac rather than assuming either way.
+    ///
+    /// What genuinely was removed is the three other workspaces' invalidation at
+    /// the Tower's reply rate — see `TowerReachabilityReader`. That one was a
+    /// dead dependency, so removing it cost nothing.
     let explanation: String
     var inspection: WorldInspectionMode = .live
 

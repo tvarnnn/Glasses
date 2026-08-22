@@ -910,9 +910,19 @@ Limitation 8, and shipping in the drawer today.
 provably could not change, re-rendering at reply rate on the sender's actor.
 `TowerReachabilityReader` — §3.3.
 
-**MAJOR.** `WorldCanvasView` rebuilt its explanation string inside `body`, on the
-one workspace whose body runs at the 24 Hz capture rate. The composition moved to
-the view model and the shared layer; the view takes a `String`.
+**MAJOR, partially fixed — read the caveat.** `WorldCanvasView` rebuilt its
+explanation string inside `body`, on the one workspace whose body runs at the
+24 Hz capture rate. The composition moved to the view model and the shared layer,
+which is right for ownership reasons — but `WorldBuilderWorkspaceView` still
+evaluates it as an argument on every body, so **it moved up a level rather than
+disappearing**. Two small string allocations per body, against frame encoding in
+the same window, did not look worth a cache; that is a judgement, not a
+measurement. **Worth checking on the Mac** if the sender rate regresses at all
+(see section 13.2) — and if it does, memoising it on the view model is the fix.
+
+The part that genuinely was removed is the *other three* workspaces
+invalidating at the Tower reply rate, which was a dead dependency and therefore
+free to delete.
 
 **MAJOR.** No client update could reach a view model — `stateUpdates`, §3.5.
 
