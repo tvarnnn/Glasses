@@ -253,3 +253,119 @@ class TestPurgeThroughTheCli:
         )
 
         assert json.loads(result.stdout)["complete"] is True
+
+
+class TestFollowingALiveCapture:
+    """The live path: the Tower records, a separate process reads.
+
+    This is the integration the whole three-process shape exists for, and
+    it reuses the follower the World Builder closeout built. Worth testing
+    end to end rather than assuming, because it is the only path where
+    frames carry REAL receipt times -- everything else has to assume an
+    interval.
+    """
+
+    @staticmethod
+    def _write_capture(root, frames, clock_start=1000.0):
+        from tower.capture import CaptureRecorder
+
+        clock = [clock_start]
+
+        def clock_fn():
+            clock[0] += 0.3
+            return clock[0]
+
+        recorder = CaptureRecorder(root, clock=clock_fn)
+        capture_id = recorder.start()
+        for index, payload in enumerate(frames):
+            recorder.write_frame(
+                payload, source_seq=index, wire_seq=index, tx_seq=index
+            )
+        recorder.stop()
+        return recorder.capture_dir(capture_id), capture_id
+
+    def test_a_recorded_capture_becomes_an_observed_document(self, tmp_path):
+        from tests import document_fixtures as fx
+
+        frames = fx.document_frames(fx.TRANSFORMER_PAPER, 10) + [
+            fx.encode(fx.no_page_frame())
+        ] * 6
+        directory, capture_id = self._write_capture(tmp_path / "capture", frames)
+
+        result = _run(
+            "document_memory_session.py",
+            "--follow-capture",
+            str(directory),
+            "--ocr",
+            "none",
+            "--root",
+            str(tmp_path / "memory"),
+            "--format",
+            "json",
+        )
+
+        assert result.returncode == 0, result.stderr
+        report = json.loads(result.stdout)
+        assert report["documents_observed"] == 1
+        assert report["capture_id"] == capture_id
+
+    def test_a_followed_capture_uses_real_receipt_times(self, tmp_path):
+        """The point of reading the journal instead of globbing the images.
+
+        A directory glob would lose the timestamps and force an assumed
+        frame interval, which is exactly what the assumed/measured
+        distinction exists to keep visible.
+        """
+        from tests import document_fixtures as fx
+
+        frames = fx.document_frames(fx.RECEIPT, 10) + [
+            fx.encode(fx.no_page_frame())
+        ] * 6
+        directory, _ = self._write_capture(tmp_path / "capture", frames)
+
+        report = json.loads(
+            _run(
+                "document_memory_session.py",
+                "--follow-capture",
+                str(directory),
+                "--ocr",
+                "none",
+                "--root",
+                str(tmp_path / "memory"),
+                "--format",
+                "json",
+            ).stdout
+        )
+
+        assert report["timing_source"] == "capture-journal"
+        assert report["assumed_frame_interval_s"] is None
+
+        store = DocumentStore(tmp_path / "memory")
+        document = store.read_all()[0]
+        assert document.timing_source == "capture-journal"
+        assert document.assumed_frame_interval_s is None
+        # The recorder advanced its clock 0.3s per frame, so a dwell over
+        # ten frames must span roughly three seconds of REAL receipt time.
+        assert 2.0 < document.observed_seconds < 4.0
+
+    def test_the_document_records_which_capture_it_came_from(self, tmp_path):
+        """Provenance: a memory must be traceable to its raw imagery."""
+        from tests import document_fixtures as fx
+
+        frames = fx.document_frames(fx.DEPTH_NOTES, 10) + [
+            fx.encode(fx.no_page_frame())
+        ] * 6
+        directory, capture_id = self._write_capture(tmp_path / "capture", frames)
+
+        _run(
+            "document_memory_session.py",
+            "--follow-capture",
+            str(directory),
+            "--ocr",
+            "none",
+            "--root",
+            str(tmp_path / "memory"),
+        )
+
+        document = DocumentStore(tmp_path / "memory").read_all()[0]
+        assert document.capture_id == capture_id
