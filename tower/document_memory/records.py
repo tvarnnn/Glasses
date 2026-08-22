@@ -48,8 +48,13 @@ TEXT_SOURCE_OCR = "ocr"
 # "capture-journal": real receipt times, from the recorder's journal.
 # "assumed-interval": frames had no timestamps; a fixed interval was
 #   supplied by the operator and `assumed_frame_interval_s` says which.
+# "mixed": SOME frames carried real receipt times and some did not.
+#   Reported rather than collapsed to either -- labelling a mixed document
+#   as fully assumed understates what is known, and labelling it as fully
+#   measured overstates it.
 TIMING_CAPTURE_JOURNAL = "capture-journal"
 TIMING_ASSUMED_INTERVAL = "assumed-interval"
+TIMING_MIXED = "mixed"
 
 
 @dataclass(frozen=True)

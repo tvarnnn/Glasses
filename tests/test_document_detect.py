@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from tower.document_memory.detect import (
+    MIN_ROW_TRANSITIONS,
     MIN_TEXT_ROW_FRACTION,
     detect_page,
     measure_text_likeness,
@@ -109,23 +110,24 @@ class TestItRefusesWhatIsNotADocument:
 
 
 class TestTextLikeness:
-    def test_a_rendered_page_scores_above_the_gate(self):
+    def test_a_rendered_page_scores_above_every_gate(self):
         page = cv2.cvtColor(fx.render_page(fx.TRANSFORMER_PAPER), cv2.COLOR_BGR2GRAY)
 
-        rows, ink = measure_text_likeness(page)
+        rows, ink, transitions = measure_text_likeness(page)
 
         assert rows > MIN_TEXT_ROW_FRACTION
         assert 0.0 < ink < 0.6
+        assert transitions > MIN_ROW_TRANSITIONS
 
     def test_a_blank_page_scores_below_it(self):
         blank = np.full((1040, 800), 250, np.uint8)
 
-        rows, ink = measure_text_likeness(blank)
+        rows, ink, _ = measure_text_likeness(blank)
 
         assert rows < MIN_TEXT_ROW_FRACTION or ink < 0.004
 
     def test_an_empty_image_returns_zeros_rather_than_raising(self):
-        assert measure_text_likeness(np.zeros((0, 0), np.uint8)) == (0.0, 0.0)
+        assert measure_text_likeness(np.zeros((0, 0), np.uint8)) == (0.0, 0.0, 0.0)
 
 
 class TestCornerOrdering:

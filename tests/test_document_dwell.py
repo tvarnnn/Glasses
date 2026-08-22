@@ -46,6 +46,7 @@ def _candidate(centre=(320.0, 240.0), area=0.5, sharpness=500.0, squareness=0.95
         solidity=0.99,
         text_row_fraction=0.3,
         ink_fraction=0.1,
+        row_transitions=60.0,
         sharpness=sharpness,
         squareness=squareness,
     )

@@ -98,7 +98,15 @@ def read_raw_jsonl(path: Path) -> tuple[list[dict], int]:
         return [], 0
     raw_records: list[dict] = []
     corrupt = 0
-    with path.open("r", encoding="utf-8") as handle:
+    # errors="replace" rather than the default strict: a write interrupted
+    # mid-codepoint leaves an invalid byte sequence, and a UnicodeDecodeError
+    # raised from the file iterator would take out the WHOLE journal rather
+    # than the one torn line -- exactly the failure this function promises
+    # not to have. Not reachable through this module's own writes today
+    # (json.dumps defaults to ensure_ascii, so every byte written is ASCII
+    # and a tear can only fall on a character boundary), but the promise
+    # should not depend on that staying true.
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line_number, line in enumerate(handle, start=1):
             line = line.strip()
             if not line:

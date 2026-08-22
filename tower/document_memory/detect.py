@@ -5,11 +5,21 @@ expensive path can be rare. Classical, not learned: a page is a bright,
 roughly rectangular, roughly convex region, and a contour finder answers
 that in a couple of milliseconds without a model, a download or a GPU.
 
-**Two gates, not one.** A closed laptop lid, a picture frame, a monitor
+**Three gates, not one.** A closed laptop lid, a picture frame, a monitor
 bezel and a blank whiteboard are all page-shaped. Rectangle detection
-alone would call every one of them a document. The second gate asks
-whether the region's interior actually looks like lines of text, and it is
-what keeps "document detected" from meaning "rectangle detected".
+alone would call every one of them a document.
+
+The second gate asks whether the interior has rows of ink. That is
+necessary and, on its own, badly insufficient: **venetian blinds, brick
+courses, floor tiles and a striped shirt all produce rows of dark pixels
+just as reliably as text does**, and an adversarial review drove a brick
+wall all the way through detection, dwell, OCR and persistence.
+
+The third gate is what separates them, and it comes from what text
+actually IS. A line of text is made of glyphs -- many short dark runs with
+gaps between them. A slat, a mortar course or a stripe is ONE run
+spanning the width. Counting dark/light transitions along each inky row
+tells them apart with an enormous margin (measured below).
 """
 
 from dataclasses import dataclass
@@ -44,6 +54,22 @@ MIN_TEXT_ROW_FRACTION = 0.08
 MIN_INK_FRACTION = 0.004
 MAX_INK_FRACTION = 0.60
 
+# The glyph gate, and the margin is not close. Median dark/light
+# transitions along an inky row, measured on the probe:
+#
+#     rendered text   43 - 86
+#     blinds           0
+#     bricks           0
+#     floor tiles      0
+#     striped shirt    0
+#     keyboard         0
+#
+# A threshold of 8 sits an order of magnitude below the text floor and
+# well above every structure measured. Chosen from that distribution
+# rather than from taste -- the same discipline that set World Builder's
+# ChArUco tilt threshold after a first guess landed below the noise floor.
+MIN_ROW_TRANSITIONS = 8
+
 
 @dataclass(frozen=True)
 class PageCandidate:
@@ -55,6 +81,7 @@ class PageCandidate:
     solidity: float
     text_row_fraction: float
     ink_fraction: float
+    row_transitions: float
     sharpness: float
     squareness: float
 
@@ -128,17 +155,23 @@ def warp_page(gray: np.ndarray, corners: np.ndarray, size=None) -> np.ndarray:
     return cv2.warpPerspective(gray, matrix, size)
 
 
-def measure_text_likeness(page_gray: np.ndarray) -> tuple[float, float]:
-    """(text_row_fraction, ink_fraction) for a warped page.
+def measure_text_likeness(page_gray: np.ndarray) -> tuple[float, float, float]:
+    """(text_row_fraction, ink_fraction, row_transitions) for a warped page.
 
     Lines of text produce rows with far more dark pixels than the margins
     between them. A blank sheet has no such rows; a photograph has dark
     pixels everywhere and no row structure. Measuring the FRACTION OF ROWS
-    that stand out separates the two, where a plain darkness count could
+    that stand out separates those two, where a plain darkness count could
     not.
+
+    It does NOT separate text from blinds, bricks, tiles or stripes, all
+    of which have exactly that row structure. `row_transitions` -- the
+    median number of dark/light crossings ALONG an inky row -- does: text
+    is made of glyphs and crosses dozens of times, while a slat or a
+    mortar course is one unbroken run and crosses zero.
     """
     if page_gray.size == 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     probe = cv2.resize(page_gray, TEXT_PROBE_SIZE, interpolation=cv2.INTER_AREA)
     # Otsu rather than a fixed level: page brightness varies enormously
     # with lighting, and a fixed threshold would measure the lamp.
@@ -148,11 +181,23 @@ def measure_text_likeness(page_gray: np.ndarray) -> tuple[float, float]:
     ink_fraction = float(np.count_nonzero(binary)) / binary.size
     row_ink = binary.sum(axis=1) / (255.0 * binary.shape[1])
     if not row_ink.size:
-        return 0.0, ink_fraction
+        return 0.0, ink_fraction, 0.0
+
     # A row carries text if it is meaningfully inkier than the median row.
     threshold = max(float(np.median(row_ink)) * 1.5, 0.02)
-    text_row_fraction = float(np.count_nonzero(row_ink > threshold)) / row_ink.size
-    return text_row_fraction, ink_fraction
+    inky_rows = np.flatnonzero(row_ink > threshold)
+    text_row_fraction = float(len(inky_rows)) / row_ink.size
+    if not len(inky_rows):
+        return text_row_fraction, ink_fraction, 0.0
+
+    # Median, not mean: one row of solid rule or a table border should not
+    # drag the figure down for a page that is otherwise glyphs.
+    mask = binary > 0
+    transitions = [
+        int(np.count_nonzero(np.diff(mask[row].astype(np.int8))))
+        for row in inky_rows
+    ]
+    return text_row_fraction, ink_fraction, float(np.median(transitions))
 
 
 def detect_page(gray: np.ndarray) -> PageCandidate | None:
@@ -205,10 +250,15 @@ def detect_page(gray: np.ndarray) -> PageCandidate | None:
             continue
 
         page = warp_page(gray, corners)
-        text_row_fraction, ink_fraction = measure_text_likeness(page)
+        text_row_fraction, ink_fraction, row_transitions = measure_text_likeness(
+            page
+        )
         if text_row_fraction < MIN_TEXT_ROW_FRACTION:
             continue
         if not MIN_INK_FRACTION <= ink_fraction <= MAX_INK_FRACTION:
+            continue
+        # The glyph gate. Without it a brick wall reaches OCR.
+        if row_transitions < MIN_ROW_TRANSITIONS:
             continue
 
         candidate = PageCandidate(
@@ -218,6 +268,7 @@ def detect_page(gray: np.ndarray) -> PageCandidate | None:
             solidity=solidity,
             text_row_fraction=text_row_fraction,
             ink_fraction=ink_fraction,
+            row_transitions=row_transitions,
             sharpness=float(cv2.Laplacian(page, cv2.CV_64F).var()),
             squareness=_squareness(corners),
         )

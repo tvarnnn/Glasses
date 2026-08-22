@@ -95,7 +95,7 @@ cannot be overridden"* — and the numbers above turn that prediction into
 a requirement on the iOS/DAT side. It is recorded in
 `docs/agent-handoffs/TOWER-TO-IOS.md`.
 
-## Detection: two gates, not one
+## Detection: three gates, not one
 
 A closed laptop lid, a picture frame, a monitor bezel and a blank
 whiteboard are all page-shaped. Rectangle detection alone would call every
@@ -106,6 +106,28 @@ one of them a document.
 2. **Text-likeness.** Inside the warped quad, the fraction of ROWS whose
    ink content stands out against the median row. Lines of text produce
    that structure; a blank sheet and a photograph do not.
+3. **Glyphs.** The median number of dark/light transitions ALONG an inky
+   row. Gate 2 is necessary and badly insufficient on its own: venetian
+   blinds, brick courses, floor tiles and a striped shirt all have rows of
+   dark pixels, and an adversarial review drove a brick wall through
+   detection, dwell, OCR and persistence. Text is many short runs per row;
+   a slat is one. Measured — text 43–86, every structure above 0 —
+   threshold 8.
+
+### Known false negatives
+
+The gates that keep a brick wall out are the same gates that keep these
+out, so each is a trade-off rather than an oversight:
+
+- **Sparse pages** — a title-only note or a business card falls below the
+  text-row gate. A six-line receipt passes, so the boundary is narrow.
+- **A page on a near-white desk** — Canny finds no border where page and
+  surface share an intensity.
+- **A page held closer than 98% of frame area** — rejected by
+  `MAX_AREA_FRACTION`, which does contradict "the wearer reads normally"
+  for anyone who holds reading material close.
+
+Dark and dim pages are fine: Otsu adapts down to about 25% brightness.
 
 ## Retrieval is lexical, and says so
 

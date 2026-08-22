@@ -25,12 +25,13 @@ import numpy as np
 from tower.confidence import Confidence
 from tower.document_memory.detect import detect_page, warp_page
 from tower.document_memory.dwell import DwellPolicy, DwellTracker
-from tower.document_memory.ocr import TextRecogniser
+from tower.document_memory.ocr import OcrResult, TextRecogniser
 from tower.document_memory.records import (
     END_REASON_STOPPED,
     REDACTION_NONE,
     TIMING_ASSUMED_INTERVAL,
     TIMING_CAPTURE_JOURNAL,
+    TIMING_MIXED,
     DocumentObservation,
     PageObservation,
 )
@@ -144,7 +145,13 @@ class DocumentMemoryEngine:
         # has to assume a frame interval, and the assumption is recorded
         # on every document it produces rather than hidden here.
         self._assumed_interval = assumed_frame_interval_s
-        self._synthetic_now: float | None = None
+        # The last timestamp handed out, real or synthetic. A synthetic
+        # one continues from here rather than restarting at "now", so a
+        # single frame with a missing timestamp cannot detach the clock
+        # from the stream around it.
+        self._last_at: float | None = None
+        self._used_real_time = False
+        self._used_assumed_time = False
         self._frames_observed = 0
         self._documents_recorded = 0
 
@@ -209,24 +216,65 @@ class DocumentMemoryEngine:
     def release(self) -> None:
         self._recogniser.release()
 
+    def _read(self, page_image):
+        """OCR one page, or record that it could not be read.
+
+        A recogniser can fail for ordinary reasons -- a model OOM, a CUDA
+        hiccup, a corrupted tensor. Before this guard existed the
+        exception propagated out of `observe()` and, in a live
+        `--follow-capture` session, ended observation for the REST OF THE
+        WEARER'S SESSION with a traceback and nothing persisted.
+
+        Recording an empty page instead is consistent with this module's
+        own rule: "we looked and found no readable text" is a real answer,
+        and losing the document entirely is not.
+        """
+        try:
+            return self._recogniser.read(page_image)
+        except Exception:
+            logger.exception(
+                "document memory: OCR failed on a page; recording it as "
+                "unreadable and continuing"
+            )
+            return OcrResult(text="")
+
     def _timestamp(self, received_at: float | None) -> float:
         """Real receipt time, or a stated assumption -- never a guess.
 
-        With `assumed_frame_interval_s` set, frames advance a synthetic
-        clock at that rate. That is the only way a batch of undated jpegs
-        can produce a dwell duration at all, and every document it
-        produces is stamped `timing_source: "assumed-interval"` so the
-        duration can never be read as measured.
+        With `assumed_frame_interval_s` set, a frame with no timestamp
+        advances a synthetic clock at that rate. That is the only way a
+        batch of undated jpegs can produce a dwell duration at all, and
+        every document it touches is stamped so the duration can never be
+        read as measured.
+
+        **The synthetic clock continues from the last timestamp handed
+        out, not from "now".** An earlier version anchored to
+        `self._clock()` the first time it was needed, so ONE frame with a
+        missing timestamp inside a stream of real ones jumped the clock to
+        wall-time -- an adversarial review produced a document claiming
+        ninety-two days of reading from exactly that.
         """
         if received_at is not None:
+            self._used_real_time = True
+            self._last_at = received_at
             return received_at
+
         if self._assumed_interval is None:
-            return self._clock()
-        if self._synthetic_now is None:
-            self._synthetic_now = self._clock()
-        else:
-            self._synthetic_now += self._assumed_interval
-        return self._synthetic_now
+            at = self._clock()
+            self._last_at = at
+            return at
+
+        self._used_assumed_time = True
+        at = self._clock() if self._last_at is None else self._last_at + self._assumed_interval
+        self._last_at = at
+        return at
+
+    def _timing_source(self) -> str:
+        if self._used_real_time and self._used_assumed_time:
+            return TIMING_MIXED
+        if self._used_assumed_time:
+            return TIMING_ASSUMED_INTERVAL
+        return TIMING_CAPTURE_JOURNAL
 
     # -- internals -----------------------------------------------------
 
@@ -259,12 +307,9 @@ class DocumentMemoryEngine:
 
         for index, frame in enumerate(dwell.best):
             page_image = warp_page(frame.gray, frame.candidate.corners)
-            result = self._recogniser.read(page_image)
+            result = self._read(page_image)
 
-            duplicate = next(
-                (page for page in pages if is_same_page(page.text, result.text)),
-                None,
-            )
+            duplicate = _find_duplicate(pages, result.text)
             if duplicate is not None:
                 # The same page seen twice within one dwell -- which is the
                 # NORMAL case, since best-frame selection deliberately picks
@@ -309,12 +354,10 @@ class DocumentMemoryEngine:
             end_reason=dwell.end_reason,
             confidence=_document_confidence(pages),
             capture_id=self._capture_id,
-            timing_source=(
-                TIMING_ASSUMED_INTERVAL
-                if self._assumed_interval is not None
-                else TIMING_CAPTURE_JOURNAL
+            timing_source=self._timing_source(),
+            assumed_frame_interval_s=(
+                self._assumed_interval if self._used_assumed_time else None
             ),
-            assumed_frame_interval_s=self._assumed_interval,
             world_id=self._world_id,
             world_session_id=self._world_session_id,
             retains_raw_imagery=self._keep_page_images,
@@ -336,6 +379,42 @@ class DocumentMemoryEngine:
         from tower.document_memory.store import IMAGES_DIRNAME
 
         return f"{IMAGES_DIRNAME}/{filename}"
+
+
+def _find_duplicate(pages, incoming: str):
+    """Which already-recorded page, if any, this reading belongs to.
+
+    Two rules, and the difference between them matters.
+
+    A TEXT-to-TEXT match may be against any page in the document: OCR
+    reading the same words again is the same page wherever it sits.
+
+    A BLANK match is restricted to the page recorded IMMEDIATELY BEFORE.
+    The dwell's best frames are the two sharpest views of a region, not
+    guaranteed to be the same physical page -- a wearer can turn a page
+    without the region moving. An adversarial review showed the
+    unrestricted rule erasing a genuinely different page whenever OCR
+    happened to fail on it, which is an observation gap reported as
+    content.
+    """
+    incoming_blank = not incoming.strip()
+    if incoming_blank:
+        if pages and not pages[-1].text.strip():
+            return pages[-1]
+        if pages and pages[-1].text.strip():
+            # The previous page read fine and this view did not. Same
+            # page, seen badly once -- keep the reading that worked.
+            return pages[-1]
+        return None
+    for page in pages:
+        if not page.text.strip():
+            continue
+        if token_overlap(page.text, incoming) >= SAME_PAGE_TOKEN_OVERLAP:
+            return page
+    # A blank page followed by a reading: the reading belongs to it.
+    if pages and not pages[-1].text.strip():
+        return pages[-1]
+    return None
 
 
 def _decode_gray(raw_bytes: bytes):

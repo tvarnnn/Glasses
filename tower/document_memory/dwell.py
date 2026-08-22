@@ -46,6 +46,12 @@ class DwellPolicy:
     # Rule 15: nothing unbounded. A page left on a desk in view all
     # afternoon becomes one bounded observation, not an ever-growing one.
     max_seconds: float = 180.0
+    # A gap this large between two detections is not one continuous
+    # reading. Timestamps come from the capture journal and are WALL
+    # CLOCK, so this also contains the damage when a clock jumps: an
+    # adversarial review produced a document claiming 92 days of reading
+    # from a single bad timestamp.
+    max_frame_gap_s: float = 5.0
     # How much the region may move between frames and still be "the same
     # page", as a fraction of the frame diagonal. A person holding a page
     # is not a tripod.
@@ -92,10 +98,22 @@ class Dwell:
     best: list[ScoredFrame] = field(default_factory=list)
     end_reason: str = END_REASON_LOST
     reference: PageCandidate | None = None
+    # Accumulated FORWARD-ONLY, one inter-frame delta at a time.
+    elapsed_seconds: float = 0.0
+    clock_regressions: int = 0
 
     @property
     def seconds(self) -> float:
-        return max(self.last_seen_at - self.started_at, 0.0)
+        """How long the page was observed, immune to a clock that moves back.
+
+        Accumulated from positive inter-frame deltas rather than computed
+        as `last_seen_at - started_at`. The difference is not academic:
+        timestamps are wall-clock from the capture journal, so an NTP
+        correction on the LAST frame of an otherwise perfect dwell used to
+        clamp this to zero, fail `qualifies()`, and discard the whole
+        document with no error and no trace.
+        """
+        return self.elapsed_seconds
 
     def qualifies(self, policy: DwellPolicy) -> bool:
         return (
@@ -146,6 +164,14 @@ class DwellTracker:
             self._start(candidate, at, gray, source_seq)
             return None
 
+        if at - self._current.last_seen_at > self._policy.max_frame_gap_s:
+            # Too long since the last detection for this to be one
+            # continuous reading -- a stalled stream, or a clock jump.
+            # Ending the dwell contains the damage either way.
+            finished = self._finish(END_REASON_LOST)
+            self._start(candidate, at, gray, source_seq)
+            return finished
+
         if not self._is_same_region(candidate, frame_diagonal):
             # A different page is a NEW dwell, not a continuation. Without
             # this, turning from one document to another would merge two
@@ -174,6 +200,14 @@ class DwellTracker:
 
     def _extend(self, candidate, at, gray, source_seq) -> None:
         dwell = self._current
+        delta = at - dwell.last_seen_at
+        if delta < 0:
+            # The clock moved back. Contribute nothing rather than
+            # subtracting, and record that it happened so a short
+            # observation is explainable.
+            dwell.clock_regressions += 1
+        else:
+            dwell.elapsed_seconds += delta
         dwell.frames_seen += 1
         dwell.frames_considered += 1
         dwell.last_seen_at = at

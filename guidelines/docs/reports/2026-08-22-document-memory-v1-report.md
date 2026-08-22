@@ -281,6 +281,166 @@ Retrieval, and storage growth:
 - **A new dwell starting inside the same region is a new document.** Two
   documents read back-to-back without the camera moving would merge; the
   region test is the only separator.
+- **Sparse pages are not detected.** A title-only note or a business card
+  falls below the text-row gate. A six-line receipt passes, so the
+  boundary is narrow — but loosening it trades directly against keeping a
+  brick wall out (§13.1).
+- **A page on a near-white surface is not detected.** Canny finds no
+  border where page and desk share an intensity.
+- **A page held very close, filling more than 98% of the frame, is
+  rejected.** That contradicts "the wearer reads normally" for anyone who
+  holds reading material close, and is a genuine trade-off rather than an
+  oversight.
 - **Search recomputes the corpus per query** (§6).
 - **Nothing validates that the wearer read anything.** By construction,
   and permanently, on this hardware.
+
+
+---
+
+## 13. Adversarial review — findings and fixes
+
+An independent reviewer was told to break it. Four blockers, three
+majors, two minors. One of the blockers had already been found and fixed
+here before the report arrived, which is corroboration rather than
+duplication; the rest were new.
+
+### 13.1 BLOCKER — a brick wall was persisted as a document
+
+The second gate keys on **rows of dark pixels**, and venetian blinds,
+brick courses, floor tiles and a striped shirt all have exactly that
+structure. The reviewer drove a jittering brick-wall texture through
+detection, dwell, **OCR and persistence**, producing a stored
+`DocumentObservation`. That is precisely the "expensive path firing when
+it should not" the whole cost model exists to prevent.
+
+**Fixed with a third gate, from what text actually is.** A line of text is
+made of glyphs — many short dark runs with gaps. A slat, a mortar course
+or a stripe is *one* run spanning the width. Counting dark/light
+transitions along each inky row separates them, and the margin is not
+close:
+
+| Surface | Median transitions per inky row |
+|---|---|
+| rendered text | **43 – 86** |
+| venetian blinds | 0 |
+| brick wall | 0 |
+| floor tiles | 0 |
+| striped shirt | 0 |
+| keyboard | 0 |
+
+The threshold is **8** — an order of magnitude below the text floor and
+well above every structure measured. Chosen from that distribution, the
+same way World Builder's ChArUco tilt threshold was set after a first
+guess landed below the noise floor.
+
+Six structured surfaces are now pinned by test, both at the detector and
+end to end through OCR and persistence. **The test gap that let this ship
+was real and worth naming: the fixture suite had no "structured but not
+text" imagery at all.**
+
+### 13.2 BLOCKER — one backward clock step silently destroyed a document
+
+`observed_seconds` was `last_seen_at - started_at`, clamped at zero.
+Timestamps are **wall clock** from the capture journal, so an NTP
+correction on the *last* frame of an otherwise perfect dwell clamped the
+duration to zero, failed `qualifies()`, and discarded the entire reading —
+no error, no warning, no partial record.
+
+Reproduced: eight frames over 3.5 s, well past every threshold, then one
+backward step. `flush()` returned `None`.
+
+**Fixed** by accumulating forward-only inter-frame deltas.
+`clock_regressions` is recorded, so a short observation stays
+explainable. A mid-dwell regression no longer understates the duration
+either.
+
+### 13.3 BLOCKER — a single missing timestamp produced a 92-day document
+
+The synthetic clock anchored to `self._clock()` — wall time — the first
+time it was needed. So one frame with no `received_at` inside a stream of
+real ones jumped the clock forward by the difference, and the dwell
+absorbed it: **`observed_seconds: 8,000,000`**, about ninety-two days.
+The record was additionally mislabelled `assumed-interval` even though
+most of its frames carried real receipts.
+
+**Fixed** three ways: the synthetic clock now continues from the last
+timestamp handed out rather than from "now"; a single inter-frame gap
+larger than `max_frame_gap_s` (5 s) ends the dwell rather than being
+absorbed, because that is not one continuous reading whatever caused it;
+and a stream carrying both kinds of timestamp is labelled
+**`timing_source: "mixed"`**, since calling it fully assumed understates
+what is known and fully measured overstates it.
+
+### 13.4 BLOCKER — retention left the pixels on disk
+
+Found and fixed here before the review reported it; recorded in §9. The
+independent confirmation is worth having.
+
+### 13.5 MAJOR — one OCR failure ended the whole session
+
+`self._recogniser.read()` was uncaught. A realistic EasyOCR failure — a
+model OOM, a CUDA hiccup — raised out of `_record` **before**
+`store.append` was ever reached, so the triggering document was lost with
+no trace. Worse, the exception propagated out of `observe()` and the
+driver loop has no per-frame guard, so in a live `--follow-capture`
+session **one hiccup ended observation for the rest of the wearer's
+session** with a traceback and nothing persisted.
+
+**Fixed** by recording the page as unreadable and continuing — consistent
+with this module's own rule that "we looked and found no readable text"
+is a real answer, where losing the document is not. A test pins that a
+second document later in the same stream is still observed.
+
+### 13.6 MAJOR — a blank reading could erase a genuinely different page
+
+The rule "one view read text and the other did not → same page" was
+applied against **any** already-recorded page. But a dwell's two best
+frames are the two sharpest views of a *region*, not guaranteed to be the
+same physical page — a wearer can turn a page without the region moving.
+If OCR then failed on the second view, the failure merged into the first
+page and the second page vanished from the record.
+
+**Fixed** by splitting the rule: a text-to-text match may be against any
+page, a **blank** match only against the page recorded immediately
+before.
+
+### 13.7 MAJOR — false negatives, accepted and now documented
+
+Sparse pages (a title-only note, a business card) fall below
+`MIN_TEXT_ROW_FRACTION`; a page on a near-white desk has no border for
+Canny to find; a page held closer than 98% of frame area is rejected by
+`MAX_AREA_FRACTION`. A six-line receipt does pass, so the boundary is
+narrow and real.
+
+**Accepted, not fixed.** Each is a consequence of the classical approach
+chosen, and loosening any of them trades directly against §13.1 — the
+gates that keep a brick wall out are the same gates that keep a
+two-line note out. They are now in the module doc's limitations rather
+than being discovered by a user. Dark and dim pages were *cleared*: Otsu
+adapts robustly down to 25% brightness.
+
+### 13.8 MINOR — a torn multi-byte line would have crashed the reader
+
+`read_raw_jsonl` promises "skip a corrupt line". A write interrupted
+mid-codepoint would have raised `UnicodeDecodeError` from the file
+iterator and taken the **whole journal** with it. Not reachable today —
+`json.dumps` defaults to `ensure_ascii`, so every byte this code writes is
+ASCII and a tear can only fall on a character boundary — but the promise
+should not depend on that staying true. The file is now read with
+`errors="replace"`.
+
+### 13.9 Attacks that were cleared
+
+Reported so an absent finding is evidence rather than silence. Verified
+with runnable probes: BM25 IDF stays strictly positive across every
+corpus size (the smoothing works); `around()`'s window edge is inclusive
+as coded; `_snippet` handles empty, single-word and short text;
+`search_text` survives empty-text documents; `coverage()` is honest;
+`Dwell.best` stays bounded under a 500-frame stress; a *regular* page turn
+with distinct text correctly produces two pages; `purge`'s two branches
+are consistent despite a misleading variable name (since renamed); the
+EasyOCR seam handles 1×1, 2×2 and 6000×4000 images; and a keyboard, a
+barcode, a bookshelf of vertical spines and a monitor showing dense text
+were all correctly refused even before the glyph gate — vertical-dominant
+structure fails the row gate on its own.
