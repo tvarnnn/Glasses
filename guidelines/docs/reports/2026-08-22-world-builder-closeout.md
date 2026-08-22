@@ -2,7 +2,7 @@
 
 **Branch:** `world-builder/v1`. **Audited from:** `019cd1c`.
 **Suite at audit time:** 376 passed, 3 skipped. **After this closeout:**
-418 passed, 3 skipped.
+429 passed, 3 skipped.
 
 Companion to `2026-08-22-world-builder-v1-report.md`, which describes what
 was built and why. This document does something different and narrower:
@@ -30,15 +30,17 @@ qualifications, all of which were already known and none of which is new:
 2. **Storage is observable, not capped.** The definition of done says
    "bounded"; what exists is a growth figure a caller can read. Accepted
    deliberately — see §5.1.
-3. **Trajectory drift at 16 keyframes is 21.6%**, an order of magnitude
-   worse than at 8 and 12. Investigated during this closeout — see §5.2.
+3. **The 21.6% drift figure at 16 keyframes was a synthetic-scene
+   artifact** — the benchmark walk left the room at that exact keyframe.
+   Re-measured in-room it is 1.05%. Resolved during this closeout, with a
+   proposed fix measured and rejected — see §5.2.
 4. **Nothing has been validated on physical footage.** Every measurement
    in the project is synthetic. That gate is unchanged and unmovable
    without hardware.
 
-Three fixes were made during closeout, all small and all tested:
-production capture arming (§3.1), the event cursor and follow drivers
-(§4), and documentation corrections (§6).
+Four fixes were made during closeout, all tested: production capture
+arming (§3.1), the event cursor and follow drivers (§4), the benchmark's
+out-of-room walk (§5.2), and documentation corrections (§6).
 
 ---
 
@@ -77,10 +79,10 @@ production capture arming (§3.1), the event cursor and follow drivers
 | 13–17 | Clean stop, persist, restart, reload, inspect | IMPLEMENTED | |
 | 18 | Storage intentional/**bounded** | **PARTIAL, accepted** | Observable, not capped. §5.1 |
 | 19 | Failures do not silently corrupt | IMPLEMENTED | Torn lines skipped, schema mismatches left alone, atomic writes, purge reports what it retained |
-| 20 | Full suite passes | IMPLEMENTED | 418 passed, 3 skipped |
+| 20 | Full suite passes | IMPLEMENTED | 429 passed, 3 skipped |
 | 21 | New tests pass | IMPLEMENTED | |
 | 22 | Meaningful benchmarks recorded | IMPLEMENTED | Per-stage live-path timings, build timing, trajectory accuracy vs ground truth. Not every category in §32 has its own number — see §5.3 |
-| 23 | No unresolved critical correctness/data-loss issue | **PARTIAL** | Two CRITICALs found and fixed. The 16-keyframe drift figure is the one open accuracy question. §5.2 |
+| 23 | No unresolved critical correctness/data-loss issue | IMPLEMENTED (was PARTIAL) | Two CRITICALs found and fixed. The one open accuracy question, the 16-keyframe drift figure, was investigated and resolved: it was the walk leaving the room, not the engine. §5.2 |
 | 24 | Architecture documented | IMPLEMENTED | V1 report + `CARTRIDGE-GROUNDWORK.md` |
 | 25 | Physical-only claims deferred | IMPLEMENTED | Every World Builder test module opens "SYNTHETIC, NOT PHYSICAL" |
 | 26 | Shared infrastructure cartridge-neutral | IMPLEMENTED | Enforced by AST tests in `test_architecture_boundaries.py` |
@@ -294,24 +296,83 @@ definition of done says "bounded"; what exists is "observable and
 intentional", and the difference is recorded here rather than smoothed
 over.
 
-### 5.2 Trajectory drift at 16 keyframes
+### 5.2 Trajectory drift at 16 keyframes — RESOLVED: it was the wall
 
-Measured against synthetic ground truth after the landmark-propagation
-fix: 1.06% at 8 keyframes, 1.97% at 12, **21.61% at 16**. Smooth
-accumulating drift does not do that; a tenfold jump over four keyframes
-is a discontinuity, and the V1 report attributes it only to "unbounded
-drift with no correction".
+The reported figures were 1.06% at 8 keyframes, 1.97% at 12, and **21.61%
+at 16**. Smooth accumulating drift does not do that, so this closeout
+treated the tenfold jump as the one open correctness question and
+investigated it.
 
-This closeout treated that as the one open correctness question and
-investigated it. Findings are in §5.2.1.
+**The dominant cause was the synthetic scene, not the engine.** The
+keyframe sweep used `strafe(N, step=0.20)`, which advances the camera
+0.20 m per keyframe from x = 0. The default room is 6 m wide, so keyframe
+16 sits at **x = 3.00 m — exactly the right wall**. Approaching it, the
+near-field boxes leave the frame and correspondences collapse from ~1000
+to ~640; one step later the pose is refused outright as
+`no_correspondence`. The camera was walking through a wall, and running
+out of scene looks identical to accumulated drift in a single error
+percentage.
 
-Regardless of mechanism, the standing answer does not change: `pycolmap
-4.1.1` is verified as a 23.5 MB cp312 Windows wheel, BSD-3, needing no
-compiler and bundling Ceres. Bundle adjustment was declined because no
-measurement yet showed drift it would fix. This measurement is the
-candidate trigger — but it must be reproduced on **physical** footage
-before it justifies the dependency, because a synthetic-scene artifact is
-not evidence about a real camera.
+Re-measured with the walk kept inside the room (step scaled so the chain
+spans a fixed 2.5 m):
+
+| keyframes | step | max drift, % of path |
+|---|---|---|
+| 8 | 0.200 m | 0.83% |
+| 12 | 0.200 m | 0.87% |
+| 16 | 0.167 m | **1.05%** |
+| 20 | 0.132 m | 10.77% |
+| 24 | 0.109 m | 22.64% |
+
+**There is no cliff at 16.** Per-keyframe residuals along the 20-keyframe
+chain grow smoothly — 1.1%, 2.7%, 4.5%, 7.6%, 10.8% — with match counts
+holding near 1000 throughout. What the longer chains show is ordinary
+monocular accumulation, made worse by the shrinking per-pair baseline that
+packing more keyframes into a fixed path implies. That is textbook
+behaviour for incremental SfM without bundle adjustment, and it is exactly
+what `pycolmap` would reduce.
+
+**Fixed:** `world_builder_benchmark.py` now scales its step with the
+keyframe count and refuses outright if the walk would leave the room, and
+reports `step_m` and `max_offset_m` so two runs at different counts are
+comparable rather than silently different. `synthetic_scene.poses_outside_room()`
+makes the scene's validity envelope checkable, and
+`tests/test_synthetic_scene_bounds.py` pins it.
+`tests/test_world_builder_drift.py` pins the *shape* of the error — short
+chains bounded, long chains larger — rather than a percentage.
+
+**Rejected fix, with the measurement that rejected it.** The obvious
+response was to gate `_extend`'s PnP acceptance on inlier ratio, mirroring
+`_estimate_pair`'s gate, since `_extend` checks only an absolute
+correspondence count. Measured inlier ratios say that would be backwards:
+
+| walk | median inlier ratio, later keyframes |
+|---|---|
+| interior, `strafe(16, step=0.09)` — the **good** case | ~0.25 |
+| toward the wall, `strafe(16, step=0.20)` — the **bad** case | ~0.47 |
+
+A ratio floor would have refused the healthy configuration and admitted
+the failing one. A large healthy match set with plenty of far-field
+structure carries proportionally more outliers than a shrinking one, so
+the ratio moves the wrong way. The negative result is pinned by a test so
+the fix is not re-proposed from first principles.
+
+**Reproducibility caveat, now recorded.** `findEssentialMat(USAC_MAGSAC)`
+and `solvePnPRansac(SQPNP)` are not seeded anywhere, and results differ
+across OpenCV builds: the committed
+`test_trajectory_matches_truth_after_similarity_alignment` docstring
+claims 1.32% where the same passing test measures 1.62% on this build.
+**Any single-run percentage in this repository is a measurement of one
+host, not a portable constant**, and a comment in
+`backends/classical.py` that restated two such figures has been replaced
+with a pointer to this section.
+
+**The standing answer is unchanged.** `pycolmap 4.1.1` is verified as a
+23.5 MB cp312 Windows wheel, BSD-3, needing no compiler and bundling
+Ceres. Bundle adjustment was declined because no measurement showed drift
+it would fix. The long-chain numbers above are a candidate trigger — but
+they must be reproduced on **physical** footage first, because a
+synthetic scene's geometry is not evidence about a real camera.
 
 ### 5.3 Benchmark coverage is partial
 

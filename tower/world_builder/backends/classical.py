@@ -339,10 +339,18 @@ class ClassicalTwoViewBackend(GeometryBackend):
             # THE propagation. Without this the map is write-only: a
             # landmark seen in frame N-1 and re-seen in frame N cannot be
             # found from frame N, so step N->N+1 re-triangulates the same
-            # physical structure instead of reusing it. Measured effect at
-            # 16 keyframes: 39.5% trajectory drift without, 15.2% with,
-            # and roughly double the point count from re-triangulating
-            # the same points over and over.
+            # physical structure instead of reusing it, roughly doubling
+            # the point count with duplicates of the same structure and
+            # badly degrading the trajectory.
+            #
+            # Deliberately no percentage here. The figures this comment
+            # used to carry were single-run measurements, and
+            # findEssentialMat(USAC_MAGSAC)/solvePnPRansac(SQPNP) are not
+            # seeded -- a committed test's own docstring claims 1.32%
+            # where the same test now measures 1.62% on a different
+            # OpenCV build. Point at the report, which can carry the
+            # conditions; a bare number in a comment cannot.
+            # See reports/2026-08-22-world-builder-closeout.md 5.2.
             reobserved[(current_index, index_current)] = landmark
 
         if len(object_points) < MIN_PNP_CORRESPONDENCES:

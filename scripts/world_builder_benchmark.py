@@ -92,7 +92,20 @@ def bench_build(keyframes: int = 8, repeat: int = 3) -> dict:
     width, height = 480, 360
     camera_matrix = ss.camera_matrix(width, height)
     scene = ss.furnished_room()
-    poses = ss.strafe(keyframes, step=0.20)
+    # The step scales with the keyframe count instead of being fixed.
+    # A fixed 0.20 m put keyframe 16 at x = 3.00 m -- exactly the room's
+    # right wall -- so "more keyframes" silently meant "walk into a wall",
+    # and the resulting error was read as accumulated drift. A benchmark
+    # that leaves the scene is measuring the scene, not the algorithm.
+    usable_half_width = ss.ROOM_WIDTH_M / 2 - 0.5
+    step = min(0.20, usable_half_width / max(keyframes - 1, 1))
+    poses = ss.strafe(keyframes, step=step)
+    outside = ss.poses_outside_room(poses)
+    if outside:  # pragma: no cover - guard against a future edit re-breaking it
+        raise SystemExit(
+            f"benchmark walk leaves the room at pose {outside[0]}; "
+            "lower --keyframes or shorten the step"
+        )
     images = ss.render_sequence(scene, poses, camera_matrix, width, height)
     intrinsics = CameraIntrinsics(
         source=INTRINSICS_SOURCE_SELF_CALIBRATED,
@@ -118,6 +131,11 @@ def bench_build(keyframes: int = 8, repeat: int = 3) -> dict:
     return {
         "keyframes": keyframes,
         "resolution": f"{width}x{height}",
+        # Recorded, not implied: two runs at different keyframe counts use
+        # different steps and therefore different parallax, and comparing
+        # their drift without knowing that is how the wall got missed.
+        "step_m": round(step, 4),
+        "max_offset_m": round(step * (keyframes - 1), 3),
         "poses_solved": solved,
         "points": 0 if estimate.points is None else len(estimate.points),
         "estimate_window": timing,

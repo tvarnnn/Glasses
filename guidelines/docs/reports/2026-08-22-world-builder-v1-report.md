@@ -542,6 +542,14 @@ truth:
 | 12 | 32.81% | **1.97%** |
 | 16 | 39.53% | **21.61%** |
 
+> **Correction, 2026-08-22 (closeout).** The 21.61% figure is mostly a
+> fact about the synthetic scene, not about the engine: `strafe(16,
+> step=0.20)` puts keyframe 16 at x = 3.00 m, exactly the wall of the 6 m
+> room. Re-measured with the walk kept inside, 16 keyframes drifts
+> **1.05%** and there is no cliff. All three columns are also single-run
+> measurements on one unseeded OpenCV build and are not portable. See
+> `2026-08-22-world-builder-closeout.md` §5.2.
+
 The point count roughly halved — the duplicates were the same structure
 counted repeatedly, which is the number `BuildResult` reports as "points
 mapped". This shipped because the only multi-frame test stopped at **four**

@@ -236,11 +236,55 @@ def render(
     return colour, depth
 
 
+# The room's dimensions, as module constants rather than defaults buried
+# in a signature. A measurement taken with the camera outside these bounds
+# is not a measurement of the algorithm -- it is a measurement of running
+# out of scene, and it looks exactly like accumulated drift.
+ROOM_WIDTH_M = 6.0
+ROOM_DEPTH_M = 4.0
+ROOM_HEIGHT_M = 2.7
+
+
+def poses_outside_room(
+    poses,
+    *,
+    width_m: float = ROOM_WIDTH_M,
+    depth_m: float = ROOM_DEPTH_M,
+    height_m: float = ROOM_HEIGHT_M,
+    margin_m: float = 0.5,
+) -> list[int]:
+    """Indices of poses too close to a wall, floor or ceiling to trust.
+
+    This exists because a real defect hid behind its absence. A keyframe
+    sweep using `strafe(N, step=0.20)` puts keyframe 16 at x = 3.00 m --
+    exactly the right wall of the default room. Match counts collapse from
+    ~1000 to ~640 as the camera approaches it and the pose is refused
+    outright one step later, and the resulting trajectory error was read
+    as "unbounded drift" for a while rather than as the camera walking
+    into a wall.
+
+    `margin_m` is not cosmetic: structure leaves the frame well before the
+    camera reaches a surface, so the usable envelope is strictly smaller
+    than the room.
+    """
+    half_w = width_m / 2 - margin_m
+    outside = []
+    for index, pose in enumerate(poses):
+        x, y, z = (float(value) for value in pose.position)
+        if not -half_w <= x <= half_w:
+            outside.append(index)
+        elif not margin_m <= z <= depth_m - margin_m:
+            outside.append(index)
+        elif not -(height_m - margin_m) <= y <= -margin_m:
+            outside.append(index)
+    return outside
+
+
 def room_planes(
     rng: np.random.Generator,
-    width_m: float = 6.0,
-    depth_m: float = 4.0,
-    height_m: float = 2.7,
+    width_m: float = ROOM_WIDTH_M,
+    depth_m: float = ROOM_DEPTH_M,
+    height_m: float = ROOM_HEIGHT_M,
 ) -> list[Plane]:
     """A closed box room. Dimensions are inputs, so tests can assert them.
 
