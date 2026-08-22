@@ -172,6 +172,17 @@ Report: `reports/2026-08-22-document-memory-v1-report.md`.
 
 Exit criterion: **met for the Tower half** — a rendered reading session becomes a searchable memory that refuses to answer questions it has no record of. Not met, and not meetable here, for reading at the delivered resolution.
 
+### V0.9.7 — Scene Understanding V1 (complete, synthetic-only)
+- A live structured view of what is around the wearer: detection, anonymous tracking, counts from CONFIRMED TRACKS, camera-relative positions and relationships, and a query layer that refuses rather than guesses.
+- **Counting uses tracking**, measured rather than asserted: the count of 2 holds exactly through 0%, 10% and 20% detector dropout, and is correct 97.4% of the time at 40%.
+- Coarse head orientation ("appears to be facing your direction") implemented but **OFF by default**: `keypointrcnn_resnet50_fpn` costs 798 ms per call on this CPU, 24x the detector and 2.5x the delivered frame interval. It runs at a cadence with every estimate carrying its age, and it is never called gaze.
+- **Persists nothing**, enforced by test. This cartridge is the present; Environmental Memory is the past, and that boundary is now real.
+- Relationships the evidence cannot support are refused with the measurement that would settle each one, rather than being silently absent.
+
+Report: `reports/2026-08-22-scene-understanding-v1-report.md`.
+
+Exit criterion: **met** — every asserted relationship is checked against geometry a test chose, every refused one explains itself, and the count survives detector dropout.
+
 ### V1.0 — Generalize Module Registry (When Justified)
 - Triggered only once a second production module (a promoted Experimental CV Lab result, or another module such as Object Memory) creates real, concrete requirements.
 - Build dynamic module discovery, the module registry, and descriptor/sensor-profile negotiation generalized from actual usage rather than speculative design.
@@ -193,7 +204,8 @@ Candidates, each with its own specification under `docs/modules/`:
 - Accessibility.
 - Visual Q&A / Reading — comparatively heavy (STT + OCR/CV + multimodal reasoning + TTS); not an early starter module. Its OCR half now has a working, measured implementation to reuse in Document Memory (V0.9.6), which removes one of its four unknowns.
 - Document Memory — **built** at V0.9.6 above; blocked on delivered camera resolution rather than on Tower work. See `docs/modules/DOCUMENT-MEMORY.md`.
-- Environmental / Physical-World Search — highest privacy exposure of the current module set; requires the retention/deletion policy in `06-PRIVACY-DATA.md` to be actually implemented, not just documented, before real data collection begins.
+- Environmental / Physical-World Search — highest privacy exposure of the current module set; requires the retention/deletion policy in `06-PRIVACY-DATA.md` to be actually implemented, not just documented, before real data collection begins. **Its live-state neighbour now exists** (Scene Understanding, V0.9.7), and deliberately persists nothing so that this decision lands here.
+- Scene Understanding — **built** at V0.9.7 above. See `docs/modules/SCENE-UNDERSTANDING.md`.
 - Translator — future low-latency conversational translation module; see `docs/modules/TRANSLATOR.md`. Not an early candidate — depends on a streaming ASR/MT/TTS pipeline and the latency-instrumentation work in `01-SYSTEM-ARCHITECTURE.md` that have not been built or measured yet.
 
 ## Future Research

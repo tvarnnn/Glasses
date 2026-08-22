@@ -126,10 +126,35 @@ prediction held on every point.
   behind a substitutable seam, and a lexical retrieval layer that refuses
   rather than guesses. Visual Q&A's `READ_TEXT` route can reuse both.
 
+### Scene Understanding (BUILT, 2026-08-22 -- see `SCENE-UNDERSTANDING.md`)
+
+- **Reuses:** the capture recorder and its follower, `Confidence`, and
+  the DETECTOR MEASUREMENT the Lab produced -- not the Lab's code. The
+  Lab's `ExperimentResult` cannot carry a box, so the two share a model
+  and nothing else. That is the promotion path working as intended:
+  measure in the sandbox, build in the cartridge.
+- **Camera pattern:** continuous, every frame, cheap. ~33 ms detection
+  plus 0.016 ms for tracking, relations and the query layer together.
+- **Persists NOTHING**, enforced by test, and that is the cleanest
+  privacy posture any cartridge has managed. It is affordable only
+  because the cartridge's purpose is a live answer.
+- **Adds, for anyone building a perception cartridge:** counts that come
+  from tracks rather than detections and survive 20% detector dropout
+  unchanged; anonymous IoU-only association, which is how you track
+  without acquiring identity; and a REFUSAL REGISTRY -- relationships the
+  evidence cannot support, each recorded with what would settle it.
+- **The pattern worth copying:** an answer type with `answered: False`
+  and a reason. Asking "how many people are facing me" with orientation
+  disabled refuses instead of returning 0, because zero looks like data.
+
 ### Environmental Memory
 
 - **Reuses:** store shape, `Confidence`, retention/purge discipline.
 - **Camera pattern:** sparse, event-driven.
+- **Its boundary with Scene Understanding is now real, not hypothetical.**
+  That cartridge holds the present and persists nothing; this one holds
+  the past. The day a durable record of the physical world is wanted is
+  the day this module starts -- not the day a store is added there.
 - **Missing:** the shared spatial service, which depends on the Object
   Memory contract above.
 

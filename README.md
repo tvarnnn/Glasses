@@ -511,6 +511,20 @@ tower/
     engine.py             Cheap per frame, expensive per dwell
     retrieval.py          BM25 by content, window by time, and an explicit
                           refusal when there is no record
+  scene/
+    records.py            Detection / Track / Relation / FacingEstimate.
+                          A track_id is "the same blob one frame later",
+                          never an identity
+    detect.py             Detector seam: torchvision SSDLite320 + a fast
+                          fake. Does NOT import the Lab
+    tracking.py           IoU-only association. Counts come from
+                          CONFIRMED TRACKS, never from detections
+    orientation.py        Coarse facing from keypoint VISIBILITY. Off by
+                          default: 798ms per call. Never gaze
+    state.py              The live scene, and the relationships it
+                          refuses to assert, with reasons
+    engine.py             Frames in, a scene out. Stores nothing
+    query.py              The brief's questions, and honest refusals
   routes/
     health.py             GET /health
     ws.py                 WebSocket /ws (ping/pong, frame receive +
@@ -550,6 +564,12 @@ scripts/
                           Detection cost per frame, retrieval latency and
                           storage growth, plus read quality swept over
                           frame size and tilt
+  scene_session.py        What is around the wearer, from a frame stream.
+                          Answers the questions in the run that observed
+                          the frames -- nothing is persisted, so there is
+                          deliberately no separate query script
+  scene_benchmark.py      Per-frame cost with and without orientation,
+                          and count stability under detector dropout
   world_builder_benchmark.py
                           Stage timings for the World Builder pipeline
                           (synthetic input; timings real, imagery rendered)
