@@ -122,7 +122,7 @@ after; suite unchanged at 583 passed either side. Declared as an optional
 
 ---
 
-## 5. Detection: two gates, because one is not enough
+## 5. Detection: three gates, because two were not enough
 
 A closed laptop lid, a picture frame, a monitor bezel and a blank
 whiteboard are all page-shaped. **Rectangle detection alone would call
@@ -135,6 +135,9 @@ every one of them a document.**
    that structure; a blank sheet and a photograph do not. Measuring the
    fraction of *rows* rather than total darkness is what separates a page
    of text from a dark photograph.
+3. **Glyphs** — the median dark/light transitions *along* an inky row.
+   This gate was added after review; gates 1 and 2 shipped without it and
+   a brick wall got all the way through to persistence. See §13.1.
 
 Measured: a rendered page is found at tilts of 0.0, 0.5 and 1.0 with a
 recovered-corner error under 6 px against the corners the fixture chose.
