@@ -4,26 +4,44 @@ import time
 import cv2
 import numpy as np
 
-from tower.experiments import ExperimentResult
+from tower.experiments import ExperimentResult, ExperimentSettings
 from tower.instrumentation import StageTimer
 from tower.modules.base import FrameProcessingError
 
 logger = logging.getLogger(__name__)
 
 
+def resolve_device(requested: str) -> str:
+    """Turn a requested device into one that actually exists.
+
+    "auto" means CUDA if it is genuinely usable, else CPU. Asking for
+    "cuda" on a machine without it is an error rather than a silent
+    downgrade -- an unnoticed downgrade turns a GPU benchmark into a CPU
+    benchmark with a GPU label on it, which is worse than a failure.
+    """
+    if requested == "cpu":
+        return "cpu"
+
+    import torch
+
+    available = torch.cuda.is_available()
+    if requested == "auto":
+        return "cuda" if available else "cpu"
+    if requested == "cuda" and not available:
+        raise RuntimeError("cuda requested but torch reports it is unavailable")
+    return requested
+
+
 class DepthEstimation:
     """Stateful monocular depth estimation (MiDaS-small).
-
-    Deliberately NOT registered in tower/experiments/__init__.py's
-    EXPERIMENTS dict -- that registry is for pure stateless functions.
-    This holds a loaded model across frames, so DepthEstimationModule
-    owns an instance directly instead.
 
     Output is relative (inverse) depth, not metric distance -- MiDaS-
     small does not produce metric output. result_label says "relative"
     explicitly; treat as model inference, not measurement, per
     07-PLATFORM-CONSTRAINTS.md Limitation 1 / Core Principle 2.
     """
+
+    name = "depth"
 
     def __init__(self, capture_depth_array: bool = False) -> None:
         self._model = None
@@ -38,7 +56,10 @@ class DepthEstimation:
         self.capture_depth_array = capture_depth_array
         self.last_depth_array = None
 
-    def load(self, device: str) -> None:
+    def load(self, settings: ExperimentSettings | None = None) -> None:
+        device = resolve_device(
+            "auto" if settings is None else settings.device
+        )
         import torch  # local import: torch is an optional [ml] extra;
         # nothing outside a depth-selected module may require it.
 
@@ -125,4 +146,10 @@ class DepthEstimation:
             result_label="mean_relative_depth",
             processing_ms=timer.total_ms,
             stage_ms=timer.snapshot(),
+            metrics={
+                "mean_relative_depth": mean_relative_depth,
+                "min_relative_depth": float(depth.min()),
+                "max_relative_depth": float(depth.max()),
+                "std_relative_depth": float(depth.std()),
+            },
         )

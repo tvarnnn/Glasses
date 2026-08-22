@@ -28,7 +28,66 @@ It must not bypass:
 - resource cleanup;
 - privacy/security rules.
 
-## Candidate Experiments
+## Registered Experiments (V1, 2026-08-22)
+
+What actually exists. Each names one **headline** measurement and may
+report others alongside it.
+
+| Experiment | Headline | Cost at 640x360 | State |
+|---|---|---|---|
+| `baseline` | `mean_intensity` | 1.0 ms | none |
+| `edge_detection` | `edge_density` | 1.5 ms | none |
+| `frame_quality` | `sharpness_laplacian_var` | 5.6 ms | none |
+| `feature_detection` | `keypoint_count` | 4.2 ms | none |
+| `redaction_impact` | `keypoint_retention` | 4.5 ms | none |
+| `optical_flow` | `median_flow_px` | 4.6 ms | previous frame |
+| `object_detection` | `detections` | 35.3 ms | model (`[ml]` extra) |
+| `depth` | `mean_relative_depth` | 26.0 ms | model (`[ml]` extra) |
+
+Costs are measured on this host with synthetic imagery
+(`scripts/cv_lab_benchmark.py`) — real for the code, not a statement
+about a real room. Selected with `TOWER_CV_EXPERIMENT`.
+
+**Every experiment must expose useful measurements.** An experiment whose
+result nobody can act on is not an experiment, and the headline exists to
+force the question: an experiment that cannot name its single most
+important number has not decided what it is measuring.
+
+## Result contract
+
+```python
+ExperimentResult(
+    result_value: float,        # the headline, mandatory
+    result_label: str,          # its name, mandatory
+    processing_ms: float,
+    stage_ms: dict[str, float],
+    mean_intensity: float | None = None,   # historical, V0.7-compatible
+    metrics: dict[str, float] = {},        # everything else
+)
+```
+
+`metrics` reaches a client on `frame_result`, and is **omitted entirely
+when empty** so a client that has never heard of it is unaffected. It is
+deliberately `name -> number`: a **measurement** channel, not a general
+result channel. Structured results (a detection list, a geometry delta)
+need the module-contract work that is blocked at V1.0/V1.1.
+
+## Experiment protocol
+
+An experiment is anything with `name`, `load(settings)`, `run(bytes)` and
+`release()`. The registry holds **factories**, not instances — building a
+detector at import time would load model weights in any process that
+imported the module.
+
+A stateless experiment is still just a function; `StatelessExperiment`
+adapts it. Before this existed, a stateful experiment cost a whole
+`Module` subclass, and there were two of them sharing one descriptor id.
+
+`release()` must free whatever `load()` allocated, must be safe to call
+twice, and must be safe after a partial load — it runs on the FAILED
+transition, which is reachable from anywhere.
+
+## Candidate Experiments (not yet built)
 
 Examples:
 
@@ -51,6 +110,17 @@ Examples:
 - a GPU-accelerated variant of an existing experiment, benchmarked against its CPU baseline (see GPU / Acceleration Benchmarking, below).
 
 The list is intentionally broad. Only one experiment needs to be active at a time.
+
+**Do not turn this into a random collection of models.** Each addition
+must answer a question another part of the platform actually has. Several
+of the items above were considered for V1 and deliberately left out:
+semantic and instance segmentation, tracking-by-detection, image
+retrieval and novelty detection all lack a consumer today. Face detection
+is not merely unbuilt but **BLOCKED**: this OpenCV 5 build has no
+`CascadeClassifier`, `FaceDetectorYN` ships no model, no cascade or ONNX
+file exists anywhere on disk, and there is no face imagery to validate
+against. `redaction_impact` measures the *consequence* of redaction
+without pretending to detect a face.
 
 ## Sensor Profile
 
@@ -136,9 +206,32 @@ For example, if relevance classification becomes essential across modules, it ma
 
 ## Persistence
 
-Store only experiment-specific datasets/results.
+**The Lab persists nothing.** Its descriptor declares
+`persists_data=False` and `retains_raw_imagery=False`, and the descriptor
+is what `06-PRIVACY-DATA.md` is enforced against — an experiment that
+quietly wrote to disk would make that declaration a lie. A test asserts
+that no experiment calls a write primitive.
+
+Measured results live in `guidelines/docs/reports/`. Recorded datasets
+live under the shared recorder's root. Neither belongs to an experiment.
 
 Do not read/write another module's private data without an explicit shared-data design.
+
+## Isolation from the cartridges
+
+The Lab must not import `tower.world_builder` or `tower.object_memory`,
+and a test enforces it in both directions.
+
+The reason is specific rather than tidiness: the Lab's job is to
+**measure** properties — blur rejection, feature yield, apparent motion —
+that World Builder also has private opinions about. Importing that
+opinion would mean restating a cartridge's answer instead of measuring
+the underlying property, and a threshold change on the cartridge side
+would silently move a measurement. It would also put a sandbox that may
+be thrown away upstream of a persistent world.
+
+The Lab may read a world for visualisation one day. Today it does not,
+and it must never write one.
 
 ## Failure Behavior
 

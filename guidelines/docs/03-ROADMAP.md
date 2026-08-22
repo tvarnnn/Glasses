@@ -147,6 +147,19 @@ Reports: `reports/2026-08-22-world-builder-v1-report.md`, `reports/2026-08-22-wo
 
 Exit criterion: **met** for the engine — a world survives a process restart and can be inspected cold, every claim is labelled synthetic, and the integration boundary is documented and tested.
 
+### V0.9.5 — Experimental CV Lab V1 (complete, synthetic-only)
+- A real measurement channel: `ExperimentResult.metrics` (`name -> number`), additive on the wire and omitted when empty. This is the type four other cartridges' "there is no non-scalar result channel" complaint traced back to; it is the Lab's own type, so the Lab fixed it.
+- One `Experiment` protocol (`load`/`run`/`release`) and a registry of factories, so a stateful experiment no longer costs a `Module` subclass. `tower/modules/depth_cv.py` was **deleted**: the refactor removed a class rather than adding one.
+- Five new experiments, each with a named headline and measured cost: `frame_quality`, `feature_detection`, `optical_flow`, `redaction_impact`, `object_detection`.
+- `scripts/cv_lab_benchmark.py` — every experiment at three resolutions, plus the sparse-versus-dense optical-flow A/B kept as the evidence that chose sparse.
+- Isolation asserted by test: no experiment may import a cartridge, and none may persist anything.
+
+Still **not** a second module: the Lab is the one registry slot it has always been. Nothing here crosses the V1.0 boundary.
+
+Report: `reports/2026-08-22-cv-lab-v1-report.md`.
+
+Exit criterion: **met** — every experiment exposes a measurement checked against independent truth, and every cost is measured rather than assumed.
+
 ### V1.0 — Generalize Module Registry (When Justified)
 - Triggered only once a second production module (a promoted Experimental CV Lab result, or another module such as Object Memory) creates real, concrete requirements.
 - Build dynamic module discovery, the module registry, and descriptor/sensor-profile negotiation generalized from actual usage rather than speculative design.

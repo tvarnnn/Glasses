@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from tower.capture import CaptureRecorder
 from tower.config import Settings, get_settings
+from tower.experiments import ExperimentSettings
 from tower.logging_config import configure_logging
 from tower.modules.base import Module
 from tower.modules.container import ModuleContainer
@@ -14,11 +15,18 @@ from tower.session import ConnectionTracker
 
 
 def _build_cv_module(settings: Settings) -> Module:
-    if settings.cv_experiment == "depth":
-        from tower.modules.depth_cv import DepthEstimationModule
+    """The one module slot.
 
-        return DepthEstimationModule(settings.cv_device)
-    return ExperimentalCVModule(settings.cv_experiment)
+    There used to be a branch here selecting a different Module subclass
+    for the depth experiment, because that experiment holds a model.
+    Experiment state now lives behind the Experiment protocol, so the
+    module is the same one whichever experiment is selected -- which is
+    what the module doc always said: one Lab slot, many experiments.
+    """
+    return ExperimentalCVModule(
+        settings.cv_experiment,
+        ExperimentSettings(device=settings.cv_device),
+    )
 
 
 def _build_frame_observers(settings: Settings) -> list:

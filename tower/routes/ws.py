@@ -105,6 +105,14 @@ async def _handle_frame_message(
     }
     if result.mean_intensity is not None:
         payload["mean_intensity"] = result.mean_intensity
+    # Additive, and omitted entirely when empty: a client that ignores
+    # this field is unaffected, and an experiment whose headline says
+    # everything does not pay for an empty object on every frame.
+    # Deliberately name -> number only. This is a MEASUREMENT channel,
+    # not the structured result channel -- that one needs the module
+    # contract work that is blocked.
+    if getattr(result, "metrics", None):
+        payload["metrics"] = dict(result.metrics)
 
     try:
         await websocket.send_json(payload)

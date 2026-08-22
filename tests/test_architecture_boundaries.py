@@ -94,3 +94,73 @@ def test_world_builder_is_not_registered_as_a_production_module():
 
     assert "world_builder" not in main
     assert not (TOWER / "modules" / "world_builder.py").exists()
+
+
+def test_the_experimental_cv_lab_does_not_import_a_cartridge():
+    """The Lab must not depend on World Builder or Object Memory.
+
+    Its job is to MEASURE things like blur rejection, feature yield and
+    parallax -- the same questions World Builder answers privately. If it
+    imported that answer it would be restating a cartridge's opinion
+    rather than measuring the underlying property, and a change on the
+    cartridge side would silently move a measurement.
+
+    It would also invert the dependency the platform is built on: a
+    sandbox may be thrown away, and nothing that can be thrown away should
+    be upstream of a persistent world.
+    """
+    offenders = []
+    paths = list((TOWER / "experiments").rglob("*.py"))
+    paths.append(TOWER / "modules" / "experimental_cv.py")
+    for path in paths:
+        if "__pycache__" in path.parts:
+            continue
+        for name in _imports(path):
+            if "world_builder" in name or "object_memory" in name:
+                offenders.append(f"{path} -> {name}")
+
+    assert offenders == []
+
+
+def test_no_experiment_persists_anything():
+    """The Lab's descriptor declares persists_data=False. Keep it true.
+
+    The descriptor is what `06-PRIVACY-DATA.md` is enforced against, so an
+    experiment that quietly wrote to disk would not merely be untidy -- it
+    would make the module's declared data behaviour a lie.
+
+    Dataset recording is not an exception to this: it belongs to the
+    SHARED recorder (`tower/capture.py`), armed by the transport, not to
+    an experiment.
+    """
+    forbidden = ("write_json_atomic", "append_jsonl", "WorldStore", "ObservationStore")
+    offenders = []
+    for path in (TOWER / "experiments").rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                target = node.func
+                called = getattr(target, "id", None) or getattr(target, "attr", None)
+                if called in forbidden or called in ("open",):
+                    offenders.append(f"{path.name} calls {called}()")
+
+    assert offenders == []
+
+
+def test_shared_code_does_not_import_an_experiment_implementation():
+    """`tower/routes` and `tower/frames.py` must stay experiment-agnostic.
+
+    The transport may know the SHAPE of a result; it must not know which
+    experiment produced it. A transport that special-cased `depth` would
+    make the next experiment a transport change.
+    """
+    offenders = []
+    for name in ("routes/ws.py", "routes/health.py", "frames.py", "metrics.py"):
+        for imported in _imports(TOWER / name):
+            if imported.startswith("tower.experiments."):
+                offenders.append(f"{name} -> {imported}")
+
+    assert offenders == []

@@ -40,9 +40,11 @@ and the test dependencies (pytest, httpx, websockets).
 
 ## Model-Backed Experiments (Optional)
 
-The `depth` experiment (`TOWER_CV_EXPERIMENT=depth`) requires the `ml`
-extra, which includes PyTorch, torchvision, and timm (needed by MiDaS's
-hubconf backbone chain).
+The `depth` and `object_detection` experiments require the `ml` extra,
+which includes PyTorch, torchvision, and timm (needed by MiDaS's hubconf
+backbone chain). `object_detection` additionally downloads ~13.4 MB of
+torchvision COCO weights on first run. Every other experiment needs only
+OpenCV and runs by default.
 
 **Install order matters here.** `pyproject.toml`'s `ml` extra declares an
 unconstrained `"torch"`/`"torchvision"` requirement (no CUDA-specific index
@@ -53,7 +55,7 @@ requirement, so a later `pip install -e ".[dev,ml]"` will **not**
 force-replace it, and even running the `--index-url` command below
 afterward can report "already satisfied" without actually giving you a CUDA
 build. The practical symptom: `TOWER_CV_DEVICE=cuda` fails with a
-`RuntimeError` from `_resolve_device()` (`tower/modules/depth_cv.py`)
+`RuntimeError` from `resolve_device()` (`tower/experiments/depth.py`)
 because CUDA isn't actually available to torch, and `TOWER_CV_DEVICE=auto`
 silently falls back to CPU with no error at all.
 
@@ -130,8 +132,9 @@ Configuration is read from environment variables (all optional):
 | `TOWER_HOST`       | `0.0.0.0` | Interface to bind to                       |
 | `TOWER_PORT`       | `8000`    | Port to listen on                          |
 | `TOWER_DEV_MODE`   | `true`    | Enables debug-level logging                |
-| `TOWER_CV_EXPERIMENT` | `baseline` | Active CV experiment (`baseline` or `edge_detection` or `depth`) |
+| `TOWER_CV_EXPERIMENT` | `baseline` | Active CV experiment: `baseline`, `edge_detection`, `frame_quality`, `feature_detection`, `optical_flow`, `redaction_impact`, `object_detection`, `depth` |
 | `TOWER_CV_DEVICE`   | `auto`    | Device for model-backed experiments (`auto`, `cpu`, or `cuda`) |
+| `TOWER_CAPTURE_ROOT` | *(unset)* | Arms the raw dataset recorder at this path. **Unset means no recording, ever.** Arming is not recording: nothing is written until a `stream_start` arrives, and `GET /health` reports the state |
 
 The server binds to `0.0.0.0` by default so it is reachable from other
 devices on the LAN, not just `localhost`.
@@ -468,23 +471,31 @@ tower/
   instrumentation.py      StageTimer: per-stage timing shared by
                           module experiments
   experiments/
-    __init__.py           Stateless EXPERIMENTS registry (baseline,
-                          edge_detection) + ExperimentResult
+    __init__.py           Experiment protocol, ExperimentResult (with
+                          the `metrics` measurement channel), and the
+                          EXPERIMENTS registry of factories
     baseline.py           Grayscale + mean-intensity OpenCV experiment
     edge_detection.py     Canny edge-detection OpenCV experiment
+    frame_quality.py      Sharpness, gradient energy, entropy, contrast,
+                          edge density, exposure clipping
+    feature_detection.py  ORB keypoint yield and spatial coverage
+    optical_flow.py       Sparse LK flow: magnitude, coherence,
+                          forward-backward error (holds one frame)
+    redaction_impact.py   What blurring a region costs downstream
+                          feature tracking
+    object_detection.py   torchvision SSDLite320 COCO detection
+                          (holds a model)
     depth.py              Stateful MiDaS-small monocular depth
-                          experiment (holds a loaded model; not in the
-                          stateless registry above)
+                          experiment (holds a loaded model)
   modules/
     base.py               Module ABC, lifecycle states,
                           FrameProcessingError/FrameSkippedError/
                           ModuleUnavailableError
     container.py          ModuleContainer: lifecycle orchestration for
                           the one active module slot
-    experimental_cv.py    Module wrapping the stateless EXPERIMENTS
-                          registry (baseline/edge_detection)
-    depth_cv.py           Module wrapping the stateful depth experiment
-                          (TOWER_CV_EXPERIMENT=depth)
+    experimental_cv.py    The one Lab module slot. Hosts ANY registered
+                          experiment, stateful or not -- there is no
+                          longer a second Module class for depth
   routes/
     health.py             GET /health
     ws.py                 WebSocket /ws (ping/pong, frame receive +
@@ -543,8 +554,14 @@ tests/
   test_module_container_wiring.py
   test_main_module_factory.py
   test_experimental_cv_module.py
-  test_depth_cv_module.py
+  test_experimental_cv_stateful.py      the Lab module hosting a stateful
+                                        experiment
+  test_experiments_measure_truth.py     each measurement checked against
+                                        independent truth
+  test_ws_metrics_channel.py            the additive `metrics` wire field
+  test_cv_lab_benchmark_cli.py
   test_depth_experiment_integration.py  (opt-in, real model — see below)
+  test_object_detection_integration.py  (opt-in, real model)
   test_soak_script_cli.py
   test_depth_benchmark_cli.py
   test_ws_malformed_message.py
