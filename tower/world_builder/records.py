@@ -327,6 +327,15 @@ class Session:
     # the posture travels with the data.
     retains_raw_imagery: bool = True
     privacy_tags: tuple[str, ...] = ("raw-imagery", "first-person")
+    # What, if anything, was removed from the imagery before it was
+    # written. "none" is the honest V1 value: no redaction is implemented.
+    #
+    # This field exists now because it is the one genuinely
+    # un-retrofittable part of any future redaction work. Without it, the
+    # day redaction ships there is no way to tell whether an older
+    # session's images were filtered, so every historical session must be
+    # assumed unredacted forever. One string now avoids that permanently.
+    redaction: str = "none"
 
     def to_json_dict(self) -> dict:
         return {
@@ -351,6 +360,7 @@ class Session:
             "rejected_by_reason": dict(self.rejected_by_reason),
             "retains_raw_imagery": self.retains_raw_imagery,
             "privacy_tags": list(self.privacy_tags),
+            "redaction": self.redaction,
         }
 
 
@@ -377,6 +387,7 @@ def session_from_json_dict(data: dict) -> Session:
         rejected_by_reason=dict(data["rejected_by_reason"]),
         retains_raw_imagery=data["retains_raw_imagery"],
         privacy_tags=tuple(data["privacy_tags"]),
+        redaction=data["redaction"],
     )
 
 

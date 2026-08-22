@@ -435,3 +435,134 @@ class TestBackendIsolation:
                         offenders.append(f"{path.name} -> {name}")
 
         assert offenders == []
+
+
+class TestMultiFrameTrajectory:
+    """Regression cover for a fabricated-trajectory bug.
+
+    An earlier backend chained independent two-view solutions. Every
+    recoverPose translation is unit-length, so the resulting path had a
+    constant step length regardless of how far the camera actually
+    travelled -- a confident, smooth, entirely invented trajectory. No
+    test caught it because every test used exactly two keyframes.
+
+    These use FOUR keyframes with deliberately UNEQUAL spacing, which is
+    the only shape that can distinguish real scale propagation from
+    normalisation.
+    """
+
+    def _unequal_walk(self):
+        return [
+            ss.look_at((0.00, -1.6, 0.6), (0.00, -1.6, 1.6)),
+            ss.look_at((0.30, -1.6, 0.6), (0.30, -1.6, 1.6)),
+            ss.look_at((0.90, -1.6, 0.6), (0.90, -1.6, 1.6)),
+            ss.look_at((1.20, -1.6, 0.6), (1.20, -1.6, 1.6)),
+        ]
+
+    def _centres(self, estimate):
+        """Camera centres in the anchor frame: C = -R.T @ t."""
+        centres = [np.zeros(3)]
+        for pose in estimate.poses[1:]:
+            if pose.rotation is None or pose.translation is None:
+                return None
+            centres.append((-pose.rotation.T @ pose.translation).ravel())
+        return np.asarray(centres)
+
+    def test_unequal_steps_are_not_normalised_to_equal_length(
+        self, scene, camera_matrix, intrinsics
+    ):
+        """The bug this exists to catch, stated directly.
+
+        True spacing is 0.30 / 0.60 / 0.30, so the middle step is twice
+        the others. A chain of normalised two-view translations reports
+        1 / 1 / 1.
+        """
+        poses = self._unequal_walk()
+        estimate = _solve(scene, camera_matrix, intrinsics, poses)
+        centres = self._centres(estimate)
+        assert centres is not None
+
+        steps = np.linalg.norm(np.diff(centres, axis=0), axis=1)
+        ratios = steps / steps[0]
+
+        assert ratios[1] > 1.4, f"middle step not recovered as longer: {ratios}"
+        assert ratios[2] < 1.4, f"final step not recovered as shorter: {ratios}"
+
+    def test_every_pose_is_expressed_in_the_anchor_frame(
+        self, scene, camera_matrix, intrinsics
+    ):
+        """Poses must be anchor-relative, not predecessor-relative.
+
+        Predecessor-relative poses are each individually correct and
+        collectively meaningless, because their translations carry no
+        common scale.
+        """
+        poses = self._unequal_walk()
+        estimate = _solve(scene, camera_matrix, intrinsics, poses)
+        centres = self._centres(estimate)
+        assert centres is not None
+
+        # Monotonic travel away from the anchor, since the walk is one way.
+        distances = np.linalg.norm(centres, axis=1)
+        assert np.all(np.diff(distances) > 0)
+
+    def test_trajectory_matches_truth_after_similarity_alignment(
+        self, scene, camera_matrix, intrinsics
+    ):
+        """Drift measured against ground truth -- the BA trigger metric.
+
+        Monocular reconstruction is correct only up to a similarity, so
+        the comparison aligns first. Measured residual at the time of
+        writing: 1.32% of path length over a 1.2 m walk, with the 2x step
+        recovered as 1.79x rather than 2.00x. That error is real and is
+        exactly what bundle adjustment would reduce; the bound here is
+        deliberately loose so it documents current behaviour rather than
+        freezing it.
+        """
+        poses = self._unequal_walk()
+        estimate = _solve(scene, camera_matrix, intrinsics, poses)
+        centres = self._centres(estimate)
+        assert centres is not None
+
+        truth = np.asarray([pose.position for pose in poses])
+        scale, rotation, translation = ss.umeyama_similarity(centres, truth)
+        aligned = (scale * (rotation @ centres.T).T) + translation
+
+        residual = np.linalg.norm(aligned - truth, axis=1)
+        path_length = float(
+            np.linalg.norm(np.diff(truth, axis=0), axis=1).sum()
+        )
+
+        assert residual.max() / path_length < 0.10
+
+    def test_a_long_window_produces_points_in_one_frame(
+        self, scene, camera_matrix, intrinsics
+    ):
+        """Points from every pair must share the anchor frame.
+
+        Concatenating per-pair triangulations, each in its own camera's
+        frame at its own arbitrary unit, produces a cloud that looks
+        populated and means nothing.
+        """
+        estimate = _solve(
+            scene, camera_matrix, intrinsics, self._unequal_walk()
+        )
+
+        assert estimate.points is not None
+        assert len(estimate.points) > 200
+        # A single coherent frame keeps the cloud in front of the anchor
+        # camera; mixed frames scatter points behind it.
+        in_front = (estimate.points.xyz[:, 2] > 0).mean()
+        assert in_front > 0.9
+
+    def test_a_window_that_cannot_initialise_reports_all_unavailable(
+        self, scene, camera_matrix, intrinsics
+    ):
+        """A chain that never starts must not silently report later poses."""
+        poses = ss.pure_rotation(4, degrees_per_step=2.0)
+        estimate = _solve(scene, camera_matrix, intrinsics, poses)
+
+        assert estimate.poses[0].status == POSE_STATUS_ANCHOR
+        for pose in estimate.poses[1:]:
+            assert pose.status != POSE_STATUS_SOLVED
+            assert pose.translation is None

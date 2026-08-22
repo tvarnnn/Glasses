@@ -78,6 +78,28 @@ def match_descriptors(
     return points_a, points_b
 
 
+def match_indices(
+    descriptors_a, descriptors_b, ratio: float = LOWE_RATIO
+) -> list[tuple[int, int]]:
+    """Ratio-test matches as INDEX pairs rather than coordinates.
+
+    Incremental SfM needs feature identity, not just position: a landmark
+    triangulated from frames (i-1, i) can only be reused to solve frame
+    i+1 by PnP if we can say which feature in frame i it belongs to.
+    Returning coordinates throws that identity away.
+    """
+    if descriptors_a is None or descriptors_b is None:
+        return []
+    if len(descriptors_a) < 2 or len(descriptors_b) < 2:
+        return []
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    return [
+        (pair[0].queryIdx, pair[0].trainIdx)
+        for pair in matcher.knnMatch(descriptors_a, descriptors_b, k=2)
+        if len(pair) == 2 and pair[0].distance < ratio * pair[1].distance
+    ]
+
+
 def homography_ratio(points_a: np.ndarray, points_b: np.ndarray) -> float | None:
     """ORB-SLAM's r_H = H_inliers / (H_inliers + F_inliers).
 
@@ -174,7 +196,8 @@ def triangulate_points(
     rotation: np.ndarray,
     translation: np.ndarray,
     camera_matrix: np.ndarray,
-) -> np.ndarray:
+    return_mask: bool = False,
+):
     """Triangulate into the FIRST camera's frame, dropping bad points.
 
     Points behind either camera, or non-finite, are removed rather than
@@ -193,4 +216,6 @@ def triangulate_points(
     xyz_b = (rotation @ xyz.T).T + translation.reshape(3)
     in_front_b = xyz_b[:, 2] > 0
     keep = np.isfinite(xyz).all(axis=1) & in_front_a & in_front_b
+    if return_mask:
+        return xyz[keep], keep
     return xyz[keep]

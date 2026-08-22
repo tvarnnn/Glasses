@@ -313,6 +313,16 @@ class WorldStore:
         raw_records, _ = read_raw_jsonl(self.edges_path(world_id, session_id))
         return _parse_all(raw_records, keyframe_edge_from_json_dict, "edge")
 
+    def append_event(self, world_id: str, session_id: str, event) -> None:
+        with self._lock:
+            append_jsonl(
+                self.events_path(world_id, session_id), event.to_json_dict()
+            )
+
+    def read_events(self, world_id: str, session_id: str) -> list[dict]:
+        raw_records, _ = read_raw_jsonl(self.events_path(world_id, session_id))
+        return raw_records
+
     # -- images --------------------------------------------------------
 
     def write_keyframe_image(
@@ -368,6 +378,39 @@ class WorldStore:
             logger.warning("world builder: derived manifest unreadable at %s", path)
             return None
         return data
+
+    def write_derived(
+        self, world_id: str, session_id: str, *, poses, points, manifest
+    ) -> None:
+        """Write the rebuildable reconstruction outputs.
+
+        Poses and points are JSON rather than .npy: at V1 scale a session
+        is hundreds of poses and low tens of thousands of points, JSON
+        round-trips exactly without a dtype contract to get wrong, and it
+        stays inspectable by eye. The trigger to switch to .npy is a world
+        large enough that a viewer needs partial or memory-mapped reads --
+        the same "small enough that rewriting wholesale is fine" reasoning
+        object memory's store already documents for itself.
+        """
+        derived = self.derived_dir(world_id) / session_id
+        write_json_atomic(derived / "poses.json", {"poses": poses})
+        write_json_atomic(derived / "points.json", {"points": points})
+        self.write_derived_manifest(world_id, manifest)
+
+    def read_derived(self, world_id: str, session_id: str) -> dict | None:
+        derived = self.derived_dir(world_id) / session_id
+        poses_path = derived / "poses.json"
+        points_path = derived / "points.json"
+        if not poses_path.exists() or not points_path.exists():
+            return None
+        try:
+            return {
+                "poses": read_json_closed(poses_path)["poses"],
+                "points": read_json_closed(points_path)["points"],
+            }
+        except (json.JSONDecodeError, KeyError):
+            logger.warning("world builder: derived output unreadable for %s", world_id)
+            return None
 
     def derived_is_current(self, world_id: str, input_digest: str) -> bool:
         manifest = self.read_derived_manifest(world_id)
