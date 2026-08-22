@@ -141,15 +141,13 @@ pose to anchor to, so none is invented.
 |---|---|---|
 | `left_of` / `right_of` | Centroid x, with a minimum separation so a one-pixel difference asserts nothing | MEDIUM |
 | `higher_in_view` | Centroid y. Named for the **image**, not the room | LOW |
-| `nearer_than_same_class` | Box area, within one class, at ≥1.5× | LOW |
+
+A third, `nearer_than_same_class`, **shipped and was then withdrawn** —
+see §8.6.
 
 `higher_in_view` is not called `above` on purpose: something further away
 sits higher in the frame without being higher in the room, and the name
 is the only thing stopping a consumer reading it as a world relation.
-
-`nearer_than_same_class` carries its caveat **in its name** for the same
-reason. Across classes a size comparison is meaningless — a laptop is not
-further away than a sofa for being smaller.
 
 **Refused, each with what would settle it:**
 
@@ -221,3 +219,143 @@ test pins it so that stops being an assumption if it ever changes.
 - **Greedy IoU association.** A Kalman filter or Hungarian assignment
   would both be defensible; neither is justified without a measurement
   showing greedy failing.
+
+
+---
+
+## 8. Adversarial review — findings and fixes
+
+A reviewer was told to break it, with the tracker named as the priority
+because counting is this cartridge's one stated correctness requirement.
+Six blockers and three majors. **Two of them had already been found and
+fixed here** before the report arrived — the per-track estimate age and
+the unknown-frame-size guard — which is corroboration rather than
+duplication. The rest were new, and every one produced a *wrong answer*
+rather than a crash.
+
+The review also diagnosed why the original 80-test suite missed all of
+them, and that diagnosis is worth more than any individual fix:
+**every existing tracking test used widely separated, non-competing
+boxes.** No test ever gave two tracks a shared candidate detection, so
+nothing exercised association at all.
+
+### 8.1 BLOCKER — a flicker became a permanent person
+
+`Track.hits` was a lifetime total. A detection appearing **once every six
+frames** — a reflection, a TV showing a person, a poster glimpsed in
+passing — accumulated three lifetime hits, confirmed, and then stayed
+confirmed for the rest of the session, having never been seen twice in a
+row. Measured: present in 7 of 40 frames (18%), permanently counted.
+
+**Fixed** with a consecutive-hit `streak` and a **latched** confirmation.
+Latching matters as much as the streak: a track that has earned
+confirmation must keep it through a dropout, or the count flickers
+exactly as it would from raw detections. A test pins both directions.
+
+### 8.2 BLOCKER — greedy association starved a real track
+
+Given `IoU(T1,D1)=1.00`, `IoU(T1,D2)=0.67`, `IoU(T2,D1)=0.25`,
+`IoU(T2,D2)=0.11`, a complete matching exists — and greedy takes
+`T1←D1` because it is the single highest pair, stealing T2's only
+qualifying detection.
+
+With `min_hits=1` that inflates the count to 3. With the default
+`min_hits=3` the count still reads 2, **which is worse**: the real second
+person starves across frames and is dropped while a phantom track
+confirms in their place, invisibly.
+
+**Fixed** by replacing greedy with a **maximum-cardinality matching**
+(augmenting paths, candidates ordered by descending IoU, tracks with
+fewest options first). Deliberately not `scipy.optimize.linear_sum_assignment`,
+which would be one line: scipy arrived on this host as an *OCR*
+dependency, and this cartridge must not acquire it by accident.
+
+### 8.3 BLOCKER — identity through a crossing followed detector output order
+
+Two people cross; at the crossing frame their boxes coincide and all four
+IoUs tie exactly. Which walker kept track id 1 afterwards was decided by
+which detection the detector happened to list first — and torchvision
+guarantees no ordering.
+
+**Partly fixed, partly accepted and documented.** The matching is now
+deterministic and globally consistent. But **identity through a symmetric
+crossing is not preserved and cannot be**: nothing in a box tells you
+which person continued which way. A motion model would help and is not
+justified yet — and for this cartridge losing identity through a crossing
+is a small cost, because it must never *have* identity.
+
+### 8.4 BLOCKER — one person's orientation was reported as another's
+
+A track id could be reused across a short occlusion for a **different
+physical person**, and the old person's facing estimate went with it.
+Measured: Person 2 reported as "facing toward the wearer" on evidence
+collected from Person 1 up to six seconds earlier, on a different body.
+
+**Fixed:** re-matching a track after any miss clears its facing estimate.
+Whatever was behind that gap, this box is no longer evidence for what was
+measured before it. Continuous tracking keeps its estimate; a test pins
+both.
+
+### 8.5 BLOCKER — "configured" was mistaken for "measured"
+
+`orientation_enabled` meant only that an object had been passed to the
+constructor. A pose model that raised on **every** call — bad weights, an
+incompatible torch build — still produced `answered: True, value: 0`,
+with `oldest_estimate_seconds: 0.0` reading as corroborating freshness.
+
+That is the observation-gap trap the refusal exists to prevent, recreated
+one layer down, and worse there because everything about the answer looks
+healthy.
+
+**Fixed:** orientation counts as enabled only once it has produced at
+least one real estimate. `oldest_estimate_seconds` is now `None` when
+nothing has one, instead of folding "no estimate" into "zero seconds
+old".
+
+### 8.6 MAJOR — a relationship shipped, then was withdrawn
+
+`nearer_than_same_class` inferred relative distance from box area within
+one class. The reviewer produced a counterexample: **two chairs at the
+same distance**, one face-on (60000 px) and one edge-on (24000 px), give
+a 2.5× ratio against a 1.5× threshold — a **wrong** relation asserted,
+not a weak one.
+
+Nothing in a 2-D box separates shape from distance. An aspect-ratio gate
+would reduce the error rate without eliminating it, and this cartridge's
+own bar is that a wrong relationship is worse than a missing one.
+
+**Withdrawn**, and moved to the refusal registry with the counterexample
+recorded, so it is not re-invented by the next person who thinks of it.
+Depth would settle it — and depth is what the other refusals are already
+waiting for.
+
+### 8.7 MAJOR — a backward clock extended an estimate's life
+
+`Track.age_seconds` clamped at zero; `FacingEstimate`'s age did not. A
+backward NTP step produced a **negative** age, which quietly pushed the
+expiry deadline further into the future — the one direction it must never
+move. Same module, same concept, inconsistent defensiveness. Clamped.
+
+### 8.8 Test-enforcement gaps, closed
+
+- `test_scene_understanding_persists_nothing` named only the project's
+  own write helpers, so `Path.write_text`, `cv2.imwrite`, `np.save` and
+  `pickle.dump` would all have slipped through. Nothing calls them today;
+  the enforcement should not depend on that continuing by luck.
+- The banned-vocabulary test matched string constants **exactly**, so a
+  banned word inside a longer string — a JSON key, a rendered answer —
+  was invisible. It now matches substrings and inspects f-string
+  literals.
+
+### 8.9 Attacks that were cleared
+
+Verified with runnable probes, not by reading: track ids cannot collide
+or overflow; the track list is self-pruning and bounded, not unbounded
+over a session; degenerate and inverted boxes produce neither a crash nor
+a wrong relation; no path manufactures NaN or Infinity from well-formed
+input; `left_of`/`right_of` are mutually exclusive per pair and
+transitive; **nothing under `tower/scene/` writes to disk**; counts touch
+only confirmed tracks on every path; orientation confidence never reaches
+HIGH on any of the nine visibility branches; refused relationship names
+never intersect the asserted set; and 50 tracks produce 780 relations in
+1.5 ms — O(n²), and irrelevant at realistic scene sizes.

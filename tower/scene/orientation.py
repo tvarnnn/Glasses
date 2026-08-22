@@ -146,9 +146,15 @@ def age_estimate(estimate: FacingEstimate, seconds: float) -> FacingEstimate:
     An expired estimate becomes UNKNOWN rather than being deleted, so the
     consumer sees "we do not know" instead of a missing field it might
     read as "not facing".
+
+    Clamped at zero, matching `Track.age_seconds`. Timestamps come from
+    the capture journal and are wall clock: a backward NTP step produced a
+    NEGATIVE age, which quietly pushed the expiry deadline further into
+    the future -- the one direction it must never move.
     """
     from dataclasses import replace
 
+    seconds = max(seconds, 0.0)
     if seconds > MAX_ESTIMATE_AGE_S:
         return FacingEstimate(
             state=FACING_UNKNOWN,

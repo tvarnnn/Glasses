@@ -297,6 +297,11 @@ def test_scene_understanding_persists_nothing():
     retention and purge surface for no gain. There is no store here, and
     there must not become one by accident.
     """
+    # An adversarial review pointed out that an earlier version of this
+    # list only named the project's OWN write helpers, so
+    # `Path.write_text`, `cv2.imwrite`, `np.save` or `pickle.dump` would
+    # all have slipped through. Nothing here calls them today; the
+    # enforcement should not depend on that continuing by luck.
     forbidden = (
         "write_json_atomic",
         "append_jsonl",
@@ -304,6 +309,17 @@ def test_scene_understanding_persists_nothing():
         "ObservationStore",
         "DocumentStore",
         "open",
+        "write_text",
+        "write_bytes",
+        "imwrite",
+        "save",
+        "savez",
+        "savetxt",
+        "dump",
+        "to_csv",
+        "mkdir",
+        "makedirs",
+        "touch",
     )
     offenders = []
     for path in (TOWER / "scene").rglob("*.py"):
@@ -356,8 +372,6 @@ def test_no_cartridge_claims_gaze_or_persistent_identity():
             if "__pycache__" in path.parts:
                 continue
             source = path.read_text(encoding="utf-8")
-            # Strip comments and docstrings crudely: the ban is on
-            # identifiers a consumer sees, not on prose explaining it.
             tree = ast.parse(source)
             names = set()
             for node in ast.walk(tree):
@@ -370,8 +384,27 @@ def test_no_cartridge_claims_gaze_or_persistent_identity():
                 elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
                     names.add(node.name)
                 elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-                    if node.value in banned:
-                        names.add(node.value)
+                    # ANY string containing a banned word, not only one
+                    # equal to it. A JSON key or a rendered answer reaches
+                    # a consumer just as an identifier does, and a review
+                    # pointed out that exact-match let a substring through.
+                    for word in banned:
+                        if word in node.value:
+                            names.add(word)
+                elif isinstance(node, ast.JoinedStr):
+                    # An f-string can assemble a banned word from parts.
+                    # Its literal segments are Constants handled above;
+                    # this catches the whole rendered shape where it is
+                    # statically visible.
+                    literal = "".join(
+                        piece.value
+                        for piece in node.values
+                        if isinstance(piece, ast.Constant)
+                        and isinstance(piece.value, str)
+                    )
+                    for word in banned:
+                        if word in literal:
+                            names.add(word)
             for word in banned:
                 if word in names:
                     offenders.append(f"{path} uses {word!r}")

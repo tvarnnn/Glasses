@@ -23,7 +23,6 @@ from tower.confidence import Confidence
 from tower.scene.records import (
     REL_HIGHER_IN_VIEW,
     REL_LEFT_OF,
-    REL_NEARER_SAME_CLASS,
     REL_RIGHT_OF,
     Relation,
     Track,
@@ -35,10 +34,6 @@ from tower.scene.records import (
 # as one across the whole view.
 MIN_HORIZONTAL_SEPARATION_FRACTION = 0.08
 MIN_VERTICAL_SEPARATION_FRACTION = 0.08
-
-# Same-class size ratio before "nearer" is asserted. A 20% difference is
-# noise in a detector's box; a 50% difference is a real size gap.
-MIN_NEARER_AREA_RATIO = 1.5
 
 # Relationships this cartridge will NOT assert, and what each would need.
 # Kept as data rather than prose so a query layer can answer "why not"
@@ -63,6 +58,17 @@ REFUSED_RELATIONSHIPS = {
         "image proximity is not world proximity. Two things at opposite "
         "ends of a room can be adjacent in a frame, and two things a metre "
         "apart can be at opposite edges of one."
+    ),
+    "nearer_than_same_class": (
+        "SHIPPED, THEN WITHDRAWN. Box area within one class looked like "
+        "safe evidence for relative distance, and an adversarial review "
+        "produced a counterexample: two chairs at the SAME distance, one "
+        "face-on (60000 px area) and one edge-on (24000), give a ratio of "
+        "2.5 against a 1.5 threshold -- a WRONG relation asserted, not a "
+        "weak one. Nothing in a 2-D box separates shape from distance, and "
+        "this cartridge's own rule is that a wrong relationship is worse "
+        "than a missing one. Depth would settle it, and depth is what the "
+        "entries above are already waiting for."
     ),
 }
 
@@ -229,24 +235,4 @@ def relate(tracks, frame_width: int, frame_height: int) -> list[Relation]:
                     )
                 )
 
-            if subject.label == other.label:
-                # Same class only. Across classes a size comparison is
-                # meaningless: a laptop is not further away than a sofa
-                # for being smaller.
-                bigger, smaller = (
-                    (subject, other)
-                    if subject.box.area >= other.box.area
-                    else (other, subject)
-                )
-                if smaller.box.area > 0:
-                    ratio = bigger.box.area / smaller.box.area
-                    if ratio >= MIN_NEARER_AREA_RATIO:
-                        relations.append(
-                            Relation(
-                                bigger.track_id,
-                                REL_NEARER_SAME_CLASS,
-                                smaller.track_id,
-                                confidence=Confidence.LOW,
-                            )
-                        )
     return relations

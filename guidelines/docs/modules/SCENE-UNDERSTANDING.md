@@ -131,7 +131,6 @@ to anchor to. No world ids are invented.
 |---|---|
 | `left_of` / `right_of` | Box centroid x, with a minimum separation so a one-pixel difference asserts nothing |
 | `higher_in_view` | Box centroid y. Named for the **image**, not the room: something further away sits higher in frame without being higher in the room |
-| `nearer_than_same_class` | Box area, **within one class only**, at a ≥1.5× ratio |
 
 **Refused, each with the evidence it would need:**
 
@@ -141,6 +140,7 @@ to anchor to. No world ids are invented.
 | `on` | Needs support-surface reasoning and depth. Box containment is not it — a laptop *in front of* a desk overlaps its box identically to one *on* it |
 | `inside` | Same: 2-D containment cannot distinguish it |
 | `near` | Image proximity is not world proximity. Two things at opposite ends of a room can be adjacent in a frame |
+| `nearer_than_same_class` | **Shipped, then withdrawn.** Box area within one class looked like safe evidence for relative distance; an adversarial review produced two chairs at the *same* distance, one face-on and one edge-on, whose areas differ 2.5x — a wrong relation, not a weak one. Nothing in a 2-D box separates shape from distance |
 
 `why_not(relationship)` returns those reasons, so the next cartridge does
 not re-derive them from scratch. **A relationship nobody can support is

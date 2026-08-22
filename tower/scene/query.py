@@ -133,9 +133,11 @@ class SceneQuery:
                 question="how many people appear to be facing my direction",
                 answered=False,
                 reason=(
-                    "orientation estimation is disabled, so this was never "
-                    "measured. Reporting 0 would be an observation gap "
-                    "presented as an observation of absence"
+                    "orientation has never produced an estimate -- either "
+                    "it is disabled, or the pose model has not once "
+                    "succeeded -- so this was never measured. Reporting 0 "
+                    "would be an observation gap presented as an "
+                    "observation of absence"
                 ),
                 detail={
                     "people_in_view": self._state.count("person"),
@@ -162,10 +164,14 @@ class SceneQuery:
             detail={
                 "people_in_view": len(people),
                 "orientation_unknown": len(unknown),
+                # None when nothing has an estimate. `or 0.0` folded
+                # "no estimate exists" into "zero seconds old", which read
+                # as corroborating freshness that was never measured.
                 "oldest_estimate_seconds": max(
                     (
-                        track.facing.age_seconds or 0.0
+                        track.facing.age_seconds
                         for track in people
+                        if track.facing.age_seconds is not None
                     ),
                     default=None,
                 ),

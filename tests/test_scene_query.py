@@ -170,22 +170,74 @@ class TestHowManyAreFacingMe:
 
     def test_the_answer_denies_being_gaze(self):
         """The camera cannot see attention, and the answer must say so."""
-        pose = FixedPoseEstimator([[]])
+        facing = {"nose": 9.0, "left_eye": 8.0, "right_eye": 8.0, "left_ear": 6.0}
+        pose = FixedPoseEstimator([[(BoundingBox(60, 80, 160, 300), facing)]])
 
         _, state = _run(TWO_PEOPLE_AND_A_CHAIR, pose=pose)
         answer = SceneQuery(state).facing_wearer()
 
+        assert answer.answered is True
         assert "NOT gaze" in answer.reason
 
     def test_people_whose_orientation_is_unknown_are_reported_as_such(self):
-        """Not silently counted as "not facing"."""
-        pose = FixedPoseEstimator([[]])
+        """Not silently counted as "not facing".
+
+        One of the two people is estimated; the other is never found by
+        the pose model. The second must be reported as UNKNOWN, not
+        quietly folded into "not facing".
+        """
+        facing = {"nose": 9.0, "left_eye": 8.0, "right_eye": 8.0, "left_ear": 6.0}
+        pose = FixedPoseEstimator([[(BoundingBox(60, 80, 160, 300), facing)]])
 
         _, state = _run(TWO_PEOPLE_AND_A_CHAIR, pose=pose)
         answer = SceneQuery(state).facing_wearer()
 
-        assert answer.detail["orientation_unknown"] == 2
-        assert answer.value == 0
+        assert answer.value == 1
+        assert answer.detail["orientation_unknown"] == 1
+
+    def test_a_pose_model_that_never_succeeds_is_a_refusal_not_a_zero(self):
+        """"Configured" is not "measured", and the difference is the trap.
+
+        A pose model with bad weights or an incompatible torch build
+        raises on every call. Reporting `answered: True, value: 0` for
+        that is the same observation-gap error the refusal exists to
+        prevent, one layer further down -- and it is worse there, because
+        everything about the answer looks healthy.
+        """
+
+        class _AlwaysFails:
+            name = "always-fails"
+
+            def load(self):
+                return None
+
+            def estimate(self, frame_bgr):
+                raise RuntimeError("bad weights")
+
+            def release(self):
+                return None
+
+        _, state = _run(TWO_PEOPLE_AND_A_CHAIR, pose=_AlwaysFails())
+        answer = SceneQuery(state).facing_wearer()
+
+        assert answer.answered is False
+        assert answer.value is None
+        assert "has not once succeeded" in answer.reason
+
+    def test_the_oldest_estimate_is_none_rather_than_zero_when_absent(self):
+        """`or 0.0` folded "no estimate" into "zero seconds old", which
+        read as corroborating a freshness nobody measured."""
+        facing = {"nose": 9.0, "left_eye": 8.0, "right_eye": 8.0, "left_ear": 6.0}
+        pose = FixedPoseEstimator([[(BoundingBox(60, 80, 160, 300), facing)]])
+
+        _, state = _run(TWO_PEOPLE_AND_A_CHAIR, pose=pose)
+        detail = SceneQuery(state).facing_wearer().detail
+
+        oldest = detail["oldest_estimate_seconds"]
+        assert oldest is not None and oldest >= 0.0
+        assert detail["states"][2]["age_seconds"] is None, (
+            "the unestimated person must report no age, not zero"
+        )
 
 
 class TestRelationships:
@@ -234,39 +286,40 @@ class TestRelationships:
         )
         assert not any(entry["relationship"] == "above" for entry in relations)
 
-    def test_nearer_is_only_asserted_within_a_class(self):
-        """A laptop is not further away than a sofa for being smaller."""
-        _, state = _run(
-            [
-                _det("laptop", (100, 100, 140, 130)),
-                _det("couch", (300, 100, 600, 340)),
-            ]
-        )
+    def test_relative_distance_is_never_asserted_from_box_size(self):
+        """SHIPPED, THEN WITHDRAWN, and the counterexample is why.
+
+        Box area within one class looked like safe evidence for relative
+        distance. An adversarial review produced two chairs at the SAME
+        distance -- one face-on, one edge-on -- whose areas differ 2.5x,
+        which the rule asserted as "nearer". That is a WRONG relation, not
+        a weak one, and this cartridge's own bar is that a wrong
+        relationship is worse than a missing one.
+        """
+        face_on = _det("chair", (100, 100, 400, 300))  # 300 x 200 = 60000
+        edge_on = _det("chair", (500, 100, 620, 300))  # 120 x 200 = 24000
+        assert (
+            (400 - 100) * (300 - 100) / ((620 - 500) * (300 - 100))
+        ) == 2.5, "the counterexample must actually have a 2.5x area ratio"
+
+        _, state = _run([face_on, edge_on])
 
         relations = SceneQuery(state).relationships().value
-
         assert not any(
-            entry["relationship"] == "nearer_than_same_class" for entry in relations
-        )
-
-    def test_a_much_bigger_box_of_the_same_class_is_nearer(self):
-        _, state = _run(
-            [
-                _det("chair", (20, 100, 220, 340)),
-                _det("chair", (400, 200, 460, 260)),
-            ]
-        )
-
-        relations = SceneQuery(state).relationships().value
-        nearer = [
-            entry
+            entry["relationship"] == "nearer_than_same_class"
             for entry in relations
-            if entry["relationship"] == "nearer_than_same_class"
-        ]
+        )
 
-        assert len(nearer) == 1
-        assert nearer[0]["subject_track_id"] == 1
-        assert nearer[0]["confidence"] == Confidence.LOW.value
+    def test_the_withdrawal_is_recorded_with_its_counterexample(self):
+        """A withdrawn feature must leave its reasoning behind, or it gets
+        re-invented by the next person who thinks of it."""
+        _, state = _run(TWO_PEOPLE_AND_A_CHAIR)
+
+        answer = SceneQuery(state).why_not("nearer_than_same_class")
+
+        assert answer.answered is True
+        assert "WITHDRAWN" in answer.value
+        assert "face-on" in answer.value
 
     def test_every_relation_declares_it_is_camera_relative(self):
         _, state = _run(TWO_PEOPLE_AND_A_CHAIR)

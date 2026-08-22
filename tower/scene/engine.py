@@ -56,6 +56,13 @@ class SceneEngine:
         self._orientation_interval = orientation_interval_s
         self._score_threshold = score_threshold
         self._last_orientation_at: float | None = None
+        # Whether orientation has ever produced a real estimate, as
+        # opposed to merely being configured. A pose model that raises on
+        # every call -- bad weights, an incompatible torch build -- used
+        # to leave `orientation_enabled` True and the query layer
+        # answering a confident 0, which is the same observation-gap trap
+        # the refusal exists to prevent, one layer further down.
+        self._orientation_succeeded = False
         self._frames_observed = 0
         self._frame_size = (0, 0)
         self._loaded = False
@@ -66,6 +73,15 @@ class SceneEngine:
 
     @property
     def orientation_enabled(self) -> bool:
+        """Configured AND has actually produced an estimate.
+
+        "An object was passed to the constructor" is not evidence that
+        anyone's orientation was ever measured.
+        """
+        return self._pose is not None and self._orientation_succeeded
+
+    @property
+    def orientation_configured(self) -> bool:
         return self._pose is not None
 
     def load(self) -> None:
@@ -183,6 +199,7 @@ class SceneEngine:
             estimate = facing_from_keypoints(keypoint_scores)
             best.facing = age_estimate(estimate, 0.0)
             best.facing_estimated_at = at
+            self._orientation_succeeded = True
 
     def _age_orientation(self, at: float) -> None:
         """Age each estimate from when THAT TRACK was last estimated.

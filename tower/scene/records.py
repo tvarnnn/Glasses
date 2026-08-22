@@ -34,19 +34,18 @@ FACING_AWAY = "away_from_wearer"
 FACING_PROFILE = "profile"
 
 # Relationships this cartridge is willing to assert from 2-D boxes. The
-# ones it REFUSES -- on, inside, near, in_front_of, behind -- are absent
-# on purpose and documented in SCENE-UNDERSTANDING.md, because a
+# ones it REFUSES -- on, inside, near, in_front_of, behind, and
+# nearer_than_same_class -- are absent on purpose and each is recorded in
+# state.REFUSED_RELATIONSHIPS with what would settle it, because a
 # relationship nobody can support is worse than a missing one.
 REL_LEFT_OF = "left_of"
 REL_RIGHT_OF = "right_of"
 REL_HIGHER_IN_VIEW = "higher_in_view"
-REL_NEARER_SAME_CLASS = "nearer_than_same_class"
 
 RELATIONSHIPS = (
     REL_LEFT_OF,
     REL_RIGHT_OF,
     REL_HIGHER_IN_VIEW,
-    REL_NEARER_SAME_CLASS,
 )
 
 
@@ -166,6 +165,17 @@ class Track:
     last_seen_at: float
     hits: int = 1
     misses: int = 0
+    # Consecutive hits, reset by a miss. `hits` is a lifetime total and
+    # makes a poor confirmation test on its own: a reflection glimpsed
+    # once every six frames accumulates three lifetime hits and becomes a
+    # permanent phantom person, never having been seen twice in a row.
+    streak: int = 1
+    # Latched once a streak reaches the policy's minimum, and NOT
+    # recomputed afterwards. Latching is what lets a confirmed track
+    # survive a detector dropout without the count flickering -- which is
+    # the whole point -- while still requiring real consecutive evidence
+    # to earn confirmation in the first place.
+    is_confirmed: bool = False
     facing: FacingEstimate = field(default_factory=FacingEstimate)
     # When THIS track's facing was last actually estimated -- per track,
     # not per orientation run. The distinction is the whole value of the
@@ -179,12 +189,14 @@ class Track:
         return max(self.last_seen_at - self.first_seen_at, 0.0)
 
     def confirmed(self, min_hits: int) -> bool:
-        """Seen often enough to count.
+        """Seen often enough, CONSECUTIVELY enough, to count.
 
-        A single detection is a flicker. Counting unconfirmed tracks is
-        the same error as counting raw detections, one step later.
+        A single detection is a flicker. So is one every six frames --
+        which a lifetime hit count would happily confirm and then keep
+        confirmed forever. Confirmation needs a streak; staying confirmed
+        needs only staying alive.
         """
-        return self.hits >= min_hits
+        return self.is_confirmed or self.streak >= min_hits
 
     def to_json_dict(self) -> dict:
         return {
@@ -193,7 +205,9 @@ class Track:
             "score": self.score,
             "box": self.box.to_json_dict(),
             "hits": self.hits,
+            "streak": self.streak,
             "misses": self.misses,
+            "confirmed": self.is_confirmed,
             "age_seconds": round(self.age_seconds, 3),
             "facing": self.facing.to_json_dict(),
         }
