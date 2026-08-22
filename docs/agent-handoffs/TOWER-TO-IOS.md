@@ -91,7 +91,7 @@ logged and ignored. An unknown `type` is logged and ignored.
 | `type` | Fields |
 |---|---|
 | `pong` | `type` |
-| `frame_result` | `seq`, `processing_ms`, `result_value`, `result_label`, `stage_ms`, and `mean_intensity` only when the module produced one |
+| `frame_result` | `seq`, `processing_ms`, `result_value`, `result_label`, `stage_ms`; plus `mean_intensity` and `metrics` **only when the module produced them** |
 | `frame_error` | `seq` (may be `null`), `reason`, `message` |
 
 `frame_error.reason` is one of exactly: `invalid_frame` (failed parsing or
@@ -107,15 +107,56 @@ read. That is deliberate — Rule 3 forbids inventing a sequence number.
 write on the event loop, so putting it first would add disk latency to
 every reply (`ws.py::_record_capture`).
 
-### 1.3 What `frame_result` can carry — **the binding constraint**
+### 1.3 `metrics` — a measurement channel (added 2026-08-22)
 
-`result_value` is a single float and `result_label` a single string
-(`tower/experiments/__init__.py::ExperimentResult`: `result_value`,
-`result_label`, `processing_ms`, `stage_ms`, `mean_intensity`).
+`frame_result` may carry a `metrics` object: **`name -> number`, nothing
+richer.**
 
-**Five scalars is the entire per-frame return channel.** No structured
-object, no geometry, no detection list, no world delta can be returned to
-iOS today. Every "why can't iOS see X" question below ends here.
+```json
+{
+  "type": "frame_result", "seq": 41,
+  "processing_ms": 5.4,
+  "result_value": 357.9, "result_label": "sharpness_laplacian_var",
+  "stage_ms": {"decode": 0.7, "sharpness": 1.8, "...": 0.0},
+  "metrics": {
+    "sharpness_laplacian_var": 357.9,
+    "entropy_bits": 4.93,
+    "edge_density": 0.0537,
+    "overexposed_fraction": 0.0
+  }
+}
+```
+
+Rules a client can rely on:
+
+- **The field is omitted entirely when there is nothing to report.** The
+  default `baseline` experiment does not emit it. A client that has never
+  heard of `metrics` is unaffected — this is an additive change under §7
+  rule 3.
+- **`result_label` always appears as a key in `metrics`** when `metrics`
+  is present, with the same value as `result_value`. A client may read
+  either; they can never disagree.
+- **Every value is a JSON number.** Never a string, never a bool, never
+  `null`, and never `NaN`/`Infinity` — a test pins that, because
+  `json.dumps` writes bare `NaN` and a strict parser would reject the
+  whole message.
+- **The key set depends on the selected experiment and is not frozen.**
+  Treat it as a bag to display or log, not a schema to destructure. New
+  keys may appear; do not fail on an unknown one.
+- **These are measurements, not facts.** Anything model-derived
+  (`detections`, `mean_relative_depth`) is inference, and must never be
+  presented as a sensor measurement (Rule 16 / Core Principle 2).
+
+### 1.4 What `frame_result` still cannot carry — **the binding constraint**
+
+`metrics` widened the channel; it did not open it. There is still **no
+way to return a structured object** — no detection list with boxes, no
+geometry, no world delta, no event. `dict[str, float]` was chosen
+deliberately over something richer, because a general result type needs
+the module-contract work that is blocked at V1.0/V1.1, and widening this
+type would have been a quiet way of pretending otherwise.
+
+Every "why can't iOS see X" question below still ends here.
 
 ---
 
@@ -538,7 +579,7 @@ source:
 | Location | Gap |
 |---|---|
 | `ws.py` | `process()` is synchronous on the event loop and takes only `bytes`; `observe()` needs `received_at`, `source_seq`, `tx_seq` |
-| `ExperimentResult` | Five scalars — cannot carry a keyframe decision or a world delta |
+| `ExperimentResult` | Scalars plus a `name -> number` bag — cannot carry a keyframe decision or a world delta |
 | `main.py::_build_cv_module` | A registry of one. A second module id **is** the V1.0 trigger, and V1.0 is untriggered |
 | `container.LIFECYCLE_TIMEOUT_S` | A stop-time `build()` would exceed it. That bound is V1.1 hardening, and V1.1 is **BLOCKED** on an unrecorded user ruling |
 
@@ -601,9 +642,12 @@ negotiation protocol before the real DAT configuration model is known.
    half.** Update this document in the same change.
 2. **Do not invent an endpoint here.** If iOS needs something Tower lacks,
    add it to §6 as a missing requirement.
-3. **Additive wire changes only** while `frame_result` remains scalar. A
-   sender that omits `source_seq`/`tx_seq` must keep working; both fall
-   back honestly.
+3. **Additive wire changes only** while `frame_result` remains
+   scalar-shaped. A sender that omits `source_seq`/`tx_seq` must keep
+   working; both fall back honestly. A receiver that has never heard of
+   `metrics` must keep working; it is omitted when empty. This is the
+   rule `metrics` itself was added under, and it is the rule the next
+   field must follow.
 4. **Never present `tower-receipt` time as capture time** (Rule 16).
 5. **Never render world units as metres** unless `scale.state ==
    "measured"` (§3.7).
