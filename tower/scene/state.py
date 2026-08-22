@@ -104,11 +104,20 @@ class SceneState:
             if track.label == "person" and track.facing.appears_facing_wearer
         )
 
+    @property
+    def frame_known(self) -> bool:
+        """Whether anything positional can be said at all."""
+        return bool(self.frame_width and self.frame_height)
+
     def to_json_dict(self) -> dict:
         return {
             "at": self.at,
             "time_basis": "tower-receipt",
-            "frame": {"width": self.frame_width, "height": self.frame_height},
+            "frame": {
+                "width": self.frame_width,
+                "height": self.frame_height,
+                "known": self.frame_known,
+            },
             "frame_of_reference": "camera",
             "frames_observed": self.frames_observed,
             "detector": self.detector,
@@ -124,12 +133,30 @@ class SceneState:
 def describe_position(track: Track, frame_width: int, frame_height: int) -> dict:
     """Where a track sits, in the only frame of reference available.
 
-    Normalised image coordinates plus a horizontal bearing in degrees from
-    the view centre. The bearing is **not** an angle in the world: it
-    assumes nothing about focal length, and without intrinsics it cannot.
-    It is a monotonic, comparable "how far off-centre", and the field name
-    says `view` so nobody reads it as a compass heading.
+    Normalised image coordinates plus a horizontal offset from the view
+    centre. The offset is **not** an angle in the world: it assumes
+    nothing about focal length, and without intrinsics it cannot. It is a
+    monotonic, comparable "how far off-centre", and the field name says
+    `view` so nobody reads it as a compass heading.
+
+    **Refuses when the frame size is unknown.** Normalising a pixel
+    coordinate by zero would report every object at `normalised_x: 0.0`
+    and `side: "left"` -- a specific, confident claim about where things
+    are, derived from no information at all.
     """
+    if not frame_width or not frame_height:
+        return {
+            "normalised_x": None,
+            "normalised_y": None,
+            "view_offset": None,
+            "side": "unknown",
+            "frame_of_reference": "camera",
+            "note": (
+                "frame dimensions unknown, so no position can be computed. "
+                "Reporting one would be a claim with no evidence behind it"
+            ),
+        }
+
     centre_x, centre_y = track.box.centre
     normalised_x = centre_x / frame_width if frame_width else 0.0
     normalised_y = centre_y / frame_height if frame_height else 0.0
@@ -159,6 +186,12 @@ def relate(tracks, frame_width: int, frame_height: int) -> list[Relation]:
     a flicker, and relating flickers produces relations that appear and
     vanish while the room is still.
     """
+    if not frame_width or not frame_height:
+        # Without a frame size the minimum-separation guards collapse to
+        # zero, and every pair differing by a single pixel would get a
+        # confident left/right relation. No frame, no relations.
+        return []
+
     relations: list[Relation] = []
     ordered = sorted(tracks, key=lambda track: track.track_id)
     min_dx = frame_width * MIN_HORIZONTAL_SEPARATION_FRACTION

@@ -359,3 +359,76 @@ class TestOrientationEvidence:
             {"left_ear": 9.0},
         ):
             assert self._facing(scores).confidence is not Confidence.HIGH
+
+
+class TestAnUnknownFrameSizeAssertsNothing:
+    """No frame, no position, no relation.
+
+    Reachable through direct API use before any decodable frame arrives.
+    Normalising a pixel coordinate by zero used to report EVERY object at
+    `normalised_x: 0.0` and `side: "left"`, and the minimum-separation
+    guards collapsed to zero so any two boxes differing by a pixel got a
+    confident `left_of`. Both are specific claims derived from no
+    information -- the same failure this cartridge refuses everywhere
+    else, in a quieter costume.
+    """
+
+    @staticmethod
+    def _state_without_a_frame():
+        engine = SceneEngine(
+            FixedDetector(
+                [
+                    [
+                        _det("book", (300, 40, 340, 80)),
+                        _det("cup", (302, 250, 342, 290)),
+                    ]
+                ]
+                * 20
+            ),
+            POLICY,
+            clock=lambda: 0.0,
+        )
+        engine.load()
+        state = None
+        for index in range(5):
+            state = engine.observe(None, received_at=index * 0.3)
+        return engine, state
+
+    def test_the_state_says_the_frame_is_unknown(self):
+        _, state = self._state_without_a_frame()
+
+        assert state.frame_known is False
+        assert state.to_json_dict()["frame"]["known"] is False
+
+    def test_no_relation_is_asserted(self):
+        _, state = self._state_without_a_frame()
+
+        assert state.relations == ()
+
+    def test_positions_refuse_rather_than_reporting_the_origin(self):
+        engine, state = self._state_without_a_frame()
+
+        positions = engine.describe(state)["positions"]
+
+        assert positions, "the tracks still exist"
+        for entry in positions.values():
+            assert entry["side"] == "unknown"
+            assert entry["normalised_x"] is None
+            assert "no evidence" in entry["note"]
+
+    def test_counting_still_works_without_a_frame(self):
+        """A count needs no geometry, so it must not be lost with it."""
+        _, state = self._state_without_a_frame()
+
+        assert SceneQuery(state).count("book").value == 1
+
+    def test_the_json_stays_valid(self):
+        import json
+        import math
+
+        engine, state = self._state_without_a_frame()
+
+        payload = json.dumps(engine.describe(state))
+
+        assert "NaN" not in payload and "Infinity" not in payload
+        assert math.isfinite(state.at)
