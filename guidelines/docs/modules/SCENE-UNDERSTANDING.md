@@ -64,10 +64,19 @@ throughout:
 | 0% | 2 | [2] | 1.000 |
 | 10% | 2 | [2] | 1.000 |
 | 20% | 2 | [2] | 1.000 |
-| 40% | 2 | [1, 2] | 0.974 |
+| 40% | 2 | [1, 2] | 0.939 |
 
 A count taken from raw detections would follow the dropout column
 exactly.
+
+The 40% row was **0.974 before the confirmation fix in §8.1** and is
+0.939 after. That is the correct direction for the trade: requiring a
+consecutive streak means a track dropped at extreme dropout takes longer
+to re-confirm, and it is what stops a detection present one frame in six
+from becoming a permanent phantom person. A count that is occasionally
+conservative under a detector losing 40% of frames is a better failure
+than one that is permanently wrong under a reflection.
+
 
 **Association is by IoU only, never appearance.** Matching by how
 something looks is the first step toward recognising it again. A
