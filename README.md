@@ -448,6 +448,10 @@ real-world V0.7 figures — see `07-PLATFORM-CONSTRAINTS.md` Limitation 12.
 
 ```text
 tower/
+  world_builder/          World Builder V1 engine (see
+                          guidelines/docs/reports/2026-08-22-world-builder-v1-report.md).
+                          Calibration-gated: no intrinsics means no poses,
+                          and it says so rather than guessing.
   main.py                 FastAPI app factory + ASGI entrypoint; builds
                           the one active module via TOWER_CV_EXPERIMENT
   config.py               Environment-based settings (host/port/dev
@@ -498,6 +502,17 @@ scripts/
   feature_trackability.py World Builder Experiment 2: offline ORB
                           keypoint/match/RANSAC-inlier analysis across
                           frame gaps; intrinsics-free (V0.9.3)
+  world_build_session.py  Drive a World Builder mapping session over
+                          frames on disk (or a synthetic walk), then build
+                          and persist the world
+  world_inspect.py        Reload a saved world cold and report it;
+                          --trajectory for the recorded camera path,
+                          --verify for journal/image integrity
+  calibrate_charuco.py    Recover camera intrinsics from ChArUco board
+                          views; --generate-board writes a printable board
+  world_builder_benchmark.py
+                          Stage timings for the World Builder pipeline
+                          (synthetic input; timings real, imagery rendered)
   world_builder_env_check.py
                           Read-only World Builder readiness diagnostic:
                           GPU visibility vs. torch's ability to reach it,
