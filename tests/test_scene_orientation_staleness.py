@@ -239,3 +239,82 @@ class TestKeypointThreshold:
 
         assert confident.state == FACING_TOWARD
         assert unconfident.state == FACING_UNKNOWN
+
+
+class TestAgeIsPerTrackNotPerRun:
+    """A run that fails to find someone must not refresh THEIR estimate.
+
+    Found by re-reading the design rather than by a failing test, which is
+    why it is worth spelling out: the age was computed from the last
+    orientation RUN, not from when this track was last estimated. Those
+    diverge exactly when staleness matters most -- the pose model runs,
+    does not find this person because they turned away, and the track
+    keeps its old reading.
+
+    Measured before the fix: an estimate made at t=0 still reported
+    `age=1.0` and `toward_wearer` at **t=11**, because every run reset it.
+    The expiry that exists to catch precisely this never fired.
+    """
+
+    @staticmethod
+    def _engine_that_sees_once():
+        # The pose estimator finds the person on its first call and
+        # nothing on every call after -- a person who turned away.
+        pose = FixedPoseEstimator([[(BoundingBox(*PERSON_BOX), FACING)], [], [], []])
+        engine = SceneEngine(
+            FixedDetector([_person()] * 200),
+            POLICY,
+            clock=lambda: 0.0,
+            pose_estimator=pose,
+            orientation_interval_s=2.0,
+        )
+        engine.load()
+        return engine, pose
+
+    def test_a_stale_estimate_keeps_ageing_across_later_runs(self):
+        engine, pose = self._engine_that_sees_once()
+
+        ages = []
+        at = 0.0
+        for _ in range(16):
+            state = engine.observe(FRAME, received_at=at)
+            if state.of_class("person"):
+                ages.append(state.of_class("person")[0].facing.age_seconds)
+            at += 0.5
+
+        assert pose.calls >= 3, "later runs must actually have happened"
+        assert ages == sorted(ages), f"the age reset: {ages}"
+        assert ages[-1] > 5.0, f"final age {ages[-1]} -- it was being reset"
+
+    def test_a_stale_estimate_eventually_expires_to_unknown(self):
+        """The expiry only works if the age is honest."""
+        engine, _ = self._engine_that_sees_once()
+
+        state = None
+        at = 0.0
+        while at <= MAX_ESTIMATE_AGE_S + 3.0:
+            state = engine.observe(FRAME, received_at=at)
+            at += 0.5
+
+        person = state.of_class("person")[0]
+        assert person.facing.state == FACING_UNKNOWN
+        assert person.facing.age_seconds > MAX_ESTIMATE_AGE_S
+
+    def test_a_track_that_was_never_estimated_reports_unknown(self):
+        """And not the previous occupant's reading."""
+        pose = FixedPoseEstimator([[]])
+        engine = SceneEngine(
+            FixedDetector([_person()] * 20),
+            POLICY,
+            clock=lambda: 0.0,
+            pose_estimator=pose,
+        )
+        engine.load()
+
+        state = None
+        for index in range(8):
+            state = engine.observe(FRAME, received_at=index * 0.3)
+
+        person = state.of_class("person")[0]
+        assert person.facing.state == FACING_UNKNOWN
+        assert person.facing_estimated_at is None

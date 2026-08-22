@@ -182,15 +182,30 @@ class SceneEngine:
                 continue
             estimate = facing_from_keypoints(keypoint_scores)
             best.facing = age_estimate(estimate, 0.0)
+            best.facing_estimated_at = at
 
     def _age_orientation(self, at: float) -> None:
-        if self._pose is None or self._last_orientation_at is None:
+        """Age each estimate from when THAT TRACK was last estimated.
+
+        Not from the last orientation RUN. The two diverge precisely when
+        staleness matters most: the pose model runs, fails to find this
+        person -- because they turned away, or moved behind something --
+        and the track keeps its old reading. Ageing from the run time
+        would reset that reading's age to nearly zero on every run, so a
+        ten-second-old "facing toward you" would report as one second old
+        and would never reach the expiry that exists to catch it.
+        """
+        if self._pose is None:
             return
-        seconds = at - self._last_orientation_at
         for track in self._tracker.tracks:
             if track.label != "person":
                 continue
-            if track.facing.age_seconds is None:
+            if track.facing_estimated_at is None:
+                # Never estimated -- a track that appeared since the last
+                # run. Unknown, which is the honest answer, and not the
+                # previous occupant's reading.
                 track.facing = FacingEstimate()
                 continue
-            track.facing = age_estimate(track.facing, seconds)
+            track.facing = age_estimate(
+                track.facing, at - track.facing_estimated_at
+            )

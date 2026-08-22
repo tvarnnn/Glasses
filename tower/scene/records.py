@@ -167,6 +167,12 @@ class Track:
     hits: int = 1
     misses: int = 0
     facing: FacingEstimate = field(default_factory=FacingEstimate)
+    # When THIS track's facing was last actually estimated -- per track,
+    # not per orientation run. The distinction is the whole value of the
+    # age: a run that fails to find this person must not refresh their
+    # estimate's age, or a reading from ten seconds ago reports as one
+    # second old and never expires.
+    facing_estimated_at: float | None = None
 
     @property
     def age_seconds(self) -> float:
