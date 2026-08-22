@@ -59,6 +59,62 @@ Preferred behavior during module switches is to keep the wearable connection ali
 
 The module should not know whether DAT paused, restarted a stream, or re-established a session.
 
+## Device Health Telemetry (SDK 0.9.0, recorded 2026-08-21)
+
+What the pinned SDK actually exposes about the health of the glasses. Recorded
+here per the update procedure above, because the answer constrains what the app
+is allowed to display: Rule 3 forbids inventing any of it.
+
+**The only proactive signal is thermal level.**
+
+- `WearablesInterface.deviceStateStream(for: DeviceIdentifier) -> AsyncStream<DeviceState>`
+- `DeviceState` has exactly one property, `thermalLevel: ThermalLevel`.
+- `ThermalLevel` is an ordinal, not a temperature: `unknown`, `none`, `light`,
+  `moderate`, `severe`, `critical`, `emergency`, `shutdown`.
+- There is no listener/`Announcer` variant — `AsyncStream` only.
+
+Observed in `GlassesConnection.observeDeviceState(for:)`, which follows whichever
+device `AutoDeviceSelector` reports active, and republished as
+`glassesThermalLevel`.
+
+**Absent in 0.9.0 — do not display, do not estimate:**
+
+- Battery level and charging state. `DeviceState` carried `batteryLevel: Int` in
+  0.2; it was removed, and Meta has stated battery lands in a later release. The
+  only battery signal available today is the terminal `batteryCritical` error
+  case below.
+- Any numeric temperature, in any unit.
+- `HingeState` (present in 0.2, gone in 0.9). Hinge closure is observable only
+  indirectly, as `StreamError.hingesClosed`.
+- Firmware version, storage, signal strength, worn/don-doff state.
+- Any `DeviceStatus` / `DeviceInfo` / `Health*` / `Telemetry*` / `Advisory*` type.
+
+**Reactive health signals** arrive as errors, at the point the stream is already
+failing rather than in time to prevent it:
+
+- `DeviceSessionError`: `thermalCritical`, `thermalEmergency`,
+  `peakPowerShutdown`, `batteryCritical`.
+- `StreamError` (via `stream.errorPublisher`): the same four, plus
+  `hingesClosed`.
+
+Meta's guidance is to watch `deviceStateStream` and warn the user *before* a
+thermal error kills the stream. The app currently surfaces the level on the
+developer screen; acting on it is not yet implemented.
+
+**Interruptions** are modelled as state, not as a dedicated type:
+`DeviceSessionState.paused` is a device-initiated interruption (e.g. cap-touch)
+and resumes to `.started` on its own — do not restart a session during a pause.
+`.stopped` is terminal and requires a new `createSession`.
+
+**Testing constraint.** `MockDeviceKit` in 0.9.0 exposes only camera and
+cap-touch simulation (`MockGlassesServices`), plus `fold()`/`unfold()`. Thermal
+and battery escalation **cannot** be simulated, so no automated test can cover
+the thermal path — it is physical-device-only.
+
+iPhone-side health (`ProcessInfo.thermalState`, Low Power Mode, `UIDevice`
+battery) is deliberately *not* here: those are Apple APIs and live in
+`DeviceHealth`, outside the DAT boundary.
+
 ## Documentation Update Procedure
 
 When DAT implementation work reveals a stable constraint:

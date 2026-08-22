@@ -632,6 +632,316 @@ final class TowerClientTests: XCTestCase {
 
         client.disconnect()
     }
+
+    // MARK: - 15. Send window sizing and slot instrumentation
+
+    /// The window's capacity is derived from a latency budget rather than
+    /// picked, so the shipped number and the arithmetic that justifies it must
+    /// not be able to drift apart.
+    func testDefaultWindowCapacityIsTheLatencyBudgetedOne() {
+        let client = TowerClient(metrics: SenderMetrics())
+        XCTAssertEqual(client.maxFramesInFlight, TowerClient.defaultMaxFramesInFlight)
+        XCTAssertEqual(
+            TowerClient.defaultMaxFramesInFlight,
+            SendWindow.capacity(
+                forTargetFPS: FrameRateGate.towerTargetFPS,
+                latencyBudget: TowerClient.outboundLatencyBudget
+            )
+        )
+        XCTAssertGreaterThan(
+            client.maxFramesInFlight,
+            2,
+            "the baseline capacity of 2 is what held the physical run to 3.4 fps"
+        )
+    }
+
+    /// Every completed send must contribute a timing sample, or the
+    /// `capacity / slotLifetime` diagnosis has nothing to divide.
+    func testACompletedSendRecordsItsSlotTimings() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let metrics = SenderMetrics()
+        let client = TowerClient(metrics: metrics, maxFramesInFlight: 2)
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        metrics.begin()
+        client.sendStreamStart()
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 1)
+
+        let completed = await waitUntil { metrics.currentSnapshot.sendSuccesses == 1 }
+        XCTAssertTrue(completed)
+
+        let snapshot = metrics.currentSnapshot
+        XCTAssertEqual(snapshot.slotSamples, 1, "a completed send must report a slot lifetime")
+        let latency = try XCTUnwrap(snapshot.sendLatencyMsAverage)
+        let lifetime = try XCTUnwrap(snapshot.slotLifetimeMsAverage)
+        XCTAssertGreaterThanOrEqual(
+            lifetime,
+            latency,
+            "the slot is held until the main actor returns it, so it cannot outlive its own transport time"
+        )
+        XCTAssertNotNil(snapshot.windowLimitedFPS(capacity: client.maxFramesInFlight))
+
+        client.disconnect()
+    }
+
+    /// A send abandoned by teardown has no slot left to time. It must still be
+    /// accounted as a terminal outcome, but it must not contribute a sample —
+    /// a teardown-length "slot lifetime" would poison the average that the
+    /// window is sized against.
+    func testAnAbandonedSendContributesNoTimingSample() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let metrics = SenderMetrics()
+        let client = TowerClient(metrics: metrics, maxFramesInFlight: 1)
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        metrics.begin()
+        client.sendStreamStart()
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 1)
+        XCTAssertEqual(metrics.currentSnapshot.sendAttempts, 1)
+        client.disconnect()
+
+        let settled = await waitUntil { metrics.currentSnapshot.sendAbandoned == 1 }
+        XCTAssertTrue(settled, "the outstanding send never reached a terminal outcome")
+        XCTAssertEqual(metrics.currentSnapshot.slotSamples, 0)
+        XCTAssertNil(metrics.currentSnapshot.slotLifetimeMsAverage)
+    }
+
+    /// Stall detection must not fire on ordinary backpressure. A full window
+    /// that is still draining is the mechanism working, and answering it with
+    /// a reconnect would turn a shed frame into a dropped connection.
+    func testOrdinaryWindowDropsDoNotTripStallDetection() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let metrics = SenderMetrics()
+        let client = TowerClient(metrics: metrics, maxFramesInFlight: 2)
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        metrics.begin()
+        client.sendStreamStart()
+        let image = makeTestImage()
+        for sequence in 1...8 {
+            client.sendFrame(image, width: 2, height: 2, sequence: sequence)
+        }
+
+        XCTAssertGreaterThan(metrics.currentSnapshot.sendWindowDrops, 0, "the window must actually have filled")
+        XCTAssertEqual(metrics.currentSnapshot.stallRecoveries, 0)
+        XCTAssertEqual(client.status, .online, "a full window is not a broken connection")
+
+        client.disconnect()
+    }
+
+    // MARK: - 16. Automatic reconnect
+
+    /// A mid-session drop on a remote Tailscale path is the expected case, and
+    /// until now nothing in the app re-established the connection: the Tower
+    /// pill went red and stayed red until someone tapped Connect. The
+    /// stream-bracket reopening in `ProjectManager` was written for a
+    /// reconnect that could not happen.
+    func testADroppedConnectionIsReestablishedAutomatically() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics(), autoReconnect: true)
+        client.connect(to: url(port: port))
+        var becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        client.simulateDelegateCloseForTesting(code: .abnormalClosure)
+
+        // Waiting for the drop to actually land first is what makes the second
+        // wait meaningful. The delegate callback hops to the main actor, so
+        // polling for `.online` straight away would observe the *pre-drop*
+        // state and pass without a reconnect ever happening.
+        let leftOnline = await waitUntil { client.status != .online }
+        XCTAssertTrue(leftOnline, "the simulated close never took effect")
+
+        becameOnline = await waitUntil(timeout: 6) { client.status == .online }
+        XCTAssertTrue(becameOnline, "the connection was never re-established")
+
+        client.disconnect()
+    }
+
+    /// Reconnect must never override the user. A deliberate disconnect that
+    /// silently came back would make the control a lie.
+    func testDisconnectIsNotUndoneByAPendingReconnect() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics(), autoReconnect: true)
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        // The reconnect has to be genuinely scheduled before it can be
+        // genuinely countermanded: `disconnect()` called in the same actor turn
+        // as the simulated close would tear the socket down first, and the
+        // close would then be discarded as stale without ever scheduling
+        // anything. Waiting for `.failed` is what makes this test about
+        // cancellation rather than about ordering.
+        client.simulateDelegateCloseForTesting(code: .abnormalClosure)
+        let failed = await waitUntil { client.status != .online }
+        XCTAssertTrue(failed, "a reconnect must have been scheduled for this test to mean anything")
+
+        client.disconnect()
+
+        // Comfortably past the first backoff step.
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        XCTAssertEqual(client.status, .offline, "a cancelled reconnect must not resurrect the connection")
+    }
+
+    /// Reconnect is opt-in precisely so that the failure-path tests above keep
+    /// asserting about a settled status. This pins that default.
+    func testReconnectIsOffUnlessAskedFor() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        client.simulateDelegateCloseForTesting(code: .abnormalClosure)
+        let leftOnline = await waitUntil { client.status != .online }
+        XCTAssertTrue(leftOnline)
+
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        guard case .failed = client.status else {
+            XCTFail("expected the connection to stay failed, got \(client.status)")
+            return
+        }
+    }
+
+    // MARK: - 17. Stall detection end to end
+
+    /// Occupies the whole send window and then holds the main actor without
+    /// yielding, so the outstanding send's completion cannot hop back to
+    /// release its slot.
+    ///
+    /// A busy-wait rather than `Task.sleep`, deliberately: sleeping yields the
+    /// actor, the queued completion runs, the slot comes back and there is no
+    /// stall left to detect. Blocking is the only way to hold a window open
+    /// against a loopback server that answers instantly, and it makes the test
+    /// deterministic rather than timing-dependent.
+    private func fillWindowAndHoldMainActor(
+        _ client: TowerClient,
+        seconds: TimeInterval
+    ) {
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 1)
+        let holdUntil = MonotonicClock.now + seconds
+        while MonotonicClock.now < holdUntil {
+            // Intentionally empty: the point is to not suspend.
+        }
+    }
+
+    /// The path that exists because `URLSessionWebSocketTask` cannot cancel or
+    /// time out one outstanding send: a window that stops draining has to be
+    /// answered at connection granularity or the pipeline simply reports drops
+    /// for as long as the peer stays wedged — 52 seconds, in the physical
+    /// baseline.
+    func testAWedgedSendWindowReplacesTheConnection() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let metrics = SenderMetrics()
+        let client = TowerClient(
+            metrics: metrics,
+            maxFramesInFlight: 1,
+            stallTimeout: 0.05,
+            autoReconnect: true
+        )
+        client.connect(to: url(port: port))
+        var becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        metrics.begin()
+        client.sendStreamStart()
+
+        // 0.2 s is past `stallTimeout` but well inside `mainActorGapAllowance`,
+        // so the next frame is offered by a demonstrably responsive actor and
+        // the verdict is reached rather than deferred.
+        fillWindowAndHoldMainActor(client, seconds: 0.2)
+        XCTAssertEqual(metrics.currentSnapshot.sendAttempts, 1, "the window must actually be occupied")
+
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 2)
+
+        XCTAssertEqual(metrics.currentSnapshot.stallRecoveries, 1, "the wedged window was not detected")
+        XCTAssertNotEqual(client.status, .online, "a wedged socket must be torn down, not kept")
+        // The frame that triggered the teardown still has to reach a terminal
+        // outcome, or `framesUnaccounted` would drift by one per stall.
+        XCTAssertGreaterThan(metrics.currentSnapshot.sendWindowDrops, 0)
+
+        becameOnline = await waitUntil(timeout: 6) { client.status == .online }
+        XCTAssertTrue(becameOnline, "the replacement connection never came up")
+
+        client.disconnect()
+    }
+
+    /// The false-positive guard, and the reason `mainActorGapAllowance` exists.
+    ///
+    /// A slot is held until the completion handler's hop back to the main actor
+    /// runs, so if *this actor* stalls, every slot looks old through no fault of
+    /// the socket. Tearing down a healthy connection because the main thread
+    /// hitched would invert the very diagnosis the slot-timing instrumentation
+    /// was added to make possible.
+    func testAStalledMainActorIsNotMistakenForAWedgedSocket() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let metrics = SenderMetrics()
+        let client = TowerClient(
+            metrics: metrics,
+            maxFramesInFlight: 1,
+            stallTimeout: 0.05
+        )
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        metrics.begin()
+        client.sendStreamStart()
+
+        // Same setup as above, but the actor is held past
+        // `mainActorGapAllowance` — which is exactly what a main-actor stall
+        // looks like from here.
+        fillWindowAndHoldMainActor(client, seconds: TowerClient.mainActorGapAllowance + 0.1)
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 2)
+
+        XCTAssertEqual(
+            metrics.currentSnapshot.stallRecoveries,
+            0,
+            "a main-actor stall must not be blamed on the socket"
+        )
+        XCTAssertEqual(client.status, .online, "the connection was healthy and must be kept")
+
+        client.disconnect()
+    }
 }
 
 /// Thread-safe capture of every text message a MockTowerServer receives, so

@@ -74,7 +74,8 @@ struct ContentView: View {
                         glasses: project.glassesConnection,
                         tower: project.towerClient,
                         stream: project.streamManager,
-                        senderMetrics: project.senderMetrics
+                        senderMetrics: project.senderMetrics,
+                        health: project.deviceHealth
                     )
                 #endif
                 }

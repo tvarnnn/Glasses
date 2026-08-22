@@ -71,6 +71,48 @@ struct SenderMetricsSnapshot: Equatable, Sendable {
     /// `frame_result` messages received back from the Tower.
     var frameResults = 0
 
+    // MARK: Slot lifetime
+
+    /// Completions that carried a valid send-window slot, and so contributed a
+    /// timing sample below. Abandoned sends do not: their slot was already
+    /// reclaimed by teardown, so they have no lifetime to report.
+    var slotSamples = 0
+
+    /// Time from a frame taking a send-window slot to
+    /// `URLSessionWebSocketTask.send` invoking its completion handler —
+    /// measured *inside* that handler, before hopping to the main actor.
+    ///
+    /// This is the transport's own write time, and it is the single most
+    /// important number this pipeline was not measuring. The send window's
+    /// capacity divided by the slot lifetime *is* the achievable send rate
+    /// (see `SendWindow`), so a rate below target is either this being large
+    /// or the window being small, and nothing else.
+    var sendLatencySecondsTotal: Double = 0
+    var sendLatencySecondsMax: Double = 0
+
+    /// Time from a frame taking a send-window slot to that slot actually being
+    /// returned on the main actor — i.e. `sendLatency` plus the completion
+    /// handler's hop back onto the main actor.
+    ///
+    /// The slot is held for this whole span, so this, not `sendLatency`, is
+    /// the true rate denominator. Recorded separately because the difference
+    /// between the two attributes a shortfall to the *network* or to *main-actor
+    /// congestion*, which are opposite diagnoses with opposite fixes and were
+    /// previously indistinguishable.
+    var slotLifetimeSecondsTotal: Double = 0
+    var slotLifetimeSecondsMax: Double = 0
+
+    /// Times a full, non-draining send window caused the connection to be torn
+    /// down. Each one is a stall that would previously have blocked the
+    /// pipeline for as long as the peer took to resume — 52 seconds, in the
+    /// physical baseline.
+    ///
+    /// Counts the teardown, not the recovery: whether a new connection follows
+    /// depends on `TowerClient.autoReconnect`, which the app enables and the
+    /// default initialiser does not. The teardown is the part this counter can
+    /// truthfully speak for.
+    var stallRecoveries = 0
+
     // MARK: Timing
 
     /// Seconds since `SenderMetrics.begin()`, measured monotonically.
@@ -90,8 +132,13 @@ extension SenderMetricsSnapshot {
     var captureFPS: Double? { rate(framesCaptured) }
     var selectedFPS: Double? { rate(framesSelected) }
     var sendAttemptFPS: Double? { rate(sendAttempts) }
-    /// The number that matters: frames confirmed written to the socket per
-    /// second. The Tower's own `effective_fps` should track this closely.
+    /// Frames confirmed written per second.
+    ///
+    /// "Written" means into the kernel socket buffer, which is exactly what
+    /// `URLSessionWebSocketTask.send`'s completion documents and no more: it is
+    /// not an acknowledgement that the Tower received anything. `frameResults`
+    /// is the only end-to-end figure. The two normally track closely, and a
+    /// gap between them is the Tower falling behind rather than the uplink.
     var successfulSendFPS: Double? { rate(sendSuccesses) }
     var towerResultFPS: Double? { rate(frameResults) }
     var wireBytesPerSecond: Double? { rate(wireBytes) }
@@ -104,6 +151,56 @@ extension SenderMetricsSnapshot {
     var encodeMsMax: Double? {
         guard framesEncoded > 0 else { return nil }
         return encodeSecondsMax * 1000
+    }
+
+    var sendLatencyMsAverage: Double? {
+        guard slotSamples > 0 else { return nil }
+        return sendLatencySecondsTotal / Double(slotSamples) * 1000
+    }
+
+    var sendLatencyMsMax: Double? {
+        guard slotSamples > 0 else { return nil }
+        return sendLatencySecondsMax * 1000
+    }
+
+    var slotLifetimeMsAverage: Double? {
+        guard slotSamples > 0 else { return nil }
+        return slotLifetimeSecondsTotal / Double(slotSamples) * 1000
+    }
+
+    var slotLifetimeMsMax: Double? {
+        guard slotSamples > 0 else { return nil }
+        return slotLifetimeSecondsMax * 1000
+    }
+
+    /// Mean main-actor hop between the transport finishing a write and the
+    /// send window getting its slot back.
+    ///
+    /// Derived from the two means rather than sampled directly, which is valid
+    /// because both are means over the same `slotSamples` completions. There is
+    /// deliberately no "max hop": the two maxima can come from different
+    /// frames, so subtracting them would fabricate a measurement. Compare
+    /// `sendLatencyMsMax` and `slotLifetimeMsMax` directly instead.
+    var completionHopMsAverage: Double? {
+        guard let lifetime = slotLifetimeMsAverage, let latency = sendLatencyMsAverage else { return nil }
+        return max(0, lifetime - latency)
+    }
+
+    /// The send rate the window can sustain at the measured slot lifetime,
+    /// independent of what the gate selected: `capacity / slotLifetime`.
+    ///
+    /// The diagnosis in one number. If this sits at or above
+    /// `FrameRateGate.towerTargetFPS` the window is not the constraint; if it
+    /// sits below, `successfulSendFPS` cannot exceed it however many frames the
+    /// gate admits, and the shortfall is arithmetic rather than mysterious.
+    ///
+    /// - Parameter capacity: the live `SendWindow.capacity`, which the
+    ///   snapshot deliberately does not store — it is configuration, not a
+    ///   measurement, and a stale copy of it here could disagree with the
+    ///   window actually in use.
+    func windowLimitedFPS(capacity: Int) -> Double? {
+        guard let lifetime = slotLifetimeMsAverage, lifetime > 0 else { return nil }
+        return Double(capacity) / (lifetime / 1000)
     }
 
     /// Fraction of captured frames that reached the socket. The 0.8 fps
@@ -279,6 +376,37 @@ final class SenderMetrics: ObservableObject {
     func recordSendAbandoned() {
         live.sendAbandoned += 1
         publishIfDue()
+    }
+
+    /// Records one completed send's slot timings.
+    ///
+    /// Called alongside `recordSendSuccess()`/`recordSendFailure()` rather than
+    /// folded into them: a failed send still occupied its slot for a real
+    /// duration, and excluding it would bias the average towards the healthy
+    /// case — precisely the case that needs no diagnosis.
+    ///
+    /// - Parameters:
+    ///   - sendLatency: slot taken → transport completion handler entered.
+    ///   - slotLifetime: slot taken → slot returned on the main actor. Never
+    ///     less than `sendLatency`; clamped rather than trusted, since the two
+    ///     are sampled from different execution contexts.
+    func recordSlotTiming(sendLatency: TimeInterval, slotLifetime: TimeInterval) {
+        let latency = max(0, sendLatency)
+        let lifetime = max(latency, slotLifetime)
+        live.slotSamples += 1
+        live.sendLatencySecondsTotal += latency
+        live.sendLatencySecondsMax = max(live.sendLatencySecondsMax, latency)
+        live.slotLifetimeSecondsTotal += lifetime
+        live.slotLifetimeSecondsMax = max(live.slotLifetimeSecondsMax, lifetime)
+        publishIfDue()
+    }
+
+    func recordStallRecovery() {
+        live.stallRecoveries += 1
+        // Deliberately not rate limited: a stall recovery is rare, it is the
+        // event this instrumentation exists to catch, and waiting up to half a
+        // second to surface it would hide the moment the pipeline resumed.
+        publish(at: MonotonicClock.now)
     }
 
     func recordFrameResult() {

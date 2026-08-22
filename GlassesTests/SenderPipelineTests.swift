@@ -2,13 +2,15 @@
 //  SenderPipelineTests.swift
 //  GlassesTests
 //
-//  Covers the two pieces that decide, and then account for, how many captured
-//  frames reach the Tower: `FrameRateGate` (the sampling cadence that replaced
-//  the fixed 1-in-30 stride) and `SenderMetrics` (the per-stage counters that
-//  make a shortfall attributable instead of mysterious).
+//  Covers the three pieces that decide, and then account for, how many
+//  captured frames reach the Tower: `FrameRateGate` (the sampling cadence that
+//  replaced the fixed 1-in-30 stride), `SendWindow` (the bounded set of
+//  outstanding sends, which turned out to be the pipeline's real rate limiter)
+//  and `SenderMetrics` (the per-stage counters that make a shortfall
+//  attributable instead of mysterious).
 //
-//  Both are pure enough to drive with synthetic arrival times, so these tests
-//  assert exact cadence rather than sleeping and hoping.
+//  All three are pure enough to drive with synthetic times, so these tests
+//  assert exact cadence and exact arithmetic rather than sleeping and hoping.
 //
 
 import XCTest
@@ -461,5 +463,315 @@ final class SenderMetricsTests: XCTestCase {
             4,
             "four selected frames reached no outcome and must be visible as backlog"
         )
+    }
+}
+
+// MARK: - Send window
+
+/// The send window turned out to be the pipeline's rate limiter rather than a
+/// passive memory guard, so it is tested as one: occupancy, slot lifetime,
+/// token safety across a teardown, and the arithmetic that ties capacity and
+/// latency to a frame rate.
+///
+/// Every case drives synthetic times, so the assertions are exact rather than
+/// dependent on how fast the test machine happens to be.
+@MainActor
+final class SendWindowTests: XCTestCase {
+
+    private func makeWindow(capacity: Int = 4, stallTimeout: TimeInterval = 2) -> SendWindow {
+        SendWindow(capacity: capacity, stallTimeout: stallTimeout)
+    }
+
+    // MARK: Occupancy
+
+    func testReservesUpToCapacityAndThenRefuses() {
+        var window = makeWindow(capacity: 3)
+        XCTAssertNotNil(window.reserve(at: 0))
+        XCTAssertNotNil(window.reserve(at: 0))
+        XCTAssertNotNil(window.reserve(at: 0))
+        XCTAssertEqual(window.inFlight, 3)
+        XCTAssertTrue(window.isFull)
+        XCTAssertNil(window.reserve(at: 0), "a full window must refuse rather than grow")
+        XCTAssertEqual(window.inFlight, 3, "a refused reservation must not occupy a slot")
+    }
+
+    func testReleasingReopensExactlyOneSlot() throws {
+        var window = makeWindow(capacity: 2)
+        let first = try XCTUnwrap(window.reserve(at: 0))
+        _ = window.reserve(at: 0)
+        XCTAssertNil(window.reserve(at: 0))
+
+        XCTAssertNotNil(window.release(first, at: 0))
+        XCTAssertEqual(window.inFlight, 1)
+        XCTAssertNotNil(window.reserve(at: 0), "the freed slot must be reusable")
+        XCTAssertNil(window.reserve(at: 0), "and only that one slot")
+    }
+
+    /// The number the whole diagnosis rests on: a slot's lifetime is what the
+    /// achievable send rate is divided by.
+    func testReleaseReportsHowLongTheSlotWasHeld() throws {
+        var window = makeWindow()
+        let token = try XCTUnwrap(window.reserve(at: 10))
+        let lifetime = window.release(token, at: 10.29)
+        XCTAssertEqual(try XCTUnwrap(lifetime), 0.29, accuracy: 0.0001)
+    }
+
+    func testUnknownTokenReleasesNothing() {
+        var window = makeWindow(capacity: 1)
+        _ = window.reserve(at: 0)
+        XCTAssertNil(window.release(9999, at: 1), "an unknown token has no slot to report on")
+        XCTAssertEqual(window.inFlight, 1, "and must not free somebody else's slot")
+    }
+
+    // MARK: Teardown safety
+
+    func testResetReopensTheWholeWindow() {
+        var window = makeWindow(capacity: 2)
+        _ = window.reserve(at: 0)
+        _ = window.reserve(at: 0)
+        window.reset()
+        XCTAssertEqual(window.inFlight, 0)
+        XCTAssertFalse(window.isFull)
+    }
+
+    /// The leak this design exists to prevent, from the other direction: a
+    /// completion handler for a torn-down socket arriving *after* the next
+    /// connection has started sending must not credit a slot it does not own.
+    /// If tokens were rewound by `reset()`, the stale completion would release
+    /// the new connection's frame and the window would silently widen.
+    func testStaleTokenFromBeforeAResetCannotCreditASlotAfterIt() throws {
+        var window = makeWindow(capacity: 1)
+        let staleToken = try XCTUnwrap(window.reserve(at: 0))
+
+        window.reset()
+
+        let freshToken = try XCTUnwrap(window.reserve(at: 1))
+        XCTAssertNotEqual(staleToken, freshToken, "tokens must not be reused across a teardown")
+
+        XCTAssertNil(window.release(staleToken, at: 2), "the stale completion owns nothing")
+        XCTAssertEqual(window.inFlight, 1, "the live send must still hold its slot")
+        XCTAssertNil(window.reserve(at: 2), "the window must still be full")
+    }
+
+    // MARK: Stall detection
+
+    func testAYoungFullWindowIsNotStalled() {
+        var window = makeWindow(capacity: 2, stallTimeout: 2)
+        _ = window.reserve(at: 0)
+        _ = window.reserve(at: 0)
+        XCTAssertFalse(window.isStalled(at: 1.9))
+    }
+
+    func testAFullWindowThatStopsDrainingIsStalled() {
+        var window = makeWindow(capacity: 2, stallTimeout: 2)
+        _ = window.reserve(at: 0)
+        _ = window.reserve(at: 0)
+        XCTAssertTrue(window.isStalled(at: 2.0))
+        XCTAssertTrue(window.isStalled(at: 52.0), "the 52-second baseline outlier is unambiguously a stall")
+    }
+
+    /// A window with room is still admitting frames, so nothing is blocked and
+    /// tearing the connection down would cost more than it recovered.
+    func testAnAgedButNonFullWindowIsNotStalled() {
+        var window = makeWindow(capacity: 3, stallTimeout: 2)
+        _ = window.reserve(at: 0)
+        XCTAssertFalse(window.isStalled(at: 100))
+    }
+
+    /// URLSession does not document send-completion ordering, so stall
+    /// detection must key off the genuinely oldest reservation rather than
+    /// assuming the first one reserved is the first one released.
+    func testOldestAgeSurvivesOutOfOrderCompletion() throws {
+        var window = makeWindow(capacity: 3, stallTimeout: 2)
+        let oldest = try XCTUnwrap(window.reserve(at: 0))
+        let middle = try XCTUnwrap(window.reserve(at: 1))
+        _ = window.reserve(at: 2)
+
+        XCTAssertNotNil(window.release(middle, at: 3), "a later send may complete first")
+        XCTAssertEqual(try XCTUnwrap(window.oldestAge(at: 3)), 3, accuracy: 0.0001)
+
+        XCTAssertNotNil(window.release(oldest, at: 3))
+        XCTAssertEqual(try XCTUnwrap(window.oldestAge(at: 3)), 1, accuracy: 0.0001)
+    }
+
+    func testOldestAgeIsNilWhenNothingIsInFlight() {
+        let window = makeWindow()
+        XCTAssertNil(window.oldestAge(at: 5))
+        XCTAssertFalse(window.isStalled(at: 5))
+    }
+
+    // MARK: Capacity arithmetic
+
+    /// Capacity is derived from a latency budget, and this is that derivation.
+    func testCapacityIsTheFrameCountThatFitsInTheLatencyBudget() {
+        XCTAssertEqual(SendWindow.capacity(forTargetFPS: 12, latencyBudget: 1.0 / 3.0), 4)
+        XCTAssertEqual(SendWindow.capacity(forTargetFPS: 12, latencyBudget: 0.5), 6)
+        XCTAssertEqual(SendWindow.capacity(forTargetFPS: 24, latencyBudget: 0.25), 6)
+    }
+
+    func testCapacityIsNeverZeroHoweverItIsConfigured() {
+        XCTAssertEqual(SendWindow.capacity(forTargetFPS: 12, latencyBudget: 0), 1)
+        XCTAssertEqual(SendWindow.capacity(forTargetFPS: 0, latencyBudget: 1), 1)
+        XCTAssertEqual(SendWindow.capacity(forTargetFPS: -5, latencyBudget: -5), 1)
+        XCTAssertEqual(
+            SendWindow.capacity(forTargetFPS: 1, latencyBudget: 0.1),
+            1,
+            "rounding to zero must still admit frames"
+        )
+    }
+
+    /// A zero capacity would stall the pipeline permanently and a non-positive
+    /// stall timeout would tear the connection down on the first full window.
+    func testDegenerateConfigurationIsClampedRatherThanTrapping() {
+        var window = SendWindow(capacity: 0, stallTimeout: 0)
+        XCTAssertEqual(window.capacity, 1)
+        XCTAssertNotNil(window.reserve(at: 0), "a clamped window must still admit one frame")
+        XCTAssertFalse(window.isStalled(at: 1_000_000), "a non-positive timeout must not mean always-stalled")
+    }
+
+    // MARK: The regression this exists for
+
+    /// The physical baseline, as arithmetic. A capacity of 2 against the
+    /// measured slot lifetimes produces exactly the rates that run reported —
+    /// which is what identified the window, rather than the encoder or the
+    /// gate, as the constraint. The same latencies with the latency-budgeted
+    /// capacity clear the 12 fps target.
+    ///
+    /// This is a statement about the design, not about the device: it will
+    /// keep holding on any machine, because it divides two constants.
+    func testTheBaselineRatesAreExplainedByCapacityOverSlotLifetime() {
+        func achievableFPS(capacity: Int, slotLifetime: TimeInterval) -> Double {
+            Double(capacity) / slotLifetime
+        }
+
+        // What the device measured: ~7 fps early in the run, ~3.4 fps by the end.
+        XCTAssertEqual(achievableFPS(capacity: 2, slotLifetime: 0.29), 6.9, accuracy: 0.1)
+        XCTAssertEqual(achievableFPS(capacity: 2, slotLifetime: 0.59), 3.4, accuracy: 0.1)
+
+        // The same link, with capacity derived from the latency budget.
+        let sized = SendWindow.capacity(
+            forTargetFPS: FrameRateGate.towerTargetFPS,
+            latencyBudget: TowerClient.outboundLatencyBudget
+        )
+        XCTAssertGreaterThanOrEqual(
+            achievableFPS(capacity: sized, slotLifetime: 0.29),
+            FrameRateGate.towerTargetFPS,
+            "the sized window must clear the target at the latency it was budgeted for"
+        )
+    }
+}
+
+// MARK: - Slot-lifetime instrumentation
+
+/// The counters added so a send-rate shortfall can be attributed to the
+/// network or to the main actor instead of guessed at.
+@MainActor
+final class SlotTimingMetricsTests: XCTestCase {
+
+    func testTimingsAreNilRatherThanZeroBeforeAnySend() {
+        let metrics = SenderMetrics()
+        metrics.begin()
+        let snapshot = metrics.currentSnapshot
+        XCTAssertNil(snapshot.sendLatencyMsAverage)
+        XCTAssertNil(snapshot.slotLifetimeMsAverage)
+        XCTAssertNil(snapshot.completionHopMsAverage)
+        XCTAssertNil(snapshot.windowLimitedFPS(capacity: 4))
+    }
+
+    func testAverageAndWorstCaseAreTrackedSeparatelyForBothSpans() {
+        let metrics = SenderMetrics()
+        metrics.begin()
+        metrics.recordSlotTiming(sendLatency: 0.100, slotLifetime: 0.110)
+        metrics.recordSlotTiming(sendLatency: 0.300, slotLifetime: 0.390)
+
+        let snapshot = metrics.currentSnapshot
+        XCTAssertEqual(snapshot.slotSamples, 2)
+        XCTAssertEqual(try XCTUnwrap(snapshot.sendLatencyMsAverage), 200, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(snapshot.sendLatencyMsMax), 300, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(snapshot.slotLifetimeMsAverage), 250, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(snapshot.slotLifetimeMsMax), 390, accuracy: 0.001)
+    }
+
+    /// The whole point of sampling the two spans separately: the difference is
+    /// main-actor congestion, and it is what distinguishes "the network is
+    /// slow" from "we are too busy to notice the network finished".
+    func testTheHopIsTheDifferenceBetweenTheTwoSpans() throws {
+        let metrics = SenderMetrics()
+        metrics.begin()
+        metrics.recordSlotTiming(sendLatency: 0.100, slotLifetime: 0.150)
+        metrics.recordSlotTiming(sendLatency: 0.200, slotLifetime: 0.250)
+
+        XCTAssertEqual(try XCTUnwrap(metrics.currentSnapshot.completionHopMsAverage), 50, accuracy: 0.001)
+    }
+
+    /// The two spans are sampled from different execution contexts, so a
+    /// lifetime shorter than its own latency is a clock artefact rather than a
+    /// measurement. Clamping keeps the derived hop from going negative.
+    func testALifetimeShorterThanItsLatencyIsClampedRatherThanReportedNegative() throws {
+        let metrics = SenderMetrics()
+        metrics.begin()
+        metrics.recordSlotTiming(sendLatency: 0.200, slotLifetime: 0.150)
+
+        let snapshot = metrics.currentSnapshot
+        XCTAssertEqual(try XCTUnwrap(snapshot.slotLifetimeMsAverage), 200, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(snapshot.completionHopMsAverage), 0, accuracy: 0.001)
+    }
+
+    func testNegativeLatencyIsClampedToZero() throws {
+        let metrics = SenderMetrics()
+        metrics.begin()
+        metrics.recordSlotTiming(sendLatency: -0.05, slotLifetime: 0.05)
+        XCTAssertEqual(try XCTUnwrap(metrics.currentSnapshot.sendLatencyMsAverage), 0, accuracy: 0.001)
+    }
+
+    /// The diagnosis in one number: at the measured slot lifetime, this is the
+    /// most the window can deliver however many frames the gate selects.
+    func testWindowLimitedRateIsCapacityOverSlotLifetime() throws {
+        let metrics = SenderMetrics()
+        metrics.begin()
+        metrics.recordSlotTiming(sendLatency: 0.28, slotLifetime: 0.29)
+
+        XCTAssertEqual(
+            try XCTUnwrap(metrics.currentSnapshot.windowLimitedFPS(capacity: 2)),
+            6.9,
+            accuracy: 0.1,
+            "the baseline window and the baseline latency must reproduce the baseline rate"
+        )
+        XCTAssertGreaterThanOrEqual(
+            try XCTUnwrap(metrics.currentSnapshot.windowLimitedFPS(capacity: 4)),
+            FrameRateGate.towerTargetFPS
+        )
+    }
+
+    func testStallRecoveriesAreCounted() {
+        let metrics = SenderMetrics()
+        metrics.begin()
+        XCTAssertEqual(metrics.currentSnapshot.stallRecoveries, 0)
+        metrics.recordStallRecovery()
+        metrics.recordStallRecovery()
+        XCTAssertEqual(metrics.currentSnapshot.stallRecoveries, 2)
+    }
+
+    /// A stall recovery is rare and is the event the instrumentation exists to
+    /// catch, so unlike the per-frame counters it publishes immediately rather
+    /// than waiting for the next 2 Hz interval.
+    func testStallRecoveryPublishesWithoutWaitingForTheInterval() {
+        let metrics = SenderMetrics()
+        metrics.begin()
+        metrics.recordStallRecovery()
+        XCTAssertEqual(metrics.snapshot.stallRecoveries, 1)
+    }
+
+    /// Slot timings are pure instrumentation: they must not disturb the
+    /// accounting that says whether frames are queueing.
+    func testSlotTimingDoesNotAffectTheBacklogInvariant() {
+        let metrics = SenderMetrics()
+        metrics.begin()
+        metrics.recordSelection()
+        metrics.recordSendAttempt(wireBytes: 100)
+        metrics.recordSlotTiming(sendLatency: 0.1, slotLifetime: 0.1)
+        metrics.recordSendSuccess()
+
+        XCTAssertEqual(metrics.currentSnapshot.framesUnaccounted, 0)
     }
 }

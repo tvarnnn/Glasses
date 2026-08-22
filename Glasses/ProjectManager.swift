@@ -28,6 +28,13 @@ final class ProjectManager: ObservableObject {
     /// vs. replied) comparable within one session.
     let senderMetrics: SenderMetrics
 
+    /// iPhone-side thermal, power and battery telemetry, so a rate that decays
+    /// over a long run can be attributed to the device throttling rather than
+    /// only to the network. The glasses' own thermal level comes from
+    /// `glassesConnection.glassesThermalLevel`, which keeps DAT behind its
+    /// boundary (docs/02-DEVELOPMENT-RULES.md Rule 1).
+    let deviceHealth: DeviceHealth
+
     /// Retains the subscriptions that forward each child's `objectWillChange`
     /// into this object's own publisher. Without this, `@StateObject`/
     /// `@ObservedObject` callers observing `ProjectManager` never re-render
@@ -47,11 +54,23 @@ final class ProjectManager: ObservableObject {
         self.senderMetrics = metrics
         self.glassesConnection = glassesConnection ?? GlassesConnection(metrics: metrics)
         self.streamManager = streamManager ?? StreamManager()
-        self.towerClient = towerClient ?? TowerClient(metrics: metrics)
+        // `autoReconnect` is opted into here rather than defaulted on inside
+        // `TowerClient`, so that unit tests asserting "a dropped connection
+        // settles at .failed" keep asserting about a settled value. In the app
+        // the opposite is wanted: a mid-session drop on a remote Tailscale
+        // path is the expected case, and until now it ended Tower delivery for
+        // good — nothing in the app called `connect()` again except the
+        // developer's own button. The stream-bracket reopening wired up below
+        // was already written for a reconnect that could not happen.
+        self.towerClient = towerClient ?? TowerClient(metrics: metrics, autoReconnect: true)
+
+        let health = DeviceHealth()
+        self.deviceHealth = health
 
         for child in [self.glassesConnection.objectWillChange.eraseToAnyPublisher(),
                       self.streamManager.objectWillChange.eraseToAnyPublisher(),
-                      self.towerClient.objectWillChange.eraseToAnyPublisher()] {
+                      self.towerClient.objectWillChange.eraseToAnyPublisher(),
+                      health.objectWillChange.eraseToAnyPublisher()] {
             child
                 .receive(on: DispatchQueue.main)
                 .sink { [weak self] _ in self?.objectWillChange.send() }
@@ -81,6 +100,10 @@ final class ProjectManager: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.towerClient.sendStreamStart()
+                // Battery notifications fire at most once a minute, so without
+                // an explicit read the health figures shown against a session
+                // can predate it.
+                self?.deviceHealth.refresh()
             }
             .store(in: &cancellables)
 

@@ -23,6 +23,7 @@ struct DeveloperToolsView: View {
     @ObservedObject var tower: TowerClient
     @ObservedObject var stream: StreamManager
     @ObservedObject var senderMetrics: SenderMetrics
+    @ObservedObject var health: DeviceHealth
 
     @Environment(\.dismiss) private var dismiss
 
@@ -30,6 +31,7 @@ struct DeveloperToolsView: View {
         NavigationStack {
             List {
                 senderSection
+                deviceHealthSection
                 mockDeviceSection
                 rawStateSection
                 towerSection
@@ -92,15 +94,31 @@ struct DeveloperToolsView: View {
             LabeledContent("Uplink", value: Self.bytesPerSecond(s.wireBytesPerSecond))
             LabeledContent("Delivered", value: Self.percent(s.deliveredFraction))
 
+            // The rate arithmetic, spelled out. "Sent OK" above cannot exceed
+            // "Window limit", so whenever it falls short of the target these
+            // rows say whether the cause is the network (send ms), the main
+            // actor (hop ms), or the window being too small for the measured
+            // latency.
+            LabeledContent("Send ms", value: "\(Self.ms(s.sendLatencyMsAverage)) avg / \(Self.ms(s.sendLatencyMsMax)) max")
+            LabeledContent("Slot ms", value: "\(Self.ms(s.slotLifetimeMsAverage)) avg / \(Self.ms(s.slotLifetimeMsMax)) max")
+            LabeledContent("Main-actor hop ms", value: Self.ms(s.completionHopMsAverage))
+            LabeledContent(
+                "Window limit",
+                value: "\(Self.fps(s.windowLimitedFPS(capacity: tower.maxFramesInFlight)))  (\(tower.maxFramesInFlight) slots)"
+            )
+            LabeledContent("Stall recoveries", value: "\(s.stallRecoveries)")
+
             // Health checks rather than measurements. "Backlog" is a count,
             // not a verdict: a small steady number is the main-queue hop plus
-            // the send window; a climbing one is queue growth.
+            // the send window; a climbing one is queue growth. The healthy
+            // ceiling scales with the window, so it is stated in the footer
+            // rather than left for the reader to infer.
             LabeledContent("Backlog", value: "\(s.framesUnaccounted)")
             LabeledContent("Sequence 1:1", value: s.sequenceInvariantHolds ? "yes" : "NO")
         } header: {
             Text("Sender Pipeline")
         } footer: {
-            Text("Counts and rates for one camera session, from DAT callback to Tower reply. Target send rate is \(String(format: "%.0f", FrameRateGate.towerTargetFPS)) fps. Debug build with per-frame logging — treat rates as a floor.")
+            Text("Counts and rates for one camera session, from DAT callback to Tower reply. Target send rate is \(String(format: "%.0f", FrameRateGate.towerTargetFPS)) fps. \"Window limit\" is slots ÷ slot ms — the ceiling on \"Sent OK\" regardless of how many frames the gate selects. \"Backlog\" is healthy up to about \(tower.maxFramesInFlight + 1); what matters is that it does not climb. Debug build with per-frame logging — treat rates as a floor.")
         }
     }
 
@@ -126,6 +144,46 @@ struct DeveloperToolsView: View {
     private static func bytesPerSecond(_ value: Double?) -> String {
         guard let value else { return "—" }
         return String(format: "%.0f KB/s", value / 1024)
+    }
+
+    // MARK: Device health
+
+    /// Thermal, power and battery telemetry for both ends of the link.
+    ///
+    /// Present because a five-minute physical run left the glasses warm to the
+    /// touch and the sender rate decayed over the same minutes, and there was
+    /// no way to tell whether those facts were related. Every row is a value
+    /// the OS or the SDK actually reports; nothing here is estimated.
+    private var deviceHealthSection: some View {
+        Section {
+            LabeledContent("Glasses thermal", value: glassesThermalText)
+            LabeledContent("iPhone thermal", value: phoneThermalText)
+            LabeledContent("iPhone battery", value: batteryText)
+            LabeledContent("Low Power Mode", value: health.isLowPowerModeEnabled ? "On" : "Off")
+        } header: {
+            Text("Device Health")
+        } footer: {
+            Text("Glasses thermal is DAT's ThermalLevel — the only device-health value the pinned 0.9.0 SDK exposes. Glasses battery, charging state and any numeric temperature are not in that API, so they are absent rather than estimated. \"iPhone thermal\" at Serious or above means the system is throttling, which shows up in the sender rows above as encode and hop times growing.")
+        }
+    }
+
+    /// Spells out the consequence rather than leaving the reader to know which
+    /// `ThermalState` cases mean the system has started shedding performance.
+    private var phoneThermalText: String {
+        let name = health.thermalState.displayName
+        return health.thermalState.isThrottling ? "\(name) — throttling" : name
+    }
+
+    /// `nil` — no active device, or the stream has not yielded yet — is shown
+    /// as unavailable rather than as a benign-looking level.
+    private var glassesThermalText: String {
+        guard let level = glasses.glassesThermalLevel else { return "—" }
+        return "\(level)"
+    }
+
+    private var batteryText: String {
+        guard let level = health.batteryLevel else { return health.batteryState.displayName }
+        return "\(Int((level * 100).rounded()))%  \(health.batteryState.displayName)"
     }
 
     // MARK: Mock Device Kit
@@ -183,7 +241,13 @@ struct DeveloperToolsView: View {
             }
             LabeledContent("Status", value: "\(tower.status)")
             LabeledContent("Streaming To Tower", value: tower.isStreamingToTower ? "Yes" : "No")
-            LabeledContent("Frame Results", value: "\(tower.frameResultCount)")
+            // Labelled as per-bracket on purpose. It counts replies since the
+            // last `stream_start`, and a reconnect reopens the bracket — so
+            // after one it will read lower than the per-session "Tower replies"
+            // on the Sender Pipeline section above. That difference is
+            // information here, not a discrepancy, but only if the label says
+            // which is which.
+            LabeledContent("Frame Results (this bracket)", value: "\(tower.frameResultCount)")
         } header: {
             Text("Tower")
         } footer: {

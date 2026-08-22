@@ -297,9 +297,16 @@ private extension SessionView {
                     value: SessionView.fps(senderMetrics.snapshot.successfulSendFPS),
                     footnote: "frames per second"
                 )
+                // Read from `senderMetrics`, not from `tower.frameResultCount`.
+                // The latter counts one *stream bracket*, and now that a
+                // dropped Tower connection reconnects on its own, a bracket no
+                // longer matches a camera session: a mid-session blip would
+                // reopen the bracket and visibly reset this tile to zero while
+                // the tile beside it kept counting. Both tiles now come from
+                // the same per-session source and cannot disagree.
                 MetricTile(
                     caption: "Tower replies",
-                    value: tower.frameResultCount.formatted(),
+                    value: senderMetrics.snapshot.frameResults.formatted(),
                     footnote: "frames processed"
                 )
                 if let frame = glasses.latestCapturedFrame {
