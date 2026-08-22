@@ -39,7 +39,7 @@ report others alongside it.
 | `edge_detection` | `edge_density` | 1.5 ms | none |
 | `frame_quality` | `sharpness_laplacian_var` | 5.6 ms | none |
 | `feature_detection` | `keypoint_count` | 4.2 ms | none |
-| `redaction_impact` | `keypoint_retention` | 4.5 ms | none |
+| `redaction_impact` | `region_keypoint_retention` | 4.9 ms | none |
 | `optical_flow` | `median_flow_px` | 4.6 ms | previous frame |
 | `object_detection` | `detections` | 35.3 ms | model (`[ml]` extra) |
 | `depth` | `mean_relative_depth` | 26.0 ms | model (`[ml]` extra) |

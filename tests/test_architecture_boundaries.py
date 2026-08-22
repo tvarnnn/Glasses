@@ -164,3 +164,27 @@ def test_shared_code_does_not_import_an_experiment_implementation():
                 offenders.append(f"{name} -> {imported}")
 
     assert offenders == []
+
+
+def test_importing_the_lab_does_not_import_torch():
+    """The optional [ml] extra must stay optional.
+
+    Two experiments need torch; six do not, and the Tower must start on a
+    machine that has never installed it. Every torch import is therefore
+    inside a function, and this is the only way to check that -- an
+    in-process assertion would pass merely because some earlier test in
+    the same session had already imported it.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys, tower.main, tower.experiments; "
+        "print([m for m in ('torch','torchvision','timm') if m in sys.modules])"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("[]"), result.stdout

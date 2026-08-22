@@ -16,9 +16,8 @@ the others offer.
 import cv2
 import numpy as np
 
-from tower.experiments import ExperimentResult
+from tower.experiments import ExperimentResult, decode_color
 from tower.instrumentation import StageTimer
-from tower.modules.base import FrameProcessingError
 
 # 8-bit imagery, so these are absolute levels rather than fractions.
 # Chosen at the ends of the range: a pixel at 250+ has almost certainly
@@ -31,11 +30,7 @@ def run(raw_bytes: bytes) -> ExperimentResult:
     timer = StageTimer()
 
     with timer.stage("decode"):
-        array = np.frombuffer(raw_bytes, dtype=np.uint8)
-        image = cv2.imdecode(array, cv2.IMREAD_COLOR)
-        if image is None:
-            raise FrameProcessingError("undecodable frame")
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(decode_color(raw_bytes), cv2.COLOR_BGR2GRAY)
 
     with timer.stage("sharpness"):
         sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())

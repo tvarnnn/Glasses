@@ -4,7 +4,7 @@ import time
 import cv2
 import numpy as np
 
-from tower.experiments import ExperimentResult, ExperimentSettings
+from tower.experiments import ExperimentResult, ExperimentSettings, decode_color
 from tower.instrumentation import StageTimer
 from tower.modules.base import FrameProcessingError
 
@@ -119,17 +119,25 @@ class DepthEstimation:
         timer = StageTimer()
 
         with timer.stage("decode"):
-            array = np.frombuffer(raw_bytes, dtype=np.uint8)
-            image = cv2.imdecode(array, cv2.IMREAD_COLOR)
-            if image is None:
-                raise FrameProcessingError("undecodable frame")
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image_rgb = cv2.cvtColor(decode_color(raw_bytes), cv2.COLOR_BGR2RGB)
 
         import torch  # deferred: only the stages below need it, so an
         # undecodable frame never requires torch to be installed at all.
 
         with timer.stage("preprocess"):
-            input_tensor = self._transform(image_rgb).to(self._device)
+            try:
+                input_tensor = self._transform(image_rgb).to(self._device)
+            except cv2.error as exc:
+                # MiDaS's transform resizes, and its internal cv2.resize
+                # asserts on a non-positive scale for an extreme aspect
+                # ratio (measured: 1x1000 and 1000x1 both fail; 1x1 and
+                # 16x16 are fine, so this is about the RATIO, not size).
+                # Without this the bare cv2.error marks the whole module
+                # FAILED, terminally, for the life of the process.
+                raise FrameProcessingError(
+                    f"frame {image_rgb.shape[1]}x{image_rgb.shape[0]} could "
+                    f"not be prepared for the depth model: {exc}"
+                ) from exc
 
         with timer.stage("inference"):
             with torch.inference_mode():

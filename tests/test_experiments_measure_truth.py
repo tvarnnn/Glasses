@@ -209,6 +209,16 @@ class TestOpticalFlowMeasuresRealCameraMotion:
 
 
 class TestRedactionImpactMeasuresTheCost:
+    @staticmethod
+    def _room(width=640, height=360) -> bytes:
+        """A rendered room -- textured the way a real scene is, not uniformly."""
+        scene = ss.furnished_room()
+        poses = ss.strafe(1, step=0.1)
+        images = ss.render_sequence(
+            scene, poses, ss.camera_matrix(width, height), width, height
+        )
+        return ss.encode_jpeg(images[0])
+
     def test_redaction_removes_keypoints_from_the_region_we_chose(self):
         """The rectangle is ours, so its contents are independent truth."""
         frame = _textured(size=(240, 320))
@@ -218,6 +228,50 @@ class TestRedactionImpactMeasuresTheCost:
         assert metrics["keypoints_in_region_after"] < metrics[
             "keypoints_in_region_before"
         ]
+
+    def test_the_headline_is_the_in_region_number_not_the_frame_number(self):
+        """A frame-wide retention is nearly a constant and decides nothing.
+
+        The region covers ~6% of the area, so frame retention sits near
+        0.99 whether the redaction was clean or leaky. The in-region
+        number moves: measured 0.12 on a rendered room against 0.99
+        frame-wide, an 8x difference in what the two numbers say.
+        """
+        metrics = redaction_impact.run(self._room()).metrics
+
+        assert metrics["region_keypoint_retention"] < 0.5
+        assert metrics["frame_keypoint_retention"] > 0.9
+        assert (
+            metrics["region_keypoint_retention"]
+            < metrics["frame_keypoint_retention"] / 2
+        )
+
+    def test_survivors_near_the_redaction_sit_on_its_boundary(self):
+        """The finding this experiment exists to reproduce.
+
+        A box blur leaves features along its own edge. They look
+        trackable and describe the transition rather than the scene, so a
+        high retention with a high boundary fraction is WORSE than a low
+        retention. Measured on a rendered room: 0.96.
+        """
+        metrics = redaction_impact.run(self._room()).metrics
+
+        assert metrics["survivors_near_region"] > 10
+        assert metrics["boundary_fraction"] > 0.7
+
+    def test_the_boundary_denominator_is_the_nearby_survivors(self):
+        """Divided by every survivor in the frame this measures the frame.
+
+        Ordinary never-blurred texture anywhere near the box edge would
+        dominate the number and dilute the signal. Pinned so a future
+        edit cannot quietly widen the denominator again.
+        """
+        metrics = redaction_impact.run(self._room()).metrics
+
+        assert metrics["survivors_near_region"] < metrics["keypoints_after"]
+        assert metrics["boundary_fraction"] == pytest.approx(
+            metrics["survivors_on_boundary"] / metrics["survivors_near_region"]
+        )
 
     def test_a_blank_frame_loses_nothing_because_it_had_nothing(self):
         metrics = redaction_impact.run(_encode(_flat())).metrics
@@ -256,7 +310,15 @@ class TestUndecodableInputIsAFrameLevelFailure:
     """One bad frame must not take the module down (FrameProcessingError)."""
 
     @pytest.mark.parametrize(
-        "name", ["frame_quality", "feature_detection", "redaction_impact", "optical_flow"]
+        "name",
+        [
+            "baseline",
+            "edge_detection",
+            "frame_quality",
+            "feature_detection",
+            "redaction_impact",
+            "optical_flow",
+        ],
     )
     def test_garbage_bytes_raise_a_frame_scoped_error(self, name):
         from tower.modules.base import FrameProcessingError
@@ -266,3 +328,36 @@ class TestUndecodableInputIsAFrameLevelFailure:
 
         with pytest.raises(FrameProcessingError):
             experiment.run(b"not a jpeg at all")
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "baseline",
+            "edge_detection",
+            "frame_quality",
+            "feature_detection",
+            "redaction_impact",
+            "optical_flow",
+        ],
+    )
+    def test_a_header_only_jpeg_raises_a_frame_scoped_error(self, name):
+        """The reachable case, not the obvious one.
+
+        The transport validates a frame with `Image.open(...).size`, which
+        parses the JPEG HEADER only. A truncated file with an intact
+        header passes that check and reaches the experiment, where
+        `cv2.imdecode` returns None. Anything other than
+        FrameProcessingError here marks the whole module FAILED for the
+        rest of the process.
+        """
+        from tower.modules.base import FrameProcessingError
+
+        # Built from hex so this source file stays plain ASCII: a
+        # literal ÿ byte in a test file is a trap for every tool
+        # that reads it as text.
+        truncated = bytes.fromhex("ffd8ffe00010") + b"JFIF" + bytes(40)
+        experiment = EXPERIMENTS[name]()
+        experiment.load(ExperimentSettings())
+
+        with pytest.raises(FrameProcessingError):
+            experiment.run(truncated)

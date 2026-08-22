@@ -14,18 +14,24 @@ face imagery anywhere to validate against. Detecting nothing and blurring
 a fixed central rectangle measures the consequence honestly; pretending
 to find a face would not.
 
-The headline is retention: what fraction of the original keypoints
-survive redaction. `boundary_fraction` is the number that matters most
-though -- a high retention with most survivors on the boundary is worse
-than a low one, because those features look trackable and are not.
+The headline is retention **inside the redacted region**, not across the
+frame. A frame-wide retention number is nearly a constant -- the region
+covers ~6% of the area, so global retention sits near 0.97 whether the
+redaction was clean or leaky, and nobody would gate a decision on 0.96
+versus 0.97. The in-region number is the one that moves.
+
+`boundary_fraction` is measured over survivors **near the region**, for
+the same reason. Divided by every survivor in the frame it is dominated
+by ordinary never-blurred texture that happens to lie near the box edge,
+which dilutes the signal by roughly 2.5x and reports a property of the
+frame rather than of the redaction.
 """
 
 import cv2
 import numpy as np
 
-from tower.experiments import ExperimentResult
+from tower.experiments import ORB_MIN_DIMENSION, ExperimentResult, decode_gray
 from tower.instrumentation import StageTimer
-from tower.modules.base import FrameProcessingError
 
 ORB_FEATURES = 1000
 # A centred rectangle covering a quarter of each dimension -- roughly the
@@ -59,10 +65,7 @@ def run(raw_bytes: bytes) -> ExperimentResult:
     timer = StageTimer()
 
     with timer.stage("decode"):
-        array = np.frombuffer(raw_bytes, dtype=np.uint8)
-        gray = cv2.imdecode(array, cv2.IMREAD_GRAYSCALE)
-        if gray is None:
-            raise FrameProcessingError("undecodable frame")
+        gray = decode_gray(raw_bytes, min_dimension=ORB_MIN_DIMENSION)
 
     height, width = gray.shape[:2]
     x0, y0, x1, y1 = redaction_region(width, height)
@@ -106,25 +109,38 @@ def run(raw_bytes: bytes) -> ExperimentResult:
         original_inside = sum(1 for kp in original if inside(kp.pt))
         survivors_inside = sum(1 for kp in survivors if inside(kp.pt))
         survivors_on_boundary = sum(1 for kp in survivors if on_boundary(kp.pt))
+        # Survivors the redaction could plausibly have affected: inside it
+        # or within the boundary band. This is boundary_fraction's honest
+        # denominator -- dividing by every survivor in the frame answers a
+        # question about the frame, not about the redaction.
+        survivors_near = sum(
+            1 for kp in survivors if inside(kp.pt) or on_boundary(kp.pt)
+        )
 
-        retention = survivor_count / original_count if original_count else 0.0
+        region_retention = (
+            survivors_inside / original_inside if original_inside else 0.0
+        )
+        frame_retention = survivor_count / original_count if original_count else 0.0
         boundary_fraction = (
-            survivors_on_boundary / survivor_count if survivor_count else 0.0
+            survivors_on_boundary / survivors_near if survivors_near else 0.0
         )
         region_area_fraction = ((x1 - x0) * (y1 - y0)) / float(gray.size)
 
     return ExperimentResult(
-        result_value=retention,
-        result_label="keypoint_retention",
+        result_value=region_retention,
+        result_label="region_keypoint_retention",
         processing_ms=timer.total_ms,
         stage_ms=timer.snapshot(),
         metrics={
-            "keypoint_retention": retention,
+            "region_keypoint_retention": region_retention,
+            "frame_keypoint_retention": frame_retention,
             "keypoints_before": float(original_count),
             "keypoints_after": float(survivor_count),
             "keypoints_lost": float(original_count - survivor_count),
             "keypoints_in_region_before": float(original_inside),
             "keypoints_in_region_after": float(survivors_inside),
+            "survivors_near_region": float(survivors_near),
+            "survivors_on_boundary": float(survivors_on_boundary),
             "boundary_fraction": boundary_fraction,
             "region_area_fraction": region_area_fraction,
             "blur_kernel": float(BLUR_KERNEL),

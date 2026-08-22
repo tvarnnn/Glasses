@@ -56,3 +56,57 @@ def test_resolve_device_cuda_raises_when_unavailable():
         pytest.skip("only meaningful on a machine without CUDA")
     with pytest.raises(RuntimeError):
         resolve_device("cuda")
+
+
+def test_an_extreme_aspect_ratio_is_a_frame_level_failure():
+    """MiDaS's transform resizes, and its internal cv2.resize asserts on a
+    non-positive scale for a 1-pixel-thin frame. Measured: 1x1000 and
+    1000x1 fail while 1x1 and 16x16 succeed, so this is about the RATIO
+    rather than the size.
+
+    Without the guard the bare cv2.error marks the module FAILED, which is
+    terminal -- one such frame would end CV processing for the life of the
+    process.
+    """
+    import cv2
+    import numpy as np
+
+    from tower.experiments import ExperimentSettings
+    from tower.modules.base import FrameProcessingError
+
+    experiment = DepthEstimation()
+    experiment.load(ExperimentSettings(device="cpu"))
+    try:
+        rng = np.random.default_rng(0)
+        for height, width in ((1, 1000), (1000, 1)):
+            array = rng.integers(0, 255, (height, width, 3), dtype=np.uint8)
+            ok, buffer = cv2.imencode(".jpg", array)
+            assert ok
+            with pytest.raises(FrameProcessingError):
+                experiment.run(buffer.tobytes())
+    finally:
+        experiment.release()
+
+
+def test_an_ordinary_frame_still_works_after_a_rejected_one():
+    """The rejection must be frame-scoped, not experiment-scoped."""
+    import cv2
+    import numpy as np
+
+    from tower.experiments import ExperimentSettings
+    from tower.modules.base import FrameProcessingError
+
+    experiment = DepthEstimation()
+    experiment.load(ExperimentSettings(device="cpu"))
+    try:
+        rng = np.random.default_rng(1)
+        thin = cv2.imencode(
+            ".jpg", rng.integers(0, 255, (1, 1000, 3), dtype=np.uint8)
+        )[1].tobytes()
+        with pytest.raises(FrameProcessingError):
+            experiment.run(thin)
+
+        result = experiment.run(_jpeg_bytes(64, 64, (120, 130, 140)))
+        assert result.result_label == "mean_relative_depth"
+    finally:
+        experiment.release()

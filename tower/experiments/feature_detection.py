@@ -21,9 +21,8 @@ test enforces that.
 import cv2
 import numpy as np
 
-from tower.experiments import ExperimentResult
+from tower.experiments import ORB_MIN_DIMENSION, ExperimentResult, decode_gray
 from tower.instrumentation import StageTimer
-from tower.modules.base import FrameProcessingError
 
 ORB_FEATURES = 1000
 COVERAGE_GRID = 8
@@ -33,10 +32,7 @@ def run(raw_bytes: bytes) -> ExperimentResult:
     timer = StageTimer()
 
     with timer.stage("decode"):
-        array = np.frombuffer(raw_bytes, dtype=np.uint8)
-        image = cv2.imdecode(array, cv2.IMREAD_GRAYSCALE)
-        if image is None:
-            raise FrameProcessingError("undecodable frame")
+        image = decode_gray(raw_bytes, min_dimension=ORB_MIN_DIMENSION)
 
     with timer.stage("detect"):
         orb = cv2.ORB_create(nfeatures=ORB_FEATURES)

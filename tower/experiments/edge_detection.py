@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from tower.experiments import ExperimentResult
+from tower.experiments import ExperimentResult, decode_color
 from tower.instrumentation import StageTimer
 
 
@@ -9,8 +9,7 @@ def run(raw_bytes: bytes) -> ExperimentResult:
     timer = StageTimer()
 
     with timer.stage("decode"):
-        array = np.frombuffer(raw_bytes, dtype=np.uint8)
-        image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+        image = decode_color(raw_bytes)
 
     with timer.stage("blur"):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)

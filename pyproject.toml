@@ -26,6 +26,12 @@ dev = [
 ]
 ml = [
     "torch",
+    # torchvision is now a DIRECT dependency, not only a transitive one:
+    # tower/experiments/object_detection.py uses its
+    # ssdlite320_mobilenet_v3_large with COCO weights (~13.4 MB, downloaded
+    # on first use). No new package was added for it -- it was already
+    # here, which is most of why that detector was chosen over one that
+    # would have cost a dependency.
     "torchvision",
     # timm: not a Tower dependency directly, but MiDaS's hubconf.py
     # (intel-isl/MiDaS, loaded via torch.hub in tower/experiments/depth.py)
