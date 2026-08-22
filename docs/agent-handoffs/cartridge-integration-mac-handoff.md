@@ -21,7 +21,7 @@ git log --oneline -10     # expect 8 commits on top of 6a2d114
 
 Then, in order:
 
-1. **§11** — the Xcode validation sequence. Debug build, 220 tests, Release
+1. **§11** — the Xcode validation sequence. Debug build, 225 tests, Release
    build, warning comparison against `6a2d114`.
 2. **§10** — read *before* fixing the first compile error. It ranks where errors
    are most likely and records two candidate errors that were investigated and
@@ -491,12 +491,12 @@ Sender, camera, DAT, `TowerClient` transport, `GlassesConnection`,
 
 ## 9. Tests
 
-**220 total: 112 pre-existing (Mac-validated at `7508db1`) + 108 new.
+**225 total: 112 pre-existing (Mac-validated at `7508db1`) + 113 new.
 EVERY NEW TEST IS UNRUN — NOT RUN ON WINDOWS.**
 
 | File | Base | Now | Added |
 |---|---|---|---|
-| `ProductShellTests.swift` | 26 | 131 | +105 |
+| `ProductShellTests.swift` | 26 | 136 | +110 |
 | `TowerClientTests.swift` | 35 | 38 | +3 |
 | `SenderPipelineTests.swift` | 51 | 51 | 0 |
 
@@ -639,7 +639,7 @@ git log --oneline -6
    Fix compile errors; §10 ranks where they are most likely. The 16 new app
    sources should appear automatically via the synchronized group — **confirm
    they did** before concluding anything about warnings.
-3. **Run all tests.** Expect **220**. The **112 pre-existing must still pass** —
+3. **Run all tests.** Expect **225**. The **112 pre-existing must still pass** —
    any regression there is a defect in this change.
 4. **Release build**
    (`xcodebuild -scheme Glasses -configuration Release -sdk iphoneos build`).
@@ -795,7 +795,7 @@ Specific reconciliation points, per cartridge:
 
 ## 16. Merge / revise / revert criteria
 
-**Merge** when: Debug and Release build clean; all 220 tests pass; no new
+**Merge** when: Debug and Release build clean; all 225 tests pass; no new
 warnings against `6a2d114`; the Simulator smoke test in §12 passes; and the
 physical cartridge-switching check in §13.1 shows an uninterrupted stream and a
 single `GlassesConnection created` line.
@@ -999,6 +999,24 @@ uncertainty.
 them needs a protocol over four unrelated state types with an `associatedtype`
 or an existential — the plugin framework this design refuses, bought for four
 lines.
+
+### Accepted as-is, and why
+
+Two findings from the final verification pass were judged not worth changing
+now, both in code paths that **cannot be reached today**:
+
+- **Three workspace headers state the Tower's incapacity unconditionally** —
+  "The Tower runs none yet", "keeps none yet", "analyses nothing yet" — outside
+  the availability branch, so they would keep asserting it after a contract
+  landed. That is the same shape as `WorldBuilderWorkspaceView`'s pre-existing
+  header, so it is consistent rather than a regression. **Fold each into its
+  availability branch when that cartridge's real client arrives** — it is on the
+  §15 checklist by implication and stated here so it is not missed.
+- **`@ViewBuilder` on a stored closure property, relying on the synthesized
+  memberwise init** (`TowerReachabilityReader`) is standard SwiftUI idiom but is
+  **not used anywhere else in this codebase**. It is the single item the review
+  most wanted a real compile to confirm. If it does not compile, the fix is an
+  explicit `init(tower:content:)` with `@ViewBuilder` on the parameter.
 
 ### Open, and worth putting to the roadmap owner
 

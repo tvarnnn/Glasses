@@ -1174,6 +1174,64 @@ final class ObservationProvenanceTests: XCTestCase {
     }
 }
 
+/// The rule that "metric" is not "metres", as a test.
+///
+/// `ReportedFigure` was extracted because two screens were rendering
+/// `String(format: "%.1f m", …)` from a bare `Double` — inventing the unit —
+/// while `CVMetric.unit` two files away had already taken the correct position
+/// ("never assumed"). It is the smallest shared helper in the change and it was
+/// the only one with no coverage, which is a poor combination for something
+/// whose entire job is a display rule.
+@MainActor
+final class ReportedFigureTests: XCTestCase {
+
+    /// A figure with no unit renders bare. That is not a degraded rendering —
+    /// it is the honest one, because an unlabelled quantity is what the Tower
+    /// sent.
+    func testAFigureWithNoUnitRendersBare() {
+        XCTAssertEqual(ReportedFigure.format(14.2, unit: nil), "14.2")
+        XCTAssertEqual(ReportedFigure.format(3, unit: nil), "3")
+    }
+
+    /// An empty unit string is treated as no unit, not as a trailing space.
+    func testAnEmptyUnitIsTreatedAsNoUnit() {
+        XCTAssertEqual(ReportedFigure.format(14.2, unit: ""), "14.2")
+    }
+
+    /// The Tower's unit is used verbatim — never translated, never normalised.
+    /// iOS does not know that "cm" and "m" are related, and must not act as
+    /// though it does.
+    func testTheTowerUnitIsUsedVerbatim() {
+        XCTAssertEqual(ReportedFigure.format(14.2, unit: "m"), "14.2 m")
+        XCTAssertEqual(ReportedFigure.format(1420, unit: "cm"), "1420 cm")
+        XCTAssertEqual(ReportedFigure.format(7, unit: "keyframes"), "7 keyframes")
+    }
+
+    /// A whole number renders without a decimal point, so a count does not read
+    /// as a measurement.
+    func testWholeNumbersDoNotGrowADecimalPoint() {
+        XCTAssertEqual(ReportedFigure.format(40, unit: nil), "40")
+        XCTAssertEqual(ReportedFigure.format(-3, unit: nil), "-3")
+        XCTAssertEqual(ReportedFigure.format(0, unit: nil), "0")
+    }
+
+    /// **The regression this exists to prevent.** No output may contain a unit
+    /// the caller did not supply — in particular not the metres two screens
+    /// used to print from a scale that only ever claimed to be metric *in
+    /// kind*.
+    func testNoUnitIsEverInvented() {
+        for value in [0.0, 1.0, 14.2, -7.5, 1_000.0] {
+            let rendered = ReportedFigure.format(value, unit: nil)
+            for invented in ["m", "cm", "metre", "meter", "ft"] {
+                XCTAssertFalse(
+                    rendered.contains(invented),
+                    "\(rendered) carries a unit nobody supplied"
+                )
+            }
+        }
+    }
+}
+
 @MainActor
 final class ObservationTimeTests: XCTestCase {
 

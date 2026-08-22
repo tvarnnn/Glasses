@@ -259,9 +259,9 @@ struct WorldSummaryView: View {
             .fixedSize(horizontal: false, vertical: true)
     }
 
-    private func row(_ caption: String, _ value: String) -> some View {
+    private func row(_ label: String, _ value: String) -> some View {
         HStack {
-            Text(caption)
+            Text(label)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
             Spacer(minLength: 12)

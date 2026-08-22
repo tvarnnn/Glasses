@@ -105,7 +105,19 @@ struct DocumentMemoryWorkspaceView: View {
             .padding(12)
             .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 12))
 
-            if !availability.isAvailable {
+            // Two reasons the field is disabled, and they must not share a
+            // sentence. "Needs a Tower that keeps a document memory" is true of
+            // a Tower that never will; it is the wrong thing to tell someone
+            // whose Tower simply is not connected — the same conflation the
+            // `.disconnected` phase separates in the panel below. Unreachable
+            // today, because no contract exists for either branch to disagree
+            // about, and written now so it cannot be got wrong later.
+            if availability == .towerUnreachable {
+                Text("Searching needs the Tower. Nothing typed here is sent anywhere.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if !availability.isAvailable {
                 Text("Searching needs a Tower that keeps a document memory. Nothing typed here is sent anywhere.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
