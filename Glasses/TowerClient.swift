@@ -12,6 +12,24 @@ import Foundation
 import UIKit
 #endif
 
+/// One `frame_result` message, as the Tower actually sends it today.
+///
+/// Not a guess at a future protocol: these are exactly the three keys the
+/// current Tower puts on the wire, and every one is optional because the
+/// decoder must not fabricate a value the message omitted. The Tower's whole
+/// per-frame vocabulary is `seq`, `mean_intensity` and `processing_ms` — it
+/// runs one fixed handler and has no module runtime — so this is the complete
+/// truth about what comes back, and the app must not imply otherwise.
+struct TowerFrameResult: Equatable, Sendable {
+    /// The frame this result answers, matching the `seq` the app sent.
+    let sequence: Int?
+    /// Mean pixel intensity, 0...1. The only thing the Tower currently reports
+    /// about a frame's *content*.
+    let meanIntensity: Double?
+    /// How long the Tower spent on the frame.
+    let processingMs: Double?
+}
+
 /// Connection status to the Tower (the project's base-station/hub service).
 enum TowerStatus: Equatable {
     case offline
@@ -44,6 +62,19 @@ final class TowerClient: NSObject, ObservableObject {
     /// the view tree at the Tower's reply rate (target ~12 Hz), which is the
     /// same order as `GlassesConnection.frameCount` has always done at 24 Hz.
     @Published private(set) var frameResultCount = 0
+
+    /// The most recent `frame_result` the Tower returned.
+    ///
+    /// The Tower's reply already carries a `mean_intensity`, and until now it
+    /// was formatted into a decimated log line and thrown away. It is the only
+    /// thing the Tower currently says *about a frame's content*, which makes it
+    /// the one piece of real evidence the app can show that the round trip is
+    /// doing something rather than merely completing. Surfacing it is what lets
+    /// a workspace describe what the Tower actually does today without
+    /// inventing a capability it does not have.
+    ///
+    /// Republished at the reply rate, like `frameResultCount` beside it.
+    @Published private(set) var latestFrameResult: TowerFrameResult?
 
     /// True between a sent `stream_start` and the matching `stream_stop`.
     /// `sendFrame` will not forward anything while this is false, so a frame
@@ -245,7 +276,35 @@ final class TowerClient: NSObject, ObservableObject {
     /// exhausted schedule is how the client says "I have stopped trying", and
     /// a deliberate tap on Connect is the user saying to try again.
     func connect(to url: URL = TowerConfiguration.webSocketURL) {
-        reconnectAttempt = 0
+        // Refilled only when this call is actually going to open a socket. It
+        // used to be reset unconditionally, before `openConnection`'s
+        // `.connecting` guard — so a redundant tap during an in-flight connect
+        // did nothing visible while silently resurrecting an exhausted
+        // schedule. The budget is meant to say "I have stopped trying"; a
+        // no-op must not undo that.
+        if status != .connecting { reconnectAttempt = 0 }
+        openConnection(to: url)
+    }
+
+    /// Connects only if nothing is connected or in flight, and **without**
+    /// refilling the reconnect budget.
+    ///
+    /// The entry point for automation — app launch, specifically. It is
+    /// deliberately not `connect()`: that call means "the user asked to try
+    /// again", which is why it refills the budget and why it is allowed to
+    /// replace a live connection. Neither is true of code running on its own
+    /// initiative, and routing automation through the same door would dissolve
+    /// the bound that stops a dead Tower from being retried forever.
+    ///
+    /// Guarding on `.offline` also makes this safe to call more than once: it
+    /// will not disturb a healthy connection, cancel a pending reconnect, or
+    /// restart a schedule that has already given up. A Tower that has failed
+    /// stays failed and visible until the user acts.
+    func connectIfIdle(to url: URL = TowerConfiguration.webSocketURL) {
+        guard status == .offline else {
+            log("automatic connect skipped — status is \(status)")
+            return
+        }
         openConnection(to: url)
     }
 
@@ -556,6 +615,10 @@ final class TowerClient: NSObject, ObservableObject {
         // counter would diverge by tens of thousands over a long run and
         // invite reading the pair as a delivery ratio.
         frameResultCount = 0
+        // Scoped to the bracket for the same reason as the count above: a reply
+        // from the previous bracket displayed against a fresh one is a stale
+        // claim about the current session.
+        latestFrameResult = nil
     }
 
     /// Marks the stream as inactive and sends `{"type":"stream_stop"}` once.
@@ -567,6 +630,10 @@ final class TowerClient: NSObject, ObservableObject {
             return
         }
         isStreamingToTower = false
+        // Cleared with the bracket it belongs to. The tile that shows it is
+        // captioned "latest Tower reply", and after a stop there is no current
+        // reply - leaving the last one on screen would date it silently.
+        latestFrameResult = nil
         _ = sendLifecycleMarker(type: "stream_stop")
     }
 
@@ -705,11 +772,12 @@ final class TowerClient: NSObject, ObservableObject {
             // rate an unguarded line here is ~12 prints a second — and the
             // string builds two `Optional.map` allocations before `print` even
             // takes its lock. `metrics.frameResults` is the real count.
+            let seq = json["seq"] as? Int
+            let meanIntensity = json["mean_intensity"] as? Double
+            let processingMs = json["processing_ms"] as? Double
+
             resultLogCounter += 1
             if resultLogCounter % Self.frameLogStride == 1 {
-                let seq = json["seq"] as? Int
-                let meanIntensity = json["mean_intensity"] as? Double
-                let processingMs = json["processing_ms"] as? Double
                 log(
                     "frame_result received: seq=\(seq.map(String.init) ?? "?")"
                         + " mean_intensity=\(meanIntensity.map { String($0) } ?? "?")"
@@ -718,6 +786,17 @@ final class TowerClient: NSObject, ObservableObject {
             }
             #if DEBUG
             frameResultCount += 1
+            // Decoding moved above the log gate so the value is kept for every
+            // reply rather than only for the one-in-twelve that gets logged —
+            // the counters were always exact and the surfaced value has to be
+            // too. It is three optional casts on an existing dictionary, at the
+            // reply rate; the publish that follows is the only real cost, and
+            // it is the same order as `frameResultCount` next to it.
+            latestFrameResult = TowerFrameResult(
+                sequence: seq,
+                meanIntensity: meanIntensity,
+                processingMs: processingMs
+            )
             #endif
             metrics.recordFrameResult()
         default:

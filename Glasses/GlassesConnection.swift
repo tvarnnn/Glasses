@@ -159,6 +159,17 @@ final class GlassesConnection: ObservableObject {
         self.devices = wearables.devices
 
         #if DEBUG
+        // The object-lifetime invariant, made directly observable. Exactly one
+        // of these lines must appear per app launch: this type owns the camera
+        // and the device session, and its `deinit` stops both, so a second
+        // construction means a SwiftUI change has started tearing the runtime
+        // graph down mid-session. The smoke test used to infer this from the
+        // first registration-state line, which is a weaker signal because it
+        // depends on DAT emitting.
+        print("[Glasses][Init] GlassesConnection created")
+        #endif
+
+        #if DEBUG
         mockDeviceKitEnabled = MockDeviceKit.shared.isEnabled
         isMockDevicePaired = !MockDeviceKit.shared.pairedDevices.isEmpty
 
@@ -236,7 +247,16 @@ final class GlassesConnection: ObservableObject {
         }
     }
 
-    func checkCameraPermission() {
+    /// Reads the current camera permission without prompting.
+    ///
+    /// - Parameter reportErrors: whether a failure should surface as
+    ///   `errorMessage`, which the root view presents as a modal alert. `true`
+    ///   for a user-initiated check, because the user is looking at the result.
+    ///   `false` for the automatic read at launch: an alert nobody's action
+    ///   caused is worse than a permission that stays unknown, and a failed
+    ///   read simply leaves the status nil, which is displayed truthfully as
+    ///   "Not checked yet".
+    func checkCameraPermission(reportErrors: Bool = true) {
         Task {
             do {
                 cameraPermissionStatus = try await wearables.checkPermissionStatus(.camera)
@@ -244,7 +264,10 @@ final class GlassesConnection: ObservableObject {
                 print("[Glasses][CameraPermission] checkPermissionStatus -> \(String(describing: cameraPermissionStatus))")
                 #endif
             } catch {
-                errorMessage = error.localizedDescription
+                #if DEBUG
+                print("[Glasses][CameraPermission] check failed: \(error.localizedDescription)")
+                #endif
+                if reportErrors { errorMessage = error.localizedDescription }
             }
         }
     }
@@ -397,6 +420,12 @@ final class GlassesConnection: ObservableObject {
         if let camera {
             cameraStreamState = .stopping
             camera.stop()
+            // Kept, not cleared. The frame is the last thing the glasses really
+            // saw, and blanking the preview on Stop would discard a true
+            // observation. What must not happen is it continuing to *read* as
+            // live — `ViewfinderCard` dims it and labels it with its sequence
+            // number once `isStreaming` goes false, which is the honest
+            // presentation of "this is the last frame, the camera is off".
             cameraStreamDidStop.send(())
             // Freezes the session's final counters so they stay readable
             // after Stop rather than being wiped or left mid-interval.

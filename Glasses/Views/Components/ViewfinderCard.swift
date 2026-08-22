@@ -38,7 +38,18 @@ struct ViewfinderCard: View {
                 Image(uiImage: frame.image)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
-                    .accessibilityLabel("Latest frame from the glasses camera")
+                    // Dimmed and desaturated once the stream stops. The frame
+                    // is kept because it is the last thing the glasses really
+                    // saw, but a full-brightness image in a large workspace
+                    // layout reads as live - and the camera is off. The badge
+                    // below says which, and this makes it legible at a glance.
+                    .saturation(isStreaming ? 1 : 0.35)
+                    .opacity(isStreaming ? 1 : 0.55)
+                    .accessibilityLabel(
+                        isStreaming
+                            ? "Live frame from the glasses camera"
+                            : "Last frame from the glasses camera. The camera is off."
+                    )
             } else {
                 placeholder
             }
@@ -48,7 +59,13 @@ struct ViewfinderCard: View {
         .frame(height: frame == nil ? 150 : 260)
         .clipShape(.rect(cornerRadius: 18))
         .overlay(alignment: .topLeading) {
-            if isStreaming { liveBadge.padding(12) }
+            if isStreaming {
+                liveBadge.padding(12)
+            } else if let frame {
+                // Replaces the LIVE badge rather than leaving the corner empty,
+                // so a stopped preview always states what it is.
+                stoppedBadge(sequence: frame.sequence).padding(12)
+            }
         }
         .overlay(alignment: .bottomTrailing) {
             if let frame {
@@ -74,6 +91,15 @@ struct ViewfinderCard: View {
                 .padding(.horizontal, 32)
         }
         .accessibilityElement(children: .combine)
+    }
+
+    private func stoppedBadge(sequence: Int) -> some View {
+        Text("Camera off · last frame #\(sequence)")
+            .font(.caption2.weight(.medium))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(.ultraThinMaterial, in: .capsule)
+            .accessibilityHidden(true)
     }
 
     private var liveBadge: some View {

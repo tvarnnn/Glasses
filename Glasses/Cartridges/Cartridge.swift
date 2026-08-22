@@ -31,8 +31,12 @@ enum CartridgeStatus: Equatable {
     }
 }
 
-/// A module the platform intends to host. Static catalog data only — this type
-/// carries no runtime behaviour and selecting one does nothing yet.
+/// A module the platform intends to host.
+///
+/// Static catalog data. `status` describes the module's position on the *Tower*
+/// roadmap and carries no runtime behaviour; `workspace` describes whether
+/// *this app* has a screen for it. See `CartridgeWorkspace` for why those are
+/// deliberately independent.
 struct Cartridge: Identifiable, Equatable {
     let id: String
     let name: String
@@ -40,6 +44,10 @@ struct Cartridge: Identifiable, Equatable {
     let status: CartridgeStatus
     /// Where this module is defined, so the drawer can cite a real source.
     let specPath: String
+    /// The workspace this app can open for the cartridge, or `nil` if the app
+    /// has no screen for it — in which case its drawer row stays informational,
+    /// exactly as every row was before workspaces existed.
+    var workspace: CartridgeWorkspace? = nil
 }
 
 extension Cartridge {
@@ -69,12 +77,23 @@ extension Cartridge {
             status: .planned,
             specPath: "docs/modules/VISUAL-QA.md"
         ),
+        // The only cartridge with a workspace today. `status` stays `.future`
+        // because that is still where the *module* sits on the Tower roadmap —
+        // the spec file is a concept seed and no Tower module runtime exists.
+        // Having a workspace does not promote it, and the badge must keep
+        // saying so.
+        //
+        // Named "World Builder" here, while the spec file it cites is titled
+        // "World Build". Same module; the product surface and the Tower work
+        // both use the longer name, and two names for one thing on screen would
+        // be worse than the small mismatch with the document title.
         Cartridge(
             id: "world-build",
-            name: "World Build",
+            name: "World Builder",
             summary: "Reconstructs a persistent spatial model of a space over time.",
             status: .future,
-            specPath: "docs/modules/WORLD-BUILD.md"
+            specPath: "docs/modules/WORLD-BUILD.md",
+            workspace: .worldBuilder
         ),
         Cartridge(
             id: "accessibility",

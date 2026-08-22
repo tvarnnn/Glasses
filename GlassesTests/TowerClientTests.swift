@@ -942,6 +942,200 @@ final class TowerClientTests: XCTestCase {
 
         client.disconnect()
     }
+
+    // MARK: - 18. Automatic connection
+
+    /// The invariant the whole auto-connect design rests on: bringing the Tower
+    /// up at launch must not put a single frame on the wire.
+    ///
+    /// It holds structurally rather than by convention — `sendFrame` requires a
+    /// `stream_start` bracket as well as an online socket, and only a live
+    /// camera stream opens one — but that is exactly the kind of guarantee that
+    /// quietly stops being true, so it is pinned here.
+    func testAutomaticConnectOpensTheSocketButSendsNothing() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = attachRecorder(server)
+        defer { server.stop() }
+
+        let metrics = SenderMetrics()
+        let client = TowerClient(metrics: metrics)
+        client.connectIfIdle(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        metrics.begin()
+        XCTAssertFalse(client.isStreamingToTower, "an automatic connect must not open a stream bracket")
+
+        // A frame offered without a bracket must be refused, not sent.
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 1)
+        XCTAssertEqual(metrics.currentSnapshot.sendAttempts, 0)
+        XCTAssertEqual(metrics.currentSnapshot.sessionGateDrops, 1)
+
+        let frames = recorder.all.compactMap(decode).filter { $0["type"] as? String == "frame" }
+        XCTAssertTrue(frames.isEmpty, "no frame may reach the Tower from an automatic connect")
+
+        client.disconnect()
+    }
+
+    /// `connectIfIdle` is called from a SwiftUI `.task`, which can run more than
+    /// once. A second call must not punch a hole in a live connection —
+    /// `connect()` in that situation tears the socket down, which would close
+    /// the stream bracket mid-session and drop frames.
+    func testAutomaticConnectLeavesAHealthyConnectionAlone() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        client.sendStreamStart()
+        XCTAssertTrue(client.isStreamingToTower)
+
+        client.connectIfIdle(to: url(port: port))
+
+        // Teardown would have cleared the bracket, so this is the precise
+        // observable difference between "did nothing" and "reconnected".
+        XCTAssertTrue(client.isStreamingToTower, "an automatic connect tore down a live connection")
+        XCTAssertEqual(client.status, .online)
+
+        client.disconnect()
+    }
+
+    /// A Tower that has failed must stay visibly failed. Automation retrying on
+    /// its own is how an app ends up looking like it is still trying after it
+    /// has given up — and it would bypass the bounded backoff that exists to
+    /// stop exactly that.
+    func testAutomaticConnectDoesNotRetryAFailedConnection() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        client.simulateDelegateCloseForTesting(code: .abnormalClosure)
+        let failed = await waitUntil { client.status != .online }
+        XCTAssertTrue(failed)
+
+        client.connectIfIdle(to: url(port: port))
+        try? await Task.sleep(nanoseconds: 400_000_000)
+
+        guard case .failed = client.status else {
+            XCTFail("automatic connect resurrected a failed connection: \(client.status)")
+            return
+        }
+    }
+
+    /// After a deliberate disconnect the client is `.offline`, and automation
+    /// may bring it back — that is the state auto-connect exists for. Pinned so
+    /// the `.offline` guard is not mistaken for "never reconnect".
+    func testAutomaticConnectDoesConnectWhenOffline() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        XCTAssertEqual(client.status, .offline)
+
+        client.connectIfIdle(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline, "automatic connect must work from the idle state")
+
+        client.disconnect()
+    }
+
+    // MARK: - 19. The Tower's own reply, surfaced
+
+    /// `mean_intensity` was decoded for a log line and discarded. It is the only
+    /// thing the Tower says about a frame's *content*, and a workspace that
+    /// shows it is describing what the Tower really does instead of a
+    /// capability it does not have.
+    func testTheLatestFrameResultIsSurfacedNotJustCounted() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        XCTAssertNil(client.latestFrameResult, "nothing has been reported yet")
+
+        server.send(text: #"{"type":"frame_result","seq":7,"mean_intensity":0.42,"processing_ms":8.5}"#)
+        let arrived = await waitUntil { client.latestFrameResult != nil }
+        XCTAssertTrue(arrived)
+
+        XCTAssertEqual(client.latestFrameResult?.sequence, 7)
+        XCTAssertEqual(client.latestFrameResult?.meanIntensity ?? -1, 0.42, accuracy: 0.0001)
+        XCTAssertEqual(client.latestFrameResult?.processingMs ?? -1, 8.5, accuracy: 0.0001)
+
+        client.disconnect()
+    }
+
+    /// Captured for *every* reply, not only the one-in-twelve that gets logged.
+    /// The decode used to sit inside the log gate; a surfaced value that
+    /// updates at a twelfth of the reply rate would be stale on screen.
+    func testEveryReplyUpdatesTheSurfacedResultNotJustLoggedOnes() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        // Two consecutive replies: the second is not on the logging stride, so
+        // under the old decode-inside-the-log-gate arrangement it would be lost.
+        server.send(text: #"{"type":"frame_result","seq":1,"mean_intensity":0.10,"processing_ms":1.0}"#)
+        let first = await waitUntil { client.latestFrameResult?.sequence == 1 }
+        XCTAssertTrue(first)
+
+        server.send(text: #"{"type":"frame_result","seq":2,"mean_intensity":0.90,"processing_ms":1.0}"#)
+        let second = await waitUntil { client.latestFrameResult?.sequence == 2 }
+        XCTAssertTrue(second, "a reply between log lines was not surfaced")
+        XCTAssertEqual(client.latestFrameResult?.meanIntensity ?? -1, 0.90, accuracy: 0.0001)
+
+        client.disconnect()
+    }
+
+    /// Scoped to the stream bracket, like `frameResultCount` beside it: a
+    /// reading from the previous bracket shown against a fresh one is a stale
+    /// claim about the current session.
+    func testTheSurfacedResultResetsWithTheStreamBracket() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        client.sendStreamStart()
+        server.send(text: #"{"type":"frame_result","seq":1,"mean_intensity":0.5,"processing_ms":1.0}"#)
+        let arrived = await waitUntil { client.latestFrameResult != nil }
+        XCTAssertTrue(arrived)
+
+        client.sendStreamStop()
+        client.sendStreamStart()
+        XCTAssertNil(client.latestFrameResult, "a new bracket must not inherit the previous one's reply")
+
+        client.disconnect()
+    }
 }
 
 /// Thread-safe capture of every text message a MockTowerServer receives, so

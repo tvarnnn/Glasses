@@ -35,11 +35,33 @@ final class ProjectManager: ObservableObject {
     /// boundary (docs/02-DEVELOPMENT-RULES.md Rule 1).
     let deviceHealth: DeviceHealth
 
-    /// Retains the subscriptions that forward each child's `objectWillChange`
-    /// into this object's own publisher. Without this, `@StateObject`/
-    /// `@ObservedObject` callers observing `ProjectManager` never re-render
-    /// when a child's `@Published` properties change, since `ProjectManager`
-    /// itself has no `@Published` properties to trigger its own publisher.
+    /// Guards `startAutomaticConnections()` against running twice.
+    ///
+    /// The call site is a SwiftUI `.task`, which re-runs whenever its view's
+    /// identity changes — and the whole point of automation is that nobody is
+    /// watching it. Idempotence lives here rather than at the call site so it
+    /// cannot be lost by a later change to the view hierarchy.
+    private var hasStartedAutomaticConnections = false
+
+    /// Retains the frame/lifecycle bridges below.
+    ///
+    /// This used to *also* fan every child's `objectWillChange` into this
+    /// object's own publisher, so that a view observing `ProjectManager` would
+    /// re-render on any child change. That fan-in has been removed, and its
+    /// absence is deliberate.
+    ///
+    /// It re-broadcast `GlassesConnection.frameCount` at the 24 Hz capture
+    /// rate, which meant the root view's `body` — and therefore the whole
+    /// shell — was re-evaluated 24 times a second during a session. That cost
+    /// lands on the main actor, which is the actor the send window's completion
+    /// handlers hop back to in order to release their slots; the sender's
+    /// achievable rate is `capacity / slotLifetime`, and slot lifetime includes
+    /// that hop. A presentation convenience was therefore paying out of the
+    /// sender's throughput budget.
+    ///
+    /// Nothing observes `ProjectManager` any more. Every view takes the
+    /// specific children it needs and observes those, so each re-renders on its
+    /// own data and no faster.
     private var cancellables: Set<AnyCancellable> = []
 
     /// Injected children keep whatever `SenderMetrics` instance they were
@@ -66,16 +88,6 @@ final class ProjectManager: ObservableObject {
 
         let health = DeviceHealth()
         self.deviceHealth = health
-
-        for child in [self.glassesConnection.objectWillChange.eraseToAnyPublisher(),
-                      self.streamManager.objectWillChange.eraseToAnyPublisher(),
-                      self.towerClient.objectWillChange.eraseToAnyPublisher(),
-                      health.objectWillChange.eraseToAnyPublisher()] {
-            child
-                .receive(on: DispatchQueue.main)
-                .sink { [weak self] _ in self?.objectWillChange.send() }
-                .store(in: &cancellables)
-        }
 
         #if DEBUG
         // Bridges captured camera frames to the Tower. GlassesConnection and
@@ -134,5 +146,53 @@ final class ProjectManager: ObservableObject {
             }
             .store(in: &cancellables)
         #endif
+    }
+
+    // MARK: Automatic connection
+
+    /// Brings up the infrastructure the app can establish on its own, once per
+    /// process.
+    ///
+    /// **This does not start the camera and cannot.** Capture begins in exactly
+    /// one place, `GlassesConnection.startCameraSession()`, reached from one
+    /// button; and even an open socket transmits nothing, because `sendFrame`
+    /// additionally requires a `stream_start` that only a live camera stream
+    /// emits. Auto-connect ≠ auto-stream is a property of the pipeline's shape
+    /// here, not a promise this method keeps.
+    ///
+    /// Two calls, chosen because they are the only two that are honest to make
+    /// without the user asking:
+    ///
+    /// - `checkCameraPermission()` is a pure query. It presents nothing and
+    ///   changes no authorization. It also fixes a real defect: nothing
+    ///   populated `cameraPermissionStatus` automatically, so it began every
+    ///   launch as "Not checked yet" and the first session of each launch was
+    ///   refused for a permission the user had already granted. Reading it is
+    ///   *more* truthful than not reading it.
+    ///
+    /// - `connectIfIdle()` opens the Tower socket. Deliberately not
+    ///   `connect()`: that means "the user asked to retry", refills the bounded
+    ///   reconnect budget and will replace a live connection. Code running on
+    ///   its own initiative gets neither privilege, so a Tower that has given
+    ///   up stays visibly failed until a person intervenes.
+    ///
+    /// Deliberately absent: `connect()` (Meta AI registration hands off to
+    /// another app and re-registers an already-registered user),
+    /// `requestCameraPermission()` (a context-free prompt at launch is how
+    /// permissions get denied), and anything touching the camera. Registration
+    /// and device state need no call at all — `GlassesConnection` already
+    /// follows those streams from `init`.
+    func startAutomaticConnections() {
+        guard !hasStartedAutomaticConnections else { return }
+        hasStartedAutomaticConnections = true
+
+        // `reportErrors: false` because this runs with nobody watching. A DAT
+        // failure here would otherwise write `errorMessage`, which the root
+        // view presents as a modal "Something went wrong" — an unexplained
+        // alert on first launch, attributable to nothing the user did. The
+        // failure still leaves `cameraPermissionStatus` unset, which the
+        // Connections sheet reports honestly as "Not checked yet".
+        glassesConnection.checkCameraPermission(reportErrors: false)
+        towerClient.connectIfIdle()
     }
 }
