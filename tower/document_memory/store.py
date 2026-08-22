@@ -167,19 +167,53 @@ class DocumentStore:
 
     # -- delete --------------------------------------------------------
 
-    def prune_expired(self, now: float | None = None) -> int:
-        """Drop documents older than the retention window. Returns the count.
+    def prune_expired(self, now: float | None = None) -> dict:
+        """Drop documents older than the retention window, PIXELS INCLUDED.
 
-        No retention window means no pruning -- but the window is a
-        constructor argument precisely so "forever" has to be chosen.
+        Returns the same report shape as `purge`, and for the same reason:
+        an earlier version returned a bare count and deleted only the
+        JOURNAL RECORDS, leaving each expired document's page images on
+        disk. Retention then said the document was gone while the picture
+        of it remained -- a retention window that does not remove the data
+        is not a retention window, and a caller receiving only a count had
+        no way to find out.
+
+        No retention window means no pruning. The window is a constructor
+        argument precisely so that "forever" has to be chosen rather than
+        inherited.
         """
         if self._retention_seconds is None:
-            return 0
+            return {
+                "documents_removed": 0,
+                "images_removed": 0,
+                "images_retained": [],
+                "complete": True,
+            }
+
         now = self._clock() if now is None else now
         cutoff = now - self._retention_seconds
-        return self._rewrite_keeping(
-            lambda record: record.get("recorded_at", 0.0) >= cutoff
-        )
+
+        def expired(record: dict) -> bool:
+            return record.get("recorded_at", 0.0) < cutoff
+
+        # Collect the doomed images BEFORE rewriting: once the records are
+        # gone there is nothing left that names them.
+        doomed = [
+            self._directory / page.image_relpath
+            for document in self.read_all()
+            if document.recorded_at < cutoff
+            for page in document.pages
+            if page.image_relpath
+        ]
+        removed = self._rewrite_keeping(lambda record: not expired(record))
+        removed_images, retained_images = self._delete_paths(doomed)
+
+        return {
+            "documents_removed": removed,
+            "images_removed": len(removed_images),
+            "images_retained": retained_images,
+            "complete": not retained_images,
+        }
 
     def purge(self, document_id: str | None = None) -> dict:
         """Really delete. Reports what it could NOT delete.
@@ -188,37 +222,30 @@ class DocumentStore:
         success -- `06-PRIVACY-DATA.md` requires real deletion, and a
         false claim of deletion is worse than an honest failure.
         """
-        removed_images, retained_images = [], []
-
         if document_id is None:
-            removed = self._rewrite_keeping(lambda record: False)
+            # Everything, including any orphaned image an older or
+            # interrupted write left behind.
             targets = (
-                list(self.images_dir().rglob("*")) if self.images_dir().exists() else []
+                list(self.images_dir().rglob("*"))
+                if self.images_dir().exists()
+                else []
             )
+            removed = self._rewrite_keeping(lambda record: False)
         else:
-            keep_ids = {document_id}
-            doomed = [
-                page.image_relpath
+            # The images belonging to the document being REMOVED. Gathered
+            # before the rewrite, because afterwards nothing names them.
+            targets = [
+                self._directory / page.image_relpath
                 for document in self.read_all()
-                if document.document_id in keep_ids
+                if document.document_id == document_id
                 for page in document.pages
                 if page.image_relpath
             ]
             removed = self._rewrite_keeping(
                 lambda record: record.get("document_id") != document_id
             )
-            targets = [self._directory / relpath for relpath in doomed]
 
-        for path in sorted(targets, key=lambda p: len(p.parts), reverse=True):
-            try:
-                if path.is_dir():
-                    path.rmdir()
-                elif path.exists():
-                    path.unlink()
-                removed_images.append(str(path))
-            except OSError as exc:
-                logger.warning("document store: could not remove %s: %s", path, exc)
-                retained_images.append(str(path))
+        removed_images, retained_images = self._delete_paths(targets)
 
         return {
             "documents_removed": removed,
@@ -226,6 +253,27 @@ class DocumentStore:
             "images_retained": retained_images,
             "complete": not retained_images,
         }
+
+    def _delete_paths(self, paths) -> tuple[list[str], list[str]]:
+        """Really delete, and report what would not go.
+
+        Deepest first, so a directory is emptied before it is removed.
+        Never raises: a locked file must be REPORTED, not thrown, because
+        the caller needs the rest of the deletion to proceed and needs to
+        learn that this one did not.
+        """
+        removed, retained = [], []
+        for path in sorted(paths, key=lambda p: len(p.parts), reverse=True):
+            try:
+                if path.is_dir():
+                    path.rmdir()
+                elif path.exists():
+                    path.unlink()
+                removed.append(str(path))
+            except OSError as exc:
+                logger.warning("document store: could not remove %s: %s", path, exc)
+                retained.append(str(path))
+        return removed, retained
 
     def _rewrite_keeping(self, keep) -> int:
         """Atomically rewrite the journal, returning how many were dropped."""

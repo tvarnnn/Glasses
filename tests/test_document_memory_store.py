@@ -134,7 +134,7 @@ class TestRetention:
         store = DocumentStore(tmp_path, retention_seconds=None)
         store.append(_document("old", recorded_at=0.0))
 
-        assert store.prune_expired(now=1e9) == 0
+        assert store.prune_expired(now=1e9)["documents_removed"] == 0
         assert store.count() == 1
 
     def test_documents_older_than_the_window_are_really_gone(self, tmp_path):
@@ -142,7 +142,7 @@ class TestRetention:
         store.append(_document("old", recorded_at=0.0))
         store.append(_document("new", recorded_at=950.0))
 
-        removed = store.prune_expired(now=1000.0)
+        removed = store.prune_expired(now=1000.0)["documents_removed"]
 
         assert removed == 1
         assert [document.document_id for document in store.read_all()] == ["new"]
@@ -153,6 +153,92 @@ class TestRetention:
     def test_a_negative_window_is_rejected_at_construction(self, tmp_path):
         with pytest.raises(ValueError):
             DocumentStore(tmp_path, retention_seconds=-1.0)
+
+    def test_retention_deletes_the_page_pixels_not_just_the_record(self, tmp_path):
+        """A retention window that leaves the picture is not a window.
+
+        An earlier version dropped the journal record and orphaned the
+        page image, so the store reported the document gone while the
+        image of it stayed on disk indefinitely.
+        """
+        store = DocumentStore(tmp_path, retention_seconds=100.0)
+        store.write_page_image("old-00.jpg", b"sensitive page pixels")
+        store.append(
+            DocumentObservation(
+                document_id="old",
+                observed_at=0.0,
+                recorded_at=0.0,
+                observed_seconds=5.0,
+                pages=(
+                    PageObservation(
+                        page_index=0, text="secret", image_relpath="pages/old-00.jpg"
+                    ),
+                ),
+                retains_raw_imagery=True,
+            )
+        )
+        image = store.images_dir() / "old-00.jpg"
+        assert image.exists()
+
+        report = store.prune_expired(now=100_000.0)
+
+        assert report["documents_removed"] == 1
+        assert report["images_removed"] == 1
+        assert report["complete"] is True
+        assert not image.exists()
+
+    def test_retention_keeps_the_images_of_documents_it_keeps(self, tmp_path):
+        """The other half: pruning must not delete a live document's image."""
+        store = DocumentStore(tmp_path, retention_seconds=100.0)
+        store.write_page_image("new-00.jpg", b"still current")
+        store.append(_document("old", recorded_at=0.0))
+        store.append(
+            DocumentObservation(
+                document_id="new",
+                observed_at=950.0,
+                recorded_at=950.0,
+                observed_seconds=5.0,
+                pages=(
+                    PageObservation(
+                        page_index=0, text="t", image_relpath="pages/new-00.jpg"
+                    ),
+                ),
+            )
+        )
+
+        store.prune_expired(now=1000.0)
+
+        assert (store.images_dir() / "new-00.jpg").exists()
+
+    def test_a_prune_that_cannot_delete_an_image_says_so(self, tmp_path, monkeypatch):
+        store = DocumentStore(tmp_path, retention_seconds=100.0)
+        store.write_page_image("stuck.jpg", b"bytes")
+        store.append(
+            DocumentObservation(
+                document_id="old",
+                observed_at=0.0,
+                recorded_at=0.0,
+                observed_seconds=1.0,
+                pages=(
+                    PageObservation(
+                        page_index=0, text="x", image_relpath="pages/stuck.jpg"
+                    ),
+                ),
+            )
+        )
+        real_unlink = type(store.path).unlink
+
+        def refuse(self, *args, **kwargs):
+            if self.suffix == ".jpg":
+                raise OSError("locked")
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr("pathlib.Path.unlink", refuse)
+
+        report = store.prune_expired(now=100_000.0)
+
+        assert report["complete"] is False
+        assert report["images_retained"]
 
 
 class TestPurgeIsRealDeletion:

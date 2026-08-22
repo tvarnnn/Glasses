@@ -160,6 +160,18 @@ Report: `reports/2026-08-22-cv-lab-v1-report.md`.
 
 Exit criterion: **met** — every experiment exposes a measurement checked against independent truth, and every cost is measured rather than assumed.
 
+### V0.9.6 — Document Memory V1 (complete, synthetic-only)
+- Observe a document being read without asking the wearer to photograph it: page-quad detection plus text-likeness (~2.6 ms/frame), dwell tracking, best-frame selection, perspective correction, then OCR on one or two frames per document (~1.2 s each).
+- Persistent, purgeable, retention-bounded memory of the TEXT (not the pixels), with lexical BM25 retrieval by time, content and recency, and an explicit "insufficient evidence" refusal.
+- OCR via EasyOCR behind a substitutable seam, as an optional `[ocr]` extra. `rapidocr_onnxruntime` was rejected because a dry-run showed it installs `opencv-python` alongside this project's `opencv-python-headless`.
+- Named honestly throughout: the camera cannot establish attention (`07-PLATFORM-CONSTRAINTS.md` Limitation 8), so the record is an *observation*, never a *reading*.
+
+**The milestone's most valuable output is a measurement that blocks it.** Word recall against known rendered text is 0.957–1.000 at 1280×720 and **0.429–0.810 at the 640×360 the glasses deliver**. Tilt barely matters; resolution dominates. Page *detection* still works at the delivered resolution — only *recognition* is starved. That is an iOS/DAT requirement no Tower work can satisfy, recorded in `docs/agent-handoffs/TOWER-TO-IOS.md` §6.8.
+
+Report: `reports/2026-08-22-document-memory-v1-report.md`.
+
+Exit criterion: **met for the Tower half** — a rendered reading session becomes a searchable memory that refuses to answer questions it has no record of. Not met, and not meetable here, for reading at the delivered resolution.
+
 ### V1.0 — Generalize Module Registry (When Justified)
 - Triggered only once a second production module (a promoted Experimental CV Lab result, or another module such as Object Memory) creates real, concrete requirements.
 - Build dynamic module discovery, the module registry, and descriptor/sensor-profile negotiation generalized from actual usage rather than speculative design.
@@ -179,7 +191,8 @@ Candidates, each with its own specification under `docs/modules/`:
 - Object Memory — data layer **built and tested**; detector, `Module` subclass and routes **blocked** on the synchronous-`_do_load()` decision gate. See `docs/modules/OBJECT-MEMORY.md`.
 - World Build — engine **built** at V0.9.4 above; production registration blocked at the V1.0/V1.1 boundary. See `docs/modules/WORLD-BUILD.md`.
 - Accessibility.
-- Visual Q&A / Reading — comparatively heavy (STT + OCR/CV + multimodal reasoning + TTS); not an early starter module.
+- Visual Q&A / Reading — comparatively heavy (STT + OCR/CV + multimodal reasoning + TTS); not an early starter module. Its OCR half now has a working, measured implementation to reuse in Document Memory (V0.9.6), which removes one of its four unknowns.
+- Document Memory — **built** at V0.9.6 above; blocked on delivered camera resolution rather than on Tower work. See `docs/modules/DOCUMENT-MEMORY.md`.
 - Environmental / Physical-World Search — highest privacy exposure of the current module set; requires the retention/deletion policy in `06-PRIVACY-DATA.md` to be actually implemented, not just documented, before real data collection begins.
 - Translator — future low-latency conversational translation module; see `docs/modules/TRANSLATOR.md`. Not an early candidate — depends on a streaming ASR/MT/TTS pipeline and the latency-instrumentation work in `01-SYSTEM-ARCHITECTURE.md` that have not been built or measured yet.
 

@@ -5,7 +5,9 @@ platform (the wearable gateway / capture-and-control plane), and any
 future Tower agent who must not break what iOS already depends on.
 
 **Written:** 2026-08-22, from `world-builder/v1` @ `019cd1c`, during the
-World Builder V1 closeout.
+World Builder V1 closeout. Updated the same day with the `metrics` wire
+field (§1.3) and Document Memory's measured resolution requirement
+(§6.8).
 
 ## What this document is
 
@@ -627,12 +629,55 @@ frames simultaneously. `frame_observers` is a genuine list, but it is a
 *side-errand* channel — an observer returns no result to the client — so
 it is not a substitute for a second active module.
 
-### 6.8 Resolution negotiation — **MISSING**
+### 6.8 Resolution negotiation — **MISSING, and now measured**
 
 DAT's adaptive ladder drops resolution first under bandwidth pressure and
 cannot be overridden. A Document/OCR cartridge wanting high-resolution
-stills has no way to ask for them. Rule 4 forbids designing a generalised
-negotiation protocol before the real DAT configuration model is known.
+stills has no way to ask for them.
+
+**This stopped being a hypothetical on 2026-08-22.** Document Memory
+measured word recall against known rendered text — the fraction of a
+page's words OCR actually captured, which is what makes a document
+findable at all:
+
+| Frame size | Word recall |
+|---|---|
+| 1280×720 | 0.957 – 1.000 |
+| 640×480 | 0.905 – 1.000 |
+| **640×360 — what iOS delivers today** | **0.429 – 0.810** |
+
+A page inside a 640×360 frame warps to roughly 500×320, putting ordinary
+body text at about 10 px. **Tilt barely matters; resolution dominates** —
+the spread across a full range of viewing angles at 640×480 is only
+0.905–1.000, so perspective is handled and pixels are not.
+
+**Page DETECTION still works at 640×360.** Only recognition is starved,
+which means the cheap per-frame machinery is fine and the requirement is
+narrowly about the frames that get read.
+
+**What iOS would need to provide**, stated as a requirement rather than a
+design:
+
+1. A way for a Tower-side consumer to request a **higher-resolution
+   frame**, at least occasionally — this cartridge needs one or two per
+   document, not a sustained high-rate stream. A ~1280×720 still on
+   demand would move recall from ~0.5 to ~0.96.
+2. Failing that, a way to learn **which rung of the adaptive ladder is
+   currently active**, so a consumer can record that a reading was taken
+   at a resolution too low to trust rather than storing a bad one
+   silently.
+
+Rule 4 still forbids designing a generalised negotiation protocol before
+the real DAT configuration model is known via `search_dat_docs`. This
+section states the requirement and the measurement; the mechanism is a
+Mac-side question.
+
+### 6.9 A way to arm capture from iOS — **MISSING**
+
+`TOWER_CAPTURE_ROOT` arms the recorder at Tower start-up, and
+`stream_start`/`stream_stop` bound each recording. There is no way for
+iOS to arm or disarm it, and no way for the wearer to. `GET /health`
+reports the state, so a client can at least display it truthfully.
 
 ---
 

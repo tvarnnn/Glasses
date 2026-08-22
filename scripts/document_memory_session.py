@@ -208,7 +208,11 @@ def main(argv=None) -> int:
         "frames_observed": engine.frames_observed,
         "documents_observed": len(recorded),
         "document_ids": recorded,
-        "pruned_expired": pruned,
+        "pruned_expired": pruned["documents_removed"],
+        "pruned_images_removed": pruned["images_removed"],
+        # A retention pass that could not delete the pixels must say so.
+        "prune_complete": pruned["complete"],
+        "prune_images_retained": pruned["images_retained"],
         "stored_documents": store.count(),
         "bytes": store.bytes_used(),
         "keep_page_images": args.keep_page_images,

@@ -33,6 +33,8 @@ frame stream and make its own decisions about which frames matter.
 | `time_basis` on every timestamp | both modules | There is no capture timestamp on the wire. Every cartridge inherits that and must say which clock it means |
 | Explicit Dataset-Recording Session pattern | `tower/capture.py` | Off by default, bounded in seconds and bytes, purgeable, manifest declares posture |
 | Synthetic ground-truth harness | `tests/synthetic_scene.py` | Exact poses, exact intrinsics, deterministic. Any cartridge doing geometry can assert real answers instead of eyeballing plausible ones |
+| Refusal as a first-class result | `document_memory.retrieval.QueryResult` | `sufficient_evidence: False` plus a reason that says the refusal is about what was CAPTURED, not about the world. Every memory-shaped cartridge needs this and none should re-derive it |
+| An OCR seam with a fast fake | `document_memory.ocr` | `TextRecogniser` protocol, `FixedTextRecogniser` for tests. A default suite must not download a model or pay 1.2 s per assertion |
 | Tailing a capture as it is written | `capture.CaptureFollower` | A cartridge can process a dataset session live, in its own process, reading the journal so `source_seq`/`tx_seq`/receipt time survive. Bounded, so a crashed recorder ends the follow rather than hanging it |
 | Calibration record + harness | `records.CameraIntrinsics`, `scripts/calibrate_charuco.py` | Intrinsics are a **platform** property, not a World Builder property. Every geometric cartridge needs them and none should re-derive them |
 
@@ -98,15 +100,31 @@ These are World Builder's, and they are wrong for other cartridges.
   specifically, and it is the same V1.0/V1.1 work World Builder is
   stopped behind.
 
-### Text / Document
+### Document Memory (BUILT, 2026-08-22 — see `DOCUMENT-MEMORY.md`)
 
-- **Reuses:** capture recorder, calibration record (undistortion helps OCR).
+This entry was written as a prediction. It is now a report, and the
+prediction held on every point.
+
+- **Reuses:** the capture recorder AND its follower, `Confidence`, the
+  shared JSONL store shape, `time_basis` discipline. It processes a
+  capture in a separate process exactly as World Builder does.
 - **Camera pattern:** high resolution, deliberate still-like frames.
-- **Must not inherit:** World Builder's blur and motion gates would reject
-  precisely the frames this wants — a held-still, high-detail view has
-  near-zero parallax.
-- **Missing:** resolution negotiation. DAT's adaptive ladder drops
-  resolution first and cannot be overridden.
+  Confirmed, and quantified below.
+- **Did not inherit** World Builder's blur and motion gates, as predicted
+  — and the reasoning turned out to be exactly right. A held-still page
+  has near-zero parallax and is `insufficient_motion` to a mapper. This
+  cartridge INVERTS World Builder's signal, and a test now forbids the
+  import in both directions.
+- **The predicted missing piece is now the measured blocker.** Word recall
+  against known rendered text: 0.957–1.000 at 1280×720, 0.905–1.000 at
+  640×480, and **0.429–0.810 at the 640×360 the glasses deliver**. Tilt
+  barely matters once the page is warped; resolution dominates. Page
+  *detection* still works at the delivered resolution — only *recognition*
+  is starved. Recorded as a requirement in
+  `docs/agent-handoffs/TOWER-TO-IOS.md` §6.8.
+- **What it adds for the next cartridge:** a working, measured OCR path
+  behind a substitutable seam, and a lexical retrieval layer that refuses
+  rather than guesses. Visual Q&A's `READ_TEXT` route can reuse both.
 
 ### Environmental Memory
 
@@ -163,8 +181,12 @@ Named so nobody assumes it exists.
 2. **Frame metadata into modules.** `Module.process()` takes only `bytes`.
    `received_at`, `source_seq` and `tx_seq` are unavailable to a module,
    which is why World Builder's engine is driven offline.
-3. **A non-scalar result channel.** `ExperimentResult` is five scalars.
-   No geometry, no structured event, no delta can cross the wire.
+3. **A non-scalar result channel.** PARTIALLY CLOSED at V0.9.5:
+   `ExperimentResult.metrics` is a `name -> number` bag, additive on the
+   wire. That is a MEASUREMENT channel. Structured results — a detection
+   list with boxes, a geometry delta, a world event — still cannot cross,
+   and widening `metrics` beyond numbers would be a quiet way of
+   pretending otherwise.
 4. **An asynchronous execution path.** There is no worker, queue or
    executor anywhere in `tower/`.
 5. **Cartridge-declared sensor requirements.** Rule 4 forbids designing a
