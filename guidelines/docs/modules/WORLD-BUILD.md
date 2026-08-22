@@ -8,7 +8,46 @@ Future module. This is a concept/specification seed, not authorization to implem
 
 Use first-person wearable camera observations to incrementally construct a spatial representation of environments the user traverses.
 
+## Session Model — superseded product ruling (2026-08-22)
+
+**For V1, a deliberate Start → Walk → Stop mapping session IS World Build.**
+
+The V1 product experience is explicitly: start World Builder, walk
+naturally around a room, watch the world build incrementally, stop, and
+have the world persist on the Tower for later reopening and inspection.
+
+This is a deliberate product decision recorded on 2026-08-22, and it
+supersedes the final paragraph of the Passive Operation Requirement below
+— the sentence ruling that a deliberate capture action "is not World
+Build". That earlier ruling is **preserved verbatim below, not erased**,
+because it records real design reasoning that still applies to everything
+except the session boundary.
+
+What the earlier requirement still governs, unchanged and binding:
+
+- The wearer is **not** directed *during* a session. No instruction to
+  scan a specific wall, rotate slowly, walk around an object, point the
+  camera somewhere specific, or complete a predefined capture sequence.
+- Within a session the wearer walks and looks **naturally**, and the
+  system — not the user — decides which ordinary frames are worth the
+  expensive path (see Relevance, below).
+- A session that degenerates into scanner-operator behaviour has failed
+  the premise, and that failure is still a product-integrity bug.
+
+What changed is only the **boundary**: an explicit start and stop are now
+permitted, and are how V1 scopes a mapping session to one room. Explicit
+start/stop also aligns the module with `06-PRIVACY-DATA.md`'s Explicit
+Dataset-Recording Session rules, which is a privacy improvement over
+implicit always-on accumulation: capture becomes visible and bounded
+rather than incidental.
+
+Passive, undirected accumulation across sessions remains the long-term
+direction; V1 does not foreclose it.
+
 ## Passive Operation Requirement
+
+*(Historical. Superseded on its session-boundary clause only — see the
+Session Model ruling above. Retained in full.)*
 
 World Build must not behave like a traditional room-scanning application. Do not instruct the wearer to scan a specific wall, rotate slowly, walk around an object, point the camera somewhere specific, or complete any predefined capture sequence. The wearer uses the glasses normally; World Build incrementally accumulates spatial information from whatever the wearer naturally looks at.
 
