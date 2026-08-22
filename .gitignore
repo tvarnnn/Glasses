@@ -37,3 +37,6 @@ Desktop.ini
 # Object memory's default store path (relative data/object_memory) --
 # real observation history must never be swept up by a broad `git add`.
 data/
+
+# Operator brief for an autonomous run; an input to the work, not part of it.
+plan.md
