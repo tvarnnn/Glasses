@@ -768,12 +768,16 @@ The change is bounded and identical for every cartridge:
 1. Add the contract identifier to `TowerCapabilities.declared` **and**
    `TowerCapabilities.supported`.
 2. Write a Tower-backed client conforming to that cartridge's existing client
-   protocol, mapping the wire payload onto the existing domain types.
-3. Pass it to the view model in the workspace view.
-   **No view changes** — every view already renders the full lifecycle.
-4. Add decode tests including the negative ones: a malformed payload must produce
+   protocol, mapping the wire payload onto the existing domain types, and publish
+   every change through `stateUpdates`.
+3. Construct it in `CartridgeClients`, which `ProjectManager` owns — **not** in
+   the workspace view, whose `@StateObject` a cartridge switch destroys. The view
+   model initialisers have no default `client:` argument precisely so this is the
+   only wiring available.
+4. **No view changes** — every view already renders the full lifecycle.
+5. Add decode tests including the negative ones: a malformed payload must produce
    `CartridgeFailure(kind: .undecodableResponse)`, never a partially populated
-   snapshot.
+   snapshot and never a stronger claim than the Tower made.
 
 If the real contract does not fit that shape, `IOS-TO-TOWER.md` guessed wrong
 somewhere and that is worth saying out loud rather than working around.

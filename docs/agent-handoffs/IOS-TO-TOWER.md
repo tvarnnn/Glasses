@@ -623,12 +623,20 @@ time:
 2. Write a Tower-backed client conforming to the cartridge's existing client
    protocol (`WorldBuilderClient`, `ExperimentalCVClient`,
    `DocumentMemoryClient`, `SceneUnderstandingClient`), mapping the wire payload
-   onto the existing domain types.
-3. Pass it to the cartridge's view model in its workspace view. **No view
-   changes**, because every view already renders the full lifecycle.
-4. Add the decode tests, including the negative ones: a malformed payload must
+   onto the existing domain types. Publish every change through `stateUpdates` —
+   the `state` property alone can be read but cannot announce, and the view
+   models subscribe to that publisher in `init`.
+3. Construct it in `CartridgeClients`, which `ProjectManager` owns. **Not in the
+   workspace view**: that `@StateObject` is destroyed on every cartridge switch,
+   and a client holding a subscription and a partly-built world must outlive it.
+   This is why the view model initialisers have no default `client:` argument.
+4. **No view changes.** Every view already renders the full lifecycle, including
+   the states no client can currently reach.
+5. Add the decode tests, including the negative ones: a malformed payload must
    produce `CartridgeFailure(kind: .undecodableResponse)`, not a partially
-   populated snapshot.
+   populated snapshot and not a stronger claim than the Tower made. Document
+   Memory already works this way — `DocumentQueryResult.init` throws rather than
+   quietly downgrading an incoherent answer to "nothing matched".
 
 Anything that does not fit that shape is a signal that this document guessed
 wrong somewhere — which is worth saying out loud rather than working around.
