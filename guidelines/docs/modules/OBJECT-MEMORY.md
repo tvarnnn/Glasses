@@ -2,7 +2,37 @@
 
 ## Status
 
-Planned module. Strong candidate for an early computer-vision course project because it is bounded enough to build incrementally while exercising detection, tracking, temporal reasoning, relevance filtering, and persistence.
+**PARTIALLY IMPLEMENTED, then BLOCKED.** Still a strong candidate for an
+early project — it is bounded enough to build incrementally while
+exercising detection, tracking, temporal reasoning, relevance filtering
+and persistence — but it is no longer entirely unbuilt, and it is stopped
+at a named gate rather than merely unstarted.
+
+| Part | Status |
+|---|---|
+| Observation record schema, relevance filtering, observation store (append, read, `last_seen`, retention pruning, real `purge`) | **CURRENTLY IMPLEMENTED** — `tower/object_memory/{records,relevance,store}.py`, tested |
+| A detector producing observations | **BLOCKED** |
+| A `Module` subclass, wiring, any HTTP/WS surface | **BLOCKED** |
+| Spatial anchors against a World Builder world | **PLANNED** — the contract is written down but no anchor exists yet |
+
+**The blocker, precisely.** Task 4 requires the module's `_do_load()` to
+load a detector synchronously, which reproduces the unbounded-blocking
+lifecycle gap `DepthEstimationModule` already has (see
+`01-SYSTEM-ARCHITECTURE.md` — Reliability Policies, Known exception).
+Four costed options are written up in
+`docs/superpowers/plans/2026-08-20-object-memory-first-slice.md`; the
+Master Guide classifies choosing between them as needing user judgement,
+so an agent must not resolve it autonomously.
+
+Nothing currently produces an observation: `Module.process()` receives
+raw JPEG bytes and no timestamp, sequence number or session id, so even a
+working detector could not populate the fields the schema already has.
+
+**Before the first anchor is ever written**, add `anchor_keyframe_id` and
+`position_in_anchor_frame` to the anchor schema. Without them the first
+loop closure permanently and undetectably invalidates every earlier
+anchor, because a submap re-anchor is not a global similarity and cannot
+be composed forward. See `CARTRIDGE-GROUNDWORK.md` §4.
 
 ## Goal
 

@@ -2,6 +2,11 @@
 
 ## Status
 
+**CURRENTLY IMPLEMENTED.** The only cartridge that actually runs on the
+live frame path today (`tower/modules/experimental_cv.py`, wired in
+`tower/main.py`). See "Actual structure" below for how the shipped layout
+differs from the one this document originally proposed.
+
 Module #1 — the first module to be implemented (see `03-ROADMAP.md` V0.8–V0.9). Its role in this phase is to prove the complete glasses -> iPhone -> tower -> CV pipeline, serve as the sandbox for course experiments, and validate the module lifecycle/descriptor contract against real implementation experience before any dynamic registry is built.
 
 ## Goal
@@ -63,17 +68,25 @@ Examples:
 
 The module may optionally support explicit dataset-recording sessions for course/research purposes.
 
+Dataset capture is **not** this module's own mechanism. `tower/capture.py`
+is shared infrastructure — the transport arms it, and Object Memory or a
+Document cartridge would use the same recorder. Versioning a recording
+made by shared transport with one cartridge's schema would let an
+unrelated schema bump invalidate it.
+
 Dataset capture must:
 - be manually started/stopped;
-- clearly indicate recording state;
-- store data in this module's namespace;
+- clearly indicate recording state (`GET /health` reports it);
+- store data under the recorder's own root, not inside a cartridge;
 - avoid indefinite background capture;
 - include useful metadata such as timestamp/configuration;
 - follow the platform data policy in `06-PRIVACY-DATA.md`.
 
 ## Experiment Structure
 
-Preferred organization:
+### Proposed structure (historical)
+
+This was the shape proposed before implementation:
 
 ```text
 experimental_cv/
@@ -86,7 +99,22 @@ experimental_cv/
     results/
 ```
 
-Exact structure should follow the tower repository once implemented.
+### Actual structure
+
+The Tower did not adopt it, and the divergence is deliberate rather than
+accidental — a per-experiment package directory buys nothing when an
+experiment is one module:
+
+```text
+tower/experiments/          one module per experiment
+tower/modules/experimental_cv.py   the Module that hosts whichever one is selected
+scripts/                    benchmark and analysis drivers
+```
+
+There is no `data/` or `results/` directory. Recorded datasets live under
+the **shared** recorder's root (`tower/capture.py`, armed by
+`TOWER_CAPTURE_ROOT`), and measured results live in
+`guidelines/docs/reports/`.
 
 ## Promotion Path
 

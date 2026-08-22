@@ -2,6 +2,13 @@
 
 ## Status
 
+**PLANNED — do not implement.** No code exists under `tower/`, and the
+platform has **no audio path of any kind**: no microphone transport, no
+audio recorder, no streaming primitive, no output routing. This module is
+the first planned cartridge whose primary input is not a camera frame,
+which is why its first prototype is deliberately specified to run on
+Tower-local microphone and speakers, entirely outside the glasses path.
+
 Future module concept. Not scheduled on the current roadmap (see `03-ROADMAP.md` Phase 3 and Future Research) and not authorized for implementation. This is a specification seed, recorded so the module-system and roadmap documentation have a concrete place to point to — see `02-DEVELOPMENT-RULES.md` Rule 10 (No Premature Scope Expansion).
 
 ## Goal

@@ -108,6 +108,15 @@ Exit criterion: the tower runtime can load, run, and cleanly tear down one modul
 
 Exit criterion: at least one bounded CV experiment runs end-to-end from glasses/mock device input through to measured results.
 
+### V0.9.1 — Depth CV Baseline (complete)
+- MiDaS-small monocular depth as the second Experimental CV Lab experiment, and the first module holding a resource across frames (`tower/modules/depth_cv.py`).
+- CPU-versus-CUDA baseline measured on the RTX 5070 rather than assumed (`scripts/depth_benchmark.py`, `guidelines/docs/reports/V0.9.1-depth-cv-baseline-report.md`).
+- Established that depth output is **relative inverse depth, not metric distance**, and must be labelled as inference rather than measurement.
+
+This milestone was executed and reported but never given a heading here; recorded retrospectively on 2026-08-22.
+
+Exit criterion: a measured GPU-versus-CPU comparison exists for a real workload, so any future acceleration decision is made from data.
+
 ### V0.9.2 — Backend Truthfulness & Reliability Hardening (complete)
 - Client-facing `frame_error` WebSocket message on frame-skip and module-unavailable, so a connected client no longer has to poll `GET /health` to learn why `frame_result` messages stopped (closes a standing Rule 3 truthful-state gap).
 - Malformed non-JSON / non-dict WebSocket messages are logged and ignored instead of abruptly ending the connection.
@@ -120,9 +129,23 @@ Exit criterion: the Tower reports frame-level and module-level failures to the c
 ### V0.9.3 — World Builder Foundations, Experiments 1–2 (complete, dataset-based)
 - `depth_temporal_consistency` and `feature_trackability` run as bounded offline experiments per `docs/modules/EXPERIMENTAL-CV.md`'s Success Criteria discipline. See `docs/reports/V0.9.3-world-builder-experiments-1-2-report.md`.
 - **Measured on a public head-mounted dataset clip, not on Ray-Ban Meta glasses.** Results are feasibility evidence only; the report carries a hard acceptance gate requiring both experiments to be re-run on real DAT footage before any conclusion is used as validation.
-- Experiments 3 (`monocular_pose_feasibility`) and 4 (`depth_scale_fusion`) remain **blocked on DAT camera intrinsics**, which exist nowhere in this repository. Resolving that requires a Mac-side `search_dat_docs` session or empirical calibration against a real device.
+- Experiments 3 (`monocular_pose_feasibility`) and 4 (`depth_scale_fusion`) remain **blocked on DAT camera intrinsics**. **2026-08-22 update:** the *tooling* to obtain them now exists — `scripts/calibrate_charuco.py` produces a versioned, resolution-keyed `CameraIntrinsics` from board views, and the exact physical procedure is written down. What is still missing is the *values*, which require a real device and a printed board. The blocker's substance is unchanged; its shape is now "run the procedure" rather than "invent an approach".
 
 Exit criterion: both experiments produce measured numbers with their validity scope explicitly bounded.
+
+### V0.9.4 — World Builder V1 engine (complete, synthetic-only)
+- A monocular mapping engine: create a world, run a session, evaluate and reject frames, select keyframes on measured information, reconstruct relative-scale geometry where the data supports it, persist everything, survive process restart, reload and inspect cold (`tower/world_builder/`).
+- ChArUco camera calibration, and calibration-gated geometry: unknown intrinsics produce **no poses** rather than guessed ones.
+- Incremental update stream (append-only event journal with a cursor) plus Tower-side live following, so a world can be watched as it is built from a separate process.
+- A production-armable dataset recorder (`TOWER_CAPTURE_ROOT`), which is what makes the physical validation procedure executable.
+
+**Deliberately NOT part of this milestone:** registration as a production module. That crosses the V1.0 registry boundary and the V1.1 lifecycle boundary, both of which remain untriggered/blocked, so a test pins non-registration rather than leaving it to memory. See `docs/agent-handoffs/TOWER-TO-IOS.md` §6.1.
+
+Numbered V0.9.4 rather than V1.x deliberately: it is Experimental-CV-era work that stops at the same registry boundary as everything before it, and calling it V1.x would imply the registry generalisation below had happened.
+
+Reports: `reports/2026-08-22-world-builder-v1-report.md`, `reports/2026-08-22-world-builder-closeout.md`.
+
+Exit criterion: **met** for the engine — a world survives a process restart and can be inspected cold, every claim is labelled synthetic, and the integration boundary is documented and tested.
 
 ### V1.0 — Generalize Module Registry (When Justified)
 - Triggered only once a second production module (a promoted Experimental CV Lab result, or another module such as Object Memory) creates real, concrete requirements.
@@ -140,8 +163,8 @@ Exit criterion: two or more modules coexist through the registry; adding a norma
 ## Phase 3 — Advanced Modules
 
 Candidates, each with its own specification under `docs/modules/`:
-- Object Memory — strong bounded candidate for an early production module.
-- World Build.
+- Object Memory — data layer **built and tested**; detector, `Module` subclass and routes **blocked** on the synchronous-`_do_load()` decision gate. See `docs/modules/OBJECT-MEMORY.md`.
+- World Build — engine **built** at V0.9.4 above; production registration blocked at the V1.0/V1.1 boundary. See `docs/modules/WORLD-BUILD.md`.
 - Accessibility.
 - Visual Q&A / Reading — comparatively heavy (STT + OCR/CV + multimodal reasoning + TTS); not an early starter module.
 - Environmental / Physical-World Search — highest privacy exposure of the current module set; requires the retention/deletion policy in `06-PRIVACY-DATA.md` to be actually implemented, not just documented, before real data collection begins.
@@ -156,6 +179,6 @@ Possible but explicitly outside V1:
 - persistent shared world models;
 - custom firmware/reverse engineering;
 - Tower-optional / heterogeneous compute degradation (see `01-SYSTEM-ARCHITECTURE.md` — Heterogeneous Compute & Graceful Degradation);
-- live world-state visualization for World Build (see `docs/modules/WORLD-BUILD.md` — Live Visualization).
+- live world-state visualization for World Build on a PC or phone (see `docs/modules/WORLD-BUILD.md` — Live Visualization). **Partially delivered 2026-08-22:** the Tower half exists — a world can be built and followed live from a separate process. The viewer half is blocked on there being no transport for world data at all, not on the reconstruction.
 
 These must not block the supported DAT-based platform.

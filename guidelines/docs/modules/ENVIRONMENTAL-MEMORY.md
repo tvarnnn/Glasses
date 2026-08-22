@@ -2,7 +2,7 @@
 
 ## Status
 
-Longer-term module. Broader than Object Memory and likely dependent on several mature perception services. This module has the highest privacy exposure of the current module set (see Privacy below) — it must not begin real data collection until the retention/deletion policy in `06-PRIVACY-DATA.md` is actually implemented for this module, not merely documented.
+**PLANNED.** No code exists under `tower/`. Longer-term module. Broader than Object Memory and likely dependent on several mature perception services. This module has the highest privacy exposure of the current module set (see Privacy below) — it must not begin real data collection until the retention/deletion policy in `06-PRIVACY-DATA.md` is actually implemented for this module, not merely documented.
 
 ## Goal
 

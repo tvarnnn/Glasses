@@ -92,6 +92,19 @@ These are architectural requirements; exact timing constants are an implementati
 
 **Lifecycle timeouts.** No lifecycle operation (LOADING, STOPPING, or equivalent) may block indefinitely. Each requires a bounded timeout. On timeout, the module transitions to a defined FAILED/unavailable state rather than hanging. A module timeout must not crash the persistent tower runtime.
 
+> **Known exception, stated rather than glossed (2026-08-22).** This
+> guarantee is **not currently true for a synchronous `_do_load()`**.
+> `ModuleContainer` wraps each lifecycle call in `asyncio.wait_for`, but
+> `asyncio.wait_for` cannot cancel synchronous CPU-bound work already
+> running on the event-loop thread — the timeout fires only *after* the
+> blocking call returns. `DepthEstimationModule._do_load()` calls
+> `torch.hub.load()` synchronously inside an `async def`, so a slow or
+> hanging model download is genuinely unbounded today. This is a **known,
+> named, deliberately unfixed gap**: it is the V1.1 lifecycle work, and
+> resolving it is a standing decision gate that also blocks Object Memory
+> Tasks 4–8. Do not treat the bullet above as describing current
+> behaviour for that path.
+
 **Reconnection.** Automatic reconnection (glasses session or tower connection) must use bounded/exponential backoff rather than a tight retry loop. Exact retry timing is an implementation decision.
 
 **Backpressure.** The real-time perception pipeline must not grow an unbounded frame queue. Freshness generally matters more than processing every frame; when the tower/module cannot keep up, stale frames should normally be dropped rather than accumulating latency. Exact queue/drop strategy should be set from the measurements taken in `03-ROADMAP.md` V0.7, not decided in the abstract.

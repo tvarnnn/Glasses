@@ -119,13 +119,20 @@ Frames captured during an unsafe transition are dropped by default, not injected
 
 Each module owns a data directory/storage namespace.
 
-Examples:
+The shape below was illustrative and the shipped modules did not adopt it.
+What they actually use, as of 2026-08-22:
 
 ```text
-modules/world_build/data/
-modules/accessibility/data/
-modules/object_memory/data/
+data/world_builder/worlds/<world_id>/...     (World Builder, DEFAULT_ROOT)
+data/world_builder/captures/<capture_id>/    (shared dataset recorder)
+<caller-supplied directory>                  (Object Memory ObservationStore)
 ```
+
+The principle held; the path convention did not. What matters is that a
+module owns its namespace and no module reads another's, not that the
+directories share a prefix. `ObservationStore` takes its directory as a
+constructor argument and hardcodes no default at all, which is the
+better shape — the owner of the data decides where it lives.
 
 Storage technology may differ by module. Do not impose a universal database prematurely.
 

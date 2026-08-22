@@ -2,7 +2,23 @@
 
 ## Status
 
-Future module. This is a concept/specification seed, not authorization to implement the entire system now.
+**PARTIALLY IMPLEMENTED** as of 2026-08-22. This document began as a
+concept seed and much of it still is one; the sections below are no longer
+uniformly aspirational, so read the split carefully.
+
+| Part | Status |
+|---|---|
+| Mapping engine — world/session/keyframe lifecycle, frame evaluation, keyframe selection, relative-scale geometry, persistence, cold reload, inspection | **CURRENTLY IMPLEMENTED** (`tower/world_builder/`, V1) |
+| ChArUco camera calibration | **CURRENTLY IMPLEMENTED** (`scripts/calibrate_charuco.py`) |
+| Incremental update stream and Tower-side live following | **CURRENTLY IMPLEMENTED** (`events.jsonl` + cursor, `world_inspect.py --follow`) |
+| Registration as a production module on the live frame path | **BLOCKED** — the module contract is a registry of one with a scalar result type. A test pins non-registration deliberately (`tests/test_architecture_boundaries.py`) |
+| PC/phone viewer | **PLANNED** — see Live Visualization below |
+| Metric scale, loop closure, relocalisation, multi-session refinement | **PLANNED** |
+| Validation against real Ray-Ban footage | **BLOCKED** on hardware. Every measurement to date is synthetic |
+
+Reports: `reports/2026-08-22-world-builder-v1-report.md` (what was built
+and why) and `reports/2026-08-22-world-builder-closeout.md` (requirement
+coverage, open items).
 
 ## Goal
 
@@ -226,7 +242,25 @@ Conceptual viewer content, once built:
 
 Prefer incremental world-state updates/deltas over repeatedly transmitting the complete world representation, consistent with the platform's general preference for bounded, freshness-oriented data flow (`01-SYSTEM-ARCHITECTURE.md` — Reliability Policies).
 
-This is architecture for a future milestone. Do not implement the viewer now — it depends on a working reconstruction pipeline that does not yet exist.
+**Status update, 2026-08-22.** The premise of the sentence this
+paragraph used to carry — "it depends on a working reconstruction pipeline
+that does not yet exist" — is no longer true. The pipeline exists and runs
+end to end offline, and the Tower half of live viewing is built: the
+append-only event journal is an incremental update stream, `read_events`
+takes a cursor, `world_build_session.py --follow-capture` builds a world
+while frames are still arriving, and `world_inspect.py --follow` watches
+it happen from a separate process.
+
+**The conclusion still holds, for a different reason.** Do not implement
+the PC/phone viewer yet — not because there is nothing to show, but
+because there is **no transport to show it over**. `frame_result` carries
+five scalars and World Builder is not a registered module, so no world
+data can reach a phone at all. The exact blockers are listed in
+`docs/agent-handoffs/TOWER-TO-IOS.md` §6.1.
+
+The preference for incremental deltas over whole-world transmission,
+stated above, is already how the persisted representation works — a viewer
+built later inherits it rather than needing it retrofitted.
 
 ## Relationship to Object Memory / Environmental Memory (Future)
 
