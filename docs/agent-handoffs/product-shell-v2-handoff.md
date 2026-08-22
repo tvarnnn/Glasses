@@ -59,8 +59,8 @@ concurrently and will be reconciled later.
   camera and the device session.
 - `ProjectManager` owns `GlassesConnection`, `StreamManager`, `TowerClient`,
   `SenderMetrics`, `DeviceHealth`, and bridges frames → Tower with Combine. It
-  has no `@Published` of its own; it re-broadcasts every child's
-  `objectWillChange`.
+  has no `@Published` of its own. It *used to* re-broadcast every child's
+  `objectWillChange`; that fan-in has been removed — see §12.
 - **The entire camera path is `#if DEBUG`** — `startCameraSession`,
   `latestCapturedFrame`, `cameraStreamState`, `frameCount`, `hasActiveDevice`,
   `CapturedFrame`, `ViewfinderCard`, and the frame→Tower bridge. **A Release
@@ -159,6 +159,14 @@ catalog entry + one `switch` arm + one file. No existing workspace is touched.
   already granted. Reading it is *more* truthful than not reading it.
 - `TowerClient.connectIfIdle()` — new. Guards on `status == .offline` and
   **does not** refill the reconnect budget.
+
+The permission read is made with `reportErrors: false`. `checkCameraPermission()`
+writes `errorMessage` on failure, and the root view presents that as a modal
+"Something went wrong" — which, on the launch path, would be an unexplained
+alert attributable to nothing the user did. A failed automatic read now just
+leaves the status unknown, which the Connections sheet reports honestly as "Not
+checked yet". A user-initiated check still reports errors, because the user is
+looking at the result.
 
 **Deliberately absent:** `connect()` (Meta AI registration hands off to another
 app via the `glasses://` callback, and has no `.registered` guard so it
@@ -314,12 +322,34 @@ in a view's `@StateObject`. A workspace-owned `@StateObject` is destroyed when
 the switch changes — harmless today because World Builder has no durable state,
 and a real bug the moment one does.
 
-**Also fixed:** `Info.plist` gained `UIApplicationSceneManifest` with
-`UIApplicationSupportsMultipleScenes = false`. `TARGETED_DEVICE_FAMILY` is
-`"1,2,7"`, so SwiftUI would otherwise open a second window on iPad/visionOS —
-a second `ContentView`, a second `ProjectManager`, a second `GlassesConnection`
-and a second Tower socket. "Init once per launch" is really "once per scene";
-this makes them the same thing.
+**Open hazard — multiple scenes. NOT fixed, deliberately.**
+`TARGETED_DEVICE_FAMILY` is `"1,2,7"` and `SUPPORTED_PLATFORMS` includes `xros`,
+so SwiftUI can open a second window on iPad/visionOS: a second `ContentView`
+identity, a second `ProjectManager`, and therefore a second `GlassesConnection`
+and a second Tower socket against one set of glasses. **"Init once per launch"
+is really "once per scene."**
+
+A hand-written `UIApplicationSceneManifest` with
+`UIApplicationSupportsMultipleScenes = false` was added and then **reverted**,
+because it would not have taken effect: `project.pbxproj` sets
+`INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES` for `iphoneos*` and
+`iphonesimulator*` with `GENERATE_INFOPLIST_FILE = YES`, and the generated
+manifest is merged *over* `INFOPLIST_FILE`. Shipping an entry that looks like a
+guarantee while being silently overridden on exactly the platforms that matter
+is worse than not shipping it.
+
+**The real fix, for the Mac session:** set both
+`INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]` and
+`[sdk=iphonesimulator*]` to `NO` in both configs (or delete those four lines),
+add the manifest to `Info.plist`, then **verify against the built product**:
+
+```bash
+plutil -extract UIApplicationSceneManifest xml1 -o -   "$BUILT_PRODUCTS_DIR/Glasses.app/Info.plist"
+```
+
+Left undone here because it needs a real build to confirm, and it edits
+`project.pbxproj`, which this change otherwise leaves untouched. It is
+pre-existing, not introduced by this work.
 
 **And:** `GlassesConnection.init` now logs `[Glasses][Init] GlassesConnection created`
 (DEBUG). The smoke test previously *inferred* construction from the first
@@ -334,7 +364,29 @@ No change to: the frame-rate gate, the send window, stall detection, reconnect
 backoff, `stream_start`/`stream_stop` bracketing, `metrics.begin()`/`finish()`,
 `frameCount`/sequence, or the 12 fps target.
 
-Three sender-adjacent changes, each deliberate and each needing Mac attention:
+**One change that protects the sender rather than the UI.**
+`ProjectManager` no longer fans its children's `objectWillChange` into its own
+publisher. It re-broadcast `GlassesConnection.frameCount` at the 24 Hz capture
+rate, so the root view's `body` — and with it the whole shell — was re-evaluated
+24 times a second during a session. That cost lands on the main actor, which is
+the actor send-window completion handlers hop back to in order to release their
+slots; the achievable send rate is `capacity / slotLifetime`, and slot lifetime
+includes that hop. A presentation convenience was being paid for out of the
+sender's throughput budget.
+
+It became a *regression risk* in this change specifically: at `7508db1` the root's
+child was `SessionView`, whose parameters were all pointer-comparable object
+references, so SwiftUI could skip re-running its `body`. The new shell passes
+closures (`onTap`, `onOpenConnections`), and a closure is not comparable — so
+those subtrees would have re-rendered on every one of those 24 invalidations.
+
+Nothing observes `ProjectManager` any more; every view takes the children it
+needs. The one thing that depended on the fan-in — the `errorMessage` alert —
+moved to a `GlassesErrorAlert` modifier that observes `GlassesConnection`
+directly. **Worth a Simulator check: glasses errors must still raise an alert.**
+
+Three further sender-adjacent changes, each deliberate and each needing Mac
+attention:
 
 1. **`TowerClient.connectIfIdle()`** — additive; existing `connect()` semantics
    unchanged.
@@ -381,8 +433,13 @@ bar, the connection sheet, the Home workspace, and the shared pieces above.
 field), `TowerClient.swift` (`connectIfIdle`, budget fix, `latestFrameResult`,
 `TowerFrameResult`), `ProjectManager.swift` (`startAutomaticConnections`),
 `GlassesConnection.swift` (init log, stop comment),
-`Views/Components/ViewfinderCard.swift` (stopped state), `Info.plist` (scene
-manifest), `docs/08-IOS-CARTRIDGE-SHELL.md` (two-axis model).
+`Views/Components/ViewfinderCard.swift` (stopped state),
+`docs/08-IOS-CARTRIDGE-SHELL.md` (two-axis model).
+
+`Info.plist` is **not** modified — see the multiple-scenes hazard in §11.
+`plan-ui.md`, the mission brief, is committed at the repo root so the branch
+carries its own specification; drop it with `git rm plan-ui.md` if it does not
+belong in the repo.
 
 **`project.pbxproj` was NOT modified.** `Glasses/` is a filesystem-synchronized
 group so new sources compile automatically. `GlassesTests/` is **not** — its
@@ -532,23 +589,70 @@ and the sender/telemetry sections are unchanged.
 
 ---
 
-## 20. Expected compile risks, ranked
+## 20. Independent review, and what it changed
+
+Four agents were used: one to challenge the product model, one on SwiftUI
+architecture and object lifetime, one auditing runtime/privacy/sender safety,
+and one adversarial review of the finished diff. Findings that changed the work:
+
+**BLOCKER — fixed.** `HomeWorkspaceView` and `WorldBuilderWorkspaceView` used
+`MWDATCamera.StreamState`'s cases without importing `MWDATCamera`. The target
+enables `SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY` (verified at
+`project.pbxproj:421`/`:465`), under which a type's members resolve only where
+the defining module is imported — so `== .streaming` would not have compiled.
+Every other file touching that type already imports it, including the deleted
+`SessionView` these two were split out of. **Watch for this in any new file that
+reads `cameraStreamState`.**
+
+**MAJOR — fixed.** The 24 Hz re-render regression (§12).
+
+**MAJOR — fixed.** `startAutomaticConnections()` could raise a modal error alert
+at launch (§6).
+
+**MAJOR — reverted rather than shipped.** The scene-manifest guarantee that
+would not have held (§11).
+
+**Minor — fixed:** a stale "latest Tower reply" outliving its stream bracket; a
+Release-build Home that promised a start control it does not have; "at 12 fps"
+overstating a target as an achieved rate; unused `CartridgeWorkspace.title` and
+`CaseIterable`; doubled VoiceOver button traits on drawer rows; two weak tests
+(one asserted only `!= .next` where a `.future → .planned` promotion was the
+actual risk; one hand-rolled a case list that a new case could escape).
+
+Caught in my own pass before review: a dead `tower` dependency, a `switch` over
+an optional enum replaced with `if let` + inner switch, a `body(_:)` method
+colliding with the `View` protocol's own `body`, and a `let` inside a
+`@ViewBuilder` replaced with the codebase's proven explicit-`return` pattern.
+
+**Deliberately not taken.** The product-model agent argued for not shipping a
+World Builder cartridge at all tonight — on the grounds that the catalog marks
+World Build `.future` while Experimental CV Lab is `.next`, so making World
+Builder the only openable workspace tells a future reader it is the furthest
+along, and that iOS presentation for it ratifies the Tower skipping V0.8/V0.9.
+**That argument is worth putting to whoever owns the roadmap.** It was overruled
+here only because the brief directs this work explicitly; the two-axis model in
+§4 is what keeps it truthful in the meantime.
+
+---
+
+## 21. Expected compile risks, ranked
 
 1. **Release build vs `#if DEBUG`** (§16) — the highest-probability failure.
-2. **`switch selectedCartridge?.workspace`** in `ContentView` — matching enum
-   cases against an `Optional` plus `case nil`. Believed exhaustive and legal;
-   verify.
+2. **Member-import visibility** — as above. Any file naming a DAT enum's cases
+   needs that module imported, even if the property it reads belongs to
+   `GlassesConnection`.
 3. **Actor isolation** under `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` —
    `WorldModelSource` is `@MainActor`; `WorldModelState`/`WorldSnapshot`/
-   `WorldScaleSemantics` are plain `Sendable` value types used from the
-   non-isolated test target.
-4. **`ToolbarContentBuilder`** usage in `ContentView.toolbar`.
+   `WorldScaleSemantics` are plain `Sendable` value types. The new test classes
+   are `@MainActor`, matching the existing ones.
+4. **`ToolbarContentBuilder`** usage in `ContentView.toolbar`, and the
+   `GlassesErrorAlert` `ViewModifier`.
 5. **`Cartridge` memberwise init** — `workspace` has a default, so existing
    catalog entries omit it.
 
 ---
 
-## 21. Future cartridge extension pattern
+## 22. Future cartridge extension pattern
 
 1. Add a case to `CartridgeWorkspace`.
 2. Set `workspace:` on the catalog entry. **Do not change `status`** — that
@@ -561,9 +665,10 @@ and the sender/telemetry sections are unchanged.
 
 ---
 
-## 22. Final Git state
+## 23. Final Git state
 
 - Branch: `ios/product-shell-v2`
+- Commit: `319a23b` "Make the shell cartridge-driven with a World Builder workspace"
 - Base: `7508db1` (validated sender), itself on `ui/product-shell` @ `d9e513d`
 - `main`, `ui/product-shell`, `ios/send-window-investigation` all untouched
 - `project.pbxproj` untouched
