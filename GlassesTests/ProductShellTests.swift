@@ -2,17 +2,34 @@
 //  ProductShellTests.swift
 //  GlassesTests
 //
-//  Guards the two truthfulness invariants the product shell introduced:
-//  the cartridge catalog must not advertise a module as usable before a
-//  module runtime exists, and no user-facing string may leak a raw DAT enum
-//  case name. Both are Rule 3 (Truthful State Only) in
-//  docs/02-DEVELOPMENT-RULES.md.
+//  Guards the truthfulness invariants of the product shell and of the cartridge
+//  integration layer built on it. Rule 3 (Truthful State Only) and Rule 16
+//  (Epistemic Honesty) in docs/02-DEVELOPMENT-RULES.md, plus the display rules
+//  in docs/06-PRIVACY-DATA.md and docs/07-PLATFORM-CONSTRAINTS.md.
+//
+//  In rough order: the cartridge catalog and its roadmap statuses; workspace
+//  selection; the shared availability/phase layer; the four cartridge clients
+//  and view models; redaction; provenance and observation time; and the four
+//  cartridges' own domain rules.
+//
+//  Everything here lives in one file because GlassesTests is NOT a
+//  filesystem-synchronized group — its members are listed explicitly in
+//  project.pbxproj — so adding a test file means hand-editing that file, which
+//  was judged the worse risk. New suites are appended rather than split out.
 //
 
+import Combine
 import MWDATCore
 import XCTest
 
 @testable import Glasses
+
+// `Combine` is imported for the cartridge client protocols' `stateUpdates`
+// requirement, whose type is `AnyPublisher`. The test doubles below satisfy it
+// through the protocol extensions' default rather than implementing it, so this
+// import is belt-and-braces — but the target enables
+// SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY, and being explicit about a
+// module whose types appear in a conformance costs nothing.
 
 final class CartridgeCatalogTests: XCTestCase {
 
