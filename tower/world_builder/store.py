@@ -26,13 +26,21 @@ that produced it, so a stale derived tree is detected rather than trusted.
 """
 
 import hashlib
+import os
 import json
 import logging
-import os
 import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+
+from tower.storage import (
+    TEMP_SUFFIX,
+    append_jsonl,
+    read_json_closed,
+    read_raw_jsonl,
+    write_json_atomic,
+)
 
 from tower.world_builder.records import (
     Keyframe,
@@ -60,7 +68,6 @@ LOCK_FILENAME = "LOCK"
 DERIVED_DIRNAME = "derived"
 DERIVED_MANIFEST = "manifest.json"
 IMAGES_DIRNAME = "images"
-TEMP_SUFFIX = ".tmp"
 
 
 class WorldStoreError(Exception):
@@ -125,72 +132,8 @@ def require_pose_convention(convention: dict) -> None:
         )
 
 
-def write_json_atomic(path: Path, payload: dict) -> None:
-    """Replace `path` atomically, leaving no temp file behind either way.
-
-    try/finally so a failure mid-write cannot leave a .tmp holding a live
-    copy of data that nothing subsequently reads, prunes, or deletes --
-    the exact defect that had to be fixed once already in object memory.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(path.name + TEMP_SUFFIX)
-    try:
-        with temp_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temp_path.replace(path)
-    finally:
-        temp_path.unlink(missing_ok=True)
 
 
-def read_json_closed(path: Path) -> dict:
-    """Read and parse with the handle closed before parsing.
-
-    Windows cannot os.replace onto an open destination (verified:
-    WinError 5), so a reader that holds a handle open across any other
-    work can block a writer. Reading the bytes and closing immediately
-    makes that structurally impossible.
-    """
-    with path.open("r", encoding="utf-8") as handle:
-        text = handle.read()
-    return json.loads(text)
-
-
-def append_jsonl(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload) + "\n")
-
-
-def read_raw_jsonl(path: Path) -> tuple[list[dict], int]:
-    """Parse a journal, counting genuinely-corrupt lines separately.
-
-    A line that is not valid JSON is corruption. A well-formed line whose
-    fields this version's schema cannot interpret is NOT corruption --
-    callers treat the two differently, exactly as object memory does.
-    A torn final line from an interrupted write lands in the first
-    category and is skipped without touching the file.
-    """
-    if not path.exists():
-        return [], 0
-    raw_records: list[dict] = []
-    corrupt = 0
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                raw_records.append(json.loads(line))
-            except json.JSONDecodeError:
-                logger.warning(
-                    "world builder: skipping corrupt line at %s:%s",
-                    path,
-                    line_number,
-                )
-                corrupt += 1
-    return raw_records, corrupt
 
 
 class WorldStore:
@@ -397,7 +340,29 @@ class WorldStore:
         write_json_atomic(derived / "points.json", {"points": points})
         self.write_derived_manifest(world_id, manifest)
 
-    def read_derived(self, world_id: str, session_id: str) -> dict | None:
+    def read_derived(
+        self, world_id: str, session_id: str, *, verify: bool = True
+    ) -> dict | None:
+        """Read the derived reconstruction, refusing stale output.
+
+        The digest is checked by default rather than on request. Serving a
+        derived tree that no longer matches the journal that produced it
+        is silent corruption of exactly the kind this store is built to
+        prevent: the numbers look fine, they are just answers to an older
+        question. Returning None makes a stale tree indistinguishable from
+        an absent one, which is the honest outcome -- both mean "rebuild".
+        """
+        if verify:
+            digest = compute_input_digest(
+                self.read_keyframes(world_id, session_id)
+            )
+            if not self.derived_is_current(world_id, digest):
+                logger.warning(
+                    "world builder: derived output for %s is stale; "
+                    "treating as absent",
+                    world_id,
+                )
+                return None
         derived = self.derived_dir(world_id) / session_id
         poses_path = derived / "poses.json"
         points_path = derived / "points.json"

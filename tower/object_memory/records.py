@@ -1,29 +1,13 @@
 from dataclasses import dataclass
-from enum import Enum
 
-# Bucket boundaries are deliberate placeholders pending measurement, not
-# tuned values: no retrieval-accuracy data exists yet to justify specific
-# thresholds. They exist so confidence is carried end-to-end from day one
-# (Rule 16) rather than retrofitted; revisit once Task 8 produces numbers.
-LOW_CONFIDENCE_MAX = 0.5
-MEDIUM_CONFIDENCE_MAX = 0.8
-
-
-class Confidence(Enum):
-    UNKNOWN = "unknown"
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-
-    @classmethod
-    def from_score(cls, score: float | None) -> "Confidence":
-        if score is None:
-            return cls.UNKNOWN
-        if score < LOW_CONFIDENCE_MAX:
-            return cls.LOW
-        if score < MEDIUM_CONFIDENCE_MAX:
-            return cls.MEDIUM
-        return cls.HIGH
+# Confidence moved to tower/confidence.py when World Builder became a
+# second consumer. Re-exported here so this module's public surface is
+# unchanged and no caller has to care where it lives.
+from tower.confidence import (  # noqa: F401
+    LOW_CONFIDENCE_MAX,
+    MEDIUM_CONFIDENCE_MAX,
+    Confidence,
+)
 
 
 @dataclass(frozen=True)

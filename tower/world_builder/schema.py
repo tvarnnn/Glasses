@@ -62,13 +62,6 @@ POSE_STATUS_SOLVED = "solved"
 POSE_STATUS_ROTATION_ONLY = "rotation_only"
 POSE_STATUS_ANCHOR = "anchor"
 
-POSE_STATUSES = (
-    POSE_STATUS_UNAVAILABLE,
-    POSE_STATUS_SOLVED,
-    POSE_STATUS_ROTATION_ONLY,
-    POSE_STATUS_ANCHOR,
-)
-
 # Why a pose was refused. Recorded per keyframe so a thin reconstruction
 # is explainable rather than merely empty.
 DEGENERACY_NONE = ""
@@ -86,8 +79,6 @@ SCALE_RELATIVE = "relative"
 SCALE_ESTIMATED = "estimated"
 SCALE_MEASURED = "measured"
 
-SCALE_STATES = (SCALE_UNKNOWN, SCALE_RELATIVE, SCALE_ESTIMATED, SCALE_MEASURED)
-
 # Only a measured scale licenses printing a physical unit. Checked in one
 # place (records.format_distance) and pinned by a test, because "we will
 # remember not to print metres" is not a mechanism.
@@ -101,12 +92,6 @@ SCALE_STATES_ALLOWING_METRES = (SCALE_MEASURED,)
 INTRINSICS_SOURCE_UNKNOWN = "unknown"
 INTRINSICS_SOURCE_SELF_CALIBRATED = "self_calibrated"
 INTRINSICS_SOURCE_DECLARED = "declared"
-
-INTRINSICS_SOURCES = (
-    INTRINSICS_SOURCE_UNKNOWN,
-    INTRINSICS_SOURCE_SELF_CALIBRATED,
-    INTRINSICS_SOURCE_DECLARED,
-)
 
 # Gauge-entry kinds, recorded for a successor to implement against.
 #
@@ -124,8 +109,6 @@ INTRINSICS_SOURCES = (
 # be brought current only if EVERY entry from R to HEAD is GLOBAL_SIM3.
 # Otherwise it must be re-resolved from its anchor keyframe, or reported
 # as unknown. Never composed anyway.
-GAUGE_GLOBAL_SIM3 = "global_sim3"
-GAUGE_NON_SIMILARITY = "non_similarity"
 
 # Session end reasons. "interrupted" is what recovery stamps on a session
 # whose process died; its ended_at stays null because we genuinely do not
@@ -136,10 +119,3 @@ END_REASON_INTERRUPTED = "interrupted"
 END_REASON_ERROR = "error"
 END_REASON_BOUNDED_LIMIT = "bounded_limit"
 
-END_REASONS = (
-    END_REASON_STOP,
-    END_REASON_DISCONNECT,
-    END_REASON_INTERRUPTED,
-    END_REASON_ERROR,
-    END_REASON_BOUNDED_LIMIT,
-)

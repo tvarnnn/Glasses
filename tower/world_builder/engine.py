@@ -21,7 +21,7 @@ import logging
 import time
 from dataclasses import dataclass, field, replace
 
-from tower.object_memory.records import Confidence
+from tower.confidence import Confidence
 from tower.world_builder.backend import KeyframeInput
 from tower.world_builder.backends import BACKEND_AUTO, select_backend
 from tower.world_builder.events import EventLog, WorldEvent
@@ -292,6 +292,7 @@ class WorldBuilderEngine:
 
         session = self._store.read_session(world_id, session_id)
         keyframes = self._store.read_keyframes(world_id, session_id)
+        _require_matching_resolution(session, keyframes)
         selection = select_backend(self._backend_name, session.intrinsics)
         backend = selection.backend
         backend.prepare(session.intrinsics)
@@ -424,6 +425,31 @@ class WorldBuilderEngine:
     # -- internals -----------------------------------------------------
 
     def _pose_row(self, keyframe, pose, segment) -> dict:
+        """Convert a backend pose into the persisted T_world_camera contract.
+
+        The backends work in the convention OpenCV hands them:
+        `recoverPose` and `solvePnPRansac` both return (R, t) mapping a
+        WORLD point into the CAMERA frame, so `t` is not a position at all
+        -- it is where the world origin sits as seen by the camera.
+
+        schema.POSE_CONVENTION declares the opposite: `T_world_camera`,
+        whose translation IS the camera's position in world coordinates,
+        chosen precisely so no consumer ever has to invert anything.
+
+        Writing the raw `t` under that contract mirrors every camera
+        through the origin. It is not a loud failure -- the trajectory
+        stays smooth, monotonic and entirely plausible -- which is exactly
+        why the convention is frozen and why this conversion lives here
+        rather than being left to whoever renders it. An earlier version
+        of this function shipped the raw value; a strafe along +X
+        persisted as -X, and nothing caught it until the values were
+        compared against ground-truth camera positions.
+
+            R_world_camera = R.T
+            C              = -R.T @ t
+        """
+        import numpy as np
+
         row = {
             "keyframe_id": keyframe.keyframe_id,
             "segment_index": segment,
@@ -436,8 +462,12 @@ class WorldBuilderEngine:
             row["rotation"] = [1.0, 0.0, 0.0, 0.0]
             row["translation"] = [0.0, 0.0, 0.0]
         elif pose.rotation is not None and pose.translation is not None:
-            row["rotation"] = _rotation_to_quaternion_wxyz(pose.rotation)
-            row["translation"] = [float(v) for v in pose.translation]
+            rotation = np.asarray(pose.rotation, dtype=np.float64)
+            translation = np.asarray(pose.translation, dtype=np.float64).reshape(3)
+            row["rotation"] = _rotation_to_quaternion_wxyz(rotation.T)
+            row["translation"] = [
+                float(v) for v in (-rotation.T @ translation)
+            ]
         return row
 
     def _load_gray(self, world_id, session_id, keyframe):
@@ -481,7 +511,9 @@ class WorldBuilderEngine:
             overlap_ratio=motion.overlap_ratio if motion else None,
             survival_ratio=motion.survival_ratio if motion else None,
             tracked_count=motion.tracked_count if motion else None,
-            r_h=motion.homography_residual_px if motion else None,
+            homography_residual_px=(
+                motion.homography_residual_px if motion else None
+            ),
             quality=Confidence.from_score(
                 motion.survival_ratio if motion else None
             ),
@@ -499,6 +531,35 @@ class WorldBuilderEngine:
             keyframe_id=keyframe_id,
             frames_observed=self._session.frames_observed,
             keyframes_accepted=self._session.keyframes_accepted,
+        )
+
+
+class IntrinsicsResolutionMismatchError(RuntimeError):
+    """Intrinsics were calibrated at a resolution the frames are not."""
+
+
+def _require_matching_resolution(session, keyframes) -> None:
+    """Refuse to apply intrinsics to frames of a different size.
+
+    Applying a 480x360 calibration to 720x1280 frames does not fail --
+    it silently produces a reconstruction wrong by the resolution ratio.
+    CameraIntrinsics.scaled_to() already refuses to rescale without
+    established linearity; this is the check that actually routes callers
+    into that refusal instead of around it.
+    """
+    intrinsics = session.intrinsics
+    if not intrinsics.is_known or not keyframes:
+        return
+    sizes = {(keyframe.width, keyframe.height) for keyframe in keyframes}
+    calibrated = (intrinsics.calibrated_width, intrinsics.calibrated_height)
+    mismatched = sorted(size for size in sizes if size != calibrated)
+    if mismatched:
+        raise IntrinsicsResolutionMismatchError(
+            f"intrinsics were calibrated at {calibrated[0]}x{calibrated[1]} "
+            f"but this session contains keyframes at {mismatched}. Refusing "
+            "to apply them: the reconstruction would be silently wrong by "
+            "the resolution ratio. Calibrate at the delivered resolution, "
+            "or establish scales_linearly_across_resolutions and rescale."
         )
 
 

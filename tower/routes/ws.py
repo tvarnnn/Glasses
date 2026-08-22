@@ -3,6 +3,7 @@ import time
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from tower.capture import END_REASON_DISCONNECT, END_REASON_STOP
 from tower.frames import FrameError, parse_and_decode_frame
 from tower.metrics import SessionMetrics
 from tower.modules.base import FrameSkippedError, ModuleUnavailableError
@@ -49,8 +50,6 @@ async def _handle_frame_message(
             frame.decoded_width,
             frame.decoded_height,
         )
-
-    _record_capture(websocket, frame)
 
     module_container = websocket.app.state.module_container
     try:
@@ -116,37 +115,54 @@ async def _handle_frame_message(
         )
         raise
 
+    # After the reply, never before: see _record_capture.
+    _record_capture(websocket, frame)
+
     if metrics is not None and metrics.should_log_summary():
         logger.info("[Tower][Session] summary: %s", metrics.snapshot())
 
 
-def _record_capture(websocket, frame) -> None:
-    """Persist one raw frame if dataset recording is switched on.
+def _frame_observers(websocket):
+    """Every registered frame observer.
 
-    Off by default: `capture_recorder` is None unless an operator started
-    a recording, so the normal frame path is byte-for-byte unchanged.
-
-    Deliberately swallows every failure. Recording is a side errand; a
-    full disk or a permission error must never cost the client its
-    frame_result, and must never take down a session. It is logged and
-    the pipeline continues.
+    A LIST, not a single slot: more than one consumer may eventually want
+    frames (a dataset recorder, and later a cartridge wanting occasional
+    high-value stills), and a singleton would force the second one to
+    either displace the first or patch this module again.
     """
-    recorder = getattr(websocket.app.state, "capture_recorder", None)
-    if recorder is None or not recorder.is_recording:
-        return
-    try:
-        recorder.write_frame(
-            frame.raw_bytes,
-            source_seq=frame.source_seq,
-            wire_seq=frame.seq,
-            tx_seq=frame.tx_seq,
-            width=frame.decoded_width,
-            height=frame.decoded_height,
-        )
-    except Exception:
-        logger.exception(
-            "[Tower][Capture] frame #%s not recorded; continuing", frame.seq
-        )
+    return getattr(websocket.app.state, "frame_observers", None) or []
+
+
+def _record_capture(websocket, frame) -> None:
+    """Offer one raw frame to each observer, after the client has its result.
+
+    Called AFTER the frame_result is sent, deliberately. Recording does a
+    durable fsync'd write, and this is an async handler with no threadpool
+    offload -- doing it before the reply would put a disk write inside the
+    latency every other cartridge measures, and would block the event loop
+    ahead of inference. Accessibility, which wants minimum latency, would
+    pay for a recording it never asked for.
+
+    Each observer is isolated: recording is a side errand, and a full disk
+    or a permission error must never cost the client its result or take
+    down a session.
+    """
+    for observer in _frame_observers(websocket):
+        try:
+            if not observer.is_recording:
+                continue
+            observer.write_frame(
+                frame.raw_bytes,
+                source_seq=frame.source_seq,
+                wire_seq=frame.seq,
+                tx_seq=frame.tx_seq,
+                width=frame.decoded_width,
+                height=frame.decoded_height,
+            )
+        except Exception:
+            logger.exception(
+                "[Tower][Capture] frame #%s not recorded; continuing", frame.seq
+            )
 
 
 async def _send_frame_error(
@@ -200,29 +216,34 @@ def _start_capture(websocket) -> None:
     the session boundary already exists on the wire, and V1 deliberately
     makes no protocol change.
     """
-    recorder = getattr(websocket.app.state, "capture_recorder", None)
-    if recorder is None or recorder.is_recording:
-        return
-    try:
-        capture_id = recorder.start()
-        logger.info("[Tower][Capture] recording started: %s", capture_id)
-    except Exception:
-        logger.exception("[Tower][Capture] could not start recording")
+    for observer in _frame_observers(websocket):
+        try:
+            if observer.is_recording:
+                # A superseding stream_start opens a new measurement
+                # window; the recording must follow it, or one capture id
+                # would span two windows and stop identifying which frames
+                # belong to which.
+                observer.stop(END_REASON_STOP)
+            capture_id = observer.start()
+            logger.info("[Tower][Capture] recording started: %s", capture_id)
+        except Exception:
+            logger.exception("[Tower][Capture] could not start recording")
 
 
-def _stop_capture(websocket) -> None:
-    recorder = getattr(websocket.app.state, "capture_recorder", None)
-    if recorder is None or not recorder.is_recording:
-        return
-    try:
-        status = recorder.stop()
-        logger.info(
-            "[Tower][Capture] recording stopped: %s frames, %s bytes",
-            status.frames_written,
-            status.bytes_written,
-        )
-    except Exception:
-        logger.exception("[Tower][Capture] could not stop recording cleanly")
+def _stop_capture(websocket, reason: str = END_REASON_STOP) -> None:
+    for observer in _frame_observers(websocket):
+        try:
+            if not observer.is_recording:
+                continue
+            status = observer.stop(reason)
+            logger.info(
+                "[Tower][Capture] recording stopped (%s): %s frames, %s bytes",
+                reason,
+                status.frames_written,
+                status.bytes_written,
+            )
+        except Exception:
+            logger.exception("[Tower][Capture] could not stop recording cleanly")
 
 
 @router.websocket("/ws")
@@ -287,12 +308,23 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "[Tower][Session] stream_stop received with no active "
                         "measurement window"
                     )
-                _stop_capture(websocket)
+                _stop_capture(websocket, END_REASON_STOP)
             else:
                 logger.warning("received unknown message type: %s", message_type)
     except WebSocketDisconnect:
         logger.info("client disconnected")
     finally:
+        # Stop recording on ANY exit, not just a polite stream_stop.
+        #
+        # A wearable client disconnects abruptly as the normal case --
+        # crash, network drop, walking out of range. Without this, a
+        # recorder started by one connection stays armed, and because
+        # _record_capture gates only on is_recording, the NEXT
+        # connection's frames land in the previous connection's capture
+        # with no stream_start and no consent. That is incidental capture
+        # of someone else's imagery, which 06-PRIVACY-DATA forbids and
+        # which capture.py's own docstring promises cannot happen.
+        _stop_capture(websocket, END_REASON_DISCONNECT)
         if active_measurement is not None:
             _finalize_stream_measurement(active_measurement, end_reason="disconnect")
         session.client_disconnected()

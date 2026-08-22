@@ -430,3 +430,71 @@ class TestStorageObservability:
 
     def test_a_missing_world_reports_zero_rather_than_raising(self, tmp_path):
         assert WorldStore(tmp_path).world_bytes("nope")["total"] == 0
+
+
+class TestPersistedPoseConvention:
+    """The persisted contract is T_world_camera: translation IS position.
+
+    Regression cover for a shipped bug. The backends work in OpenCV's
+    convention, where recoverPose and solvePnPRansac return (R, t) mapping
+    a WORLD point into the CAMERA frame -- so `t` is where the world
+    origin sits as seen by the camera, not a position. Writing it raw
+    under the T_world_camera contract mirrors every camera through the
+    origin.
+
+    It is not a loud failure: a strafe along +X persisted as -X, smooth,
+    monotonic and entirely plausible. Nothing caught it until the values
+    were compared against ground-truth camera POSITIONS, which is why
+    this test compares against those rather than against itself.
+    """
+
+    def _built_trajectory(self, tmp_path, walk_jpegs, intrinsics):
+        from tower.world_builder.inspect import WorldView
+
+        store = WorldStore(tmp_path)
+        engine, world_id, session_id, _ = _map_session(
+            store, walk_jpegs, intrinsics
+        )
+        engine.build(world_id, session_id)
+        rows = WorldView(store, world_id).trajectory(session_id)
+        return [row for row in rows if row["pose"] is not None]
+
+    def test_persisted_translation_moves_in_the_direction_the_camera_moved(
+        self, tmp_path, walk_jpegs, intrinsics
+    ):
+        """The walk fixture strafes along +X, so persisted X must increase."""
+        import numpy as np
+
+        solved = self._built_trajectory(tmp_path, walk_jpegs, intrinsics)
+        assert len(solved) >= 3
+
+        x = np.array([row["pose"]["translation"][0] for row in solved])
+
+        assert np.all(np.diff(x) > 0), f"expected +X motion, got {x}"
+
+    def test_persisted_trajectory_matches_ground_truth_camera_positions(
+        self, tmp_path, walk_jpegs, intrinsics
+    ):
+        """Compared up to a similarity, since monocular scale is arbitrary.
+
+        A mirrored trajectory does NOT survive this: Umeyama fits a
+        rotation, not a reflection, so a reflected point set cannot be
+        aligned onto the truth.
+        """
+        import numpy as np
+
+        solved = self._built_trajectory(tmp_path, walk_jpegs, intrinsics)
+        positions = np.array([row["pose"]["translation"] for row in solved])
+
+        # Ground truth for the accepted keyframes, in walk order.
+        indices = [int(row["source_seq"] // 7) for row in solved]
+        truth = np.array([ss.strafe(14, step=0.09)[i].position for i in indices])
+
+        scale, rotation, translation = ss.umeyama_similarity(positions, truth)
+        aligned = (scale * (rotation @ positions.T).T) + translation
+        residual = np.linalg.norm(aligned - truth, axis=1)
+        path_length = float(
+            np.linalg.norm(np.diff(truth, axis=0), axis=1).sum()
+        )
+
+        assert residual.max() / path_length < 0.15

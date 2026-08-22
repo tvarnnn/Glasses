@@ -1,0 +1,90 @@
+"""Filesystem primitives shared by every module that persists to disk.
+
+Extracted once a second module needed them. Both object memory and World
+Builder had independently converged on the same three operations, and the
+capture recorder -- which is shared transport infrastructure -- was
+importing them from inside a cartridge.
+
+The atomic-write pattern in particular is not incidental: the try/finally
+exists because a failure mid-write once left a temp file holding a live
+copy of data that nothing read, pruned, or deleted. That defect shipped
+before it was fixed, which is why it lives in one place now.
+"""
+
+import json
+import logging
+import os
+import uuid
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+TEMP_SUFFIX = ".tmp"
+
+
+def new_id() -> str:
+    """Mint an opaque identifier.
+
+    uuid4 hex, never derived from a display name (users rename things) and
+    never a content hash (refinement changes content). Anything that
+    references an id must survive both.
+    """
+    return uuid.uuid4().hex
+
+
+def write_json_atomic(path: Path, payload: dict) -> None:
+    """Replace `path` atomically, leaving no temp file behind either way."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(path.name + TEMP_SUFFIX)
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def read_json_closed(path: Path) -> dict:
+    """Read and parse with the handle closed before parsing.
+
+    Windows cannot os.replace onto an open destination (verified:
+    WinError 5), so a reader holding a handle across other work can block
+    a writer. Closing first makes that structurally impossible.
+    """
+    with path.open("r", encoding="utf-8") as handle:
+        text = handle.read()
+    return json.loads(text)
+
+
+def append_jsonl(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload) + "\n")
+
+
+def read_raw_jsonl(path: Path) -> tuple[list[dict], int]:
+    """Parse a journal, counting genuinely-corrupt lines separately.
+
+    A line that is not valid JSON is corruption. A well-formed line whose
+    fields the caller's schema cannot interpret is NOT corruption, and
+    callers treat the two differently. A torn final line from an
+    interrupted write lands in the first category and is skipped without
+    touching the file.
+    """
+    if not path.exists():
+        return [], 0
+    raw_records: list[dict] = []
+    corrupt = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw_records.append(json.loads(line))
+            except json.JSONDecodeError:
+                logger.warning("skipping corrupt line at %s:%s", path, line_number)
+                corrupt += 1
+    return raw_records, corrupt

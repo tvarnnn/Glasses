@@ -90,10 +90,6 @@ def make_texture(
     return image
 
 
-def flat_texture(width: int, height: int, value: int = 150) -> np.ndarray:
-    """A deliberately featureless surface, for the textureless-wall case."""
-    return np.full((height, width, 3), value, dtype=np.uint8)
-
 
 def camera_matrix(width: int, height: int, focal: float | None = None) -> np.ndarray:
     """Ground-truth K. A test that uses this KNOWS the intrinsics.
@@ -245,7 +241,6 @@ def room_planes(
     width_m: float = 6.0,
     depth_m: float = 4.0,
     height_m: float = 2.7,
-    textureless_far_wall: bool = False,
 ) -> list[Plane]:
     """A closed box room. Dimensions are inputs, so tests can assert them.
 
@@ -255,10 +250,6 @@ def room_planes(
     """
     w, d, h = width_m, depth_m, height_m
     tex = lambda a, b: make_texture(rng, a, b)  # noqa: E731
-
-    far_wall_texture = (
-        flat_texture(512, 256) if textureless_far_wall else tex(512, 256)
-    )
 
     return [
         # floor
@@ -280,7 +271,7 @@ def room_planes(
             origin=np.array([-w / 2, -h, d]),
             edge_u=np.array([w, 0.0, 0.0]),
             edge_v=np.array([0.0, h, 0.0]),
-            texture=far_wall_texture,
+            texture=tex(512, 256),
         ),
         # near wall (behind the start position)
         Plane(
@@ -391,19 +382,6 @@ def pure_rotation(
     return poses
 
 
-def orbit(count: int, radius: float = 1.2, centre=(0.0, -1.6, 2.0)) -> list[CameraPose]:
-    """A closed loop, for revisit and drift measurement."""
-    poses = []
-    for i in range(count):
-        angle = 2.0 * np.pi * i / count
-        position = (
-            centre[0] + radius * np.sin(angle),
-            centre[1],
-            centre[2] - radius * np.cos(angle),
-        )
-        poses.append(look_at(position, centre))
-    return poses
-
 
 def render_sequence(
     planes: list[Plane],
@@ -425,60 +403,6 @@ def encode_jpeg(image: np.ndarray, quality: int = 90) -> bytes:
 def blur(image: np.ndarray, kernel: int = 9) -> np.ndarray:
     return cv2.GaussianBlur(image, (kernel, kernel), 0)
 
-
-def recoverpose_motion_direction(R: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """Convert cv2.recoverPose output into the camera-motion direction.
-
-    recoverPose returns [R|t] mapping points from camera 1 into camera 2,
-    so `t` is where camera 1 sits *in camera 2's frame* -- it is not the
-    direction the camera moved. The motion of the camera, expressed in
-    camera 1's frame, is -R.T @ t.
-
-    This helper exists because getting it wrong is silent: an early probe
-    here reported a 179.1 deg translation error that was entirely this
-    convention, with the underlying geometry already correct to 0.075 deg.
-    Exactly the class of failure schema.POSE_CONVENTION refuses to guess at.
-    """
-    direction = -R.T @ np.asarray(t, dtype=np.float64).reshape(3)
-    norm = np.linalg.norm(direction)
-    return direction / norm if norm > 1e-12 else direction
-
-
-def match_orb(
-    image_a: np.ndarray,
-    image_b: np.ndarray,
-    nfeatures: int = 1500,
-    ratio: float = 0.75,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Ratio-test ORB correspondences between two images.
-
-    Lowe's ratio test rather than crossCheck: on procedural texture with
-    locally similar patches, crossCheck was measured to drop the
-    essential-matrix inlier ratio to 0.256, while the ratio test reaches
-    0.941 on the identical pair. Same threshold (0.75) that
-    scripts/feature_trackability.py already uses, for comparability.
-    """
-    gray_a = (
-        cv2.cvtColor(image_a, cv2.COLOR_BGR2GRAY) if image_a.ndim == 3 else image_a
-    )
-    gray_b = (
-        cv2.cvtColor(image_b, cv2.COLOR_BGR2GRAY) if image_b.ndim == 3 else image_b
-    )
-    orb = cv2.ORB_create(nfeatures=nfeatures)
-    keypoints_a, descriptors_a = orb.detectAndCompute(gray_a, None)
-    keypoints_b, descriptors_b = orb.detectAndCompute(gray_b, None)
-    if descriptors_a is None or descriptors_b is None:
-        return np.empty((0, 2), np.float32), np.empty((0, 2), np.float32)
-
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-    good = [
-        pair[0]
-        for pair in matcher.knnMatch(descriptors_a, descriptors_b, k=2)
-        if len(pair) == 2 and pair[0].distance < ratio * pair[1].distance
-    ]
-    points_a = np.float32([keypoints_a[m.queryIdx].pt for m in good]).reshape(-1, 2)
-    points_b = np.float32([keypoints_b[m.trainIdx].pt for m in good]).reshape(-1, 2)
-    return points_a, points_b
 
 
 def relative_pose(a: CameraPose, b: CameraPose) -> tuple[np.ndarray, np.ndarray]:

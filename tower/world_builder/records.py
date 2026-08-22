@@ -13,10 +13,9 @@ importing a frozen enum is not promoting data to a shared service. Revisit
 a tower/confidence.py only when a third consumer appears.
 """
 
-import uuid
 from dataclasses import dataclass, field, replace
 
-from tower.object_memory.records import Confidence
+from tower.confidence import Confidence
 from tower.world_builder.schema import (
     DEGENERACY_NONE,
     INTRINSICS_SOURCE_SELF_CALIBRATED,
@@ -30,15 +29,10 @@ from tower.world_builder.schema import (
 )
 
 
-def new_id() -> str:
-    """Mint an opaque identifier.
-
-    uuid4 hex, never derived from a display name (the user renames
-    "Bedroom") and never a content hash (refinement changes content). The
-    id must survive both, because Object Memory anchors will reference it
-    long after either has changed.
-    """
-    return uuid.uuid4().hex
+# Opaque ids: never derived from a display name (the user renames
+# "Bedroom") and never a content hash (refinement changes content). Object
+# Memory anchors will reference a world_id long after either has changed.
+from tower.storage import new_id  # noqa: E402,F401
 
 
 @dataclass(frozen=True)
@@ -429,13 +423,16 @@ class Keyframe:
     overlap_ratio: float | None = None
     survival_ratio: float | None = None
     tracked_count: int | None = None
-    # r_h is recorded for continuity with V0.9.3, which measured it, but a
-    # baseline sweep this session showed it barely moves between total
-    # degeneracy and healthy parallax (0.410 -> 0.359). It is NOT the
-    # degeneracy gate; median parallax plus recoverPose's cheirality
-    # fraction is. Kept because discarding a previously-reported metric
-    # would break comparability with the existing experiment record.
-    r_h: float | None = None
+    # The median distance, in PIXELS, between where a homography fitted to
+    # the tracks predicts each point should land and where it actually
+    # landed. Near zero means the motion carried no baseline.
+    #
+    # Deliberately NOT named r_h. KeyframeEdge.r_h is ORB-SLAM's
+    # dimensionless H/(H+F) inlier ratio -- a different quantity, in
+    # different units. Both once shared the name, which would have let a
+    # successor compare them and get a meaningless answer with no error.
+    # Renaming is free now and impossible once data exists.
+    homography_residual_px: float | None = None
     quality: Confidence = Confidence.UNKNOWN
     frame_revision: int = 1
     # Reserved-but-unused, carried from day one so a later cross-module
@@ -466,7 +463,7 @@ class Keyframe:
             "overlap_ratio": self.overlap_ratio,
             "survival_ratio": self.survival_ratio,
             "tracked_count": self.tracked_count,
-            "r_h": self.r_h,
+            "homography_residual_px": self.homography_residual_px,
             "quality": self.quality.value,
             "frame_revision": self.frame_revision,
             "spatial_ref": self.spatial_ref,
@@ -497,7 +494,7 @@ def keyframe_from_json_dict(data: dict) -> Keyframe:
         overlap_ratio=data["overlap_ratio"],
         survival_ratio=data["survival_ratio"],
         tracked_count=data["tracked_count"],
-        r_h=data["r_h"],
+        homography_residual_px=data["homography_residual_px"],
         quality=Confidence(data["quality"]),
         frame_revision=data["frame_revision"],
         spatial_ref=None,

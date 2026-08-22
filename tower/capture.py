@@ -1,8 +1,16 @@
 """Recording raw frames to disk, as an explicit dataset session.
 
-Separate from the keyframe corpus on purpose. World Builder persists a
-SELECTED subset of frames; this records everything, because the two jobs
-it exists for both need unselected frames:
+SHARED infrastructure, not a cartridge's. It lives here rather than under
+tower/world_builder/ because the transport arms it and any cartridge might
+want it -- Text/Document will want OCR-quality stills, Object Memory
+occasional high-value frames. Versioning a recording made by the SHARED
+transport with a CARTRIDGE's schema constant would mean a geometry-driven
+schema bump invalidating capture journals that have nothing to do with
+geometry, so this module owns its own version and time basis.
+
+Separate from any keyframe corpus on purpose. A mapper persists a SELECTED
+subset of frames; this records everything, because the two jobs it exists
+for both need unselected frames:
 
 - camera calibration, which needs board views chosen by a human holding a
   board, not by a parallax policy;
@@ -23,18 +31,17 @@ import logging
 import time
 from dataclasses import dataclass, field
 
-from tower.world_builder.records import new_id
-from tower.world_builder.schema import (
-    END_REASON_BOUNDED_LIMIT,
-    END_REASON_STOP,
-    SCHEMA_VERSION,
-    TIME_BASIS,
-)
-from tower.world_builder.store import (
-    append_jsonl,
-    read_raw_jsonl,
-    write_json_atomic,
-)
+from tower.storage import append_jsonl, new_id, read_raw_jsonl, write_json_atomic
+
+# This module's own schema version and clock label. Deliberately NOT
+# imported from a cartridge: a recording made by shared transport must not
+# be versioned by a consumer's schema.
+CAPTURE_SCHEMA_VERSION = 1
+TIME_BASIS = "tower-receipt"
+
+END_REASON_STOP = "stop"
+END_REASON_DISCONNECT = "disconnect"
+END_REASON_BOUNDED_LIMIT = "bounded_limit"
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +165,7 @@ class CaptureRecorder:
         append_jsonl(
             directory / FRAMES_FILENAME,
             {
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": CAPTURE_SCHEMA_VERSION,
                 "source_seq": source_seq,
                 "wire_seq": wire_seq,
                 "tx_seq": tx_seq,
@@ -221,7 +228,7 @@ class CaptureRecorder:
 
     def _manifest(self, status: CaptureStatus) -> dict:
         return {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": CAPTURE_SCHEMA_VERSION,
             "capture_id": status.capture_id,
             "started_at": status.started_at,
             "ended_at": status.ended_at,

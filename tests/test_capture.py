@@ -7,8 +7,12 @@ from starlette.testclient import TestClient
 
 from tests import synthetic_scene as ss
 from tower.main import create_app
-from tower.world_builder.capture import CaptureLimits, CaptureRecorder
-from tower.world_builder.schema import END_REASON_BOUNDED_LIMIT, END_REASON_STOP
+from tower.capture import (
+    END_REASON_BOUNDED_LIMIT,
+    END_REASON_STOP,
+    CaptureLimits,
+    CaptureRecorder,
+)
 
 WIDTH, HEIGHT = 160, 120
 
@@ -146,7 +150,7 @@ class TestWebSocketIntegration:
     def test_capture_is_off_by_default(self, jpeg):
         """The normal frame path must be unchanged when nothing is armed."""
         app = create_app()
-        assert getattr(app.state, "capture_recorder", None) is None
+        assert not getattr(app.state, "frame_observers", None)
 
         with TestClient(app) as client, client.websocket_connect("/ws") as ws:
             ws.send_json(self._frame_message(jpeg, 1))
@@ -159,7 +163,7 @@ class TestWebSocketIntegration:
     ):
         app = create_app()
         recorder = CaptureRecorder(tmp_path)
-        app.state.capture_recorder = recorder
+        app.state.frame_observers = [recorder]
 
         with TestClient(app) as client, client.websocket_connect("/ws") as ws:
             ws.send_json({"type": "stream_start"})
@@ -181,13 +185,48 @@ class TestWebSocketIntegration:
     ):
         app = create_app()
         recorder = CaptureRecorder(tmp_path)
-        app.state.capture_recorder = recorder
+        app.state.frame_observers = [recorder]
 
         with TestClient(app) as client, client.websocket_connect("/ws") as ws:
             ws.send_json(self._frame_message(jpeg, 1))
             ws.receive_json()
 
         assert recorder.status is None
+
+    def test_recording_stops_when_the_client_disconnects_abruptly(
+        self, tmp_path, jpeg
+    ):
+        """A wearable disconnects abruptly as the NORMAL case.
+
+        Without a stop in the endpoint's finally block, a recorder armed
+        by one connection stays armed, and because the frame path gates
+        only on is_recording, the NEXT connection's frames land in the
+        previous connection's capture -- with no stream_start and no
+        consent. That is incidental capture of someone else's imagery.
+        """
+        app = create_app()
+        recorder = CaptureRecorder(tmp_path)
+        app.state.frame_observers = [recorder]
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws") as ws:
+                ws.send_json({"type": "stream_start"})
+                ws.send_json(self._frame_message(jpeg, 1))
+                ws.receive_json()
+                # Leave without stream_stop, as a crash or drop would.
+
+            assert not recorder.is_recording
+            first_capture = recorder.status.capture_id
+            frames_after_first = recorder.status.frames_written
+
+            # A fresh connection sending frames without stream_start must
+            # not be recorded at all.
+            with client.websocket_connect("/ws") as ws:
+                ws.send_json(self._frame_message(jpeg, 2))
+                ws.receive_json()
+
+        assert recorder.status.capture_id == first_capture
+        assert recorder.status.frames_written == frames_after_first
 
     def test_a_failing_recorder_never_costs_the_client_its_result(
         self, tmp_path, jpeg
@@ -207,7 +246,7 @@ class TestWebSocketIntegration:
                 raise OSError("disk on fire")
 
         app = create_app()
-        app.state.capture_recorder = ExplodingRecorder(tmp_path)
+        app.state.frame_observers = [ExplodingRecorder(tmp_path)]
 
         with TestClient(app) as client, client.websocket_connect("/ws") as ws:
             ws.send_json(self._frame_message(jpeg, 1))

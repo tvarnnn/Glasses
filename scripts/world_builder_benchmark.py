@@ -158,7 +158,11 @@ def bench_preprocessing(repeat: int = 6) -> dict:
         keypoints, _ = detect_and_describe(filtered[0])
         results[name] = {
             "keypoints": len(keypoints),
-            "filter": _timed(lambda: fn(grays[0]), repeat),
+            # Bind fn per iteration. A bare `lambda: fn(...)` closes over
+            # the loop variable, so every timing after the first measured
+            # whichever variant the loop had reached last -- the published
+            # per-variant filter costs were wrong until this was fixed.
+            "filter": _timed((lambda f: lambda: f(grays[0]))(fn), repeat),
         }
     return results
 
