@@ -441,3 +441,85 @@ below ~2% of loop length, and wall planarity RMS below ~2% of room extent.
 Neither is producible without physical capture. Until then, orbit around
 the point cloud is the honest substitute — an external view never implies
 occupancy or that the camera is standing anywhere real.
+
+---
+
+## 10. Adversarial review — findings and fixes
+
+Three independent reviewers attacked correctness, complexity, and
+architectural leakage. Two found bugs that had shipped and were untested,
+and both were the silent kind.
+
+### 10.1 Persisted poses were mirrored through the origin — CRITICAL, fixed
+
+The backends work in OpenCV's convention: `recoverPose` and
+`solvePnPRansac` return `(R, t)` mapping a **world** point into the
+**camera** frame, so `t` is where the world origin sits as seen by the
+camera. `POSE_CONVENTION` declares the opposite — `T_world_camera`, whose
+translation **is** the camera position — chosen precisely so no consumer
+ever inverts anything. The engine wrote the raw `t` under that contract.
+
+Verified: a strafe along **+X persisted as −X**. Smooth, monotonic,
+entirely plausible, and reflected.
+
+This is exactly the failure `schema.py` spends forty lines warning about,
+shipped into the one place that writes coordinates. It also explains why
+`geometry.motion_direction` — the function written to isolate this very
+conversion, carrying a docstring about a 179° error — had **zero
+production callers**: the conversion was skipped, not delegated.
+
+Fixed to `(Rᵀ, −Rᵀt)`. Two regression tests, one asserting the persisted
+trajectory matches ground-truth camera **positions** up to a similarity —
+which a mirrored trajectory cannot pass, because Umeyama fits a rotation
+and not a reflection. Post-fix residual: **1.17% of path length**.
+
+### 10.2 Recording survived an abrupt disconnect — CRITICAL, fixed
+
+`_stop_capture` ran only on `stream_stop`. A wearable client disconnects
+abruptly as the *normal* case — crash, drop, walking out of range — and
+the recorder stayed armed. Because the frame path gated only on
+`is_recording`, the **next connection's frames landed in the previous
+connection's capture**, with no `stream_start` and no consent, up to the
+15-minute bound.
+
+That is incidental capture of someone else's imagery, which
+`06-PRIVACY-DATA.md` forbids and which `capture.py`'s own docstring
+promised could not happen. Now stopped in the endpoint's `finally` block,
+with a test that connects, drops without `stream_stop`, reconnects, and
+asserts nothing further is recorded.
+
+### 10.3 Other findings fixed
+
+| Finding | Severity | Fix |
+|---|---|---|
+| Stale `derived/` served as current — the digest existed with no caller | HIGH | `read_derived` verifies by default and treats stale as absent |
+| `Keyframe.r_h` (residual, px) and `KeyframeEdge.r_h` (ratio, dimensionless) shared a name | HIGH | Renamed to `homography_residual_px`. Free now, impossible once data exists |
+| Intrinsics could be applied at the wrong resolution — `scaled_to`'s guard was routed around | MEDIUM | `build()` checks and raises |
+| Preprocessing benchmark published wrong per-variant timings (late-binding lambda) | MEDIUM | Bound per iteration. Keypoint counts were unaffected, so the conclusion stands |
+| Capture was shared transport versioned by a cartridge's schema | MEDIUM | Moved to `tower/capture.py` with its own `CAPTURE_SCHEMA_VERSION` |
+| Single `app.state.capture_recorder` — a second consumer would displace the first | MEDIUM | `frame_observers` list |
+| Recording did a durable fsync on the event loop *ahead of* inference | HIGH | Runs after the client's reply. Accessibility would have paid for a recording it never asked for |
+| `Confidence` imported across cartridge namespaces — an Object Memory enum edit would make World Builder keyframes silently vanish | HIGH | Promoted to `tower/confidence.py` with a vocabulary version |
+| Eleven dead constants, four dead test helpers (two byte-identical to live production functions) | LOW | Deleted |
+
+`tests/test_architecture_boundaries.py` now pins the invariants: shared
+code must not import a cartridge, a cartridge must not import another
+cartridge, and World Builder must not be registered as a production
+module.
+
+### 10.4 Accepted, not fixed
+
+The complexity review argued for deleting the backend ABC, `UnposedBackend`,
+and the event journal (~300 lines). Each argument is sound on today's
+usage counts, and I have **not** acted on them, for one reason: the
+uncalibrated path is the *only* path real Ray-Ban footage can take right
+now. Collapsing it into a synthesised branch inside `build()` would mean
+the first real footage exercises code that has never run. The cost is
+~126 lines and some recomputation at build time; the benefit is that the
+honest path and the calibrated path are the same path. Revisit once
+calibration exists and the uncalibrated branch is genuinely vestigial.
+
+The review also correctly notes `capture.py` has no operator-facing arming
+path — it is reachable only by setting `app.state.frame_observers`. That
+is a real gap and is listed in §8's physical-test procedure as a step the
+operator must perform, not as something the code does for them.
