@@ -496,6 +496,21 @@ tower/
     experimental_cv.py    The one Lab module slot. Hosts ANY registered
                           experiment, stateful or not -- there is no
                           longer a second Module class for depth
+  document_memory/
+    records.py            DocumentObservation / PageObservation. Named
+                          "observed", never "read": the camera cannot
+                          establish attention
+    store.py              Append-only JSONL, retention window, real purge
+                          that reports what it could not delete
+    detect.py             Page-quad detection PLUS a text-likeness gate --
+                          a laptop lid is page-shaped too
+    dwell.py              Is this page held in view long enough to be
+                          worth 1.2s of OCR?
+    ocr.py                TextRecogniser seam: EasyOCR, plus a fast fake
+                          so the default suite neither downloads nor waits
+    engine.py             Cheap per frame, expensive per dwell
+    retrieval.py          BM25 by content, window by time, and an explicit
+                          refusal when there is no record
   routes/
     health.py             GET /health
     ws.py                 WebSocket /ws (ping/pong, frame receive +
@@ -521,6 +536,20 @@ scripts/
                           --verify for journal/image integrity
   calibrate_charuco.py    Recover camera intrinsics from ChArUco board
                           views; --generate-board writes a printable board
+  cv_lab_benchmark.py     Every Experimental CV Lab experiment across
+                          three resolutions, plus the sparse-vs-dense
+                          optical-flow comparison
+  document_memory_session.py
+                          Observe documents in a frame stream (a capture,
+                          live or recorded, or a synthetic one). Runs in a
+                          separate process: OCR costs ~1.2s per page
+  document_query.py       Ask Document Memory what it observed --
+                          --recent, --minutes-ago, --text, --coverage,
+                          --purge. Independent of any voice path
+  document_memory_benchmark.py
+                          Detection cost per frame, retrieval latency and
+                          storage growth, plus read quality swept over
+                          frame size and tilt
   world_builder_benchmark.py
                           Stage timings for the World Builder pipeline
                           (synthetic input; timings real, imagery rendered)
