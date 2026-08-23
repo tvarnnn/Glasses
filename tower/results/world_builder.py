@@ -139,6 +139,15 @@ class _FileCache:
     them is the strongest available mitigation.
     """
 
+    # Bounded, even though a remote client cannot drive it: `resolve`
+    # refuses a world id that is not on disk before anything is cached, so
+    # growth follows the OPERATOR's data, not a subscriber's requests.
+    # Capped anyway. An unbounded-in-principle cache is a latent defect
+    # whether or not today's callers can reach it, and the recovery here
+    # is free -- every entry is a pure function of a file that is still
+    # there, so dropping the lot costs one re-read.
+    MAX_ENTRIES = 64
+
     __slots__ = ("_entries",)
 
     def __init__(self) -> None:
@@ -158,6 +167,8 @@ class _FileCache:
         if cached is not None and cached[0] == fingerprint:
             return cached[1]
         value = reader()
+        if len(self._entries) >= self.MAX_ENTRIES:
+            self._entries.clear()
         self._entries[key] = (fingerprint, value)
         return value
 
@@ -463,7 +474,10 @@ class WorldBuilderStatusProducer:
         value = self._compute_path_length(store, world, session_id, manifest)
         # Replaced, never appended: one entry per (world, session), so the
         # cache is bounded by the number of distinct targets a subscriber
-        # names, not by session length or poll count.
+        # names, not by session length or poll count. Capped for the same
+        # reason as _FileCache -- and recomputing is one file read.
+        if len(self._path_length_cache) >= _FileCache.MAX_ENTRIES:
+            self._path_length_cache.clear()
         self._path_length_cache[key] = (revision, value)
         return value
 

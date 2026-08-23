@@ -181,6 +181,32 @@ def test_the_journal_cache_holds_a_summary_not_the_journal(tmp_path):
     ), "the summary must hold scalars, never the events"
 
 
+def test_the_producer_caches_are_capped(tmp_path):
+    """No cache in the producer may grow without bound.
+
+    A remote client cannot drive these -- `resolve` refuses a world id
+    that is not on disk before anything is cached -- so growth follows the
+    operator's data. Capped anyway: an unbounded-in-principle cache is a
+    latent defect whether or not today's callers can reach it, and
+    recovery is one re-read of a file that is still there.
+    """
+    from tower.results.world_builder import _FileCache
+
+    cache = _FileCache()
+    absent = tmp_path / "nope"
+    for index in range(_FileCache.MAX_ENTRIES * 4):
+        path = tmp_path / f"f{index}"
+        path.write_text("x", encoding="utf-8")
+        cache.read(path, lambda: index)
+
+    assert len(cache._entries) <= _FileCache.MAX_ENTRIES
+
+    # A file that does not exist is never cached: it must be picked up the
+    # moment it appears.
+    cache.read(absent, lambda: None)
+    assert str(absent) not in cache._entries
+
+
 # -- slow consumers -----------------------------------------------------
 
 
