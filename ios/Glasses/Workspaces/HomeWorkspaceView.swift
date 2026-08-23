@@ -175,12 +175,11 @@ private extension HomeWorkspaceView {
 
     var isStopping: Bool { glasses.cameraStreamState == .stopping }
 
-    var isRunning: Bool {
-        switch glasses.cameraStreamState {
-        case .streaming, .starting, .waitingForDevice: return true
-        default: return false
-        }
-    }
+    /// Includes the device-session states, not just the stream's. See
+    /// `GlassesConnection.isCaptureEngaged` — deriving this from the stream
+    /// alone left a window in which a session existed but the control still
+    /// read "Start", and a tap in it did nothing observable.
+    var isRunning: Bool { glasses.isCaptureEngaged }
 
     @ViewBuilder
     var sessionControl: some View {
@@ -211,6 +210,13 @@ private extension HomeWorkspaceView {
 
             if !canStart && !isRunning {
                 HelperText("Waiting for the glasses to become active.")
+            } else if glasses.cameraPermissionStatus == .denied && !isRunning {
+                // Stated rather than enforced with `.disabled`. A start that
+                // is refused now reports why and leaves the session clean, so
+                // an out-of-date reading here costs a tap and an explanation
+                // — where gating the control on it would silently withhold
+                // the button, which is the failure this task exists to fix.
+                HelperText("Camera access is not granted. Allow it under Connections, then start a session.")
             }
         }
     }

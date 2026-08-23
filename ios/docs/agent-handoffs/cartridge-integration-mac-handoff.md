@@ -1176,3 +1176,170 @@ question in §6.
 **This implementation was produced on Windows without Xcode. It has since been
 compiler-, test- and Simulator-validated on a Mac — see §11.4 — and remains
 NOT physical-device-validated.**
+
+---
+
+## 18. The camera-start regression, found and fixed on physical hardware
+
+Added on a Mac with the real iPhone 16 Pro, real Ray-Ban Meta glasses and DAT
+0.9.0, working from `main` @ `22c5783` on branch
+`ios/fix-camera-start-regression` (`33035a0`). This is the first
+physical-device validation this lineage has had; §11.4 was compiler, test and
+Simulator only, and the closing claim below has been corrected accordingly.
+
+### 18.1 Physical symptom
+
+The app launched, discovered the glasses and connected to the Tower, and then
+**Start capture did nothing at all** — no viewfinder, no `stream_start`, no
+frames, and, to the eye, no response to the tap.
+
+### 18.2 Proven root cause — two defects, compounding
+
+Reproduced on the first attempt, twice, with full console capture.
+
+**One: readiness is read before DAT can answer, and never again.**
+
+```
+[Glasses][Camera] activeDeviceStream changed: nil (hasActiveDevice=false)
+[Glasses][Devices] devicesStream changed: count=0 ids=[]
+[Glasses][CameraPermission] check failed: No wearable devices have been discovered or registered
+[Glasses][Devices] devicesStream changed: count=1 ids=["5161af8..."]
+[Glasses][Camera] activeDeviceStream changed: Optional("5161af8...") (hasActiveDevice=true)
+```
+
+`ProjectManager.startAutomaticConnections()` reads camera permission from a
+SwiftUI `.task` at first view appearance. On real hardware that reliably beats
+DAT's device discovery, so `checkPermissionStatus(.camera)` throws
+`PermissionError.noDevice`. The `catch` wrote nothing, leaving
+`cameraPermissionStatus` `nil` — and **nothing re-read it**. Grepping the whole
+session log for `checkPermissionStatus ->` returned zero hits. So
+`beginCameraStream`'s `guard cameraPermissionStatus == .granted` refused every
+session of every launch, for a permission the user had already granted.
+
+**Two: the refusal strands the session, which is why it was unrecoverable.**
+
+The refusal happens *after* `session.start()` has succeeded, so `deviceSession`
+was left non-nil with no camera on it. `startCameraSession()`'s
+`guard deviceSession == nil` then rejected every later attempt, while both
+workspaces derived Start-vs-Stop from `cameraStreamState` — still `.stopped`,
+because the stream never started — and so kept offering **Start** and never
+offered **Stop**. Nothing could clear the session. Captured verbatim:
+
+```
+[Glasses][Camera] DeviceSessionState changed: started
+[Glasses][Camera] camera permission not granted (nil); not starting stream
+[Glasses][CameraPermission] checkPermissionStatus -> Optional(...granted)   <- manual Check
+[Glasses][Camera] startCameraSession called (hasActiveDevice=true)
+[Glasses][Camera] startCameraSession called while a session already exists
+      ... eleven more identical pairs ...
+```
+
+This is the defect recorded as latent in `product-shell-v2-handoff.md` §19. A
+stale permission is simply the first thing that ever reached it. It also
+explains why the obvious repair fails: **a manual Camera access → Check does fix
+the permission and still does not fix capture.**
+
+### 18.3 Why the Simulator and the 225-test suite did not catch it
+
+- Both defects need DAT to answer a permission query *before* it has a device.
+  MockDeviceKit pairs a device synchronously, so the race does not exist there.
+- The suite had **no `WearablesInterface` double at all** (`TowerClientTests`
+  §"no mock `WearablesInterface` exists"), so nothing could drive a failing
+  permission read. `hasActiveDevice` appeared in zero tests.
+- `.disabled(!hasActiveDevice)` is correct and was never the problem, which is
+  what made "no logs" so misleading — the button was enabled the whole time.
+
+### 18.4 The fix
+
+`Glasses/GlassesConnection.swift`
+
+- Readiness is re-read when a device becomes **available**, not on a single
+  edge. Two things ruled out the obvious edges, both confirmed on hardware:
+  - An empty→non-empty edge on `devices` can never fire on a warm relaunch,
+    because `init` seeds `devices` from `wearables.devices` synchronously.
+  - Discovery alone is not enough. `AutoDeviceSelector` falls back to the first
+    *known* device when none is connected, so a non-nil active device does not
+    mean DAT can answer. **The device build proved it:** the read fired on
+    discovery and got `All discovered devices are powered off or disconnected`
+    (`PermissionError.noDeviceWithConnection`) before a later trigger succeeded.
+  - So `Device.addLinkStateListener` → `.connected` drives it as well — Meta's
+    documented availability signal, and always compiled.
+- A `cameraPermissionStatus == nil` guard bounds all of it absolutely: once a
+  read succeeds every trigger is a no-op, so device churn cannot loop. Nothing
+  polls, nothing prompts, and nothing starts a camera.
+- `abandonSessionAfterFailedStart(reason:)` — every failure in
+  `beginCameraStream` now tears the session down and reports why, so the next
+  Start is a real attempt. Teardown is synchronous rather than awaiting the
+  `.stopped` callback, because that callback is exactly what may not arrive for
+  a session that never got going.
+- `isCaptureEngaged` folds the device-session states in with the stream's.
+
+`HomeWorkspaceView.swift`, `WorldBuilderWorkspaceView.swift` — `isRunning` now
+reads `glasses.isCaptureEngaged`, closing the window in which a session existed
+and the control still read "Start". A denied permission is stated in helper
+text. It is deliberately **not** a new `.disabled` condition: gating the primary
+control on a possibly-stale reading is the failure this task exists to fix.
+
+### 18.5 Tests
+
+Five added to `GlassesTests/ProductShellTests.swift`, on a new scriptable
+`ScriptedWearables: WearablesInterface` — the seam the suite has never had.
+`Device` and `DeviceSession` carry `@_hasMissingDesignatedInitializers` and
+cannot be faked, so the link-state trigger and the session-abandon path are
+covered physically rather than in unit tests, and §18.7 notes what that leaves.
+
+Suite went 225 → **230, all passing**. Four of the five fail with the fix
+neutered; the fifth (`testDeviceArrivalRefreshesReadinessButNeverStartsTheCamera`)
+is an invariant guard that must pass either way.
+
+### 18.6 Physical validation performed
+
+Debug build on the physical iPhone, real glasses:
+
+| Step | Result |
+|---|---|
+| Cold launch, permission read races discovery and fails | reproduced, twice |
+| Device arrives → readiness refreshed without a tap | `checkPermissionStatus -> granted` |
+| Camera stays off until asked | no session; proven by a launch where nobody tapped |
+| Tap Start capture | session → `addCamera succeeded` → `stream.start()` |
+| Stream reaches `.streaming` | yes |
+| Live viewfinder on the phone | yes, confirmed by the operator |
+| Frames captured | 300+, `dimensions=360x640`, 12 fps gate admitting correctly |
+| Tap Stop | `stopping` → `stopped` → `session cleanup`, clean |
+
+Debug build ✅, Release build ✅, full suite 230/230 ✅. Warning set is
+byte-identical to the `22c5783` baseline (4 pre-existing; the
+`GlassesConnection` "'as' test is always true" line moved 407 → 535).
+
+### 18.7 What is NOT yet validated, and how to finish it
+
+**The Tower delivery leg.** During validation the Tower at
+`100.110.156.55:8000` accepted the TCP connection but never answered the
+validation ping, from the phone *or* from the Mac (`curl` → `http_code=000`,
+though `tailscale status` showed the Windows host `tvarn` active). So the app
+correctly held at `status=connecting` and logged:
+
+```
+[Glasses][Tower] stream_start not sent — Tower not online (status=connecting)
+[Glasses][Tower] frame #1 not sent — Tower not online (status=connecting)
+```
+
+That is the sender behaving correctly — it refuses to send frames without a
+validated bracket, and says so. But it means **`stream_start` arriving at the
+Tower, frames arriving, and `stream_stop` ceasing them are still unproven on
+this branch.** To finish: bring the Tower up, confirm `pong validated` in the
+console, then run start → ~30 s → stop and check the Tower's own log.
+
+One genuinely useful result came out of it: **camera start does not depend on
+Tower state.** The camera started and streamed at full rate while the Tower was
+stuck in `connecting`, which was an open question in §14.
+
+The 5-minute sender benchmark and any World Builder testing remain untouched,
+per the brief.
+
+---
+
+**Correction to the closing claim above:** this lineage is no longer
+"NOT physical-device-validated". As of `ios/fix-camera-start-regression`
+@ `33035a0` the glasses → camera → frame path is physically proven on real
+hardware; the frame → Tower leg is not, for the reason in §18.7.

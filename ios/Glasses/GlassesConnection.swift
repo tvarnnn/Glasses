@@ -138,6 +138,15 @@ final class GlassesConnection: ObservableObject {
     private var lastSkippedLogAt: TimeInterval = -.infinity
     #endif
 
+    /// Link-state listeners for every known device, rebuilt whenever the
+    /// device list changes. Always compiled: `cameraPermissionStatus` is
+    /// displayed in Release too, and a status stuck on "Not checked yet"
+    /// there is the same lie it is in Debug.
+    private let linkStateTokenBag = ListenerTokenBag()
+    /// Prevents a second read being started while one is in flight, so the
+    /// several availability triggers collapse to a single query.
+    private var isRefreshingCameraPermission = false
+
     private let wearables: WearablesInterface
     /// Sender-side instrumentation. Shared with `TowerClient` via
     /// `ProjectManager`, which owns both.
@@ -183,6 +192,14 @@ final class GlassesConnection: ObservableObject {
             for await activeDeviceId in selector.activeDeviceStream() {
                 self.hasActiveDevice = activeDeviceId != nil
                 print("[Glasses][Camera] activeDeviceStream changed: \(String(describing: activeDeviceId)) (hasActiveDevice=\(self.hasActiveDevice))")
+                // A third chance at the read, not a guarantee of one:
+                // `AutoDeviceSelector` falls back to the first *known* device
+                // when none is connected, so a non-nil active device does not
+                // by itself mean DAT can answer. `observeLinkStates(for:)`
+                // is the trigger that does.
+                if self.hasActiveDevice {
+                    self.refreshCameraPermissionForAvailableDevice()
+                }
                 // Device state is per-device, so the observation follows
                 // whichever device is active rather than being started once.
                 self.observeDeviceState(for: activeDeviceId)
@@ -207,6 +224,14 @@ final class GlassesConnection: ObservableObject {
                 #if DEBUG
                 print("[Glasses][Devices] devicesStream changed: count=\(devices.count) ids=\(devices)")
                 #endif
+                // Follows the new list's link states, and takes the earliest
+                // chance at a permission read. Both are no-ops once the
+                // status is known — see
+                // `refreshCameraPermissionForAvailableDevice()`.
+                self.observeLinkStates(for: devices)
+                if !devices.isEmpty {
+                    self.refreshCameraPermissionForAvailableDevice()
+                }
             }
         }
     }
@@ -257,19 +282,100 @@ final class GlassesConnection: ObservableObject {
     ///   read simply leaves the status nil, which is displayed truthfully as
     ///   "Not checked yet".
     func checkCameraPermission(reportErrors: Bool = true) {
-        Task {
-            do {
-                cameraPermissionStatus = try await wearables.checkPermissionStatus(.camera)
-                #if DEBUG
-                print("[Glasses][CameraPermission] checkPermissionStatus -> \(String(describing: cameraPermissionStatus))")
-                #endif
-            } catch {
-                #if DEBUG
-                print("[Glasses][CameraPermission] check failed: \(error.localizedDescription)")
-                #endif
-                if reportErrors { errorMessage = error.localizedDescription }
-            }
+        Task { await readCameraPermission(reportErrors: reportErrors) }
+    }
+
+    /// The single permission read, shared by the user-initiated check and the
+    /// automatic refresh so both report identically.
+    private func readCameraPermission(reportErrors: Bool) async {
+        do {
+            cameraPermissionStatus = try await wearables.checkPermissionStatus(.camera)
+            #if DEBUG
+            print("[Glasses][CameraPermission] checkPermissionStatus -> \(String(describing: cameraPermissionStatus))")
+            #endif
+        } catch {
+            #if DEBUG
+            print("[Glasses][CameraPermission] check failed: \(error.localizedDescription)")
+            #endif
+            if reportErrors { errorMessage = error.localizedDescription }
         }
+    }
+
+    /// Re-reads camera permission at the moment DAT first becomes able to
+    /// answer the question.
+    ///
+    /// `checkPermissionStatus(.camera)` throws `PermissionError.noDevice`
+    /// ("No wearable devices have been discovered or registered") until DAT
+    /// has a device to answer *for*. The automatic read in
+    /// `ProjectManager.startAutomaticConnections()` runs from a SwiftUI
+    /// `.task` at first view appearance, which on real hardware is reliably
+    /// *before* discovery completes — the throw was observed on every cold
+    /// launch on a physical iPhone. Nothing re-read it afterwards, so
+    /// `cameraPermissionStatus` stayed `nil` for the whole process and
+    /// `beginCameraStream` refused every session for a permission the user
+    /// had already granted.
+    ///
+    /// Driven by device availability rather than by a one-shot edge, because
+    /// no single edge is reliably the right moment:
+    ///
+    /// - Discovery is not enough. DAT answers a permission query from the
+    ///   *connected* devices — glasses that are known but powered off or in
+    ///   their case throw `.noDeviceWithConnection` instead. So the read is
+    ///   also driven by link state reaching `.connected`
+    ///   (`observeLinkStates(for:)`), which is Meta's documented availability
+    ///   signal and the only one that guarantees an answer.
+    /// - An empty→non-empty edge on `devices` can never fire at all. `init`
+    ///   seeds `devices` from `wearables.devices` synchronously, so on a warm
+    ///   relaunch the list is already populated and the first stream yield is
+    ///   not a transition.
+    ///
+    /// The `nil` guard is what bounds the work instead, and bounds it
+    /// absolutely: the moment a read succeeds every trigger below becomes a
+    /// no-op, so glasses that connect and drop repeatedly cannot turn this
+    /// into a loop. Nothing polls. A status that is already known is left
+    /// alone — `ConnectionSheet`'s Re-check covers a permission changed
+    /// outside the app, which is the case that needs a person anyway.
+    ///
+    /// This is a pure query. It presents nothing, never calls
+    /// `requestPermission`, and starts no camera — a device becoming
+    /// available must not activate capture, which stays behind
+    /// `startCameraSession()` and one explicit tap.
+    private func refreshCameraPermissionForAvailableDevice() {
+        guard cameraPermissionStatus == nil, !isRefreshingCameraPermission else { return }
+        isRefreshingCameraPermission = true
+        #if DEBUG
+        print("[Glasses][CameraPermission] device available; re-reading permission")
+        #endif
+        Task {
+            await readCameraPermission(reportErrors: false)
+            isRefreshingCameraPermission = false
+        }
+    }
+
+    /// Watches every known device's link state, so the permission read above
+    /// gets its chance the moment glasses actually connect.
+    ///
+    /// Rebuilt whenever the device list changes, and seeded from each
+    /// device's current `linkState`: glasses that are already connected when
+    /// the list arrives may never emit a change, and waiting for one would
+    /// reintroduce exactly the "waits for an event that already happened"
+    /// defect this fixes.
+    private func observeLinkStates(for devices: [DeviceIdentifier]) {
+        linkStateTokenBag.clear()
+        for identifier in devices {
+            guard let device = wearables.deviceForIdentifier(identifier) else { continue }
+            handleLinkState(device.linkState)
+            device.addLinkStateListener { [weak self] state in
+                Task { @MainActor [weak self] in
+                    self?.handleLinkState(state)
+                }
+            }.store(in: linkStateTokenBag)
+        }
+    }
+
+    private func handleLinkState(_ state: LinkState) {
+        guard state == .connected else { return }
+        refreshCameraPermissionForAvailableDevice()
     }
 
     func requestCameraPermission() {
@@ -358,6 +464,28 @@ final class GlassesConnection: ObservableObject {
         }
         device.services.camera.setCameraFeed(cameraFacing: .back)
         print("[Glasses][Camera] mock camera feed configured: back camera")
+    }
+
+    /// Whether a capture session is currently claimed, from the tap that asks
+    /// for one until it is fully torn down.
+    ///
+    /// The workspaces used to decide Start-vs-Stop from `cameraStreamState`
+    /// alone. That leaves a window — `session.start()` has been called but
+    /// the camera stream has not yet reached `.starting` — in which a session
+    /// exists and the button still reads "Start capture". A tap in that
+    /// window is refused by `startCameraSession()`'s `deviceSession == nil`
+    /// guard and does nothing observable, which is the silent no-op the
+    /// primary action must never be. Including the session state closes it:
+    /// the control flips to Stop the moment a session is claimed.
+    var isCaptureEngaged: Bool {
+        switch deviceSessionState {
+        case .starting, .started: return true
+        default: break
+        }
+        switch cameraStreamState {
+        case .streaming, .starting, .waitingForDevice: return true
+        default: return false
+        }
     }
 
     /// Creates and starts a `DeviceSession` via `AutoDeviceSelector`. Once the
@@ -466,7 +594,9 @@ final class GlassesConnection: ObservableObject {
         guard camera == nil else { return }
         guard cameraPermissionStatus == .granted else {
             print("[Glasses][Camera] camera permission not granted (\(String(describing: cameraPermissionStatus))); not starting stream")
-            errorMessage = "Camera permission not granted. Use Check/Request Camera Permission first."
+            abandonSessionAfterFailedStart(
+                reason: "Camera permission is not granted. Open Connections, allow camera access for the glasses, then start capture again."
+            )
             return
         }
 
@@ -479,7 +609,7 @@ final class GlassesConnection: ObservableObject {
         do {
             guard let newCamera = try session.addCamera(config: config) else {
                 print("[Glasses][Camera] addCamera returned nil")
-                errorMessage = "Could not create camera"
+                abandonSessionAfterFailedStart(reason: "Could not create camera")
                 return
             }
             camera = newCamera
@@ -490,9 +620,43 @@ final class GlassesConnection: ObservableObject {
             print("[Glasses][Camera] stream.start() called")
         } catch {
             print("[Glasses][Camera] addCamera failed: \(error.localizedDescription)")
-            errorMessage = error.localizedDescription
-            camera = nil
+            abandonSessionAfterFailedStart(reason: error.localizedDescription)
         }
+    }
+
+    /// Ends a `DeviceSession` that started but could not begin streaming, so
+    /// the next Start is a real attempt rather than a silent refusal.
+    ///
+    /// Every failure inside `beginCameraStream` happens *after*
+    /// `session.start()` has already succeeded, which leaves `deviceSession`
+    /// non-nil with no camera attached to it. `startCameraSession()`'s
+    /// `guard deviceSession == nil` then rejects every later attempt, while
+    /// the workspaces — which derive Start/Stop from `cameraStreamState`,
+    /// still `.stopped` because the stream never started — keep offering
+    /// Start and never offer Stop. Nothing can clear the session, so capture
+    /// is dead for the rest of the process.
+    ///
+    /// This was observed on a physical iPhone: one refused start, then
+    /// twelve consecutive taps that each logged "session already exists" and
+    /// changed nothing on screen. It is the defect recorded as latent in
+    /// `docs/agent-handoffs/product-shell-v2-handoff.md` §19; a stale camera
+    /// permission is simply the first thing that reached it.
+    ///
+    /// Teardown is synchronous rather than waiting for the session's
+    /// `.stopped` callback, because that callback is exactly what may not
+    /// arrive for a session that never got going — and waiting for it is
+    /// what left the invariant broken. `session.stop()` is still called, on
+    /// a captured reference, so DAT releases the session too.
+    private func abandonSessionAfterFailedStart(reason: String) {
+        print("[Glasses][Camera] start failed; abandoning the device session")
+        errorMessage = reason
+        let session = deviceSession
+        // Clears deviceSession, camera, both token bags, and resets the
+        // stream state and metrics. `camera` is nil here, so this does not
+        // emit a `cameraStreamDidStop` for a stream that never started.
+        cleanupCameraSession()
+        deviceSessionState = .idle
+        session?.stop()
     }
 
     private func setupStreamListeners(for stream: MWDATCamera.Stream) {

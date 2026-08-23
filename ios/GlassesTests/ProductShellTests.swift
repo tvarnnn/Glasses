@@ -1995,3 +1995,247 @@ final class SceneUnderstandingModelTests: XCTestCase {
         }
     }
 }
+
+// MARK: - Camera readiness
+
+/// A scriptable `WearablesInterface`, the seam this suite has not had before.
+///
+/// It exists for one question the rest of the file cannot ask: what happens to
+/// camera readiness when DAT answers a permission query *before* it has
+/// discovered a device. On real hardware that is not an edge case — it is what
+/// happens on every cold launch, and it is what
+/// `GlassesConnection.refreshCameraPermissionForAvailableDevice()` repairs.
+///
+/// Two DAT types cannot be faked: `Device` and `DeviceSession` both carry
+/// `@_hasMissingDesignatedInitializers`. So `deviceForIdentifier` returns nil
+/// (the link-state trigger is therefore device-only, and is covered physically
+/// rather than here) and `createSession` throws — which is enough to assert the
+/// property that matters most, that nothing automatic ever asks for a session.
+final class ScriptedWearables: WearablesInterface, @unchecked Sendable {
+    struct Token: AnyListenerToken {
+        func cancel() async {}
+    }
+
+    private let lock = NSLock()
+    private var _devices: [DeviceIdentifier] = []
+    private var _permissionResults: [Result<PermissionStatus, PermissionError>]
+    private var _permissionCheckCount = 0
+    private var _createSessionCount = 0
+    private var devicesContinuation: AsyncStream<[DeviceIdentifier]>.Continuation?
+    private var _isSubscribed = false
+
+    /// Results for successive `checkPermissionStatus` calls; the final entry
+    /// repeats once the script is exhausted.
+    init(permissionResults: [Result<PermissionStatus, PermissionError>]) {
+        _permissionResults = permissionResults
+    }
+
+    /// Whether `devicesStream()` has been subscribed. `GlassesConnection`
+    /// subscribes from a `Task` in `init`, so a test that emits immediately
+    /// after construction would otherwise race the subscription and lose.
+    var isSubscribed: Bool { lock.withLock { _isSubscribed } }
+    var permissionCheckCount: Int { lock.withLock { _permissionCheckCount } }
+    var createSessionCount: Int { lock.withLock { _createSessionCount } }
+
+    /// Publishes a new device list, as `devicesStream()` would.
+    func emitDevices(_ devices: [DeviceIdentifier]) {
+        let continuation: AsyncStream<[DeviceIdentifier]>.Continuation? = lock.withLock {
+            _devices = devices
+            return devicesContinuation
+        }
+        continuation?.yield(devices)
+    }
+
+    var registrationState: RegistrationState { .registered }
+    var devices: [DeviceIdentifier] { lock.withLock { _devices } }
+
+    /// Replays the current list on subscription, as DAT's own stream does —
+    /// which is also what makes a warm launch (devices already known before
+    /// anyone subscribes) reproducible here.
+    func devicesStream() -> AsyncStream<[DeviceIdentifier]> {
+        AsyncStream { continuation in
+            let current: [DeviceIdentifier] = lock.withLock {
+                devicesContinuation = continuation
+                _isSubscribed = true
+                return _devices
+            }
+            if !current.isEmpty { continuation.yield(current) }
+        }
+    }
+
+    func checkPermissionStatus(_ permission: Permission) async throws(PermissionError) -> PermissionStatus {
+        let result: Result<PermissionStatus, PermissionError> = lock.withLock {
+            _permissionCheckCount += 1
+            let next = _permissionResults.first ?? .failure(.internalError)
+            if _permissionResults.count > 1 { _permissionResults.removeFirst() }
+            return next
+        }
+        switch result {
+        case .success(let status): return status
+        case .failure(let error): throw error
+        }
+    }
+
+    func createSession(deviceSelector: any DeviceSelector) throws(DeviceSessionError) -> DeviceSession {
+        lock.withLock { _createSessionCount += 1 }
+        throw .noEligibleDevice
+    }
+
+    // Unused by these tests, but required by the protocol.
+    func addRegistrationStateListener(_ listener: @escaping @Sendable (RegistrationState) -> Void) -> any AnyListenerToken { Token() }
+    func addDevicesListener(_ listener: @escaping @Sendable ([DeviceIdentifier]) -> Void) -> any AnyListenerToken { Token() }
+    func deviceForIdentifier(_ identifier: DeviceIdentifier) -> Device? { nil }
+    func deviceStateStream(for identifier: DeviceIdentifier) -> AsyncStream<DeviceState> {
+        AsyncStream { $0.finish() }
+    }
+    func requestPermission(_ permission: Permission) async throws(PermissionError) -> PermissionStatus { .granted }
+    func startRegistration() async throws(RegistrationError) {}
+    func startUnregistration() async throws(UnregistrationError) {}
+    func handleUrl(_ url: URL) async throws(WearablesHandleURLError) -> Bool { false }
+    func openFirmwareUpdate() async throws(NavigationError) {}
+    func openDATGlassesAppUpdate() async throws(NavigationError) {}
+}
+
+/// The regression this suite exists for.
+///
+/// Physically observed on an iPhone 16 Pro with Ray-Ban Meta glasses: the
+/// launch permission read threw `No wearable devices have been discovered or
+/// registered`, the glasses arrived a moment later, and `cameraPermissionStatus`
+/// stayed `nil` for the rest of the process — so every capture session was
+/// refused for a permission that had in fact been granted.
+@MainActor
+final class CameraReadinessTests: XCTestCase {
+
+    /// Polls rather than sleeps a fixed interval: the refresh is driven by a
+    /// `Task` hop off the `devicesStream` loop, not by a known delay.
+    private func waitUntil(
+        _ condition: @MainActor () -> Bool,
+        timeout: TimeInterval = 2
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return condition()
+    }
+
+    /// The regression itself. A permission read that fails because DAT has no
+    /// device yet must not leave readiness permanently unknown.
+    func testAPermissionCheckBeforeDiscoveryDoesNotPoisonLaterReadiness() async {
+        let wearables = ScriptedWearables(permissionResults: [
+            .failure(.noDevice),
+            .success(.granted),
+        ])
+        let connection = GlassesConnection(wearables: wearables)
+
+        // The launch read, as `ProjectManager.startAutomaticConnections()`
+        // makes it: no devices yet, so DAT refuses to answer.
+        connection.checkCameraPermission(reportErrors: false)
+        let refused = await waitUntil { wearables.permissionCheckCount >= 1 }
+        XCTAssertTrue(refused, "the launch read should have been attempted")
+        XCTAssertNil(
+            connection.cameraPermissionStatus,
+            "a failed read must leave the status unknown rather than guessing"
+        )
+        XCTAssertNil(
+            connection.errorMessage,
+            "the automatic read must not raise an alert nobody's action caused"
+        )
+
+        // The glasses arrive.
+        wearables.emitDevices(["device-1"])
+
+        let recovered = await waitUntil { connection.cameraPermissionStatus == .granted }
+        XCTAssertTrue(
+            recovered,
+            "device arrival must make readiness truthful again; it stayed \(String(describing: connection.cameraPermissionStatus))"
+        )
+    }
+
+    /// Auto-connect != auto-camera. The whole point of refreshing readiness on
+    /// device arrival is that it must buy nothing else.
+    func testDeviceArrivalRefreshesReadinessButNeverStartsTheCamera() async {
+        let wearables = ScriptedWearables(permissionResults: [
+            .failure(.noDevice),
+            .success(.granted),
+        ])
+        let connection = GlassesConnection(wearables: wearables)
+        connection.checkCameraPermission(reportErrors: false)
+        _ = await waitUntil { wearables.permissionCheckCount >= 1 }
+
+        wearables.emitDevices(["device-1"])
+        _ = await waitUntil { connection.cameraPermissionStatus == .granted }
+
+        XCTAssertEqual(
+            wearables.createSessionCount, 0,
+            "a device becoming available must not create a capture session"
+        )
+        #if DEBUG
+        XCTAssertEqual(connection.cameraStreamState, .stopped, "the camera must stay off")
+        XCTAssertEqual(connection.frameCount, 0, "no frames may be captured without an explicit start")
+        #endif
+    }
+
+    /// The refresh is bounded by the unknown status, not by an edge, so it must
+    /// stop asking the moment it has an answer — otherwise device churn turns
+    /// into an unbounded query loop.
+    func testReadinessIsNotReReadOnceItIsKnown() async {
+        let wearables = ScriptedWearables(permissionResults: [.success(.granted)])
+        let connection = GlassesConnection(wearables: wearables)
+        _ = await waitUntil { wearables.isSubscribed }
+
+        wearables.emitDevices(["device-1"])
+        let known = await waitUntil { connection.cameraPermissionStatus == .granted }
+        XCTAssertTrue(known)
+        let afterFirstAnswer = wearables.permissionCheckCount
+
+        // Repeated arrivals and departures, as glasses reconnecting would.
+        for _ in 0..<5 {
+            wearables.emitDevices([])
+            wearables.emitDevices(["device-1"])
+        }
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertEqual(
+            wearables.permissionCheckCount, afterFirstAnswer,
+            "a known permission must not be re-read on every device change"
+        )
+        XCTAssertEqual(connection.cameraPermissionStatus, .granted)
+    }
+
+    /// A warm relaunch: `init` seeds `devices` from `wearables.devices`, so the
+    /// first stream yield is not an empty->non-empty transition. An
+    /// edge-triggered refresh would never fire here.
+    func testReadinessIsRefreshedWhenDevicesWereAlreadyKnownAtLaunch() async {
+        let wearables = ScriptedWearables(permissionResults: [.success(.granted)])
+        wearables.emitDevices(["device-1"])
+        let connection = GlassesConnection(wearables: wearables)
+        XCTAssertEqual(connection.devices, ["device-1"], "the fixture must reproduce a warm launch")
+
+        // No new emission: the only yield is the stream replaying a list that
+        // was already known. An empty->non-empty edge never occurs here.
+        let known = await waitUntil { connection.cameraPermissionStatus == .granted }
+        XCTAssertTrue(known, "a pre-seeded device list must still produce a readiness read")
+    }
+
+    /// A permission that is genuinely denied is a truthful answer, and must be
+    /// recorded as one rather than retried into an alert loop.
+    func testADeniedPermissionIsRecordedAndNotRetried() async {
+        let wearables = ScriptedWearables(permissionResults: [.success(.denied)])
+        let connection = GlassesConnection(wearables: wearables)
+        _ = await waitUntil { wearables.isSubscribed }
+
+        wearables.emitDevices(["device-1"])
+        let settled = await waitUntil { connection.cameraPermissionStatus == .denied }
+        XCTAssertTrue(settled)
+        let afterAnswer = wearables.permissionCheckCount
+
+        wearables.emitDevices([])
+        wearables.emitDevices(["device-1"])
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertEqual(wearables.permissionCheckCount, afterAnswer)
+        XCTAssertNil(connection.errorMessage, "an automatic read must never raise an alert")
+    }
+}
