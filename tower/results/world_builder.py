@@ -392,33 +392,35 @@ class WorldBuilderStatusProducer:
             has_manifest=manifest is not None,
         )
         live = lifecycle["state"] == LIFECYCLE_RECEIVING
+        progress = _progress_block(session, events, live, self._clock())
+        keyframes_now = progress["keyframes_accepted"]
 
         return {
             "world": _world_block(world),
             "session": _session_block(session),
             "lifecycle": lifecycle,
-            "progress": _progress_block(session, events, live, self._clock()),
+            "progress": progress,
             "tracking": _tracking_block(events),
             "calibration": _calibration_block(session),
             "scale": _scale_block(world),
-            "geometry": _geometry_block(manifest, geometry_current),
+            "geometry": _geometry_block(manifest, geometry_current, keyframes_now),
             "trajectory": self._trajectory_block(
-                store, world, session_id, manifest, geometry_current
+                store, world, session_id, manifest, geometry_current, keyframes_now
             ),
             "persistence": _persistence_block(world),
             "artifacts": _artifacts_block(store, world.world_id, session_id, world),
             "time_basis": TIME_BASIS,
         }
 
-    def _trajectory_block(self, store, world, session_id, manifest, current) -> dict:
+    def _trajectory_block(
+        self, store, world, session_id, manifest, current, keyframes_now
+    ) -> dict:
+        # Same reasoning as _geometry_block: a trajectory over the first N
+        # keyframes is a correct answer to an older question, not a wrong
+        # answer, and hiding it makes a live session look idle.
         if manifest is None:
             return _trajectory_unavailable(
                 "no build has run for this session, so no poses exist"
-            )
-        if not current:
-            return _trajectory_unavailable(
-                "the persisted poses are older than the keyframes; a rebuild "
-                "is outstanding"
             )
         revision = compute_revision(
             {
@@ -431,6 +433,17 @@ class WorldBuilderStatusProducer:
         )
         return {
             "available": True,
+            "current": current,
+            "built_from_keyframes": manifest.get("keyframes"),
+            "keyframes_now": keyframes_now,
+            "stale_reason": (
+                None
+                if current
+                else (
+                    "keyframes have been accepted since this build ran; this "
+                    "path covers built_from_keyframes of them"
+                )
+            ),
             # Poses that actually carry a position, which is NOT
             # poses_solved. engine.build counts an ANCHOR as neither
             # solved nor refused, yet an anchor has a translation and is a
@@ -830,18 +843,36 @@ def _scale_block(world) -> dict:
     }
 
 
-def _geometry_block(manifest, current: bool) -> dict:
+def _geometry_block(manifest, current: bool, keyframes_now) -> dict:
+    """Geometry, including geometry that is real but BEHIND.
+
+    An earlier version reported anything not matching the current
+    keyframes as simply unavailable. That is honest and it is too strict,
+    and running the actual product claim showed why: with
+    `world_build_session.py --rebuild-every N`, a build finishes and the
+    very next keyframe makes its output stale, so a walk that was
+    genuinely producing geometry every few keyframes reported **none at
+    all** until it stopped. The whole point of --rebuild-every is to watch
+    the world grow, and the channel was hiding it.
+
+    A build over the first N keyframes is not wrong; it is a correct
+    answer to an older question. So it is reported, with `current: false`
+    and BOTH counts, and a consumer can show real progress while knowing
+    exactly how far behind it is. Hiding it discarded true information;
+    reporting it without the flags would have let a viewer mistake it for
+    the finished world. The flags are the whole difference.
+    """
     if manifest is None:
         return _geometry_unavailable(
             "no build has run for this session, so no geometry exists"
         )
-    if not current:
-        return _geometry_unavailable(
-            "the persisted geometry is older than the keyframes; a rebuild "
-            "is outstanding"
-        )
     return {
         "available": True,
+        # Whether this geometry reflects every keyframe accepted so far.
+        # False is normal DURING a session that rebuilds as it goes.
+        "current": current,
+        "built_from_keyframes": manifest.get("keyframes"),
+        "keyframes_now": keyframes_now,
         # The Tower's own word, displayed verbatim and never parsed
         # (IOS-to-Tower.md 1.3).
         "representation": GEOMETRY_REPRESENTATION,
@@ -879,12 +910,25 @@ def _geometry_block(manifest, current: bool) -> dict:
         "built_at": manifest.get("built_at"),
         "time_basis": TIME_BASIS,
         "unavailable_reason": None,
+        "stale_reason": (
+            None
+            if current
+            else (
+                "keyframes have been accepted since this build ran; these "
+                "figures are correct for the keyframes named in "
+                "built_from_keyframes and are not the final world"
+            )
+        ),
     }
 
 
 def _geometry_unavailable(reason: str) -> dict:
     return {
         "available": False,
+        "current": False,
+        "built_from_keyframes": None,
+        "keyframes_now": None,
+        "stale_reason": None,
         "representation": None,
         "element_count": None,
         "element_name": None,
@@ -902,8 +946,14 @@ def _geometry_unavailable(reason: str) -> dict:
 def _trajectory_unavailable(reason: str) -> dict:
     return {
         "available": False,
+        "current": False,
+        "built_from_keyframes": None,
+        "keyframes_now": None,
+        "stale_reason": None,
         "pose_count": None,
+        "poses_solved": None,
         "poses_refused": None,
+        "keyframes": None,
         "segments": None,
         "path_length": None,
         "revision": None,

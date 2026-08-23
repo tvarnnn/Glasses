@@ -304,6 +304,98 @@ def test_a_path_length_is_refused_when_poses_have_gaps(monkeypatch, tmp_path):
         assert "reason" in path
 
 
+def test_geometry_built_mid_session_is_reported_as_real_but_behind(
+    monkeypatch, tmp_path
+):
+    """The "watch it build" case, and the reason it needed fixing.
+
+    With --rebuild-every, a build finishes and the very next keyframe
+    makes its output stale. An earlier version reported anything not
+    matching the current keyframes as simply unavailable, so a walk that
+    was genuinely producing geometry every few keyframes reported NONE AT
+    ALL until it stopped -- the channel hid the exact thing
+    --rebuild-every exists to show.
+
+    A build over the first N keyframes is a correct answer to an older
+    question, not a wrong answer. It is reported, with `current: false`
+    and both counts, so a viewer can show real progress while knowing
+    exactly how far behind it is.
+    """
+    from tests import synthetic_scene as ss
+    from tower.world_builder.engine import WorldBuilderEngine
+    from tower.world_builder.records import CameraIntrinsics
+
+    root = tmp_path / "worlds"
+    matrix = ss.camera_matrix(480, 360)
+    engine = WorldBuilderEngine(WorldStore(root))
+    world_id = engine.create_world("Growing")
+    session_id = engine.start_session(
+        world_id,
+        intrinsics=CameraIntrinsics(
+            source="self_calibrated", model="pinhole",
+            fx=float(matrix[0, 0]), fy=float(matrix[1, 1]),
+            cx=float(matrix[0, 2]), cy=float(matrix[1, 2]),
+            calibrated_width=480, calibrated_height=360,
+        ),
+        frame_source="synthetic",
+        declared_size=(480, 360),
+    )
+    images = ss.render_sequence(
+        ss.furnished_room(), ss.strafe(14, step=0.09), matrix, 480, 360
+    )
+    accepted = 0
+    for index, image in enumerate(images):
+        outcome = engine.observe(ss.encode_jpeg(image), source_seq=index)
+        if outcome.keyframe_id is not None:
+            accepted += 1
+            if accepted == 3:
+                engine.build(world_id, session_id)
+                built_at_keyframes = accepted
+    try:
+        assert accepted > built_at_keyframes, (
+            "precondition: keyframes must have been accepted AFTER the build"
+        )
+        payload = _payload(monkeypatch, root)
+        geometry = payload["geometry"]
+
+        assert geometry["available"] is True, "real geometry must not be hidden"
+        assert geometry["current"] is False
+        assert geometry["element_count"] > 0
+        assert geometry["built_from_keyframes"] == built_at_keyframes
+        assert geometry["keyframes_now"] == accepted
+        assert geometry["keyframes_now"] > geometry["built_from_keyframes"]
+        assert "not the final world" in geometry["stale_reason"]
+    finally:
+        engine.stop_session()
+
+
+def test_geometry_and_trajectory_keys_do_not_change_shape(monkeypatch, built):
+    """A strict decoder must not choke when a field becomes unavailable.
+
+    Every branch of these two blocks emits the SAME key set; only values
+    change. A key that appeared and disappeared would force every consumer
+    into optional-chaining for reasons it could not see.
+    """
+    root, _, _ = built
+    available = _payload(monkeypatch, root)
+    absent = _payload(monkeypatch, root, world_id="not-a-real-world")
+
+    assert absent["geometry"] is None, "an unresolvable target sends nulls"
+
+    from tower.results.world_builder import (
+        _geometry_block,
+        _geometry_unavailable,
+        _trajectory_unavailable,
+    )
+
+    manifest = WorldStore(root).read_derived_manifest(built[1])
+    assert set(_geometry_block(manifest, True, 4)) == set(
+        _geometry_unavailable("x")
+    )
+    assert set(available["geometry"]) == set(_geometry_unavailable("x"))
+    assert set(available["trajectory"]) == set(_trajectory_unavailable("x"))
+
+
 # -- scale, calibration, tracking --------------------------------------
 
 

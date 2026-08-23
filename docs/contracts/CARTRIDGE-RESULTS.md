@@ -526,7 +526,10 @@ sent at all.
 
 | Field | Notes |
 |---|---|
-| `available` | false until a build has produced output current with the keyframes |
+| `available` | true once **any** build has produced output for this session — including one that is now behind |
+| `current` | whether that output reflects **every** keyframe accepted so far. **`false` is normal during a session that rebuilds as it goes** |
+| `built_from_keyframes` / `keyframes_now` | how many keyframes the build consumed, and how many exist now. When they differ, the figures are correct for the first number |
+| `stale_reason` | prose, when `current` is false; null otherwise |
 | `representation` | **`"sparse point cloud"`** — Tower's own word. Display verbatim; never parse or match it |
 | `element_count` | number of points, or **null**. Never `0` for "we did not build" |
 | `element_name` | `"point"` |
@@ -542,6 +545,7 @@ sent at all.
 
 | Field | Notes |
 |---|---|
+| `current`, `built_from_keyframes`, `keyframes_now`, `stale_reason` | as for geometry |
 | `pose_count` | poses carrying a position = keyframes minus refused. **Not** `poses_solved`: an anchor has a position and is counted as neither solved nor refused |
 | `poses_solved`, `poses_refused`, `keyframes`, `segments` | the underlying figures |
 | `path_length` | see below |
@@ -717,14 +721,41 @@ refused.
 | `keyframes_accepted`, `mapping_seconds` | ✅ | ✅ | ✅ |
 | `frames_observed`, `rejected_by_reason` | ❌ null | ✅ | ✅ |
 | `scale.state` beyond `unknown` | ❌ | ❌ | ✅ |
-| geometry: representation, element count | ❌ | ❌ | ✅ |
-| trajectory: pose count, path length | ❌ | ❌ | ✅ |
+| geometry: representation, element count | ⚠️ | ❌ | ✅ |
+| trajectory: pose count | ⚠️ | ❌ | ✅ |
+| trajectory: path length | ❌ | ❌ | ✅ |
 
-**This is the honest shape of "watch it build".** With
-`world_build_session.py --rebuild-every N`, geometry and trajectory become
-available and then update *during* a walk, so the middle column collapses
-and a viewer genuinely sees the world grow. Without it, geometry appears
-once at the end.
+⚠️ = available **only** with `world_build_session.py --rebuild-every N`,
+and then always with `current: false` — see below.
+
+### "Watch it build", concretely
+
+With `--rebuild-every N`, geometry appears *during* the walk and grows.
+A real run, 28 synthetic frames, `--rebuild-every 2`, sampled through this
+channel:
+
+| lifecycle | `keyframes_now` | `element_count` | `current` | `built_from_keyframes` |
+|---|---|---|---|---|
+| `unavailable` | — | — | — | — |
+| `receiving` | 2 | null | false | null |
+| `receiving` | 6 | **1360** | false | 4 |
+| `receiving` | 10 | **2336** | false | 8 |
+| `ready` | 10 | **2712** | true | 10 |
+
+Point count grows monotonically and lands on the final figure. **Every
+mid-walk row carries `current: false`**, because the next keyframe lands
+before the viewer sees the build — that is not a defect, it is the normal
+and permanent condition of a world being built, and the two keyframe
+counts say exactly how far behind the figures are.
+
+`path_length` stays unavailable throughout a live session even with
+`--rebuild-every`: it reads the actual poses, and the store refuses a
+derived tree that no longer matches its inputs. The counts come from the
+build's own manifest and are correct for that build; the path length would
+have to trust pose files that may be mid-rewrite, so it honestly refuses.
+
+**Without `--rebuild-every`, geometry does not exist until after Stop**,
+and `Start → Walk → Stop → the world appears` is the honest description.
 
 ---
 
