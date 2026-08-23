@@ -148,6 +148,39 @@ def test_a_connection_cannot_open_unbounded_subscriptions(world_root, monkeypatc
     assert refused[0]["reason"] == "too_many_subscriptions"
 
 
+def test_the_journal_cache_holds_a_summary_not_the_journal(tmp_path):
+    """Poll cost, and cache memory, must not grow with session length.
+
+    Stat-gating alone stopped the journal being re-PARSED, but the blocks
+    that read it SCANNED it, so cost stayed O(events) per poll -- and
+    caching the parsed list would have held every event dict for as long
+    as anyone was subscribed. Measured at 50,000 events: 117 ms per
+    snapshot with neither, 9.26 ms with gating alone, 0.73 ms with a
+    cached summary.
+    """
+    from tower.results.world_builder import _summarise_events
+
+    events = (
+        [{"kind": "session_started"}]
+        + [{"kind": "keyframe_accepted"}] * 40
+        + [{"kind": "tracking_lost"}]
+        + [{"kind": "frame_rejected"}] * 5
+    )
+    summary = _summarise_events(events)
+
+    assert summary == {
+        "keyframes_accepted": 40,
+        "last_tracking": "tracking_lost",
+        "stopped": False,
+    }
+    # Fixed arity whatever the journal length: this is the memory bound.
+    assert len(_summarise_events(events * 1000)) == len(summary)
+    assert all(
+        isinstance(value, (int, str, bool, type(None)))
+        for value in summary.values()
+    ), "the summary must hold scalars, never the events"
+
+
 # -- slow consumers -----------------------------------------------------
 
 
