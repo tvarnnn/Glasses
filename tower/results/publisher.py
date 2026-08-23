@@ -57,21 +57,23 @@ DEFAULT_HEARTBEAT_SECONDS = 2.0
 # A send that takes longer than this means the consumer has stopped
 # reading. The subscription is closed rather than waited on.
 #
-# 2 seconds, not 5, and the number is a FRAME-PATH bound rather than a
-# patience setting. The result sender holds the connection's send lock for
+# 1 second, and the number is a FRAME-PATH bound rather than a patience
+# setting. `handoff.md` 13.7 is explicit that blocking the socket for >2 s
+# makes iOS treat the connection as wedged and replace it, so this stays
+# comfortably under that with the lock wait added on top. The result sender holds the connection's send lock for
 # the duration of a send, so a stuck result is also the longest a
 # `frame_result` can queue behind one. Both are blocked anyway when the
 # client has stopped reading -- one socket is one TCP stream -- but this
 # is the bound on how long a merely SLOW consumer can delay the path that
 # is measured.
-SEND_TIMEOUT_S = 2.0
+SEND_TIMEOUT_S = 1.0
 
 # How long to wait for the send lock itself, measured separately. Lumping
 # the two together let a slow FRAME send consume a result's whole budget
 # and trigger a spurious "consumer did not accept" drop -- the result had
 # not been offered to the socket at all, it was queued behind the frame
 # path. Raised by an adversarial review.
-LOCK_TIMEOUT_S = 2.0
+LOCK_TIMEOUT_S = 1.0
 
 # The backstop the sender task applies around the whole operation. The
 # inner two bounds give the precise cause; this one guarantees the task

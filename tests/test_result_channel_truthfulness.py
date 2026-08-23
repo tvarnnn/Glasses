@@ -654,3 +654,187 @@ def test_the_producer_never_reads_an_unchanged_file_twice(built):
     assert steady_state == {"journal": 0, "keyframes": 0}, (
         f"an unchanged world was re-parsed: {steady_state}"
     )
+
+
+# -- the iOS projection -------------------------------------------------
+#
+# `handoff.md` documents the Swift that exists today. These pin the one
+# contract shape it says costs the phone nothing: fields mapping 1:1 onto
+# `WorldSnapshot`, plus an explicit `WorldModelState`.
+
+
+IOS_MODEL_STATES = {
+    "unsupported",
+    "idle",
+    "awaiting_first_update",
+    "receiving",
+    "finalizing",
+    "finalized",
+    "failed",
+}
+IOS_TRACKING = {"good", "limited", "lost", "unavailable"}
+IOS_SCALE = {"relative", "inferredMetric", "measuredMetric", "unknown"}
+IOS_CALIBRATION = {"unknown", "uncalibrated", "calibrating", "calibrated"}
+IOS_PERSISTENCE = {"unknown", "session", "saved", "reloading"}
+
+
+def test_the_projection_uses_only_vocabulary_ios_implements(monkeypatch, built):
+    """Every enum value must be a case iOS already has.
+
+    A value outside these sets is a value the phone decodes into nothing,
+    and iOS's decoder is required to fail rather than downgrade -- so an
+    unknown word is a blank screen, not a degraded one.
+    """
+    root, _, _ = built
+    payload = _payload(monkeypatch, root)
+    snapshot = payload["world_snapshot"]
+
+    assert payload["model_state"] in IOS_MODEL_STATES
+    assert snapshot["tracking"] in IOS_TRACKING
+    assert snapshot["scale"] in IOS_SCALE
+    assert snapshot["calibration"] in IOS_CALIBRATION
+    assert snapshot["persistence"]["state"] in IOS_PERSISTENCE
+    assert snapshot["trajectory"]["scale"] in IOS_SCALE
+
+
+def test_the_projection_has_exactly_the_worldsnapshot_fields(monkeypatch, built):
+    """1:1 with handoff.md 8.3, so iOS decodes one flat shape."""
+    root, _, _ = built
+    snapshot = _payload(monkeypatch, root)["world_snapshot"]
+
+    assert set(snapshot) == {
+        "name",
+        "world_id",
+        "keyframe_count",
+        "revision",
+        "tracking",
+        "scale",
+        "mapping_seconds",
+        "calibration",
+        "geometry",
+        "trajectory",
+        "persistence",
+    }
+    assert set(snapshot["geometry"]) == {
+        "representation",
+        "element_count",
+        "is_incremental",
+    }
+    assert set(snapshot["trajectory"]) == {
+        "pose_count",
+        "path_length",
+        "path_length_unit",
+        "scale",
+    }
+    assert set(snapshot["persistence"]) == {"state", "revision"}
+
+
+def test_the_projection_never_disagrees_with_the_evidence(monkeypatch, built):
+    """It is a projection, not a second source of truth.
+
+    Asserted against the Tower-native blocks it was derived from, so the
+    two cannot drift into disagreeing about the same world.
+    """
+    root, _, _ = built
+    payload = _payload(monkeypatch, root)
+    snapshot = payload["world_snapshot"]
+
+    assert snapshot["world_id"] == payload["world"]["world_id"]
+    assert snapshot["name"] == payload["world"]["display_name"]
+    assert snapshot["keyframe_count"] == payload["progress"]["keyframes_accepted"]
+    assert snapshot["mapping_seconds"] == payload["progress"]["mapping_seconds"]
+    assert snapshot["scale"] == payload["scale"]["semantics"]
+    assert snapshot["calibration"] == payload["calibration"]["state"]
+    assert (
+        snapshot["geometry"]["element_count"] == payload["geometry"]["element_count"]
+    )
+    assert snapshot["trajectory"]["pose_count"] == payload["trajectory"]["pose_count"]
+    assert (
+        snapshot["trajectory"]["path_length"]
+        == payload["trajectory"]["path_length"]["value"]
+    )
+
+
+def test_the_snapshot_revision_is_the_envelope_revision(monkeypatch, built):
+    """iOS holds the revision inside the snapshot; it must be the same one."""
+    root, _, _ = built
+    client = make_client(monkeypatch, root)
+    with client.websocket_connect("/ws") as ws:
+        subscribe(ws)
+        envelope = drain(ws, expect="cartridge_result")
+
+    assert envelope["payload"]["world_snapshot"]["revision"] == envelope["revision"]
+
+
+def test_a_built_world_projects_to_finalized(monkeypatch, built):
+    root, _, _ = built
+    assert _payload(monkeypatch, root)["model_state"] == "finalized"
+
+
+def test_a_live_session_projects_to_receiving(monkeypatch, tmp_path):
+    root = tmp_path / "worlds"
+    _, _, engine = start_live_world(root, frames=6)
+    try:
+        payload = _payload(monkeypatch, root)
+        assert payload["model_state"] == "receiving"
+        assert payload["world_snapshot"]["keyframe_count"] > 0
+    finally:
+        engine.stop_session()
+
+
+def test_a_stopped_unbuilt_session_projects_to_finalizing(monkeypatch, tmp_path):
+    """`.finalizing` is "capture ended, figures may still change".
+
+    That is exactly what `stopped_unbuilt` means, and it is why the two
+    map onto each other -- not because Tower can see a build running,
+    which lifecycle.build_in_progress still reports it cannot.
+    """
+    root = tmp_path / "worlds"
+    _, _, engine = start_live_world(root, frames=8)
+    engine.stop_session()
+
+    payload = _payload(monkeypatch, root)
+    assert payload["model_state"] == "finalizing"
+    assert payload["lifecycle"]["build_in_progress"] is None
+
+
+def test_no_world_root_projects_to_unsupported_not_idle(monkeypatch):
+    """A Tower that cannot serve this at all must not look merely empty.
+
+    `.idle` invites a person to wait for something that is never coming;
+    `.unsupported` tells them the Tower cannot do it.
+    """
+    client = make_client(monkeypatch, None)
+    with client.websocket_connect("/ws") as ws:
+        reply = subscribe(ws)
+    assert reply["type"] == "result_error"
+    assert reply["reason"] == "cartridge_unavailable"
+
+
+def test_an_empty_world_root_projects_to_idle(monkeypatch, tmp_path):
+    payload = _payload(monkeypatch, tmp_path / "empty")
+    assert payload["model_state"] == "idle"
+    assert payload["world_snapshot"] is None
+
+
+def test_the_projection_never_offers_a_metric_scale(monkeypatch, built):
+    """measuredMetric from a monocular pipeline would make the app lie."""
+    root, _, _ = built
+    payload = _payload(monkeypatch, root)
+    assert payload["world_snapshot"]["scale"] != "measuredMetric"
+    assert payload["world_snapshot"]["trajectory"]["scale"] != "measuredMetric"
+
+
+def test_a_spatial_figure_never_arrives_without_its_unit_and_scale(
+    monkeypatch, built
+):
+    """handoff.md 9.6: send scale and unit TOGETHER with any spatial figure."""
+    root, _, _ = built
+    trajectory = _payload(monkeypatch, root)["world_snapshot"]["trajectory"]
+
+    if trajectory["path_length"] is not None:
+        assert trajectory["path_length_unit"] is not None
+        assert trajectory["scale"] in IOS_SCALE
+        assert trajectory["scale"] != "unknown"
+    else:
+        assert trajectory["path_length_unit"] is None

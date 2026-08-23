@@ -44,10 +44,24 @@ the live-module half remains blocked and is not what this is.
 
 ## 2. Discovery — do this first
 
-### `GET /cartridges`
+### On the socket: `{"type": "cartridges"}`
 
-No parameters. Returns the capability declaration. **Cache it**; it changes
-only when the Tower build changes.
+**This is the path for the phone.** iOS owns exactly one WebSocket and has
+no HTTP client, no REST layer and no second transport — so discovery
+happens on the socket already open. Send `{"type":"cartridges"}`, receive
+the declaration below. **Cache it**; it changes only when the Tower build
+changes.
+
+Send it only **after** the ping/pong handshake has completed. The Tower
+never speaks first, so nothing here can arrive before the pong — but a
+client that asked for capabilities before validating would be reading its
+own reply into the handshake.
+
+### `GET /cartridges` — the same object, for operators
+
+An HTTP route returning byte-identical output, for curl, dashboards and
+anything that is not the phone. Both surfaces call one function and a test
+asserts they cannot drift. **The phone does not need it.**
 
 ```json
 {
@@ -71,9 +85,7 @@ only when the Tower build changes.
 }
 ```
 
-The identical object is available over the socket as `{"type":
-"cartridges"}`. Both call one function; a test asserts they are
-byte-identical.
+Both surfaces call one function; a test asserts they are byte-identical.
 
 ### The three states, and how to tell them apart
 
@@ -417,6 +429,89 @@ already generic and already tested.
 ## 10. World Builder `status` payload
 
 Contract: `world_builder.status/2026-08-23`.
+
+### 10.0 If you implement nothing else, implement this
+
+The payload has two halves. **`model_state` and `world_snapshot` are the
+half you decode.** Everything else is Tower-native evidence for those
+values — useful when something looks wrong, not required to render.
+
+They are shaped to drop straight into the iOS types that already exist:
+`world_snapshot` maps 1:1 onto `WorldSnapshot`, and `model_state` names a
+`WorldModelState` case. Tower does that mapping deliberately — the
+alternative would put the translation table on the phone, where changing
+it is an App Store release rather than a Tower restart.
+
+```json
+"model_state": "finalized",
+"model_state_reason": null,
+"world_snapshot": {
+  "name": "Probe Room",
+  "world_id": "be5076514e0d4727ab06f2ad1df5a5bf",
+  "keyframe_count": 4,
+  "revision": "b00bfe85819804da",
+  "tracking": "good",
+  "scale": "relative",
+  "mapping_seconds": 0.0789,
+  "calibration": "calibrated",
+  "geometry": {
+    "representation": "sparse point cloud",
+    "element_count": 1360,
+    "is_incremental": false
+  },
+  "trajectory": {
+    "pose_count": 4,
+    "path_length": 2.853251890377782,
+    "path_length_unit": "world units",
+    "scale": "relative"
+  },
+  "persistence": {"state": "saved", "revision": "67ccaee79f212c8d"}
+}
+```
+
+**`model_state`** — one of `unsupported`, `idle`, `receiving`,
+`finalizing`, `finalized`, `failed`. `model_state_reason` is prose for a
+person, or null.
+
+| Tower sends | Meaning | Note |
+|---|---|---|
+| `unsupported` | this Tower cannot serve World Builder at all | e.g. no world root configured. Do not invite the user to wait |
+| `idle` | Tower is fine, there is nothing to show yet | no worlds, or a world with no sessions |
+| `receiving` | a mapping session is live | a process holds the world's writer lock |
+| `finalizing` | capture ended; the stored figures are **not** the final figures | see the caveat under `lifecycle` below — Tower cannot see whether a build is *running* |
+| `finalized` | capture ended and the stored geometry matches the keyframes | |
+| `failed` | the builder died, or the session recorded an error | `model_state_reason` says which |
+
+**`awaiting_first_update` is never sent**, deliberately. It means "frames
+are going out and the Tower has said nothing yet" — a fact about the
+phone's own situation, which only the phone can know, and which it reaches
+by not having received a snapshot.
+
+**`world_snapshot` field notes**
+
+- `revision` is the **same opaque string** the envelope carries. Compare
+  for equality; never parse or order it.
+- `tracking` — `good` / `lost` / `unavailable`. **`limited` is never
+  sent**: it would need a threshold nobody has defined.
+- `calibration` — `unknown` / `uncalibrated` / `calibrated`.
+  **`calibrating` is never sent**: there is no in-session calibration
+  procedure to be in the middle of.
+- `scale` — `relative` or `unknown` in V1. **`inferredMetric` and
+  `measuredMetric` are unreachable** on monocular hardware and will not
+  arrive. Never render any figure from this channel in metres.
+- `mapping_seconds` — the **Tower's** clock. Null if the Tower's wall
+  clock stepped backwards.
+- `geometry.is_incremental` is always `false` and never null: a build
+  replaces the whole derived tree, so every snapshot is a whole world.
+- `trajectory.scale` is carried **separately** from the snapshot's scale,
+  because a spatial figure travels with its own. When `path_length` is
+  null so is `path_length_unit`.
+- `persistence.state` is `saved` whenever a world exists — World Builder
+  persists by construction, so `session` is unreachable.
+- Any field may be `null`, and null means **absent**, never zero.
+
+**Nothing else in the payload is required.** Read on only if you want the
+evidence behind these values.
 
 ### 10.1 Field reference
 

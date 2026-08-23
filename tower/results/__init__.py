@@ -68,12 +68,23 @@ def make_snapshot_for(world_root, clock=time.time):
 
 
 def _unavailable_snapshot(reason: str) -> Snapshot:
+    """The Tower cannot serve this cartridge at all.
+
+    Distinct from "there is nothing to show yet": this is a Tower
+    limitation, so it projects to iOS's `.unsupported`, which tells a
+    person the Tower cannot do this rather than inviting them to wait.
+    """
     payload = {
         "lifecycle": {
             "state": "unavailable",
             "evidence": "nothing to read",
             "reason": reason,
-        }
+            "build_in_progress": None,
+            "build_in_progress_unavailable_reason": reason,
+        },
+        "model_state": "unsupported",
+        "model_state_reason": reason,
+        "world_snapshot": None,
     }
     return Snapshot(payload=payload, revision=compute_revision(payload))
 

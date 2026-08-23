@@ -107,12 +107,72 @@ SCALE_SEMANTICS = {
 # Fields whose value advances without anything having happened. Excluded
 # from the change revision so a UI can tell new data from repeated data
 # (IOS-to-Tower.md 1.2).
-VOLATILE_PATHS = ("progress.mapping_seconds",)
+VOLATILE_PATHS = (
+    "progress.mapping_seconds",
+    "world_snapshot.mapping_seconds",
+    # Self-referential rather than volatile: `world_snapshot.revision` IS
+    # the revision, so it cannot be an input to computing it. Excluded so
+    # the hash stays stable when the field is filled in afterwards.
+    "world_snapshot.revision",
+)
 
-# The Tower's own name for what it builds. IOS-to-Tower.md 1.3 asks for
-# exactly this and promises to display it verbatim and never parse it, so
-# it is prose, not an identifier.
+# The Tower's own name for what it builds. `handoff.md` 9.5 says iOS
+# displays this VERBATIM and never matches it against a known set, so it
+# is prose for a person, not an identifier.
 GEOMETRY_REPRESENTATION = "sparse point cloud"
+
+# --- the iOS projection ------------------------------------------------
+#
+# `handoff.md` 16 names the one contract shape that costs the phone
+# nothing: "a self-contained, coarsely-updated world report whose fields
+# map 1:1 onto WorldSnapshot, plus an explicit lifecycle state mapping
+# onto WorldModelState". Everything else in this payload is Tower-native
+# and carries the EVIDENCE for these values; this block is the part iOS
+# decodes.
+#
+# It is a projection, not a second source of truth: it is computed from
+# the same payload in the same pass, so the two cannot disagree, and a
+# test asserts every projected value against the block it came from.
+#
+# Tower deliberately does the mapping. The alternative -- shipping only
+# Tower's vocabulary and asking iOS to translate -- would put this table
+# on the phone, where the knowledge is not, and where getting it wrong is
+# an App Store release rather than a Tower restart.
+
+# WorldModelState cases (handoff.md 8.2). `awaiting_first_update` is
+# deliberately absent: it means "frames are going out and the Tower has
+# said nothing yet", which is a fact about the PHONE's own situation. Only
+# iOS can know it, and it reaches it by not having received a snapshot.
+MODEL_STATE_UNSUPPORTED = "unsupported"
+MODEL_STATE_IDLE = "idle"
+MODEL_STATE_RECEIVING = "receiving"
+MODEL_STATE_FINALIZING = "finalizing"
+MODEL_STATE_FINALIZED = "finalized"
+MODEL_STATE_FAILED = "failed"
+
+_MODEL_STATE_BY_LIFECYCLE = {
+    LIFECYCLE_RECEIVING: MODEL_STATE_RECEIVING,
+    # "capture ended, Tower still working; figures may change" is exactly
+    # what `stopped_unbuilt` means -- the stored figures are not the final
+    # figures. Tower still cannot see whether a build is RUNNING, and
+    # lifecycle.build_in_progress carries that caveat unchanged.
+    LIFECYCLE_STOPPED_UNBUILT: MODEL_STATE_FINALIZING,
+    LIFECYCLE_READY: MODEL_STATE_FINALIZED,
+    LIFECYCLE_FAILED: MODEL_STATE_FAILED,
+    LIFECYCLE_IDLE: MODEL_STATE_IDLE,
+}
+
+# WorldTrackingQuality (handoff.md 8.3). Tower's `unknown` is iOS's
+# `unavailable`; `limited` is never produced -- see _tracking_block.
+_IOS_TRACKING = {
+    TRACKING_GOOD: "good",
+    TRACKING_LOST: "lost",
+    TRACKING_UNKNOWN: "unavailable",
+}
+
+# WorldPersistenceState. Tower always persists, so `session` (meaning
+# "this session only, nothing stored") is unreachable.
+IOS_SCALE_UNKNOWN = "unknown"
 
 
 class _FileCache:
@@ -299,7 +359,15 @@ class WorldBuilderStatusProducer:
             logger.warning("result channel: world %s unreadable: %s", world_id, exc)
             return self._unavailable(f"world could not be read: {exc}")
 
-    def _unavailable(self, reason: str) -> Snapshot:
+    def _unavailable(self, reason: str, *, supported: bool = True) -> Snapshot:
+        """Nothing to report, and whether that is a Tower limitation.
+
+        `supported=False` is "this Tower cannot serve World Builder at all"
+        -- no world root configured. That maps to iOS's `.unsupported`,
+        which tells a person the Tower cannot do this. Everything else --
+        no worlds yet, an unreadable world -- maps to `.idle`, which does
+        not.
+        """
         payload = {
             "world": None,
             "session": None,
@@ -319,6 +387,11 @@ class WorldBuilderStatusProducer:
             "artifacts": None,
             "time_basis": TIME_BASIS,
         }
+        payload["model_state"] = (
+            MODEL_STATE_IDLE if supported else MODEL_STATE_UNSUPPORTED
+        )
+        payload["model_state_reason"] = reason
+        payload["world_snapshot"] = None
         return Snapshot(
             payload=payload,
             revision=compute_revision(payload, VOLATILE_PATHS),
@@ -334,9 +407,17 @@ class WorldBuilderStatusProducer:
         else:
             payload = self._payload(store, world, session_id)
 
+        _attach_ios_projection(payload)
+
+        revision = compute_revision(payload, VOLATILE_PATHS)
+        if payload.get("world_snapshot") is not None:
+            # iOS holds the revision INSIDE the snapshot (handoff.md 8.3),
+            # so it survives being handed around as one value. It is the
+            # same string the envelope carries.
+            payload["world_snapshot"]["revision"] = revision
         return Snapshot(
             payload=payload,
-            revision=compute_revision(payload, VOLATILE_PATHS),
+            revision=revision,
             volatile_fields=VOLATILE_PATHS,
         )
 
@@ -1174,6 +1255,70 @@ def _artifacts_block(store, world_id, session_id, world) -> dict:
             "a declaration that rebuilds are refused for this world, not a "
             "verified deletion of the imagery"
         ),
+    }
+
+
+def _attach_ios_projection(payload: dict) -> None:
+    """Add `model_state` and `world_snapshot` -- the fields iOS decodes.
+
+    Derived from the payload that is already built, so the projection and
+    the evidence beside it cannot drift.
+    """
+    lifecycle = payload["lifecycle"]
+    state = _MODEL_STATE_BY_LIFECYCLE.get(lifecycle["state"], MODEL_STATE_IDLE)
+    payload["model_state"] = state
+    payload["model_state_reason"] = lifecycle.get("reason")
+
+    world = payload.get("world")
+    if world is None:
+        payload["world_snapshot"] = None
+        return
+
+    progress = payload.get("progress") or {}
+    tracking = payload.get("tracking") or {}
+    scale = payload.get("scale") or {}
+    calibration = payload.get("calibration") or {}
+    geometry = payload.get("geometry") or {}
+    trajectory = payload.get("trajectory") or {}
+    persistence = payload.get("persistence") or {}
+
+    scale_word = scale.get("semantics") or IOS_SCALE_UNKNOWN
+    path = trajectory.get("path_length") or {}
+    path_available = bool(path.get("available"))
+
+    payload["world_snapshot"] = {
+        "name": world.get("display_name"),
+        "world_id": world.get("world_id"),
+        "keyframe_count": progress.get("keyframes_accepted"),
+        # The SNAPSHOT's revision, which is the envelope's revision: iOS
+        # compares it for equality to decide whether anything changed.
+        # Filled in by the caller, which is the only place that knows it.
+        "revision": None,
+        "tracking": _IOS_TRACKING.get(tracking.get("state"), "unavailable"),
+        "scale": scale_word,
+        "mapping_seconds": progress.get("mapping_seconds"),
+        "calibration": calibration.get("state") or "unknown",
+        "geometry": {
+            "representation": geometry.get("representation"),
+            "element_count": geometry.get("element_count"),
+            # Never null: iOS uses this to know whether it is looking at a
+            # whole world or a delta, and a null would leave that open.
+            "is_incremental": bool(geometry.get("is_incremental")),
+        },
+        "trajectory": {
+            "pose_count": trajectory.get("pose_count"),
+            "path_length": path.get("value") if path_available else None,
+            "path_length_unit": path.get("unit") if path_available else None,
+            # Carried separately from the snapshot's scale, because
+            # handoff.md 9.6 says every spatial figure carries its own.
+            "scale": (
+                path.get("scale_semantics") if path_available else IOS_SCALE_UNKNOWN
+            ),
+        },
+        "persistence": {
+            "state": persistence.get("state") or "unknown",
+            "revision": persistence.get("revision"),
+        },
     }
 
 
