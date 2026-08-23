@@ -1,0 +1,92 @@
+"""The Tower -> iOS structured cartridge result channel.
+
+A READ-ONLY reporting surface over state other processes have already
+persisted. Nothing in this package runs a cartridge, drives a module,
+touches a frame, or writes anything. It answers one question -- "what does
+the Tower currently know about cartridge X?" -- from files on disk.
+
+That restraint is the architecture, not an accident of scope. The obvious
+alternative was to register World Builder as a live production module and
+publish its results as they were computed; `TOWER-TO-IOS.md` 6.1 lists the
+four blockers that stop, and every one of them is real. But 6.1 also
+conflates two things that turn out to be separable:
+
+    a World Builder TRANSPORT        <- achievable now, this package
+    World Builder as a LIVE MODULE   <- blocked at V1.0/V1.1
+
+The blockers are all properties of the second. `process()` being
+synchronous and `bytes`-only, `ExperimentResult` being scalar-shaped,
+`_build_cv_module` being a registry of one, `LIFECYCLE_TIMEOUT_S` being
+too short for a build -- none of them bear on a reader that never joins
+the frame path at all.
+"""
+
+import time
+
+from tower.results.contracts import (
+    CARTRIDGE_WORLD_BUILDER,
+    RESULT_TYPE_STATUS,
+    WORLD_BUILDER_STATUS_CONTRACT,
+)
+from tower.results.envelope import Snapshot, compute_revision
+from tower.results.publisher import ResultHub
+
+
+def make_snapshot_for(world_root, clock=time.time):
+    """A callable turning (cartridge, result_type, world, session) into a Snapshot.
+
+    Built once and handed to the hub, so the hub itself imports no
+    cartridge and can be tested against a stub. Producers are constructed
+    lazily and reused, because the World Builder producer holds a small
+    per-target cache that would be thrown away on every poll otherwise.
+    """
+    producers: dict = {}
+
+    def snapshot_for(cartridge, result_type, world_id, session_id) -> Snapshot:
+        if cartridge == CARTRIDGE_WORLD_BUILDER and result_type == RESULT_TYPE_STATUS:
+            if world_root is None:
+                return _unavailable_snapshot(
+                    "no world root is configured on this Tower"
+                )
+            producer = producers.get(cartridge)
+            if producer is None:
+                from tower.results.world_builder import WorldBuilderStatusProducer
+
+                producer = WorldBuilderStatusProducer(world_root, clock)
+                producers[cartridge] = producer
+            return producer.snapshot(world_id, session_id)
+        # Unreachable through the wire: registry.find_offer refuses an
+        # unknown pair before a subscription is ever created. Present so
+        # that a future producer added to the registry and forgotten here
+        # fails as an explicit unavailable rather than a KeyError inside
+        # the poll loop.
+        return _unavailable_snapshot(
+            f"no producer is wired for {cartridge}/{result_type}"
+        )
+
+    return snapshot_for
+
+
+def _unavailable_snapshot(reason: str) -> Snapshot:
+    payload = {
+        "lifecycle": {
+            "state": "unavailable",
+            "evidence": "nothing to read",
+            "reason": reason,
+        }
+    }
+    return Snapshot(payload=payload, revision=compute_revision(payload))
+
+
+def build_hub(world_root, clock=time.time) -> ResultHub:
+    return ResultHub(make_snapshot_for(world_root, clock), clock=clock)
+
+
+__all__ = [
+    "CARTRIDGE_WORLD_BUILDER",
+    "RESULT_TYPE_STATUS",
+    "WORLD_BUILDER_STATUS_CONTRACT",
+    "ResultHub",
+    "build_hub",
+    "make_snapshot_for",
+]

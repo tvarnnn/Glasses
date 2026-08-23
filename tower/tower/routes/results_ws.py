@@ -1,0 +1,281 @@
+"""The WebSocket half of the cartridge result channel.
+
+Kept out of `ws.py` on purpose. That module owns the frame path -- the
+latency-measured, privacy-sensitive part of this system -- and the result
+channel is a side surface that must be able to fail without implicating
+it. Separate module, separate failure domain, and `ws.py` gains four small
+dispatch branches rather than three hundred lines.
+
+Every handler here returns without raising. A malformed subscribe, an
+unknown cartridge, a hostile payload: all become a `result_error` on the
+wire. The receive loop must never learn that the result channel had a
+problem, because the receive loop is what answers frames.
+"""
+
+import logging
+
+from tower.results import registry
+from tower.results.contracts import ENVELOPE_CONTRACT
+from tower.results.publisher import (
+    MAX_SUBSCRIPTIONS_PER_CONNECTION,
+    ConnectionChannel,
+    Subscription,
+    classify_cursor,
+)
+
+logger = logging.getLogger(__name__)
+
+# Client -> Tower
+MSG_CARTRIDGES = "cartridges"
+MSG_SUBSCRIBE = "result_subscribe"
+MSG_UNSUBSCRIBE = "result_unsubscribe"
+
+RESULT_MESSAGE_TYPES = frozenset({MSG_CARTRIDGES, MSG_SUBSCRIBE, MSG_UNSUBSCRIBE})
+
+# Tower -> client
+MSG_SUBSCRIBED = "result_subscribed"
+MSG_UNSUBSCRIBED = "result_unsubscribed"
+MSG_ERROR = "result_error"
+
+# Error reasons. A closed set: a client switches on these, so adding one
+# is a contract change.
+ERR_MALFORMED = "malformed_request"
+ERR_UNKNOWN_CARTRIDGE = "unknown_cartridge"
+ERR_UNKNOWN_RESULT_TYPE = "unknown_result_type"
+ERR_CONTRACT_MISMATCH = "contract_mismatch"
+ERR_UNAVAILABLE = "cartridge_unavailable"
+ERR_TOO_MANY = "too_many_subscriptions"
+ERR_UNKNOWN_SUBSCRIPTION = "unknown_subscription"
+
+
+async def handle(message: dict, *, websocket, sender, channel_holder) -> None:
+    """Dispatch one result-channel message. Never raises."""
+    try:
+        message_type = message.get("type")
+        if message_type == MSG_CARTRIDGES:
+            await _cartridges(websocket, sender)
+        elif message_type == MSG_SUBSCRIBE:
+            await _subscribe(message, websocket, sender, channel_holder)
+        elif message_type == MSG_UNSUBSCRIBE:
+            await _unsubscribe(message, sender, channel_holder)
+    except Exception:
+        # Deliberately broad, and deliberately swallowed after logging.
+        # This handler is called from the frame-serving receive loop; an
+        # escape here would end a connection that is successfully
+        # answering frames because a status subscription went wrong.
+        logger.exception(
+            "[Tower][Results] handler failed for %r; the connection continues",
+            message.get("type"),
+        )
+
+
+async def _cartridges(websocket, sender) -> None:
+    """The capability declaration, identical to `GET /cartridges`.
+
+    Served from the same `registry.declare()` so the two surfaces cannot
+    drift. A test asserts they are byte-identical.
+    """
+    await sender.send(registry.declare(_world_root(websocket)))
+
+
+async def _subscribe(message, websocket, sender, channel_holder) -> None:
+    cartridge = message.get("cartridge")
+    result_type = message.get("result_type")
+    if not isinstance(cartridge, str) or not isinstance(result_type, str):
+        await _error(
+            sender,
+            ERR_MALFORMED,
+            "result_subscribe requires string 'cartridge' and 'result_type'",
+        )
+        return
+
+    world_id = message.get("world_id")
+    session_id = message.get("session_id")
+    if world_id is not None and not isinstance(world_id, str):
+        await _error(sender, ERR_MALFORMED, "'world_id' must be a string or absent")
+        return
+    if session_id is not None and not isinstance(session_id, str):
+        await _error(sender, ERR_MALFORMED, "'session_id' must be a string or absent")
+        return
+
+    world_root = _world_root(websocket)
+    offer = registry.find_offer(world_root, cartridge, result_type)
+    if offer is None:
+        known = registry.known_cartridges(world_root)
+        if cartridge not in known:
+            await _error(
+                sender,
+                ERR_UNKNOWN_CARTRIDGE,
+                f"this Tower offers no contract for cartridge {cartridge!r}",
+                cartridge=cartridge,
+                result_type=result_type,
+                offered=sorted(known),
+            )
+        else:
+            await _error(
+                sender,
+                ERR_UNKNOWN_RESULT_TYPE,
+                f"cartridge {cartridge!r} offers no result type {result_type!r}",
+                cartridge=cartridge,
+                result_type=result_type,
+            )
+        return
+
+    requested = message.get("contract")
+    if requested is not None and requested != offer["contract"]:
+        # Compared for EQUALITY and nothing else. iOS holds contract
+        # identifiers opaque, so a mismatch is not "older" or "newer" --
+        # it is "we are not talking about the same agreement", and the
+        # only safe answer is to refuse rather than to serve a payload
+        # the client will decode under different rules.
+        await _error(
+            sender,
+            ERR_CONTRACT_MISMATCH,
+            "this Tower serves a different contract for that result type",
+            cartridge=cartridge,
+            result_type=result_type,
+            offered_contract=offer["contract"],
+            requested_contract=requested,
+        )
+        return
+
+    if not offer["available"]:
+        await _error(
+            sender,
+            ERR_UNAVAILABLE,
+            offer["unavailable_reason"],
+            cartridge=cartridge,
+            result_type=result_type,
+            contract=offer["contract"],
+        )
+        return
+
+    channel = channel_holder.ensure(websocket, sender)
+    if channel.subscription_count >= MAX_SUBSCRIPTIONS_PER_CONNECTION:
+        await _error(
+            sender,
+            ERR_TOO_MANY,
+            f"a connection may hold at most {MAX_SUBSCRIPTIONS_PER_CONNECTION} "
+            "subscriptions",
+            cartridge=cartridge,
+            result_type=result_type,
+        )
+        return
+
+    since = message.get("since_revision")
+    subscription = Subscription(
+        subscription_id=channel.next_subscription_id(),
+        cartridge=cartridge,
+        result_type=result_type,
+        contract=offer["contract"],
+        world_id=world_id,
+        session_id=session_id,
+        # Provisional: replaced below once the first snapshot is known,
+        # because "stale" versus "matched" can only be decided against a
+        # revision we have actually computed.
+        cursor_status=None,
+    )
+
+    hub = websocket.app.state.result_hub
+    # The first snapshot is computed HERE, synchronously with the reply,
+    # rather than waiting for the next poll. A subscriber that had to wait
+    # up to a poll interval to learn anything would make reconnection feel
+    # broken, and the whole contract rests on "a subscription always
+    # begins with a complete snapshot".
+    import asyncio
+
+    snapshot = await asyncio.to_thread(
+        hub._snapshot_for, cartridge, result_type, world_id, session_id
+    )
+    subscription.cursor_status = classify_cursor(since, snapshot.revision)
+
+    await sender.send(
+        {
+            "type": MSG_SUBSCRIBED,
+            "envelope_contract": ENVELOPE_CONTRACT,
+            "subscription_id": subscription.subscription_id,
+            "cartridge": cartridge,
+            "result_type": result_type,
+            "contract": offer["contract"],
+            "snapshot_only": offer["snapshot_only"],
+            "world_id": world_id,
+            "session_id": session_id,
+            "cursor_status": subscription.cursor_status,
+        }
+    )
+
+    await channel.add(subscription)
+    # Delivered through the same path every later result takes, so the
+    # first snapshot is not a special case a client has to decode twice.
+    subscription.offer(snapshot)
+    channel._wakeup.set()
+
+
+async def _unsubscribe(message, sender, channel_holder) -> None:
+    subscription_id = message.get("subscription_id")
+    if not isinstance(subscription_id, str):
+        await _error(
+            sender, ERR_MALFORMED, "result_unsubscribe requires 'subscription_id'"
+        )
+        return
+    channel = channel_holder.existing()
+    removed = False
+    if channel is not None:
+        removed = await channel.remove(subscription_id)
+    if not removed:
+        await _error(
+            sender,
+            ERR_UNKNOWN_SUBSCRIPTION,
+            f"no open subscription with id {subscription_id!r}",
+            subscription_id=subscription_id,
+        )
+        return
+    await sender.send(
+        {"type": MSG_UNSUBSCRIBED, "subscription_id": subscription_id}
+    )
+
+
+async def _error(sender, reason: str, message: str, **extra) -> None:
+    payload = {
+        "type": MSG_ERROR,
+        "envelope_contract": ENVELOPE_CONTRACT,
+        "reason": reason,
+        "message": message,
+    }
+    payload.update(extra)
+    await sender.send(payload)
+
+
+def _world_root(websocket):
+    return getattr(websocket.app.state, "world_root", None)
+
+
+class ChannelHolder:
+    """Lazily creates one ConnectionChannel per WebSocket.
+
+    Lazy because the overwhelming majority of connections -- every current
+    iOS build, and every test in this repository predating this work --
+    never subscribe to anything. Those connections must pay nothing: no
+    task, no event, no registration with the shared reader.
+    """
+
+    __slots__ = ("_channel", "_clock")
+
+    def __init__(self, clock) -> None:
+        self._channel = None
+        self._clock = clock
+
+    def ensure(self, websocket, sender) -> ConnectionChannel:
+        if self._channel is None:
+            self._channel = ConnectionChannel(
+                websocket.app.state.result_hub, sender.send, self._clock
+            )
+        return self._channel
+
+    def existing(self):
+        return self._channel
+
+    async def close(self) -> None:
+        channel, self._channel = self._channel, None
+        if channel is not None:
+            await channel.close()

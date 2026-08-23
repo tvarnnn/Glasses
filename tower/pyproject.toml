@@ -1,0 +1,61 @@
+[project]
+name = "glasses-tower"
+version = "0.1.0"
+description = "Glasses platform Windows tower runtime — transport layer"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "pillow>=10.0",
+    "opencv-python-headless>=4.9",
+    "numpy>=1.26",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    # httpx2, not httpx: starlette.testclient emits a
+    # StarletteDeprecationWarning when the older httpx backs TestClient.
+    # Do NOT `pip uninstall httpx` to "finish" this swap -- huggingface_hub
+    # (a transitive dependency of timm, in the ml extra) genuinely requires
+    # httpx, and removing it breaks `pip check` and MiDaS weight downloads.
+    # The two coexist; this line only governs which client backs TestClient.
+    "httpx2>=2.0",
+    "websockets>=12.0",
+]
+ml = [
+    "torch",
+    # torchvision is now a DIRECT dependency, not only a transitive one:
+    # tower/experiments/object_detection.py uses its
+    # ssdlite320_mobilenet_v3_large with COCO weights (~13.4 MB, downloaded
+    # on first use). No new package was added for it -- it was already
+    # here, which is most of why that detector was chosen over one that
+    # would have cost a dependency.
+    "torchvision",
+    # timm: not a Tower dependency directly, but MiDaS's hubconf.py
+    # (intel-isl/MiDaS, loaded via torch.hub in tower/experiments/depth.py)
+    # unconditionally imports a DPT/beit backbone chain that requires it,
+    # even to load the "MiDaS_small" model. Without it, DepthEstimation.load()
+    # fails with ModuleNotFoundError: No module named 'timm'.
+    "timm",
+]
+ocr = [
+    # Document Memory's text recognition. Chosen after a pip dry-run
+    # showed rapidocr_onnxruntime would install `opencv-python` ALONGSIDE
+    # this project's `opencv-python-headless` -- two cv2 distributions in
+    # one environment is a known breakage. pytesseract needs a system
+    # binary pip cannot install and which is not present here. easyocr
+    # adds no cv2 and reuses the torch already in the `ml` extra.
+    #
+    # Adds: scipy, scikit-image, imageio, tifffile, lazy-loader, ninja,
+    # pyclipper, python-bidi, shapely. `pip check` clean before and after.
+    "easyocr",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tower*"]

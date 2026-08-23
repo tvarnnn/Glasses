@@ -1,0 +1,517 @@
+"""Fan-out of cartridge snapshots to subscribers, with hard bounds.
+
+Three decisions shape everything here, and all three follow from one fact:
+**a World Builder status is a SNAPSHOT, not a log entry.** It is recomputed
+from files on disk that are themselves the durable record. Nothing is lost
+by discarding an older snapshot, because a newer one answers the same
+question better.
+
+So:
+
+1. **There is no queue.** Each subscription owns exactly ONE slot holding
+   the most recent snapshot it has not yet been sent. A new snapshot
+   REPLACES whatever is in that slot. Memory per subscription is therefore
+   one payload, not N -- and the "unbounded event queue" the brief warns
+   about is not bounded here, it is absent by construction. A bounded
+   queue of N would have been worse than either: it drops the NEWEST
+   updates once full, which is precisely backwards for a freshness-first
+   channel.
+
+2. **One poller serves everyone.** The reader is per-app, not per
+   connection, so ten subscribers watching one world cost one disk read
+   per interval, not ten. It runs only while at least one subscription
+   exists: a Tower nobody is watching does no work.
+
+3. **A slow consumer is dropped, never tolerated indefinitely.** Sends are
+   bounded by `SEND_TIMEOUT_S`. A client that stops reading gets its
+   subscription closed with a reason. This matters because the frame path
+   shares the socket: one TCP stream means a client that is not reading
+   blocks everything, and a result send must never be the thing holding
+   that up without limit.
+
+The poll loop touches no cartridge state. It reads files. It cannot alter
+capture cadence, frame routing, World Builder processing or cartridge
+correctness, because it has no reference to any of them.
+"""
+
+import asyncio
+import logging
+
+from tower.results.contracts import RESULT_TYPE_STATUS
+from tower.results.envelope import ResultEnvelope
+
+logger = logging.getLogger(__name__)
+
+# How often the shared reader looks at disk. A World Builder keyframe is
+# accepted at most a few times a second and a rebuild is far rarer, so
+# polling faster would spend IO to observe nothing. Measured read cost
+# governs how low this can go; see the contract document.
+DEFAULT_POLL_SECONDS = 0.5
+
+# A snapshot is re-sent this often even when the revision has not changed,
+# so a live figure that legitimately advances -- mapping seconds -- does
+# not freeze on screen. `revision_changed: false` marks these, so a client
+# can tell a heartbeat from news.
+DEFAULT_HEARTBEAT_SECONDS = 2.0
+
+# A send that takes longer than this means the consumer has stopped
+# reading. The subscription is closed rather than waited on.
+SEND_TIMEOUT_S = 5.0
+
+# Per connection. A client with more than this many open subscriptions is
+# either confused or hostile; either way the answer is a refusal, not
+# unbounded growth in a dict a remote party controls.
+MAX_SUBSCRIPTIONS_PER_CONNECTION = 8
+
+# How a reader failure reaches a client: as a VALUE in the subscription's
+# slot, never as an exception. The sender already swallows ordinary send
+# failures (a closing socket is routine), so an exception carrying "the
+# reader is dead" would be eaten by that same clause and the client would
+# wait forever for a channel that is never coming back. Silence is the
+# worst of the three outcomes -- worse than a crash, because nothing
+# anywhere reports it.
+CURSOR_MATCHED = "matched"
+CURSOR_STALE = "stale"
+CURSOR_UNRECOGNISED = "unrecognised"
+CURSOR_ABSENT = "absent"
+
+
+class Subscription:
+    """One client's standing interest in one cartridge result.
+
+    Holds at most one undelivered snapshot. `coalesced` counts how many
+    were superseded in that slot since the last successful send, which is
+    the only honest way to tell a client it was slow -- a sequence gap
+    would say "you missed something", and it did not.
+    """
+
+    __slots__ = (
+        "subscription_id",
+        "cartridge",
+        "result_type",
+        "contract",
+        "world_id",
+        "session_id",
+        "seq",
+        "last_revision",
+        "last_sent_at",
+        "coalesced",
+        "cursor_status",
+        "_pending",
+        "_failure",
+    )
+
+    def __init__(
+        self,
+        *,
+        subscription_id: str,
+        cartridge: str,
+        result_type: str,
+        contract: str,
+        world_id: str | None,
+        session_id: str | None,
+        cursor_status: str,
+    ) -> None:
+        self.subscription_id = subscription_id
+        self.cartridge = cartridge
+        self.result_type = result_type
+        self.contract = contract
+        self.world_id = world_id
+        self.session_id = session_id
+        self.seq = 0
+        self.last_revision: str | None = None
+        self.last_sent_at: float | None = None
+        self.coalesced = 0
+        self.cursor_status = cursor_status
+        self._pending = None
+        self._failure: str | None = None
+
+    @property
+    def target(self) -> tuple:
+        """What the shared reader keys its work on.
+
+        Two subscriptions naming the same cartridge, result type, world and
+        session are answered by ONE snapshot computation, however many
+        connections asked.
+        """
+        return (self.cartridge, self.result_type, self.world_id, self.session_id)
+
+    def offer(self, snapshot) -> None:
+        if self._pending is not None:
+            if self._pending.revision == snapshot.revision:
+                # Same content. Not a supersession, so it must not count
+                # as one: `coalesced` tells a client it was too slow to
+                # see intermediate STATES, and re-offering an identical
+                # snapshot is not an intermediate state. Counting it would
+                # report drops that never happened -- most visibly right
+                # after subscribe, where the first snapshot is seeded
+                # directly and the next poll re-offers the same one.
+                return
+            # The previous snapshot was never sent. Replaced, not queued.
+            self.coalesced += 1
+        self._pending = snapshot
+
+    def take(self):
+        snapshot, self._pending = self._pending, None
+        return snapshot
+
+    def fail(self, reason: str) -> None:
+        self._failure = reason
+
+    def take_failure(self):
+        failure, self._failure = self._failure, None
+        return failure
+
+    @property
+    def has_pending(self) -> bool:
+        return self._pending is not None or self._failure is not None
+
+
+class ConnectionChannel:
+    """Every subscription belonging to one WebSocket, plus its sender.
+
+    One sender task per CONNECTION rather than per subscription: a client
+    with eight subscriptions should not cost eight tasks, and messages on
+    one socket have to be serialised anyway.
+    """
+
+    def __init__(self, hub, send, clock) -> None:
+        self._hub = hub
+        self._send = send
+        self._clock = clock
+        self._subscriptions: dict[str, Subscription] = {}
+        self._wakeup = asyncio.Event()
+        self._task: asyncio.Task | None = None
+        self._closed = False
+        self._counter = 0
+
+    # -- lifecycle ------------------------------------------------------
+
+    def next_subscription_id(self) -> str:
+        self._counter += 1
+        return f"sub-{self._counter}"
+
+    @property
+    def subscription_count(self) -> int:
+        return len(self._subscriptions)
+
+    def get(self, subscription_id: str):
+        return self._subscriptions.get(subscription_id)
+
+    async def add(self, subscription: Subscription) -> None:
+        self._subscriptions[subscription.subscription_id] = subscription
+        if self._task is None:
+            self._task = asyncio.create_task(self._run())
+        await self._hub.attach(self)
+
+    async def remove(self, subscription_id: str) -> bool:
+        removed = self._subscriptions.pop(subscription_id, None) is not None
+        if removed and not self._subscriptions:
+            await self._hub.detach(self)
+        return removed
+
+    async def close(self) -> None:
+        """Tear down on ANY exit from the connection, polite or not.
+
+        Symmetric with ws.py's own `finally:` handling of capture. A
+        subscription that outlived its socket would keep a shared reader
+        polling disk on behalf of a client that is gone -- the exact leak
+        that makes a push channel a liability rather than a feature.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._subscriptions.clear()
+        await self._hub.detach(self)
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                # Cancellation is the expected outcome and anything else
+                # is already logged in _run. Nothing may propagate: this
+                # runs in the connection's cleanup path, where an
+                # exception would skip the capture and session teardown
+                # that follows it.
+                pass
+
+    # -- delivery -------------------------------------------------------
+
+    def offer(self, target, snapshot, *, now: float, heartbeat: float) -> None:
+        """Give a new snapshot to every matching subscription.
+
+        Called by the hub, on the event loop, and does no IO: it drops a
+        reference into a slot and sets an event. A slow client therefore
+        cannot slow the reader down, only itself.
+        """
+        woken = False
+        for subscription in self._subscriptions.values():
+            if subscription.target != target:
+                continue
+            changed = snapshot.revision != subscription.last_revision
+            due = (
+                subscription.last_sent_at is None
+                or (now - subscription.last_sent_at) >= heartbeat
+            )
+            if changed or due:
+                subscription.offer(snapshot)
+                woken = True
+        if woken:
+            self._wakeup.set()
+
+    def fail_all(self, reason: str) -> None:
+        for subscription in self._subscriptions.values():
+            subscription.fail(reason)
+        self._wakeup.set()
+
+    async def _run(self) -> None:
+        try:
+            while True:
+                await self._wakeup.wait()
+                self._wakeup.clear()
+                await self._drain()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A push-channel failure must never take the connection with
+            # it. The receive loop keeps running, frames keep being
+            # answered, and this is logged with a traceback rather than
+            # disappearing into a task nobody awaits.
+            logger.exception(
+                "[Tower][Results] sender task failed; the frame path is "
+                "unaffected and this connection will publish no further "
+                "results"
+            )
+
+    async def _drain(self) -> None:
+        for subscription in list(self._subscriptions.values()):
+            if not subscription.has_pending:
+                continue
+            failure = subscription.take_failure()
+            if failure is not None:
+                # In-band, on the same socket, and then the subscription
+                # is closed. A client is told once and never left holding
+                # a subscription that will never speak again.
+                try:
+                    await asyncio.wait_for(
+                        self._send(
+                            {
+                                "type": "result_error",
+                                "reason": "channel_failed",
+                                "subscription_id": subscription.subscription_id,
+                                "cartridge": subscription.cartridge,
+                                "result_type": subscription.result_type,
+                                "message": failure,
+                            }
+                        ),
+                        timeout=SEND_TIMEOUT_S,
+                    )
+                except Exception:
+                    return
+                await self.remove(subscription.subscription_id)
+                continue
+            snapshot = subscription.take()
+            envelope = _envelope(subscription, snapshot, self._clock())
+            try:
+                await asyncio.wait_for(
+                    self._send(envelope.to_json_dict()), timeout=SEND_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[Tower][Results] subscription %s: consumer did not accept "
+                    "a result within %.1fs; closing it",
+                    subscription.subscription_id,
+                    SEND_TIMEOUT_S,
+                )
+                await self.remove(subscription.subscription_id)
+                continue
+            except Exception:
+                # Includes WebSocketDisconnect. The socket is gone; the
+                # connection's own finally: will call close(). Stop
+                # draining rather than trying every remaining subscription
+                # against a dead socket.
+                logger.info(
+                    "[Tower][Results] subscription %s: send failed, the "
+                    "connection is closing",
+                    subscription.subscription_id,
+                )
+                return
+            subscription.seq += 1
+            subscription.last_revision = snapshot.revision
+            subscription.last_sent_at = self._clock()
+            subscription.coalesced = 0
+            # A cursor status describes the FIRST reply to a subscribe and
+            # nothing after it.
+            subscription.cursor_status = None
+
+
+def _envelope(subscription: Subscription, snapshot, now: float) -> ResultEnvelope:
+    return ResultEnvelope(
+        cartridge=subscription.cartridge,
+        result_type=subscription.result_type,
+        contract=subscription.contract,
+        subscription_id=subscription.subscription_id,
+        seq=subscription.seq + 1,
+        revision=snapshot.revision,
+        revision_changed=snapshot.revision != subscription.last_revision,
+        tower_sent_at=now,
+        payload=snapshot.payload,
+        coalesced=subscription.coalesced,
+        cursor_status=subscription.cursor_status,
+    )
+
+
+class ResultHub:
+    """The shared reader. One per app; owns the poll task.
+
+    Deliberately holds no cartridge object. It is handed a callable that
+    turns a target into a snapshot, and that callable reads files. Nothing
+    here can reach into World Builder, start a build, or touch a frame.
+    """
+
+    def __init__(
+        self,
+        snapshot_for,
+        *,
+        clock,
+        poll_seconds: float = DEFAULT_POLL_SECONDS,
+        heartbeat_seconds: float = DEFAULT_HEARTBEAT_SECONDS,
+    ) -> None:
+        self._snapshot_for = snapshot_for
+        self._clock = clock
+        self._poll_seconds = poll_seconds
+        self._heartbeat_seconds = heartbeat_seconds
+        self._channels: set = set()
+        self._task: asyncio.Task | None = None
+        # Set after every completed poll pass. Tests wait on this instead
+        # of sleeping, which is what makes them deterministic.
+        self.polled = asyncio.Event()
+
+    async def attach(self, channel) -> None:
+        self._channels.add(channel)
+        if self._task is None:
+            self._task = asyncio.create_task(self._run())
+
+    async def detach(self, channel) -> None:
+        self._channels.discard(channel)
+        if not self._channels and self._task is not None:
+            # Nobody is watching. Stop reading disk entirely rather than
+            # spinning a timer forever on a Tower whose client went home.
+            task, self._task = self._task, None
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
+    async def shutdown(self) -> None:
+        """Stop the reader on app teardown. Never raises.
+
+        Awaiting a task that already died would re-raise its exception
+        inside the shutdown handler, turning a dead push channel into a
+        failed application shutdown.
+        """
+        self._channels.clear()
+        task, self._task = self._task, None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+
+    async def _run(self) -> None:
+        try:
+            while True:
+                await self.poll_once()
+                await asyncio.sleep(self._poll_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "[Tower][Results] shared reader failed; no further results "
+                "will be published. The frame path and every cartridge are "
+                "unaffected"
+            )
+            # Tell every subscriber rather than going quiet. A dead
+            # channel that still looks alive is the failure mode this
+            # whole path is built to avoid.
+            reason = (
+                "the Tower's shared result reader stopped with "
+                f"{type(exc).__name__}; no further results will be published "
+                "on this connection"
+            )
+            for channel in list(self._channels):
+                try:
+                    channel.fail_all(reason)
+                except Exception:
+                    logger.exception(
+                        "[Tower][Results] could not notify a channel of the "
+                        "reader failure"
+                    )
+
+    async def poll_once(self) -> None:
+        """One pass: compute each distinct target once, offer it to all.
+
+        Snapshot computation is pushed off the event loop with
+        `asyncio.to_thread`, because it reads and JSON-parses files and
+        the loop is also answering frames. A disk stall must cost this
+        channel latency, never the frame path.
+        """
+        targets = {}
+        for channel in self._channels:
+            for subscription in channel._subscriptions.values():
+                targets[subscription.target] = subscription
+
+        for target, sample in targets.items():
+            try:
+                snapshot = await asyncio.to_thread(
+                    self._snapshot_for, sample.cartridge, sample.result_type,
+                    sample.world_id, sample.session_id,
+                )
+            except Exception:
+                # One unreadable target must not stop the others, and must
+                # not stop the loop. The producer already turns expected
+                # storage failures into an `unavailable` payload; reaching
+                # here means something genuinely unexpected.
+                logger.exception(
+                    "[Tower][Results] could not build a snapshot for %s", target
+                )
+                continue
+            now = self._clock()
+            for channel in list(self._channels):
+                channel.offer(
+                    target, snapshot, now=now, heartbeat=self._heartbeat_seconds
+                )
+
+        self.polled.set()
+        self.polled.clear()
+
+
+def classify_cursor(since_revision, current_revision) -> str:
+    """What to make of a cursor a reconnecting client supplied.
+
+    A cursor here can never cause data loss, and that is a property of the
+    design rather than of this function: every subscription begins with a
+    complete snapshot regardless of what the client sent. There is no
+    delta stream to resume into and therefore no gap to mis-handle, which
+    is why an unrecognised cursor is reported and not refused.
+
+    The status exists so a client can tell "nothing changed while I was
+    away" from "I have no idea what you are referring to" -- the first
+    lets it skip a redraw, and the second tells it its cached revision is
+    worthless.
+    """
+    if since_revision is None:
+        return CURSOR_ABSENT
+    if not isinstance(since_revision, str) or not since_revision:
+        return CURSOR_UNRECOGNISED
+    if since_revision == current_revision:
+        return CURSOR_MATCHED
+    return CURSOR_STALE
+
+
+def world_builder_result_type(result_type: str) -> bool:
+    return result_type == RESULT_TYPE_STATUS
