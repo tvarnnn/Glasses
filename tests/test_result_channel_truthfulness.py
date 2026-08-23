@@ -838,3 +838,105 @@ def test_a_spatial_figure_never_arrives_without_its_unit_and_scale(
         assert trajectory["scale"] != "unknown"
     else:
         assert trajectory["path_length_unit"] is None
+
+
+# -- reopening a saved world --------------------------------------------
+
+
+def test_a_saved_world_can_be_reopened_by_id(monkeypatch, tmp_path):
+    """The Tower half of iOS's `WorldInspectionMode.inspecting(worldID:)`.
+
+    `handoff.md` 9.7 says that mode exists on iOS but nothing can change
+    it -- there is no UI and no client method. The Tower side is here and
+    works: name a world (and optionally a session) on subscribe and the
+    channel reports that one, not whatever is live.
+    """
+    root = tmp_path / "worlds"
+    first_world, first_session = build_world(root, frames=10, name="First")
+    second_world, _ = build_world(root, frames=8, name="Second")
+    assert first_world != second_world
+
+    # With no id, the newest world is followed.
+    live = _payload(monkeypatch, root)
+    assert live["world"]["world_id"] == second_world
+
+    # Named explicitly, the older world is reported instead -- complete,
+    # with its own geometry, unaffected by the newer one existing.
+    reopened = _payload(monkeypatch, root, world_id=first_world)
+    assert reopened["world"]["world_id"] == first_world
+    assert reopened["world"]["display_name"] == "First"
+    assert reopened["model_state"] == "finalized"
+    assert reopened["world_snapshot"]["world_id"] == first_world
+    assert reopened["session"]["session_id"] == first_session
+
+
+def test_reopening_a_specific_session_reports_that_session(monkeypatch, tmp_path):
+    root = tmp_path / "worlds"
+    world_id, first_session = build_world(root, frames=10, name="Two sessions")
+
+    from tests import synthetic_scene as ss
+    from tower.world_builder.engine import WorldBuilderEngine
+    from tower.world_builder.records import CameraIntrinsics
+
+    matrix = ss.camera_matrix(480, 360)
+    engine = WorldBuilderEngine(WorldStore(root))
+    second_session = engine.start_session(
+        world_id,
+        intrinsics=CameraIntrinsics(
+            source="self_calibrated",
+            model="pinhole",
+            fx=float(matrix[0, 0]),
+            fy=float(matrix[1, 1]),
+            cx=float(matrix[0, 2]),
+            cy=float(matrix[1, 2]),
+            calibrated_width=480,
+            calibrated_height=360,
+        ),
+        frame_source="synthetic",
+        declared_size=(480, 360),
+    )
+    for index, image in enumerate(
+        ss.render_sequence(
+            ss.furnished_room(), ss.strafe(8, step=0.09), matrix, 480, 360
+        )
+    ):
+        engine.observe(ss.encode_jpeg(image), source_seq=index)
+    engine.stop_session()
+
+    for session_id in (first_session, second_session):
+        payload = _payload(monkeypatch, root, world_id=world_id, session_id=session_id)
+        assert payload["session"]["session_id"] == session_id
+
+
+def test_a_reopened_world_carries_the_replay_data_it_has(monkeypatch, built):
+    """What "replay" can honestly mean today, checked against the store.
+
+    Tower keeps, per keyframe, the pose and the PATH TO THE ACTUAL IMAGE
+    the glasses saw there -- which is a recorded camera path with a real
+    first-person view at every point on it.
+
+    None of it crosses this wire, deliberately. `handoff.md` 9.5 and 14:
+    iOS holds summary figures, has no pose schema, and links no 3D
+    framework, so a pose array "cannot be displayed and would be dropped".
+    The channel reports the SUMMARY, and the replay data stays on the
+    Tower where something can actually read it.
+    """
+    root, world_id, session_id = built
+    from tower.world_builder.inspect import open_world
+
+    trajectory = open_world(root, world_id).trajectory(session_id)
+    assert trajectory, "precondition: the session has keyframes"
+    for row in trajectory:
+        assert row["image_relpath"], "a path point with no observed frame"
+        assert (
+            WorldStore(root).session_dir(world_id, session_id) / row["image_relpath"]
+        ).exists()
+
+    payload = _payload(monkeypatch, root)
+    assert payload["trajectory"]["pose_count"] is not None
+    # ...and no pose data on the wire.
+    import json as _json
+
+    encoded = _json.dumps(payload)
+    assert "image_relpath" not in encoded
+    assert "translation" not in encoded
