@@ -847,6 +847,22 @@ final class TowerClient: NSObject, ObservableObject {
         receiveTask = nil
         webSocketTask?.cancel(with: closeCode, reason: nil)
         webSocketTask = nil
+        // `URLSession` retains its delegate — this object — until it is
+        // invalidated. Dropping the reference is not enough: without this, the
+        // session, its delegate queue and this client all outlive every
+        // teardown, once per connect. That was survivable when connecting was
+        // something the user did by tapping; it is not now that `autoReconnect`
+        // re-opens on a schedule whose budget refills after every 30s of
+        // healthy connection, which is once per drop on exactly the flaky link
+        // this client was built for.
+        //
+        // `invalidateAndCancel` rather than `finishTasksAndInvalidate`: the
+        // only task was cancelled on the line above, so there is nothing left
+        // to finish, and waiting would keep the session alive past the point
+        // this method promises it is gone. Late delegate callbacks from the
+        // invalidated session are already ignored — `webSocketTask` is nil by
+        // then, so `handleDelegateClose`'s identity guard drops them.
+        session?.invalidateAndCancel()
         session = nil
 
         // The send window belongs to one socket. Any completion handlers still
