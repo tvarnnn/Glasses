@@ -492,3 +492,98 @@ def test_the_registry_refuses_every_unoffered_pair(monkeypatch, built):
     assert registry.find_offer(root, "world_builder", "geometry") is None
     assert registry.find_offer(root, "document_memory", "status") is None
     assert registry.find_offer(None, "world_builder", "status")["available"] is False
+
+
+# -- the document and the code must not drift --------------------------
+
+
+def test_the_contract_document_matches_the_code():
+    """A contract document that drifts from the code is worse than none.
+
+    A fresh iOS client is told to implement from `CARTRIDGE-RESULTS.md`
+    without reading Tower's Python. Every number and identifier it quotes
+    is therefore load-bearing, and the only way to keep them honest is to
+    fail a test when they diverge.
+    """
+    import pathlib
+
+    from tower.results.publisher import (
+        DEFAULT_HEARTBEAT_SECONDS,
+        DEFAULT_POLL_SECONDS,
+        MAX_SUBSCRIPTIONS_PER_CONNECTION,
+        SEND_TIMEOUT_S,
+    )
+    from tower.results import contracts
+    from tower.routes import results_ws
+
+    document = pathlib.Path("docs/contracts/CARTRIDGE-RESULTS.md").read_text(
+        encoding="utf-8"
+    )
+
+    for value in (
+        contracts.ENVELOPE_CONTRACT,
+        contracts.WORLD_BUILDER_STATUS_CONTRACT,
+        contracts.CARTRIDGE_WORLD_BUILDER,
+        contracts.RESULT_TYPE_STATUS,
+        contracts.TIME_BASIS,
+    ):
+        assert value in document, f"the contract document never mentions {value!r}"
+
+    for label, value in (
+        ("subscriptions per connection", MAX_SUBSCRIPTIONS_PER_CONNECTION),
+        ("send timeout", SEND_TIMEOUT_S),
+        ("poll interval", DEFAULT_POLL_SECONDS),
+        ("heartbeat", DEFAULT_HEARTBEAT_SECONDS),
+    ):
+        rendered = str(int(value) if float(value).is_integer() else value)
+        assert rendered in document, (
+            f"the document does not state the {label} ({rendered})"
+        )
+
+    # Every error reason a client switches on must be documented.
+    reasons = [
+        getattr(results_ws, name)
+        for name in dir(results_ws)
+        if name.startswith("ERR_")
+    ]
+    assert reasons
+    for reason in reasons:
+        assert reason in document, f"undocumented error reason {reason!r}"
+
+    # And every message type on the wire.
+    for message_type in (
+        results_ws.MSG_CARTRIDGES,
+        results_ws.MSG_SUBSCRIBE,
+        results_ws.MSG_UNSUBSCRIBE,
+        results_ws.MSG_SUBSCRIBED,
+        results_ws.MSG_UNSUBSCRIBED,
+        results_ws.MSG_ERROR,
+    ):
+        assert message_type in document, f"undocumented message {message_type!r}"
+
+
+def test_every_payload_key_is_documented(monkeypatch, built):
+    """A key on the wire that the document never names is a key a consumer
+    has to guess at."""
+    import pathlib
+
+    root, _, _ = built
+    client = make_client(monkeypatch, root)
+    with client.websocket_connect("/ws") as ws:
+        subscribe(ws)
+        envelope = drain(ws, expect="cartridge_result")
+
+    document = pathlib.Path("docs/contracts/CARTRIDGE-RESULTS.md").read_text(
+        encoding="utf-8"
+    )
+    missing = []
+
+    def _walk(node, path=""):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key not in document:
+                    missing.append(f"{path}.{key}")
+                _walk(value, f"{path}.{key}")
+
+    _walk(envelope)
+    assert missing == [], f"undocumented payload keys: {missing}"
