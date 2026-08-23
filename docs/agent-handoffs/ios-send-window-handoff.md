@@ -1,12 +1,20 @@
 # iOS → Tower send-window investigation — cross-machine handoff
 
-**Status:** source-level implementation complete. **Never compiled. Never run.
-No test in this document has been executed.**
+**Status:** implementation complete. **Compiler- and test-validated on the Mac
+(Debug + Release build clean, 89/89 tests passing). NOT yet validated on
+hardware — no FPS measurement has been taken, so the actual fix is still
+unproven.**
 
 This work was produced on Windows, where there is no Xcode, no Swift compiler,
-no Simulator, no iPhone and no Meta DAT hardware. Every claim below is either a
-statement about source, a piece of arithmetic, or an explicitly labelled
-hypothesis. The Mac is the authoritative validation gate.
+no Simulator, no iPhone and no Meta DAT hardware. Every claim written there was
+either a statement about source, a piece of arithmetic, or an explicitly
+labelled hypothesis. The Mac was the authoritative validation gate for
+*correctness*; §11.2 records what it cleared.
+
+**The performance claim remains a hypothesis.** §15's predicted 10–12 fps has
+not been observed. The build-and-test gate says the change is safe to run, not
+that it is faster. §14 is the outstanding work and §16 must not be settled
+without it.
 
 ---
 
@@ -542,7 +550,9 @@ no way to verify. Tests were appended to the existing files instead.
 
 ---
 
-## 11. Verification actually performed on Windows
+## 11. Verification performed
+
+### 11.1 On Windows (implementation machine)
 
 **Performed:**
 
@@ -579,10 +589,10 @@ no way to verify. Tests were appended to the existing files instead.
   primary documentation (iOS 26.5 SDK header; Meta's versioned 0.9 API
   reference), not from memory.
 
-**NOT performed — no facility exists on this machine:**
+**NOT performed on Windows — no facility existed on that machine:**
 
 - ❌ Xcode compilation (Debug or Release)
-- ❌ XCTest execution — **every test described here is unrun**
+- ❌ XCTest execution — every test was unrun when this document was written
 - ❌ SwiftUI validation / previews
 - ❌ Swift concurrency and actor-isolation checking by the compiler
 - ❌ Simulator
@@ -590,6 +600,107 @@ no way to verify. Tests were appended to the existing files instead.
 - ❌ Meta DAT runtime validation
 - ❌ Physical Ray-Ban behaviour
 - ❌ Any FPS measurement whatsoever
+
+### 11.2 On the Mac — compile and test gate CLEARED
+
+Xcode 26.6 (build 17F113), iOS Simulator 26.5 SDK, simulator **iPhone 17 Pro**
+(the iPhone 16 Pro simulator named in §13 is not installed on this machine).
+Branch `ios/send-window-investigation` @ `7508db1`, working tree clean, no source
+changes were required to make any of this pass.
+
+**Now performed — these items are closed:**
+
+- ✅ **Package resolution.** `MetaWearablesDAT` resolves to **exactly 0.9.0**.
+- ✅ **Debug build: BUILD SUCCEEDED**, on the first attempt, with no edits. The
+  §13 note that compile errors were "the anticipated outcome" did not
+  materialise.
+- ✅ **Release build: BUILD SUCCEEDED** (`generic/platform=iOS`).
+- ✅ **XCTest execution: 89/89 pass, 0 failures.** Exactly the predicted count —
+  56 pre-existing + 33 new. Verified against the base: `d9e513d` has 56 test
+  methods, `7508db1` has 89. `SenderPipelineTests` 27 → 51 (+16 `SendWindowTests`,
+  +8 `SlotTimingMetricsTests`); `TowerClientTests` 19 → 28 (+9). **All 56
+  pre-existing tests still pass** — no regression.
+- ✅ **Six consecutive green runs.** The full suite was run 6 times end to end:
+  89/89 every time, zero flakes. This specifically clears **§12.4** (the
+  reconnect tests that use real wall-clock timing against a loopback server) and
+  the two deliberately main-actor-blocking stall tests
+  (`testAWedgedSendWindowReplacesTheConnection`,
+  `testAStalledMainActorIsNotMistakenForAWedgedSocket`). No timeout loosening was
+  needed.
+- ✅ **Swift concurrency / actor-isolation checking by the compiler.** The
+  project's `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` accepted the
+  `nonisolated` `SendWindow`, its tuple-array reservations, and the in-body
+  initialiser defaults. **§12.2 and §12.3 clear** — no Sendable warnings from
+  `DeviceHealth`'s notification observation.
+- ✅ **Meta DAT 0.9.0 thermal API validated at compile time.** The
+  highest-ranked risk in §12.1 is resolved: `WearablesInterface.deviceStateStream(for:)`
+  and `DeviceState.thermalLevel` both exist and compile against the real 0.9.0
+  package. The contingency in §12.1 and §16 — "delete just the DAT thermal code
+  and ship the sender work" — is **not needed**.
+- ✅ **New files are in the target automatically.** `SendWindow.o` and
+  `DeviceHealth.o` are produced by the synchronized group. `project.pbxproj`
+  remains unmodified; no test files were added.
+- ✅ **Simulator** — used as the XCTest host. Note this means the test *host*
+  ran; the app UI was not manually exercised there (see below).
+
+**Build warnings: 5, all pre-existing, none introduced by this branch.**
+
+A clean (non-incremental) Debug build emits five warnings in project sources,
+two of them "this is an error in the Swift 6 language mode". They were checked
+against the base rather than assumed: `d9e513d` was built in a scratch worktree
+under both configurations and emits the **identical five** — same kinds, same
+files, only the line numbers shifted by the new code above them.
+
+| Warning | At `d9e513d` | At `7508db1` |
+|---|---|---|
+| `FrameRateGate` — main actor-isolated static `tolerance` from nonisolated context | :104 | :104 |
+| `GlassesConnection` — `'as' test is always true` | :360 | :384 |
+| `TowerClient` — main actor-isolated static `webSocketURL` from nonisolated context | :114 | :247 |
+| `TowerClient` — captured var `self` in concurrently-executing code | :216 | :495 |
+| `TowerClient` — captured var `self` in concurrently-executing code | :305 | :596 |
+
+So this branch adds **zero** new warnings. They are worth fixing eventually —
+two are future Swift 6 errors — but they are not this change's defect and were
+deliberately not touched here.
+
+*Method note:* an incremental build recompiles nothing and therefore reports no
+warnings. Every warning count above comes from a clean build with a dedicated
+`-derivedDataPath`. A "no warnings" reading from an incremental build is not
+evidence.
+
+**Design constants verified to match this document:**
+`outboundLatencyBudget = 1.0/3.0`, capacity = `round(12 × 1/3)` = **4**,
+`sendStallTimeout = 2.0`, `mainActorGapAllowance = 1.0`, reconnect backoff
+`[0.5, 1, 2, 4, 8]`. `FrameRateGate.towerTargetFPS` is still `12` and the file is
+untouched by the diff. `project.pbxproj` untouched. §10's invariants hold at
+source level.
+
+### 11.3 STILL NOT performed — physical validation is outstanding
+
+**The compile-and-test gate proves the change is sound and safe to run. It says
+nothing whatsoever about whether it is faster.** Everything below is still open,
+and §15's expected result remains a *hypothesis, not a measurement*.
+
+- ❌ **Any FPS measurement whatsoever.** The 3.4 fps → 10–12 fps prediction is
+  unmeasured.
+- ❌ **iPhone deployment.** The physical iPhone 16 Pro is paired but was not
+  connected during this session.
+- ❌ **Meta DAT runtime validation.** The thermal symbols compile; they have
+  never been *run* against hardware, and `MockDeviceKit` cannot simulate thermal
+  (§8), so `glassesThermalLevel` remains physical-device-only and untested.
+- ❌ **Physical Ray-Ban behaviour.**
+- ❌ **Live Tower streaming over Tailscale**, and therefore no reading for
+  `Send ms`, `Slot ms`, `Main-actor hop ms`, `Window limit`, `Stall recoveries`
+  or `Uplink KB/s`.
+- ❌ **H1 / H2 / H3 remain unresolved** (§5.3). Nothing measured on the Mac
+  distinguishes them.
+- ❌ **SwiftUI previews / manual UI validation.** The views compile and the new
+  Developer sheet rows are unexercised visually; the app was not launched and
+  driven in the simulator.
+- ❌ **§16 merge criteria are NOT met.** The build and test criteria are
+  satisfied; the 5-minute ≥ 10 fps sustained-rate criterion, backlog stability,
+  clean Stop and sequence 1:1 on hardware are all still unverified. **Do not
+  merge on the strength of §11.2 alone.**
 
 ---
 
@@ -640,6 +751,10 @@ Ranked. Check these first.
 
 ## 13. Mac validation sequence
 
+> **Status: steps 1–5 COMPLETE and green. Step 6 (device) is outstanding.**
+> Results recorded in §11.2. Nothing below needed fixing; no source change was
+> made on the Mac. Re-run this sequence only if the branch moves.
+
 Run in this order. Do not skip to the device.
 
 ```bash
@@ -648,29 +763,45 @@ git checkout ios/send-window-investigation
 git log --oneline -3          # expect the send-window commit on top of d9e513d
 ```
 
-1. **Resolve packages.** Confirm meta-wearables-dat-ios pins to exactly 0.9.0.
-2. **Debug build.**
+Substitute the simulator you actually have. This machine has no iPhone 16 Pro
+simulator; validation was done on **iPhone 17 Pro** (Xcode 26.6, build 17F113,
+iOS Simulator 26.5 SDK). Check with `xcrun simctl list devices available`.
+
+1. ✅ **Resolve packages.** Confirm meta-wearables-dat-ios pins to exactly 0.9.0.
+   — **Done: resolves to exactly 0.9.0.**
+2. ✅ **Debug build.**
    ```bash
    xcodebuild -project Glasses.xcodeproj -scheme Glasses \
-     -destination 'platform=iOS Simulator,name=iPhone 16 Pro' build
+     -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
    ```
-   Expect to fix compile errors. That is the anticipated outcome, not a failure
-   of the design — see §12 for where they are most likely.
-3. **Confirm the two new files are in the target.** `SendWindow.swift` and
+   The original note here said to expect compile errors, and that fixing them
+   was the anticipated outcome. **That did not happen: BUILD SUCCEEDED on the
+   first attempt with no edits**, including the §12.1 DAT thermal symbols. The
+   warning about where errors were most likely (§12) is retained only as history.
+
+   Use a dedicated `-derivedDataPath` when you care about the warning output — an
+   incremental build recompiles nothing and reports no warnings, which is not
+   the same as being clean.
+3. ✅ **Confirm the two new files are in the target.** `SendWindow.swift` and
    `DeviceHealth.swift` should be compiled automatically via the synchronized
    group. If they are not, add them — but do **not** add new *test* files.
-4. **Run the tests.**
+   — **Done: both produce object files via the synchronized group;
+   `project.pbxproj` unmodified.**
+4. ✅ **Run the tests.**
    ```bash
    xcodebuild -project Glasses.xcodeproj -scheme Glasses \
-     -destination 'platform=iOS Simulator,name=iPhone 16 Pro' test
+     -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
    ```
+   — **Done: 89/89 pass, 0 failures.** Run 6 times consecutively, green every
+   time.
    - Expect **89** test methods total: the 56 pre-existing ones plus 33 added
      here (`SendWindowTests` 16, `SlotTimingMetricsTests` 8, and 9 appended to
-     `TowerClientTests`).
+     `TowerClientTests`). **Confirmed exactly.**
    - The 56 pre-existing tests **must all still pass**. Any regression there is a
-     defect in this change, not a test to update.
-   - **Every one of the 33 new tests is unrun.** Treat a failure among them as
-     equally likely to be a bad test as a bad implementation.
+     defect in this change, not a test to update. **They all pass.**
+   - ~~Every one of the 33 new tests is unrun.~~ **All 33 have now run and
+     pass.** The caution that a failure among them was as likely a bad test as a
+     bad implementation no longer applies to this commit.
    - Two of them (`testAWedgedSendWindowReplacesTheConnection`,
      `testAStalledMainActorIsNotMistakenForAWedgedSocket`) deliberately
      **busy-wait to block the main actor** for 0.2 s and 1.1 s respectively.
@@ -678,9 +809,19 @@ git log --oneline -3          # expect the send-window commit on top of d9e513d
      completion would run, the slot would come back, and there would be no stall
      left to detect. Blocking is the only way to hold a window open against a
      loopback server that answers instantly, and it makes both tests
-     deterministic rather than timing-dependent.
-5. **Release build**, to catch anything `#if DEBUG` hid.
-6. **Deploy to the physical iPhone.**
+     deterministic rather than timing-dependent. **Both pass, and were stable
+     across all 6 runs — §12.4's flakiness concern did not materialise and no
+     timeouts were loosened.**
+5. ✅ **Release build**, to catch anything `#if DEBUG` hid.
+   ```bash
+   xcodebuild -project Glasses.xcodeproj -scheme Glasses \
+     -destination 'generic/platform=iOS' -configuration Release \
+     build CODE_SIGNING_ALLOWED=NO
+   ```
+   — **Done: BUILD SUCCEEDED.** Nothing was hidden by `#if DEBUG`.
+6. ⬜ **Deploy to the physical iPhone.** — **OUTSTANDING.** This is where
+   validation currently stops. Proceed to §14; that procedure is entirely
+   unperformed and is what §16's merge criteria actually turn on.
 
 ---
 
@@ -798,11 +939,18 @@ branch is a strict addition on top of it.
 ## 18. Final Git state
 
 - Branch: `ios/send-window-investigation`
-- Commit: `76d3810` "Size the Tower send window to a latency budget and detect stalls"
+- Implementation commit: `76d3810` "Size the Tower send window to a latency budget and detect stalls"
 - Base: `ui/product-shell` @ `d9e513d` (unmodified)
 - `main` unmodified
 - `project.pbxproj` unmodified
 - Working tree clean; branch pushed
 
-**Implementation was produced on Windows without Xcode and has NOT yet been
-compiler- or device-validated.**
+**Validation state:** implementation was produced on Windows without Xcode, then
+compiler- and test-validated on the Mac at `7508db1` — Debug and Release builds
+clean, 89/89 tests passing across 6 consecutive runs, zero new warnings versus
+`d9e513d`. **No source change was required on the Mac; this branch's runtime
+behaviour is byte-identical to what Windows produced.**
+
+**It has NOT been device-validated.** No deployment to the physical iPhone, no
+Ray-Ban run, no Tower streaming, and no FPS measurement of any kind. See §11.3
+for the full outstanding list and §14 for the procedure that closes it.
