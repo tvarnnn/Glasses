@@ -261,21 +261,60 @@ def test_a_hostile_world_id_cannot_escape_the_world_root(monkeypatch, world):
 def test_the_channel_survives_the_world_vanishing_mid_subscription(
     monkeypatch, world
 ):
-    """Files can be purged while a subscriber is watching."""
-    import shutil
+    """Files can be deleted while a subscriber is watching.
+
+    Deliberately NOT via `shutil.rmtree(ignore_errors=True)`: on Windows
+    that partially succeeds against open handles, so the world survives in
+    pieces and the outcome depends on which files happened to go. An
+    earlier version of this test used it and passed or failed by luck.
+    Unlinking `world.json` is deterministic and is the stronger case
+    anyway -- the world becomes unreadable while the subscription is live.
+    """
+    from tests.result_channel_fixtures import pump
 
     root, world_id, _ = world
     client = make_client(monkeypatch, root)
     with client.websocket_connect("/ws") as ws:
         subscribe(ws)
-        drain(ws, expect="cartridge_result")
+        first = drain(ws, expect="cartridge_result")
+        assert first["payload"]["lifecycle"]["state"] == "ready"
 
-        shutil.rmtree(root, ignore_errors=True)
-
-        from tests.result_channel_fixtures import pump
+        WorldStore(root).world_path(world_id).unlink()
 
         pump(client)
         later = drain(ws, expect="cartridge_result")
 
     assert later["payload"]["lifecycle"]["state"] == "unavailable"
+    assert later["payload"]["world"] is None
     _assert_no_fabrication(later["payload"])
+    assert later["seq"] == 2, "the subscription survives and keeps its sequence"
+
+
+def test_a_partially_deleted_world_reports_honestly_and_does_not_crash(
+    monkeypatch, world
+):
+    """Deleting only the derived tree must degrade, not fabricate.
+
+    This is the state a purge or an interrupted rebuild leaves behind: the
+    journals survive and the geometry does not.
+    """
+    import shutil
+
+    from tests.result_channel_fixtures import pump
+
+    root, world_id, _ = world
+    shutil.rmtree(WorldStore(root).derived_dir(world_id), ignore_errors=True)
+
+    client = make_client(monkeypatch, root)
+    with client.websocket_connect("/ws") as ws:
+        subscribe(ws)
+        payload = drain(ws, expect="cartridge_result")["payload"]
+        pump(client)
+        drain(ws, expect="cartridge_result")
+
+    assert payload["lifecycle"]["state"] == "stopped_unbuilt"
+    assert payload["geometry"]["available"] is False
+    assert payload["progress"]["keyframes_accepted"] > 0, (
+        "the journals survived, so the counts must too"
+    )
+    _assert_no_fabrication(payload)
