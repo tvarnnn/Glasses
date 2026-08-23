@@ -712,9 +712,17 @@ is absent.
  "images_purged_meaning": "..."}
 ```
 
-**No imagery is offered, and none will be under this contract.** World
-Builder keyframes are written with `redaction: "none"` — raw first-person
-frames. `IOS-to-Tower.md` §5 requires an image whose treatment is not
+**No imagery is offered, and none will be under this contract.** Since
+2026-08-23 keyframes are **face-redacted before they are written**, and
+`redaction` reports what the session recorded — e.g.
+`faces-detected-and-filled/yunet-2023mar@0.30`, naming the detector and
+its threshold. That is a **process** claim ("this detector's hits were
+filled"), never an outcome claim: the detector has measured false
+negatives on heavily occluded and ~90°-rotated faces. Sessions captured
+before that date keep `none` forever.
+
+They stay unfetchable regardless. A best-effort filter is not grounds to
+start shipping first-person imagery. `IOS-to-Tower.md` §5 requires an image whose treatment is not
 `redacted` to be **withheld**, with no lenient default. So the channel
 declares that the images exist and that they are not fetchable, and mints
 **no id and no URL** — inventing a fetch scheme would be exactly the

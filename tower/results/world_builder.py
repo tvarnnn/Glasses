@@ -531,7 +531,9 @@ class WorldBuilderStatusProducer:
                 store, world, session_id, manifest, geometry_current, keyframes_now
             ),
             "persistence": _persistence_block(world),
-            "artifacts": _artifacts_block(store, world.world_id, session_id, world),
+            "artifacts": _artifacts_block(
+                store, world.world_id, session_id, world, session
+            ),
             "time_basis": TIME_BASIS,
         }
 
@@ -1196,7 +1198,7 @@ def _persistence_block(world) -> dict:
     }
 
 
-def _artifacts_block(store, world_id, session_id, world) -> dict:
+def _artifacts_block(store, world_id, session_id, world, session=None) -> dict:
     """What imagery exists, and why none of it is offered.
 
     `IOS-to-Tower.md` 5 is the strictest rule in the document: an image
@@ -1204,13 +1206,18 @@ def _artifacts_block(store, world_id, session_id, world) -> dict:
     -- withheld", and there is "deliberately no `.probablySafe` and no
     lenient default".
 
-    World Builder keyframe images are written with `redaction: "none"`
-    (records.py Session.redaction, whose comment says "none" is the honest
-    V1 value: no redaction is implemented). They are raw first-person
-    frames. So they are reported as PRESENT and NOT FETCHABLE, and no id
-    or URL is minted for them -- iOS holds "no URL, no id format, and no
-    bytes", and inventing a fetch scheme would be exactly the fabricated
-    contract that document refuses to produce.
+    Since 2026-08-23 keyframes are face-redacted before they are written,
+    and the session records WHICH detector ran at WHICH threshold. That is
+    reported here verbatim rather than being collapsed to a boolean,
+    because the value is a process claim ("this detector's hits were
+    filled") and not an outcome claim ("there are no faces"). Sessions
+    captured before that keep `none` forever.
+
+    They are still reported as NOT FETCHABLE, and no id or URL is minted.
+    A best-effort filter with measured false negatives is not grounds to
+    start shipping first-person imagery over the wire, and iOS holds "no
+    URL, no id format, and no bytes" -- inventing a fetch scheme would be
+    exactly the fabricated contract that document refuses to produce.
     """
     # `present` is TRI-STATE. False is a positive claim that no imagery
     # exists, and this flag cannot support it: a review found a world with
@@ -1235,12 +1242,18 @@ def _artifacts_block(store, world_id, session_id, world) -> dict:
         "keyframe_images": {
             "present": present,
             "count": count,
-            "redaction": "none",
+            # What the SESSION recorded, not a constant. A hardcoded
+            # "none" survived the arrival of real redaction for exactly as
+            # long as it took someone to look.
+            "redaction": (
+                session.redaction if session is not None else "none"
+            ),
             "fetchable": False,
             "reason": (
-                "these are unredacted first-person frames and no artifact "
-                "transfer contract exists; a consumer must withhold imagery "
-                "whose treatment is not stated"
+                "no artifact transfer contract exists, and these remain "
+                "first-person frames whose redaction is best-effort with "
+                "measured false negatives; a consumer must withhold imagery "
+                "it cannot verify"
             ),
         },
         # The FLAG, reported as a flag. An audit confirmed it deletes

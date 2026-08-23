@@ -479,10 +479,15 @@ def test_keyframe_imagery_is_reported_present_but_never_fetchable(
 
     assert images["present"] is True
     assert images["count"] > 0
-    assert images["redaction"] == "none"
+    # What the SESSION recorded, not a constant. Keyframes are now
+    # face-redacted before they are written, and a hardcoded "none" here
+    # survived that change for exactly as long as it took someone to look.
+    assert images["redaction"] == "faces-detected-and-filled/yunet-2023mar@0.30"
     assert images["fetchable"] is False
     assert "id" not in images and "url" not in images
-    assert "no artifact transfer contract exists" in images["reason"]
+    # Unfetchable REGARDLESS. A best-effort filter with measured false
+    # negatives is not grounds to start shipping first-person imagery.
+    assert "withhold imagery it cannot verify" in images["reason"]
 
 
 def test_no_filesystem_path_reaches_the_client(monkeypatch, built):
