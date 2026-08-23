@@ -1,11 +1,14 @@
 # Cartridge Integration — cross-machine handoff
 
-**Status:** source-level implementation complete. **Never compiled. Never run.
-No test in this document has been executed.**
+**Status:** **Mac compiler-, test- and Simulator-validated.** Debug and Release
+both build; the full suite runs **225/225 green**, repeated five times with no
+flakes; the Simulator smoke test passes. **Physical validation is still
+outstanding** — see §11.4 and §13.
 
 Produced on Windows: no Xcode, no Swift compiler, no Simulator, no iPhone, no
-Meta DAT hardware. Every claim here is a statement about source, an argument, or
-a labelled hypothesis. The Mac is the authoritative validation gate.
+Meta DAT hardware. Every claim here began as a statement about source, an
+argument, or a labelled hypothesis. The Mac was the authoritative validation
+gate and has now been passed; §11.4 records what it actually found.
 
 A fresh Mac Claude should be able to continue from this document alone.
 
@@ -15,8 +18,9 @@ A fresh Mac Claude should be able to continue from this document alone.
 
 ```bash
 git fetch origin
-git checkout ios/cartridge-integration
-git log --oneline -10     # expect 8 commits on top of 6a2d114
+git checkout ios/integration-candidate
+git log --oneline -14     # 11 commits on top of 6a2d114, plus the fix commits
+                          # and the merge of 97aa79c
 ```
 
 Then, in order:
@@ -140,7 +144,9 @@ layer — see §4.
 ### 3.2 The asymmetry in what each workspace receives
 
 `WorldBuilderWorkspaceView` takes `glasses` **and** `tower`; the other three take
-`tower` only. This is load-bearing rather than incidental: World Builder shows
+`isTowerReachable: Bool` and their client — not `tower` at all, which is stricter
+than this section originally claimed and is what `TowerReachabilityReader`
+exists to supply. This is load-bearing rather than incidental: World Builder shows
 the viewfinder and owns one of the app's two capture buttons. The other three
 show what the Tower knows, have no session control, and **are not handed the
 object that could start one**.
@@ -205,7 +211,7 @@ of `any FooClient` to become generic. The subscription is cancelled by
 
 ## 4. The shared layer, and why each piece earns its place
 
-`Glasses/Cartridges/Integration/` — five files, no generics over cartridges, no
+`Glasses/Cartridges/Integration/` — six files, no generics over cartridges, no
 plugin framework.
 
 | Type | File | Justification (the rule: 2+ cartridges must plausibly need it) |
@@ -314,9 +320,12 @@ computed across two clocks whose relationship is an open question in
 
 Retrieval models three answers, not two: `matched(confidence:)`, `notFound`, and
 **`noObservation`** — "the memory holds nothing covering that, which is not the
-same as it not existing" (Core Principle 3). `DocumentQueryResult.init` coerces a
-`matched` result carrying no documents into `notFound`, so a future decoder
-cannot produce that combination by accident.
+same as it not existing" (Core Principle 3). `DocumentQueryResult.init` **throws**
+`CartridgeFailure(kind: .undecodableResponse)` for a `matched` result carrying no
+documents, so a future decoder cannot produce that combination by accident. It
+throws rather than coercing to `notFound` deliberately: "the Tower said it
+matched but sent nothing" is an unreadable answer, not a negative one, and
+downgrading it would invent the very distinction this section exists to keep.
 
 `DocumentQueryOrigin` (`appText` / `externalIntent`) is separate from the query,
 so a future Siri intent or wake-word layer submits through the same path. **No
@@ -404,7 +413,7 @@ observes it — the 24 Hz re-render regression it caused is not reintroduced.
 
 Checked by two tests in `TowerClientTests` against a **real socket**:
 
-- `testSwitchingCartridgesDoesNotDisturbALiveStream` — opens a connection, opens
+- `testDiscardingCartridgeViewModelsDoesNotDisturbALiveStream` — opens a connection, opens
   a stream bracket, builds and discards all four view models three times, then
   asserts the status is still `.online`, the bracket is still open, **nothing new
   reached the wire**, and a frame still gets through afterwards.
@@ -426,7 +435,7 @@ Builder only), and it is a Simulator/device check — §12.
 
 | File | Purpose |
 |---|---|
-| `Glasses/Cartridges/Integration/CartridgePhase.swift` | The six truthful phases; `mayCarryData` is the load-bearing property |
+| `Glasses/Cartridges/Integration/CartridgePhase.swift` | The seven truthful phases; `mayCarryData` is the load-bearing property |
 | `Glasses/Cartridges/Integration/CartridgeAvailability.swift` | Availability, contract identity, failure |
 | `Glasses/Cartridges/Integration/CartridgeClient.swift` | The shared client question + `TowerCapabilities` |
 | `Glasses/Cartridges/Integration/Observation.swift` | `WorldScaleSemantics` (moved), provenance, time, observed duration |
@@ -450,7 +459,7 @@ Builder only), and it is a Simulator/device check — §12.
 - `Glasses/ContentView.swift` — three new switch arms, each wrapped in `TowerReachabilityReader`
 - `Glasses/ProjectManager.swift` — owns `CartridgeClients`; nothing else changed
 - `Glasses/Cartridges/Cartridge.swift` — `workspace:` on Experimental CV Lab; two new catalog entries
-- `Glasses/Workspaces/CartridgeWorkspace.swift` — three cases, `CaseIterable` restored (now used by a test)
+- `Glasses/Workspaces/CartridgeWorkspace.swift` — four cases, three of them new, `CaseIterable` restored (now used by a test)
 - `Glasses/Workspaces/WorldBuilder/WorldModel.swift` — new fields and `.finalizing`; `WorldScaleSemantics` moved out; client/source types moved out
 - `Glasses/Workspaces/WorldBuilder/WorldBuilderWorkspaceView.swift` — uses `WorldBuilderViewModel`, passes availability
 - `Glasses/Workspaces/WorldBuilder/WorldCanvasView.swift` — availability gate, `.finalizing`, new summary rows
@@ -468,13 +477,13 @@ Builder only), and it is a Simulator/device check — §12.
 
 ### Modified — tests
 
-- `GlassesTests/ProductShellTests.swift` — +96 tests
+- `GlassesTests/ProductShellTests.swift` — +110 tests (26 -> 136)
 - `GlassesTests/TowerClientTests.swift` — +3 tests
 
 ### NOT modified
 
 **`Glasses.xcodeproj/project.pbxproj` was NOT touched.** `Glasses/` is a
-filesystem-synchronized group, so the 16 new app sources compile automatically.
+filesystem-synchronized group, so the 18 new app sources compile automatically.
 `GlassesTests/` is **not** — its files are listed explicitly — so **no new test
 file was added**; all new tests were appended to the two existing files. Adding a
 test file requires hand-editing `project.pbxproj`, which was judged a worse risk
@@ -654,6 +663,90 @@ git log --oneline -6
 
 ---
 
+---
+
+## 11.4 Mac validation actually performed
+
+Run on the Mac against `ios/integration-candidate`, Xcode 26.6 (17F113), iOS
+Simulator 26.5, iPhone 17 Pro. Every number below is measured, not predicted.
+
+**SPM pin.** `meta-wearables-dat-ios` resolved to exactly **0.9.0**, revision
+`9b1b83d791dfebff7afd452e924a256819094b64`. The pbxproj requirement is
+`kind = exactVersion; version = 0.9.0`. Note that `Package.resolved` is matched
+by `.gitignore` and is **not** tracked, so the pin is enforced by the project
+file alone; a fresh clone re-resolves. That is adequate for an exact-version pin
+but worth knowing.
+
+**Builds.** Debug **BUILD SUCCEEDED**. Release **BUILD SUCCEEDED**. Both from a
+clean `-derivedDataPath`.
+
+**Tests. 225 executed, 225 passed, 0 failed, 0 skipped** — exactly the count §9
+predicted. The suite was run **five times**; every run was 225/225. **No flakes
+were observed**, including the six tests flagged as timing-sensitive.
+
+**One real compile error was found and fixed**, in the test target only:
+`XCTAssertTrue(await waitUntil { ... })` at two sites added by this branch is
+`'async' call in an autoclosure that does not support concurrency` — an error,
+not a warning. Fixed by binding the wait to a `let` first, which is what the
+other sixty-five `waitUntil` calls in the same file already do. This is exactly
+the class §16 anticipated under **Revise**. No production code was involved.
+
+**Warnings.** The bar in §16 was "no new warnings against `6a2d114`". That bar is
+**unsatisfiable as written, because `6a2d114` does not compile** — see §11.5. The
+comparison was made against `7508db1`, the most recent revision that does build,
+and after one fix the result is **better than the baseline, not merely equal**:
+
+| Configuration | `7508db1` | this branch |
+|---|---|---|
+| Debug | 5 | **4** |
+| Release | 2 | **1** |
+
+The one genuinely new warning this line of work introduced — a main-actor
+isolated `webSocketURL` read from a computed default argument in
+`connectIfIdle(to:)` — was fixed, and the identical pre-existing one in
+`connect(to:)` went with it. The remaining four are all pre-existing and
+unchanged: `FrameRateGate.swift:104` (`tolerance` from a nonisolated context),
+`GlassesConnection.swift:407` (`'as' test is always true`), and two
+`reference to captured var 'self' in concurrently-executing code` in
+`TowerClient.swift`. **Those last two are errors in the Swift 6 language mode**
+and are the first thing to fix before that migration; they are on the frame send
+path and the lifecycle-marker path.
+
+**Simulator smoke test.** Passed on the object-lifetime check, which §12 calls
+the single most important line in this document:
+`[Glasses][Init] GlassesConnection created` appeared **exactly once**. The
+console also confirms the two invariants the automated suite covers only from
+the Tower side — Tower auto-connect was attempted and the socket opened, while
+**no camera session was created and no `stream_start` was sent**. Auto-connect
+does not auto-stream, and the camera stayed inactive.
+
+## 11.5 `ios/product-shell-v2` @ `6a2d114` does not compile
+
+Established on the Mac, not inferred. A clean Debug **and** a clean Release build
+of `6a2d114` both **FAIL**, with three errors in one file:
+
+```
+Glasses/Workspaces/WorldBuilder/WorldBuilderWorkspaceView.swift:197:13:
+  error: type 'ObservableWorldModelSource' does not conform to protocol 'ObservableObject'
+Glasses/Workspaces/WorldBuilder/WorldBuilderWorkspaceView.swift:202:6:
+  error: initializer 'init(wrappedValue:)' is not available due to missing import of defining module 'Combine'
+Glasses/Workspaces/WorldBuilder/WorldBuilderWorkspaceView.swift:206:41:
+  error: call to main actor-isolated initializer 'init()' in a synchronous nonisolated context
+```
+
+`ObservableWorldModelSource` declared `@Published` without importing Combine.
+**`85d323c` on this branch removed that type outright** when the World Builder
+model layer was rebuilt around the client seam, so the defect is repaired here
+incidentally rather than deliberately.
+
+Two consequences worth stating plainly. **`ios/product-shell-v2` must never be
+merged on its own** — it would put a non-building tree on `main`. And the "112
+tests" §9 attributes to `6a2d114` is a correct *static* count of test methods,
+but those tests could never have been executed at that revision. Only the 89 at
+`7508db1` and the 225 here have actually run.
+
+---
+
 ## 12. Simulator smoke test
 
 **Object lifetime first.** Watch the console for
@@ -796,9 +889,16 @@ Specific reconciliation points, per cartridge:
 ## 16. Merge / revise / revert criteria
 
 **Merge** when: Debug and Release build clean; all 225 tests pass; no new
-warnings against `6a2d114`; the Simulator smoke test in §12 passes; and the
-physical cartridge-switching check in §13.1 shows an uninterrupted stream and a
-single `GlassesConnection created` line.
+warnings against the most recent revision that builds; the Simulator smoke test
+in §12 passes; and the physical cartridge-switching check in §13.1 shows an
+uninterrupted stream and a single `GlassesConnection created` line.
+
+**Status of that gate: four of five are met**, as recorded in §11.4 — builds,
+tests, warnings (better than baseline) and the Simulator smoke test. The fifth,
+§13.1, is a hardware check and **remains outstanding**; it cannot be performed
+without Ray-Bans, an iPhone and a running Tower. The warning clause originally
+named `6a2d114` as the baseline; it cannot be, because that revision does not
+compile (§11.5).
 
 **Revise** if: compile errors are confined to imports, isolation annotations, or
 switch exhaustiveness (all expected, all local); or a test fails in a way that
@@ -1031,5 +1131,6 @@ question in §6.
 
 ---
 
-**This implementation was produced on Windows without Xcode and has NOT yet been
-compiler-, Simulator-, or physical-device-validated.**
+**This implementation was produced on Windows without Xcode. It has since been
+compiler-, test- and Simulator-validated on a Mac — see §11.4 — and remains
+NOT physical-device-validated.**

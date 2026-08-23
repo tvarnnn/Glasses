@@ -1,11 +1,23 @@
 # Product Shell V2 — cross-machine handoff
 
-**Status:** source-level implementation complete. **Never compiled. Never run.
-No test in this document has been executed.**
+**Status:** **SUPERSEDED, and this branch's tip does not build.** A Mac
+established that `6a2d114` **fails to compile** in both Debug and Release. Do
+**not** merge `ios/product-shell-v2` on its own — it would put a non-building
+tree on `main`.
+
+The three errors are all in `Glasses/Workspaces/WorldBuilder/WorldBuilderWorkspaceView.swift`:
+`ObservableWorldModelSource` declares `@Published` without importing Combine, so
+it does not conform to `ObservableObject`, its `StateObject(wrappedValue:)` is
+unavailable, and its initialiser is called from a nonisolated context. The type
+was **removed outright by `85d323c`** on `ios/cartridge-integration` when the
+World Builder model layer was rebuilt around the client seam, so the defect is
+repaired downstream. Take this work through that branch — or through
+`ios/integration-candidate`, which contains both and is Mac-validated.
 
 Produced on Windows: no Xcode, no Swift compiler, no Simulator, no iPhone, no
 Meta DAT hardware. Every claim here is a statement about source, an argument, or
-a labelled hypothesis. The Mac is the authoritative validation gate.
+a labelled hypothesis. The Mac was the authoritative validation gate, and this
+revision did not pass it.
 
 ---
 
@@ -450,8 +462,13 @@ were appended to existing ones.
 
 ## 15. Tests
 
-**112 total: 89 pre-existing (Mac-validated) + 23 new. Every new test is
-unrun.**
+**112 total: 89 pre-existing (Mac-validated) + 23 new.**
+
+A Mac has since confirmed **112 is the correct static count of test methods at
+`6a2d114`**, and the "89 pre-existing + 23 new" split is exactly right. But none
+of them ever ran at this revision and none ever can: the app target does not
+compile here, so the test target cannot link. The 23 new tests were first
+executed as part of the 225 on `ios/integration-candidate`, where they pass.
 
 Appended to `GlassesTests/ProductShellTests.swift` (16):
 - `CartridgeWorkspaceTests` — a workspace never promotes a cartridge's status;
@@ -674,5 +691,7 @@ here only because the brief directs this work explicitly; the two-axis model in
 - `project.pbxproj` untouched
 - Working tree clean; branch pushed
 
-**Product Shell V2 was implemented on Windows without Xcode and has NOT yet
-been compiler-, Simulator-, or physical-device-validated.**
+**Product Shell V2 was implemented on Windows without Xcode. A Mac has since
+found that this branch's tip does NOT compile; the defect is fixed downstream on
+`ios/cartridge-integration`. Validate and merge through
+`ios/integration-candidate`, not through this branch.**

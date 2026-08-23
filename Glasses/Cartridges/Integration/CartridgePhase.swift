@@ -19,7 +19,7 @@ import Foundation
 ///
 /// What *is* genuinely shared is the coarse question a shell asks about any
 /// cartridge: is there nothing here, is something in flight, is there data, did
-/// it fail? That question has the same six answers for all four cartridges, and
+/// it fail? That question has the same seven answers for all four cartridges, and
 /// the app needs it in exactly two places:
 ///
 /// 1. shared presentation — one panel that renders "nothing yet" identically

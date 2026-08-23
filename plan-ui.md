@@ -1,5 +1,24 @@
 # Glasses iOS — Product Shell V2 Autonomous Implementation Mission
 
+> **HISTORICAL BRIEF — this mission has been carried out and superseded.**
+> Kept as the record of what was asked for and under what constraints; it is not
+> a live contract and its branch revisions are no longer current.
+>
+> Where it stands now: Product Shell V2 shipped as `319a23b`/`6a2d114` on
+> `ios/product-shell-v2`, **which does not compile** — see that branch's handoff.
+> The cartridge integration work on `ios/cartridge-integration` repaired it and
+> built on top. Both, plus the sender line's Mac-validation commit `97aa79c`,
+> are reconciled on **`ios/integration-candidate`**, which a Mac has validated:
+> Debug and Release build, 225/225 tests pass across five runs with no flakes,
+> and the Simulator smoke test passes. Physical hardware validation is still
+> outstanding.
+>
+> The revisions named below (`ui/product-shell @ d9e513d`,
+> `ios/send-window-investigation @ 7508db1`) were current when this was written.
+> `ios/send-window-investigation` has since advanced to `97aa79c`, a docs-only
+> commit recording that Mac validation. Resolve branch state from Git, as this
+> document itself instructs, rather than from these lines.
+
 You are the iOS/Mac-side engineering agent for the Glasses project.
 
 You are CURRENTLY RUNNING ON WINDOWS.

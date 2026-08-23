@@ -50,7 +50,9 @@ message, no capability declaration, and no per-cartridge channel.
 
 `mean_intensity` is currently the **only** thing the Tower says about a frame's
 content, and it is surfaced on the Home workspace precisely so the app can show
-something real rather than needing a "coming soon" panel.
+something real rather than needing a "coming soon" panel — in **Debug builds**.
+The whole capture-and-forward path is `#if DEBUG`, so a Release build never
+sends a frame and therefore never receives a `frame_result` to display.
 
 ### Cross-cutting, before the per-cartridge sections
 
