@@ -19,14 +19,15 @@ A fresh Mac Claude should be able to continue from this document alone.
 ```bash
 git fetch origin
 git checkout ios/integration-candidate
-git log --oneline -14     # 11 commits on top of 6a2d114, plus the fix commits
-                          # and the merge of 97aa79c
+git log --oneline -18     # 15 commits on top of 6a2d114: the 11 that built this
+                          # change, the merge of 97aa79c, and three Mac fixes
 ```
 
 Then, in order:
 
-1. **§11** — the Xcode validation sequence. Debug build, 225 tests, Release
-   build, warning comparison against `6a2d114`.
+1. **§11.4 first** — what the Mac actually found, so you do not re-run a gate
+   that has already passed. §11 is the sequence itself; its warning comparison
+   is against `7508db1`, not `6a2d114` (§11.5 explains why).
 2. **§10** — read *before* fixing the first compile error. It ranks where errors
    are most likely and records two candidate errors that were investigated and
    dismissed, so you do not re-derive them.
@@ -40,8 +41,9 @@ Then, in order:
 
 Three things to know before you start:
 
-- **Nothing here has been compiled.** Expect compile errors; that is the
-  anticipated outcome, not a failure of the change.
+- ~~**Nothing here has been compiled.**~~ **Superseded.** This branch has now
+  been compiled and tested on a Mac — see §11.4. One compile error was found, in
+  the test target, and fixed. Expect none on a fresh checkout.
 - **`project.pbxproj` was not touched**, and does not need to be. The 18 new app
   sources compile via the synchronized group; no new *test* file was added.
 - **Two decisions in this change are product questions, not engineering ones** —
@@ -463,6 +465,7 @@ Builder only), and it is a Simulator/device check — §12.
 - `Glasses/Workspaces/WorldBuilder/WorldModel.swift` — new fields and `.finalizing`; `WorldScaleSemantics` moved out; client/source types moved out
 - `Glasses/Workspaces/WorldBuilder/WorldBuilderWorkspaceView.swift` — uses `WorldBuilderViewModel`, passes availability
 - `Glasses/Workspaces/WorldBuilder/WorldCanvasView.swift` — availability gate, `.finalizing`, new summary rows
+- `Glasses/TowerClient.swift` — **added during Mac validation, not on Windows.** `connect(to:)`/`connectIfIdle(to:)` resolve the URL in the body instead of in a default argument; `teardownConnection` invalidates the `URLSession`. See §11.4.
 
 ### New — docs
 
@@ -492,16 +495,32 @@ than two large test files.
 `Info.plist` untouched. The multiple-scenes hazard from Product Shell V2 §11 is
 **still open and still not fixed** — see §14.
 
-Sender, camera, DAT, `TowerClient` transport, `GlassesConnection`,
-`ProjectManager`, `StreamManager`, `SenderMetrics`, `SendWindow`,
-`FrameRateGate`, `DeviceHealth`, Developer Tools: **all unchanged.**
+Sender, camera, DAT, `GlassesConnection`, `StreamManager`, `SenderMetrics`,
+`SendWindow`, `FrameRateGate`, `DeviceHealth`, Developer Tools: **all
+unchanged** — `SendWindow.swift`, `SenderMetrics.swift` and `FrameRateGate.swift`
+are byte-identical to `7508db1`.
+
+**`TowerClient.swift` is NOT unchanged**, and this sentence used to claim it was.
+Two changes landed on it during Mac validation, both recorded in §11.4:
+`connect(to:)` and `connectIfIdle(to:)` now take `URL? = nil` and resolve
+`TowerConfiguration.webSocketURL` in the body rather than in a default argument;
+and `teardownConnection` now calls `session?.invalidateAndCancel()` before
+`session = nil`. The transport itself — framing, the send path, the send window,
+stall detection, the reconnect schedule — is unchanged. Anyone debugging a Tower
+connection should read those two commits first.
 
 ---
 
 ## 9. Tests
 
-**225 total: 112 pre-existing (Mac-validated at `7508db1`) + 113 new.
-EVERY NEW TEST IS UNRUN — NOT RUN ON WINDOWS.**
+**225 total: 112 pre-existing + 113 new. All 225 now pass on a Mac** — see
+§11.4.
+
+Two corrections to what this line used to say. The 112 pre-existing are the count
+at **`6a2d114`**, not at `7508db1`, which has **89** — and since `6a2d114` does
+not compile (§11.5), those 112 had never actually run either; only the 89 at
+`7508db1` had. And "EVERY NEW TEST IS UNRUN" was true only until the Mac ran
+them.
 
 | File | Base | Now | Added |
 |---|---|---|---|
@@ -639,25 +658,33 @@ Recorded so the Mac session does not re-derive them.
 
 ```bash
 git fetch origin
-git checkout ios/cartridge-integration
-git log --oneline -6
+git checkout ios/integration-candidate
+git log --oneline -16
 ```
+
+**Not `ios/cartridge-integration`.** That branch's tip is `d6d79b8`, whose test
+target does not compile and which lacks the `97aa79c` merge. `ios/integration-candidate`
+is the validated line.
 
 1. **Resolve packages.** Confirm `meta-wearables-dat-ios` pins to exactly 0.9.0.
 2. **Debug build** (`xcodebuild -scheme Glasses -configuration Debug -sdk iphonesimulator build`).
-   Fix compile errors; §10 ranks where they are most likely. The 16 new app
+   Fix compile errors; §10 ranks where they are most likely. The 18 new app
    sources should appear automatically via the synchronized group — **confirm
    they did** before concluding anything about warnings.
-3. **Run all tests.** Expect **225**. The **112 pre-existing must still pass** —
-   any regression there is a defect in this change.
+3. **Run all tests.** Expect **225**, all passing. The **112 carried forward
+   must still pass** — any regression there is a defect in this change. Note
+   they were never green at `6a2d114` either, because it does not build
+   (§11.5); their first passing run is the one recorded in §11.4.
 4. **Release build**
    (`xcodebuild -scheme Glasses -configuration Release -sdk iphoneos build`).
    This is the gate §14 exists for. The three new workspaces contain **no**
    `#if DEBUG` at all and reference no camera symbols, so they should build
    unchanged in Release — that claim is exactly what this step tests.
-5. **Compare warnings against `6a2d114`.** The bar is **no new warnings**. The
-   send-window handoff records five clean-build warnings at `d9e513d`, unchanged
-   through `7508db1`; expect the same five.
+5. **Compare warnings against `7508db1`, not `6a2d114`.** The bar is **no new
+   warnings**. `6a2d114` cannot serve as a baseline because it does not compile
+   (§11.5). The send-window handoff records five clean-build warnings at
+   `d9e513d`, unchanged through `7508db1`. This branch is now at **4 Debug / 1
+   Release** — below that baseline, not merely equal; §11.4 has the table.
 6. **Simulator UI smoke test** — §12.
 7. **Physical iPhone + Ray-Ban** — §13.
 
@@ -711,6 +738,17 @@ unchanged: `FrameRateGate.swift:104` (`tolerance` from a nonisolated context),
 `TowerClient.swift`. **Those last two are errors in the Swift 6 language mode**
 and are the first thing to fix before that migration; they are on the frame send
 path and the lifecycle-marker path.
+
+**One defect was found by review rather than by the compiler, and fixed.**
+`teardownConnection` set `session = nil` without invalidating the `URLSession`.
+A `URLSession` retains its delegate until invalidated, so the session, its
+delegate queue and the `TowerClient` survived every teardown — once per connect,
+for the life of the process. Inherited from `main`, but this line of work is what
+makes it bite: `autoReconnect` is on, the app connects at launch, and the
+reconnect budget refills after every 30s of healthy connection, so the leak fires
+on its own once per drop rather than once per user tap. Three independent reviews
+found it. It is invisible to all 225 tests and to both builds, which is worth
+remembering about what a green suite proves.
 
 **Simulator smoke test.** Passed on the object-lifetime check, which §12 calls
 the single most important line in this document:
@@ -911,9 +949,13 @@ the camera stops on a workspace change. Those are the invariants this change
 exists to preserve, and none of them is worth trading for four screens that
 currently say "nothing yet".
 
-Revert is cheap: the branch touches no runtime file. Dropping the three new
-workspace arms from `ContentView` and the two new catalog entries restores
-Product Shell V2 behaviour exactly.
+Revert is **not** as cheap as this section used to claim. The branch modifies
+eight runtime files — §8 lists them — so a revert is a real revert, not a matter
+of dropping two switch arms. And it cannot target `6a2d114`, because that
+revision does not compile (§11.5); the nearest revision that builds is
+`7508db1`, which predates the product shell rebuild entirely. Reverting means
+choosing between a tree that does not build and losing Product Shell V2 with
+this change.
 
 ---
 

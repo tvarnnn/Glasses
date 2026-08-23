@@ -30,18 +30,22 @@ revision did not pass it.
 | Product-shell ancestor | `ui/product-shell` @ `d9e513d` (untouched) |
 | `main` | `645e57d` (untouched) |
 
-**One discrepancy to record.** The brief said the sender candidate had since been
-Mac-validated and to look for an updated handoff/commit rather than assume
-`7508db1` was still HEAD. **There is no such commit.** `git ls-remote` showed
+**One discrepancy to record — since resolved.** The brief said the sender
+candidate had since been Mac-validated and to look for an updated
+handoff/commit rather than assume `7508db1` was still HEAD. At the time there
+was no such commit: `git ls-remote` showed
 `refs/heads/ios/send-window-investigation` still at `7508db1`, with a clean tree
-and no new docs. The Mac session's documentation commit never reached this
-remote.
+and no new docs.
+
+**It has since surfaced.** `97aa79c` is exactly that documentation commit, and
+the prediction below held — it touches only `docs/` and merged cleanly, at
+`6ef979e` on `ios/integration-candidate`. Nothing is left to reconcile.
 
 Basing from `7508db1` is correct regardless: the brief's own account of the
 validation ("89/89 tests passing") matches exactly the count predicted in
 `ios-send-window-handoff.md` (56 pre-existing + 33 added), so the Mac validated
 this branch as-is. **If a Mac documentation commit surfaces later it will merge
-cleanly — it touches only `docs/`.** Worth reconciling before merge.
+cleanly — it touches only `docs/`.** It did, and it has been; see above.
 
 Working tree at start: clean apart from the untracked `plan-ui.md`.
 

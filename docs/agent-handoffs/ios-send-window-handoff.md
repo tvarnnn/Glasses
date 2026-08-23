@@ -694,9 +694,14 @@ and §15's expected result remains a *hypothesis, not a measurement*.
   or `Uplink KB/s`.
 - ❌ **H1 / H2 / H3 remain unresolved** (§5.3). Nothing measured on the Mac
   distinguishes them.
-- ❌ **SwiftUI previews / manual UI validation.** The views compile and the new
-  Developer sheet rows are unexercised visually; the app was not launched and
-  driven in the simulator.
+- ⚠️ **SwiftUI previews / manual UI validation — partly done since.** The app
+  has now been launched in the Simulator on `ios/integration-candidate`: it
+  renders, `GlassesConnection` is created exactly once, Tower auto-connect is
+  attempted, and the camera stays off. But the shell it renders is the
+  cartridge-driven one, not the `SessionView` this document describes — that
+  file was deleted by `319a23b`. The **Developer sheet rows remain unexercised
+  visually**, and nothing that needs a live camera or a reachable Tower can be
+  driven in the Simulator, so every sender row is still unread.
 - ❌ **§16 merge criteria are NOT met.** The build and test criteria are
   satisfied; the 5-minute ≥ 10 fps sustained-rate criterion, backlog stability,
   clean Stop and sequence 1:1 on hardware are all still unverified. **Do not
