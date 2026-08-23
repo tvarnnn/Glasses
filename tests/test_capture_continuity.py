@@ -261,3 +261,70 @@ def test_a_reconnect_over_the_wire_produces_one_continuous_frame_stream(client):
     assert seqs == [1, 3, 5, 7, 9, 11], (
         "the walk was not continuous across the reconnect"
     )
+
+
+# -- the journal tail ---------------------------------------------------
+
+
+def test_the_journal_tail_reads_only_what_is_new(tmp_path):
+    """Poll cost must not grow with how long the walk has been going.
+
+    Re-reading the whole journal every poll is O(n) per poll and O(n^2)
+    over a capture -- measured at 36.9 ms for one poll against a
+    20,000-line journal, in the same process that has to run observe() on
+    every frame. Seeking to a remembered offset makes it 0.014 ms and flat.
+    """
+    from tower.capture import _JournalTail
+
+    journal = tmp_path / "frames.jsonl"
+    journal.write_text('{"a": 1}\n{"a": 2}\n', encoding="utf-8")
+
+    tail = _JournalTail(journal)
+    assert tail.read_new() == [{"a": 1}, {"a": 2}]
+    assert tail.read_new() == [], "an unchanged journal must yield nothing"
+
+    with journal.open("a", encoding="utf-8") as handle:
+        handle.write('{"a": 3}\n')
+    assert tail.read_new() == [{"a": 3}]
+
+
+def test_a_partial_trailing_line_is_completed_not_dropped(tmp_path):
+    """The recorder appends without fsync, so arriving mid-write is normal."""
+    from tower.capture import _JournalTail
+
+    journal = tmp_path / "frames.jsonl"
+    journal.write_text('{"a": 1}\n{"a": 2', encoding="utf-8")
+
+    tail = _JournalTail(journal)
+    assert tail.read_new() == [{"a": 1}], "a torn line must not be yielded"
+
+    with journal.open("a", encoding="utf-8") as handle:
+        handle.write('}\n')
+    assert tail.read_new() == [{"a": 2}], "the completed line was lost"
+
+
+def test_a_replaced_journal_is_reread_from_the_start(tmp_path):
+    """A shrunken append-only file means it was replaced, not truncated."""
+    from tower.capture import _JournalTail
+
+    journal = tmp_path / "frames.jsonl"
+    journal.write_text('{"a": 1}\n{"a": 2}\n{"a": 3}\n', encoding="utf-8")
+    tail = _JournalTail(journal)
+    tail.read_new()
+
+    journal.write_text('{"b": 1}\n', encoding="utf-8")
+    assert tail.read_new() == [{"b": 1}]
+
+
+def test_a_corrupt_complete_line_is_skipped(tmp_path):
+    from tower.capture import _JournalTail
+
+    journal = tmp_path / "frames.jsonl"
+    journal.write_text('{"a": 1}\nnot json at all\n{"a": 2}\n', encoding="utf-8")
+    assert _JournalTail(journal).read_new() == [{"a": 1}, {"a": 2}]
+
+
+def test_an_absent_journal_yields_nothing(tmp_path):
+    from tower.capture import _JournalTail
+
+    assert _JournalTail(tmp_path / "missing.jsonl").read_new() == []
