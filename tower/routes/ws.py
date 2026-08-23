@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 
@@ -7,14 +8,45 @@ from tower.capture import END_REASON_DISCONNECT, END_REASON_STOP
 from tower.frames import FrameError, parse_and_decode_frame
 from tower.metrics import SessionMetrics
 from tower.modules.base import FrameSkippedError, ModuleUnavailableError
+from tower.routes import results_ws
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
+class _ConnectionSender:
+    """Serialises every send on one socket.
+
+    A WebSocket is one TCP stream and Starlette offers no send-side lock,
+    so two tasks awaiting `send_json` concurrently can interleave. Once
+    the result channel introduced a second sender -- the per-connection
+    push task -- serialising became a correctness requirement rather than
+    a precaution.
+
+    The frame path takes this lock too. That is a change to the
+    latency-measured path and was measured before it shipped: an
+    uncontended asyncio.Lock costs well under a microsecond against a
+    frame budget of several milliseconds, and a connection with no
+    subscription never contends at all, because no second sender exists.
+    """
+
+    __slots__ = ("_websocket", "_lock")
+
+    def __init__(self, websocket: WebSocket) -> None:
+        self._websocket = websocket
+        self._lock = asyncio.Lock()
+
+    async def send(self, payload: dict) -> None:
+        async with self._lock:
+            await self._websocket.send_json(payload)
+
+
 async def _handle_frame_message(
-    websocket: WebSocket, message: dict, metrics: SessionMetrics | None
+    websocket: WebSocket,
+    message: dict,
+    metrics: SessionMetrics | None,
+    sender: "_ConnectionSender",
 ) -> None:
     receive_start = time.perf_counter()
     try:
@@ -27,7 +59,7 @@ async def _handle_frame_message(
         # validation before seq is known. Report null rather than
         # inventing one (Rule 3: unknown stays unknown).
         await _send_frame_error(
-            websocket, message.get("seq"), "invalid_frame", str(exc)
+            sender, message.get("seq"), "invalid_frame", str(exc)
         )
         return
 
@@ -63,7 +95,7 @@ async def _handle_frame_message(
         if metrics is not None:
             metrics.record_frame_processing_error()
             metrics.record_frame_rejected()
-        await _send_frame_error(websocket, frame.seq, "frame_skipped", str(exc))
+        await _send_frame_error(sender, frame.seq, "frame_skipped", str(exc))
         return
     except ModuleUnavailableError as exc:
         logger.warning(
@@ -73,7 +105,7 @@ async def _handle_frame_message(
         )
         if metrics is not None:
             metrics.record_frame_rejected()
-        await _send_frame_error(websocket, frame.seq, "module_unavailable", str(exc))
+        await _send_frame_error(sender, frame.seq, "module_unavailable", str(exc))
         return
 
     logger.info(
@@ -115,7 +147,7 @@ async def _handle_frame_message(
         payload["metrics"] = dict(result.metrics)
 
     try:
-        await websocket.send_json(payload)
+        await sender.send(payload)
     except WebSocketDisconnect:
         logger.warning(
             "[Tower][Frame] #%s: could not send result, client disconnected mid-frame",
@@ -174,10 +206,10 @@ def _record_capture(websocket, frame) -> None:
 
 
 async def _send_frame_error(
-    websocket: WebSocket, seq: int | None, reason: str, message: str
+    sender: "_ConnectionSender", seq: int | None, reason: str, message: str
 ) -> None:
     try:
-        await websocket.send_json(
+        await sender.send(
             {
                 "type": "frame_error",
                 "seq": seq,
@@ -258,6 +290,8 @@ def _stop_capture(websocket, reason: str = END_REASON_STOP) -> None:
 async def websocket_endpoint(websocket: WebSocket) -> None:
     session = websocket.app.state.session
     active_measurement: SessionMetrics | None = None
+    sender = _ConnectionSender(websocket)
+    channels = results_ws.ChannelHolder(time.time)
     await websocket.accept()
     session.client_connected()
     logger.info("client connected")
@@ -292,9 +326,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             message_type = message.get("type")
 
             if message_type == "ping":
-                await websocket.send_json({"type": "pong"})
+                await sender.send({"type": "pong"})
             elif message_type == "frame":
-                await _handle_frame_message(websocket, message, active_measurement)
+                await _handle_frame_message(
+                    websocket, message, active_measurement, sender
+                )
             elif message_type == "stream_start":
                 if active_measurement is not None:
                     _finalize_stream_measurement(
@@ -317,8 +353,34 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "measurement window"
                     )
                 _stop_capture(websocket, END_REASON_STOP)
+            elif message_type in results_ws.RESULT_MESSAGE_TYPES:
+                await results_ws.handle(
+                    message,
+                    websocket=websocket,
+                    sender=sender,
+                    channel_holder=channels,
+                )
             else:
+                # Answered, not merely logged. IOS-to-Tower.md 2.2: iOS
+                # "never lets a request silently no-op", and
+                # 04-MODULE-SYSTEM.md already requires an unsupported
+                # request to "produce a clear degraded/failed state rather
+                # than silently pretending" it applied. Until now this
+                # branch wrote a server-side log line that no client could
+                # see, so a phone asking for something this Tower does not
+                # implement could not tell that from a message lost in
+                # flight.
                 logger.warning("received unknown message type: %s", message_type)
+                await sender.send(
+                    {
+                        "type": "protocol_error",
+                        "reason": "unknown_message_type",
+                        "message_type": message_type,
+                        "message": (
+                            "this Tower does not implement that message type"
+                        ),
+                    }
+                )
     except WebSocketDisconnect:
         logger.info("client disconnected")
     finally:
@@ -332,6 +394,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         # with no stream_start and no consent. That is incidental capture
         # of someone else's imagery, which 06-PRIVACY-DATA forbids and
         # which capture.py's own docstring promises cannot happen.
+        # Before the capture teardown, and unconditionally. A
+        # subscription that outlived its socket would keep the shared
+        # reader polling disk for a client that is gone. close() cannot
+        # raise, so nothing below it can be skipped.
+        await channels.close()
         _stop_capture(websocket, END_REASON_DISCONNECT)
         if active_measurement is not None:
             _finalize_stream_measurement(active_measurement, end_reason="disconnect")

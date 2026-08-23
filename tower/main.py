@@ -10,6 +10,7 @@ from tower.logging_config import configure_logging
 from tower.modules.base import Module
 from tower.modules.container import ModuleContainer
 from tower.modules.experimental_cv import ExperimentalCVModule
+from tower.results import build_hub
 from tower.routes import cartridges, health, ws
 from tower.session import ConnectionTracker
 
@@ -50,6 +51,14 @@ def _build_frame_observers(settings: Settings) -> list:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
+    # The result hub first: it holds a polling task, and stopping it
+    # before the module container means no snapshot can be built against
+    # an app that is half torn down. Guarded with getattr because most of
+    # this repo's tests construct the app without running lifespan at all
+    # (see the comment in create_app).
+    hub = getattr(app.state, "result_hub", None)
+    if hub is not None:
+        await hub.shutdown()
     await app.state.module_container.shutdown()
 
 
@@ -65,6 +74,10 @@ def create_app() -> FastAPI:
     # never builds a world; world_build_session.py does, in its own
     # process, and this is only where to look for what it wrote.
     app.state.world_root = settings.world_root
+    # One shared reader for the whole app. It starts no task until a
+    # client subscribes and stops again when the last one goes, so a Tower
+    # nobody is watching does no polling and no disk IO on its behalf.
+    app.state.result_hub = build_hub(settings.world_root)
     # Started here, not in `lifespan` above: TestClient(create_app()) used
     # without `with client:` (every pre-existing test in this repo) never
     # runs ASGI lifespan events, leaving the module UNLOADED forever. See

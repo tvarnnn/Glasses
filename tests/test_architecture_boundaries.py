@@ -42,9 +42,108 @@ def test_shared_code_does_not_import_a_cartridge():
     """
     offenders = []
     for path in _modules_outside("world_builder"):
+        if path in _RESULT_CHANNEL_ADAPTERS:
+            continue
         for name in _imports(path):
             if "world_builder" in name:
                 offenders.append(f"{path} -> {name}")
+
+    assert offenders == []
+
+
+# The result channel reports each cartridge to iOS, so SOMETHING has to
+# import a cartridge or there is nothing to report. Two files may, and the
+# rule below is stricter than a blanket exemption would be:
+#
+#   tower/results/world_builder.py   the adapter FOR that cartridge, named
+#                                    after it, and the only file that may
+#                                    know its record shapes
+#   tower/results/__init__.py        the single wiring point, which maps a
+#                                    cartridge name to its adapter
+#
+# Everything else in the channel -- the envelope, the publisher, the
+# registry, the routes -- must stay cartridge-blind, which is what
+# test_the_result_channel_core_is_cartridge_blind pins. That is the
+# invariant the original rule was really protecting: the generic parts
+# must not inherit one cartridge's assumptions. An adapter named after its
+# cartridge cannot leak assumptions into the next one, because the next
+# one gets its own file.
+_RESULT_CHANNEL_ADAPTERS = frozenset(
+    {
+        TOWER / "results" / "world_builder.py",
+        TOWER / "results" / "__init__.py",
+    }
+)
+
+
+def test_the_result_channel_core_is_cartridge_blind():
+    """The generic half of the result channel must import no cartridge.
+
+    Stronger than the rule it replaces. The envelope, publisher, registry
+    and routes are what the next three cartridges will publish through, so
+    a single import of `world_builder` there would bake one cartridge's
+    shape into the shared surface -- and this time the surface is a WIRE
+    CONTRACT, where that mistake is not refactorable once a phone ships
+    against it.
+    """
+    cartridges = ("world_builder", "object_memory", "document_memory", "scene")
+    core = [
+        TOWER / "results" / "envelope.py",
+        TOWER / "results" / "publisher.py",
+        TOWER / "results" / "registry.py",
+        TOWER / "results" / "contracts.py",
+        TOWER / "routes" / "results_ws.py",
+        TOWER / "routes" / "cartridges.py",
+    ]
+    offenders = []
+    for path in core:
+        for name in _imports(path):
+            for cartridge in cartridges:
+                if f"tower.{cartridge}" in name:
+                    offenders.append(f"{path.name} -> {name}")
+
+    assert offenders == []
+
+
+def test_the_result_channel_never_writes():
+    """A reporting surface must not write, and must not build.
+
+    The web process does not build worlds; a separate process does. If
+    this package ever acquired a write, the Tower would have two writers
+    to one store -- and on Windows the store's own docstring records that
+    the second one fails with a PermissionError rather than corrupting
+    quietly, which is a better failure and still a broken system.
+    """
+    forbidden = (
+        "write_json_atomic",
+        "append_jsonl",
+        "append_event",
+        "append_keyframe",
+        "write_world",
+        "write_session",
+        "write_derived",
+        "purge_world",
+        "clear_derived",
+        "acquire_writer_lock",
+        "start_session",
+        "stop_session",
+        "observe",
+        "build",
+        "write_text",
+        "write_bytes",
+        "mkdir",
+    )
+    offenders = []
+    for path in (TOWER / "results").rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = getattr(func, "attr", None) or getattr(func, "id", None)
+                if name in forbidden:
+                    offenders.append(f"{path.name} calls {name}")
 
     assert offenders == []
 

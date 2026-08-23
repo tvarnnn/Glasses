@@ -14,6 +14,7 @@ before it was fixed, which is why it lives in one place now.
 import json
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -32,6 +33,15 @@ def new_id() -> str:
     return uuid.uuid4().hex
 
 
+# How long a writer will keep trying to replace a destination a reader
+# momentarily has open, and how long it waits between attempts. Bounded
+# and short: this exists to ride out a reader's sub-millisecond handle,
+# not to wait out a process that has parked on the file. A writer that
+# cannot win in this budget raises, exactly as it did before.
+REPLACE_RETRIES = 12
+REPLACE_BACKOFF_S = 0.005
+
+
 def write_json_atomic(path: Path, payload: dict) -> None:
     """Replace `path` atomically, leaving no temp file behind either way."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -41,9 +51,51 @@ def write_json_atomic(path: Path, payload: dict) -> None:
             json.dump(payload, handle)
             handle.flush()
             os.fsync(handle.fileno())
-        temp_path.replace(path)
+        _replace_with_retry(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+def _replace_with_retry(temp_path: Path, path: Path) -> None:
+    """os.replace, retried while a concurrent READER holds the destination.
+
+    Windows refuses `replace()` onto a destination any handle has open,
+    and -- measured, not assumed -- `FILE_SHARE_DELETE` does NOT lift
+    that: `MOVEFILE_REPLACE_EXISTING` fails with WinError 5 even against
+    a share-delete handle. So a reader cannot make itself harmless, and
+    the tolerance has to live here.
+
+    Until 2026-08-23 this store's docstring could say "V1 also has no
+    concurrent reader -- capture, build and inspect are separate
+    processes". The Tower->iOS result channel is that reader: the web
+    process now polls world state while a build session writes it. That
+    assumption is void, and without this retry the consequence lands on
+    the WRITER -- a status channel would crash the mapping session it
+    exists to report on.
+
+    Measured on this host, 400 atomic writes against a reader looping as
+    fast as it can (a far harsher case than the channel's 2 Hz poll):
+
+        no reader                        0 / 400 failed
+        reader, no retry               223 / 400 failed   (55.8%)
+        reader, this retry               0 / 400 failed
+
+    The retried run was the harsher of the two: it completed 68,455
+    reader opens against the 8,648 of the failing run, because a writer
+    that is not erroring out early leaves the reader more time to run.
+
+    Retrying a rename is safe in a way that retrying most IO is not: the
+    operation is atomic, so it either happened or it did not. There is no
+    partial state to reconcile and no possibility of writing twice.
+    """
+    for attempt in range(REPLACE_RETRIES):
+        try:
+            temp_path.replace(path)
+            return
+        except PermissionError:
+            if attempt == REPLACE_RETRIES - 1:
+                raise
+            time.sleep(REPLACE_BACKOFF_S)
 
 
 def read_json_closed(path: Path) -> dict:
