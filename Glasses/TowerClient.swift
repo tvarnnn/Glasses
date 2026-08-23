@@ -268,14 +268,17 @@ final class TowerClient: NSObject, ObservableObject {
         super.init()
     }
 
-    /// - Parameter url: The Tower endpoint. Defaults to the real Tower
+    /// - Parameter url: The Tower endpoint. `nil` uses the real Tower
     ///   (`TowerConfiguration.webSocketURL`); overridable so tests can point
-    ///   this at a local mock server instead.
+    ///   this at a local mock server instead. `nil`-defaulted and resolved in
+    ///   the body for the reason `init` gives: a default argument is evaluated
+    ///   outside this type's actor, and `webSocketURL` is main-actor isolated.
     ///
     /// A caller-initiated connect also refills the reconnect budget: an
     /// exhausted schedule is how the client says "I have stopped trying", and
     /// a deliberate tap on Connect is the user saying to try again.
-    func connect(to url: URL = TowerConfiguration.webSocketURL) {
+    func connect(to url: URL? = nil) {
+        let url = url ?? TowerConfiguration.webSocketURL
         // Refilled only when this call is actually going to open a socket. It
         // used to be reset unconditionally, before `openConnection`'s
         // `.connecting` guard — so a redundant tap during an in-flight connect
@@ -300,7 +303,8 @@ final class TowerClient: NSObject, ObservableObject {
     /// will not disturb a healthy connection, cancel a pending reconnect, or
     /// restart a schedule that has already given up. A Tower that has failed
     /// stays failed and visible until the user acts.
-    func connectIfIdle(to url: URL = TowerConfiguration.webSocketURL) {
+    func connectIfIdle(to url: URL? = nil) {
+        let url = url ?? TowerConfiguration.webSocketURL
         guard status == .offline else {
             log("automatic connect skipped — status is \(status)")
             return
