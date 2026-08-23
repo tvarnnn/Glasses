@@ -138,6 +138,15 @@ class Subscription:
 
     def offer(self, snapshot) -> None:
         if self._pending is not None:
+            if self._pending.revision == snapshot.revision:
+                # Same content. Not a supersession, so it must not count
+                # as one: `coalesced` tells a client it was too slow to
+                # see intermediate STATES, and re-offering an identical
+                # snapshot is not an intermediate state. Counting it would
+                # report drops that never happened -- most visibly right
+                # after subscribe, where the first snapshot is seeded
+                # directly and the next poll re-offers the same one.
+                return
             # The previous snapshot was never sent. Replaced, not queued.
             self.coalesced += 1
         self._pending = snapshot
