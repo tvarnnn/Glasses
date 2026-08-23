@@ -1240,7 +1240,8 @@ final class TowerClientTests: XCTestCase {
 
         let client = TowerClient(metrics: SenderMetrics())
         client.connect(to: url(port: port))
-        XCTAssertTrue(await waitUntil { client.status == .online })
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline, "expected .online, got \(client.status)")
 
         let baseline = recorder.all.count
 
@@ -1293,7 +1294,8 @@ final class TowerClientTests: XCTestCase {
 
         let client = TowerClient(metrics: SenderMetrics())
         client.connect(to: url(port: port))
-        XCTAssertTrue(await waitUntil { client.status == .online })
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline, "expected .online, got \(client.status)")
 
         let isReachable = client.status == .online
         XCTAssertTrue(isReachable)
