@@ -10,7 +10,7 @@ from tower.logging_config import configure_logging
 from tower.modules.base import Module
 from tower.modules.container import ModuleContainer
 from tower.modules.experimental_cv import ExperimentalCVModule
-from tower.routes import health, ws
+from tower.routes import cartridges, health, ws
 from tower.session import ConnectionTracker
 
 
@@ -61,12 +61,17 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app.state.module_container = ModuleContainer(_build_cv_module(settings))
     app.state.frame_observers = _build_frame_observers(settings)
+    # Read-only, and read by the result channel alone. The web process
+    # never builds a world; world_build_session.py does, in its own
+    # process, and this is only where to look for what it wrote.
+    app.state.world_root = settings.world_root
     # Started here, not in `lifespan` above: TestClient(create_app()) used
     # without `with client:` (every pre-existing test in this repo) never
     # runs ASGI lifespan events, leaving the module UNLOADED forever. See
     # docs/superpowers/specs/2026-08-19-v0.8-module-container-design.md, "Wiring" Amendment.
     asyncio.run(app.state.module_container.load_and_start())
     app.include_router(health.router)
+    app.include_router(cartridges.router)
     app.include_router(ws.router)
     return app
 

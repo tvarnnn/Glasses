@@ -15,6 +15,12 @@ class Settings:
     # raw-imagery recorder, so a caller that forgets it gets no recording
     # rather than an unconfigured one.
     capture_root: str | None = None
+    # Where world_build_session.py writes its worlds. Read-only to the web
+    # process: it never builds, it only reports what another process has
+    # already persisted. None means the result channel declares World
+    # Builder's contract but reports it unavailable, which is a different
+    # claim from "this Tower has no such cartridge".
+    world_root: str | None = None
 
 
 def get_settings() -> Settings:
@@ -25,6 +31,7 @@ def get_settings() -> Settings:
         cv_experiment=os.environ.get("TOWER_CV_EXPERIMENT", "baseline"),
         cv_device=os.environ.get("TOWER_CV_DEVICE", "auto"),
         capture_root=_optional_path(os.environ.get("TOWER_CAPTURE_ROOT")),
+        world_root=_optional_path(os.environ.get("TOWER_WORLD_ROOT")),
     )
 
 
