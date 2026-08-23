@@ -8,7 +8,8 @@ import json
 
 import pytest
 
-from tests.result_channel_fixtures import (
+from tests.result_channel_fixtures import (  # noqa: F401
+    _close_result_channel_clients,
     build_world,
     drain,
     make_client,
@@ -22,9 +23,16 @@ from tower.results.contracts import (
 )
 
 
-@pytest.fixture
-def built(tmp_path):
-    root = tmp_path / "worlds"
+@pytest.fixture(scope="module")
+def built(tmp_path_factory):
+    """One real world, built once for the whole module.
+
+    Module-scoped because building it runs the real engine over rendered
+    frames and costs seconds. Nothing here mutates it -- this channel only
+    reads -- so sharing is safe, and a test that needs a world of its own
+    builds one explicitly.
+    """
+    root = tmp_path_factory.mktemp("worlds")
     world_id, session_id = build_world(root)
     return root, world_id, session_id
 
@@ -299,24 +307,33 @@ def test_a_duplicate_subscription_is_independent(monkeypatch, built):
     """Two subscriptions to the same target get their own ids and sequences.
 
     They must not share a slot: one client draining slowly cannot be
-    allowed to consume another's snapshot.
+    allowed to consume another's snapshot. Read as a MULTISET of four
+    messages rather than in a fixed order -- the acknowledgement is
+    written by the receive loop and the envelope by the sender task, and
+    nothing orders those two against each other.
     """
     root, _, _ = built
     client = make_client(monkeypatch, root)
-    with client.websocket_connect("/ws") as ws:
-        first = subscribe(ws)
-        second = subscribe(ws)
-        assert first["subscription_id"] != second["subscription_id"]
-
-        seen = {}
-        for _ in range(2):
-            envelope = drain(ws, expect="cartridge_result")
-            seen[envelope["subscription_id"]] = envelope["seq"]
-
-    assert seen == {
-        first["subscription_id"]: 1,
-        second["subscription_id"]: 1,
+    request = {
+        "type": "result_subscribe",
+        "cartridge": "world_builder",
+        "result_type": "status",
     }
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json(request)
+        ws.send_json(request)
+        messages = [ws.receive_json() for _ in range(4)]
+
+    acks = [m for m in messages if m["type"] == "result_subscribed"]
+    results = [m for m in messages if m["type"] == "cartridge_result"]
+
+    assert len(acks) == 2 and len(results) == 2
+    ids = {ack["subscription_id"] for ack in acks}
+    assert len(ids) == 2, "each subscription must get its own id"
+    assert {r["subscription_id"] for r in results} == ids
+    assert [r["seq"] for r in results] == [1, 1], (
+        "sequences are per subscription, so both start at 1"
+    )
 
 
 # -- errors -------------------------------------------------------------
@@ -388,9 +405,10 @@ def test_a_contract_mismatch_is_refused_not_served(monkeypatch, built):
 def test_subscribing_to_an_unavailable_cartridge_is_refused(monkeypatch):
     client = make_client(monkeypatch, None)
     with client.websocket_connect("/ws") as ws:
-        subscribe(ws)
-        error = drain(ws, expect="result_error")
+        # subscribe() returns the FIRST reply, which here is the refusal.
+        error = subscribe(ws)
 
+    assert error["type"] == "result_error"
     assert error["reason"] == "cartridge_unavailable"
 
 

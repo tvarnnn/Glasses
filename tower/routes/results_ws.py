@@ -46,6 +46,7 @@ ERR_CONTRACT_MISMATCH = "contract_mismatch"
 ERR_UNAVAILABLE = "cartridge_unavailable"
 ERR_TOO_MANY = "too_many_subscriptions"
 ERR_UNKNOWN_SUBSCRIPTION = "unknown_subscription"
+ERR_SNAPSHOT_FAILED = "snapshot_failed"
 
 
 async def handle(message: dict, *, websocket, sender, channel_holder) -> None:
@@ -184,9 +185,31 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
     # begins with a complete snapshot".
     import asyncio
 
-    snapshot = await asyncio.to_thread(
-        hub._snapshot_for, cartridge, result_type, world_id, session_id
-    )
+    try:
+        snapshot = await asyncio.to_thread(
+            hub._snapshot_for, cartridge, result_type, world_id, session_id
+        )
+    except Exception as exc:
+        # A subscribe that cannot produce its first snapshot must SAY so.
+        # The outer handler would have logged this and returned, leaving
+        # the client waiting on a reply that was never coming -- the
+        # silent no-op IOS-to-Tower.md 2.2 rules out, and the worst of the
+        # available failures because nothing on either side reports it.
+        logger.exception(
+            "[Tower][Results] could not build the first snapshot for %s/%s",
+            cartridge,
+            result_type,
+        )
+        await _error(
+            sender,
+            ERR_SNAPSHOT_FAILED,
+            f"the Tower could not read this cartridge's state: "
+            f"{type(exc).__name__}",
+            cartridge=cartridge,
+            result_type=result_type,
+            contract=offer["contract"],
+        )
+        return
     subscription.cursor_status = classify_cursor(since, snapshot.revision)
 
     await sender.send(

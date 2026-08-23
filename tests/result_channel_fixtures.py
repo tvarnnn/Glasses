@@ -16,6 +16,7 @@ nothing left in flight to wait for.
 """
 
 import numpy as np
+import pytest
 
 from tests import synthetic_scene as ss
 from tower.world_builder.engine import WorldBuilderEngine
@@ -75,8 +76,26 @@ def _observe(root, *, frames: int, name):
     return world_id, session_id, engine
 
 
+_OPEN_CLIENTS: list = []
+
+
+@pytest.fixture(autouse=True)
+def _close_result_channel_clients():
+    """Close every client a test opened, in reverse order.
+
+    `make_client` ENTERS the TestClient, because entering is what creates
+    the anyio portal -- and the portal is the only correct way to touch
+    the app's event loop from a test thread. Entering also runs lifespan,
+    which is how the hub's shutdown path gets exercised on every test
+    rather than only in the one that asks for it.
+    """
+    yield
+    while _OPEN_CLIENTS:
+        _OPEN_CLIENTS.pop().__exit__(None, None, None)
+
+
 def make_client(monkeypatch, world_root):
-    """A TestClient over the real app, pointed at `world_root`.
+    """An ENTERED TestClient over the real app, pointed at `world_root`.
 
     `create_app()` reads settings at construction, so the environment has
     to be set before it is called -- not after.
@@ -90,6 +109,8 @@ def make_client(monkeypatch, world_root):
     else:
         monkeypatch.setenv("TOWER_WORLD_ROOT", str(world_root))
     client = TestClient(create_app())
+    client.__enter__()
+    _OPEN_CLIENTS.append(client)
     # The hub's own timer is disabled so tests drive every poll through
     # pump(). A background task polling on its own schedule would make
     # sequence and coalescing assertions depend on wall-clock luck --
