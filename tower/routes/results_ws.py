@@ -17,7 +17,9 @@ import logging
 from tower.results import registry
 from tower.results.contracts import ENVELOPE_CONTRACT
 from tower.results.publisher import (
+    LOCK_TIMEOUT_S,
     MAX_SUBSCRIPTIONS_PER_CONNECTION,
+    SEND_TIMEOUT_S,
     ConnectionChannel,
     Subscription,
     classify_cursor,
@@ -290,8 +292,21 @@ class ChannelHolder:
 
     def ensure(self, websocket, sender) -> ConnectionChannel:
         if self._channel is None:
+
+            async def _send(payload):
+                # Bounded on BOTH waits. The push task shares the
+                # connection's send lock with the frame path, so an
+                # unbounded lock wait here would let a slow frame consume
+                # a result's budget and drop a subscription that was
+                # never actually offered to the socket.
+                await sender.send_bounded(
+                    payload,
+                    lock_timeout=LOCK_TIMEOUT_S,
+                    send_timeout=SEND_TIMEOUT_S,
+                )
+
             self._channel = ConnectionChannel(
-                websocket.app.state.result_hub, sender.send, self._clock
+                websocket.app.state.result_hub, _send, self._clock
             )
         return self._channel
 

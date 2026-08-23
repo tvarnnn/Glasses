@@ -308,9 +308,13 @@ keeps working through every one.
 | `too_many_subscriptions` | more than 8 open on one connection | — |
 | `unknown_subscription` | unsubscribing an id that is not open | `subscription_id` |
 | `snapshot_failed` | the first snapshot could not be built | `cartridge`, `result_type`, `contract` |
+| `consumer_too_slow` | a result was not accepted within the send timeout; **this subscription is now closed** — subscribe again to resume | `subscription_id`, `cartridge`, `result_type` |
 | `channel_failed` | the Tower's shared reader died; **this subscription is now closed** | `subscription_id`, `cartridge`, `result_type` |
 
-`channel_failed` is the only one that arrives unsolicited. On receiving it,
+Every `result_error` also carries `envelope_contract`.
+
+`channel_failed` and `consumer_too_slow` are the two that arrive
+unsolicited. On receiving it,
 that subscription is gone — re-subscribe to resume. It exists because a
 dead channel that still looks alive is worse than a crash: nothing anywhere
 reports it.
@@ -335,7 +339,8 @@ phone. This is additive; the six existing message types never trigger it.
 | Subscriptions per connection | **8** | a remote party must not grow a server-side dict at will |
 | Pending snapshots per subscription | **1** | there is no queue. A new snapshot replaces the pending one |
 | Snapshot size | fixed arity, measured **< 8 KB** | a test asserts the payload contains no unbounded list |
-| Send timeout | **5 s** | a consumer that does not accept a result within this has its subscription closed |
+| Send timeout | **2 s** | a consumer that does not accept a result within this has its subscription closed. It is also the longest a `frame_result` can queue behind a result send, because both take the connection's send lock — which is why it is 2 and not 5 |
+| Lock wait | **2 s** | bounded separately from the send, so a slow frame send cannot consume a result's budget and cause a spurious drop |
 | Poll interval | **0.5 s** | how often the Tower re-reads disk |
 | Heartbeat | **2 s** | how often an unchanged snapshot is re-sent |
 
@@ -450,10 +455,11 @@ Contract: `world_builder.status/2026-08-23`.
 `evidence` is prose naming what was observed. `reason` is prose for a
 person, or null.
 
-> **There is deliberately no `finalizing`.** While a build runs, the files
-> on disk are **byte-identical** to "stopped and never built" and to
-> "stopped and the build crashed" — the build writes nothing until it
-> finishes, emits no event, and the writer lock is already released. So the
+> **There is deliberately no `finalizing`.** A build *does* rewrite several
+> files before its manifest lands, so the directory changes while it runs —
+> but those writes are indistinguishable from a build that made them and
+> then **died**. The writer lock is already released by then and no event
+> is written, so nothing on disk says "a process is working right now". The
 > Tower cannot observe that work is continuing, and a state named
 > `finalizing` would assert exactly that.
 >
@@ -472,10 +478,13 @@ person, or null.
 |---|---|---|
 | `keyframes_accepted` | int | **the count the Tower actually keeps.** While live it is counted from the event journal, not from the session record, which still holds the zero written at session start |
 | `keyframes_accepted_provenance` | `"measured"` | counted, not inferred |
+| `keyframes_accepted_source` | string | `"event journal"` or `"session record"`. The journal is used until the session is stopped AND its record finalised — including when it `failed`, because a crashed session's record still holds the zeros written at start |
 | `frames_observed` | int or **null** | **null while live.** An ordinary rejected frame writes no journal event, so this is genuinely not knowable until the session stops. `null ≠ 0` |
 | `frames_observed_unavailable_reason` | string or null | why, when null |
 | `rejected_by_reason` | object or null | histogram, available only after stop |
-| `mapping_seconds` | float | **on the Tower's clock.** Do not derive this from a phone timer |
+| `journal_corrupt_lines` | int | Unparseable lines in the event journal. **1 at the tail is routine** — a journal is appended without fsync, so a reader can arrive mid-write. More than that, or a count that does not clear, means corruption, and the keyframe count beside it is correspondingly low |
+| `mapping_seconds` | float or **null** | **on the Tower's clock.** Do not derive this from a phone timer. **Null** if the Tower's wall clock moved backwards during the session — reported as unknown rather than clamped to `0.0`, because a plausible zero is worse than an absent value |
+| `mapping_seconds_unavailable_reason` | string or null | why, when null |
 | `mapping_clock` | `"tower"` | |
 
 **`tracking`**
@@ -514,6 +523,7 @@ world-level calibration state would be a fabrication.
 | Field | Notes |
 |---|---|
 | `state` | Tower's vocabulary: `unknown` or `relative` in V1 |
+| `unavailable_reason` | Set when this **session** has no build of its own. Scale lives on the world record and is earned by a build, so a session that was never built reports `unknown` rather than inheriting a scale another session earned |
 | `semantics` | iOS's vocabulary: `"relative"`, or **`null`** when state is `unknown` |
 | `unit` | `"world units"`, or **null** when there is no unit at all |
 | `meters_per_unit` | always `null` in V1 |
@@ -545,6 +555,11 @@ sent at all.
 | `confidence` | **`null`.** Tower keeps per-keyframe and per-edge confidence but has never defined an aggregate for a whole reconstruction. A number here would be one nobody specified |
 | `backend_id`, `built_at` | diagnostic |
 | `unavailable_reason` | prose, when unavailable |
+
+A manifest missing any of `input_digest`, `session_id`, `keyframes`,
+`points`, `poses_solved`, `poses_refused` or `segments` is treated as
+**absent**, not as geometry with null figures. "We have geometry" is not
+asserted without the figures to show for it.
 
 **`trajectory`** — a summary. **No pose array is sent**, per
 `IOS-to-Tower.md` §1.4.
@@ -587,6 +602,12 @@ is `false`: **no filesystem path is ever sent.** A Tower path is useless to
 a phone and names a machine's layout to a remote consumer.
 
 **`artifacts`**
+
+`present` is **tri-state**: `true`, `false`, or **`null`** for "not
+established" (the images directory could not be read). It is never `false`
+merely because `images_purged_declared` is true — that flag makes rebuilds
+refuse and deletes nothing, so it cannot support a claim that the imagery
+is absent.
 
 ```json
 {"keyframe_images": {"present": true, "count": 4, "redaction": "none",

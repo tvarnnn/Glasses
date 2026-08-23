@@ -172,6 +172,7 @@ def test_the_journal_cache_holds_a_summary_not_the_journal(tmp_path):
         "keyframes_accepted": 40,
         "last_tracking": "tracking_lost",
         "stopped": False,
+        "corrupt_lines": 0,
     }
     # Fixed arity whatever the journal length: this is the memory bound.
     assert len(_summarise_events(events * 1000)) == len(summary)
@@ -227,8 +228,9 @@ def test_a_consumer_that_never_reads_is_dropped_not_waited_on():
     async def _run():
         import tower.results.publisher as publisher
 
-        original = publisher.SEND_TIMEOUT_S
+        original = (publisher.SEND_TIMEOUT_S, publisher.TOTAL_SEND_TIMEOUT_S)
         publisher.SEND_TIMEOUT_S = 0.05
+        publisher.TOTAL_SEND_TIMEOUT_S = 0.05
         try:
             channel = ConnectionChannel(hub, _never_returns, lambda: 0.0)
             subscription = _subscription()
@@ -244,7 +246,7 @@ def test_a_consumer_that_never_reads_is_dropped_not_waited_on():
                     break
             return channel.subscription_count
         finally:
-            publisher.SEND_TIMEOUT_S = original
+            publisher.SEND_TIMEOUT_S, publisher.TOTAL_SEND_TIMEOUT_S = original
             await channel.close()
 
     assert asyncio.run(_run()) == 0
@@ -313,10 +315,12 @@ def _task_alive(hub):
 def test_a_reader_failure_reaches_the_client_instead_of_going_quiet():
     """The worst outcome is silence, so it is the one that is ruled out.
 
-    A dead reader that still looks alive leaves a client waiting forever
-    for a channel that is never coming back. The failure travels as a
-    VALUE in the subscription slot, so no swallow clause anywhere can eat
-    it on the way out.
+    Drives the REAL `ResultHub._run` loop rather than calling `fail_all`
+    by hand. An adversarial review pointed out that the earlier version
+    raised its own RuntimeError, invoked fail_all directly, and then
+    asserted the exception name against a string the test itself had
+    written -- so deleting the entire `except Exception -> fail_all` block
+    in `_run` would have left it green. It now fails if that block goes.
     """
     def _explode(*args):
         raise RuntimeError("the disk fell over")
@@ -329,14 +333,9 @@ def test_a_reader_failure_reaches_the_client_instead_of_going_quiet():
 
     async def _run():
         channel = ConnectionChannel(hub, _capture, lambda: 0.0)
+        # add() starts the hub's own task; nothing here touches fail_all.
         await channel.add(_subscription())
-        # poll_once swallows a per-target failure; the loop-level failure
-        # is what fail_all responds to, so drive that directly.
-        try:
-            raise RuntimeError("the disk fell over")
-        except RuntimeError as exc:
-            channel.fail_all(f"reader stopped with {type(exc).__name__}")
-        for _ in range(50):
+        for _ in range(200):
             await asyncio.sleep(0.01)
             if sent:
                 break
@@ -344,9 +343,57 @@ def test_a_reader_failure_reaches_the_client_instead_of_going_quiet():
         return sent
 
     messages = asyncio.run(_run())
-    assert messages, "the client was never told the channel had died"
+    assert messages, (
+        "the reader died and the client was never told -- silence is the "
+        "failure this path exists to prevent"
+    )
     assert messages[0]["reason"] == "channel_failed"
     assert "RuntimeError" in messages[0]["message"]
+
+
+def test_a_slow_consumer_is_told_before_it_is_dropped():
+    """Closing a subscription in silence leaves a client waiting forever.
+
+    The contract names the unsolicited errors; a drop that sends nothing
+    is not one of them, so a conforming client could never learn it
+    happened.
+    """
+    import tower.results.publisher as publisher
+
+    hub = ResultHub(lambda *args: _snapshot("x"), clock=lambda: 0.0)
+    seen = []
+    blocked = asyncio.Event()
+
+    async def _slow(payload):
+        if payload.get("type") == "cartridge_result":
+            blocked.set()
+            await asyncio.Event().wait()
+        seen.append(payload)
+
+    async def _run():
+        original = (publisher.SEND_TIMEOUT_S, publisher.TOTAL_SEND_TIMEOUT_S)
+        publisher.SEND_TIMEOUT_S = 0.05
+        publisher.TOTAL_SEND_TIMEOUT_S = 0.05
+        try:
+            channel = ConnectionChannel(hub, _slow, lambda: 0.0)
+            subscription = _subscription()
+            await channel.add(subscription)
+            subscription.offer(_snapshot("first"))
+            channel._wakeup.set()
+            await asyncio.wait_for(blocked.wait(), timeout=2.0)
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if seen:
+                    break
+            await channel.close()
+            return seen
+        finally:
+            publisher.SEND_TIMEOUT_S, publisher.TOTAL_SEND_TIMEOUT_S = original
+
+    messages = asyncio.run(_run())
+    assert messages, "the subscription was closed without telling the client"
+    assert messages[0]["reason"] == "consumer_too_slow"
+    assert "subscribe again" in messages[0]["message"]
 
 
 def test_one_unreadable_target_does_not_stop_the_others():

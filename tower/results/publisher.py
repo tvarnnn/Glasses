@@ -56,7 +56,38 @@ DEFAULT_HEARTBEAT_SECONDS = 2.0
 
 # A send that takes longer than this means the consumer has stopped
 # reading. The subscription is closed rather than waited on.
-SEND_TIMEOUT_S = 5.0
+#
+# 2 seconds, not 5, and the number is a FRAME-PATH bound rather than a
+# patience setting. The result sender holds the connection's send lock for
+# the duration of a send, so a stuck result is also the longest a
+# `frame_result` can queue behind one. Both are blocked anyway when the
+# client has stopped reading -- one socket is one TCP stream -- but this
+# is the bound on how long a merely SLOW consumer can delay the path that
+# is measured.
+SEND_TIMEOUT_S = 2.0
+
+# How long to wait for the send lock itself, measured separately. Lumping
+# the two together let a slow FRAME send consume a result's whole budget
+# and trigger a spurious "consumer did not accept" drop -- the result had
+# not been offered to the socket at all, it was queued behind the frame
+# path. Raised by an adversarial review.
+LOCK_TIMEOUT_S = 2.0
+
+# The backstop the sender task applies around the whole operation. The
+# inner two bounds give the precise cause; this one guarantees the task
+# cannot sit in a send forever if a transport ever fails to honour them.
+TOTAL_SEND_TIMEOUT_S = LOCK_TIMEOUT_S + SEND_TIMEOUT_S
+
+# Consecutive failed snapshot attempts for one target before its
+# subscribers are told and dropped.
+#
+# One failure is transient -- a file being replaced underneath us is
+# routine and the next poll succeeds. Failing every time is not transient,
+# and swallowing it forever leaves the client waiting on a channel that is
+# never coming back. An earlier version logged each failure and continued
+# indefinitely, which is the silence this module's header calls the worst
+# outcome. Three, so a burst of contention cannot trip it.
+MAX_CONSECUTIVE_TARGET_FAILURES = 3
 
 # Per connection. A client with more than this many open subscriptions is
 # either confused or hostile; either way the answer is a refusal, not
@@ -228,13 +259,22 @@ class ConnectionChannel:
             task.cancel()
             try:
                 await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                # Cancellation is the expected outcome and anything else
-                # is already logged in _run. Nothing may propagate: this
-                # runs in the connection's cleanup path, where an
-                # exception would skip the capture and session teardown
-                # that follows it.
-                pass
+            except asyncio.CancelledError:
+                # The sender task's cancellation, not ours. If THIS task is
+                # also being cancelled -- app shutdown racing a disconnect
+                # -- that must not be swallowed, or the shutdown waits
+                # forever for a cancellation nobody delivered.
+                current = asyncio.current_task()
+                if current is not None and current.cancelling() > 0:
+                    raise
+            except Exception:  # noqa: BLE001
+                # Anything else is already logged in _run. Nothing else may
+                # propagate: this runs in the connection's cleanup path,
+                # where an exception would skip the capture and session
+                # teardown that follows it.
+                logger.debug(
+                    "[Tower][Results] sender task ended badly", exc_info=True
+                )
 
     # -- delivery -------------------------------------------------------
 
@@ -264,6 +304,20 @@ class ConnectionChannel:
         for subscription in self._subscriptions.values():
             subscription.fail(reason)
         self._wakeup.set()
+
+    def fail_target(self, target, reason: str) -> None:
+        """Fail only the subscriptions watching one target.
+
+        A world nobody can read must not take down a subscription to a
+        different world on the same connection.
+        """
+        woken = False
+        for subscription in self._subscriptions.values():
+            if subscription.target == target:
+                subscription.fail(reason)
+                woken = True
+        if woken:
+            self._wakeup.set()
 
     async def _run(self) -> None:
         try:
@@ -315,7 +369,8 @@ class ConnectionChannel:
             envelope = _envelope(subscription, snapshot, self._clock())
             try:
                 await asyncio.wait_for(
-                    self._send(envelope.to_json_dict()), timeout=SEND_TIMEOUT_S
+                    self._send(envelope.to_json_dict()),
+                    timeout=TOTAL_SEND_TIMEOUT_S,
                 )
             except asyncio.TimeoutError:
                 logger.warning(
@@ -324,6 +379,36 @@ class ConnectionChannel:
                     subscription.subscription_id,
                     SEND_TIMEOUT_S,
                 )
+                # TELL the client before dropping it. An earlier version
+                # closed the subscription with no message at all, and the
+                # contract says `channel_failed` is the only unsolicited
+                # error -- so a conforming client had no way to learn its
+                # subscription was gone and would wait forever. This
+                # module's own header argues silence is the worst
+                # outcome; it was doing exactly that. Best-effort and
+                # short: the consumer is already not reading, so this
+                # very likely fails too, and that is fine.
+                try:
+                    await asyncio.wait_for(
+                        self._send(
+                            {
+                                "type": "result_error",
+                                "reason": "consumer_too_slow",
+                                "subscription_id": subscription.subscription_id,
+                                "cartridge": subscription.cartridge,
+                                "result_type": subscription.result_type,
+                                "message": (
+                                    "this subscription was closed because a "
+                                    f"result was not accepted within "
+                                    f"{SEND_TIMEOUT_S:.0f}s; subscribe again "
+                                    "to resume"
+                                ),
+                            }
+                        ),
+                        timeout=0.5,
+                    )
+                except Exception:
+                    pass
                 await self.remove(subscription.subscription_id)
                 continue
             except Exception:
@@ -384,6 +469,8 @@ class ResultHub:
         self._heartbeat_seconds = heartbeat_seconds
         self._channels: set = set()
         self._task: asyncio.Task | None = None
+        # Bounded by the number of live targets, and pruned every pass.
+        self._failures: dict = {}
         # Set after every completed poll pass. Tests wait on this instead
         # of sleeping, which is what makes them deterministic.
         self.polled = asyncio.Event()
@@ -398,12 +485,21 @@ class ResultHub:
         if not self._channels and self._task is not None:
             # Nobody is watching. Stop reading disk entirely rather than
             # spinning a timer forever on a Tower whose client went home.
+            #
+            # Cancel and DROP -- deliberately no `await task` here. This
+            # runs from whichever task called remove(), and that is often
+            # the per-connection SENDER task: awaiting the reader from
+            # inside the sender couples two cancellations together, and a
+            # test that drove a persistently-failing reader deadlocked the
+            # event loop exactly there (the loop went idle in select with
+            # nothing scheduled and the main coroutine waiting forever).
+            #
+            # Nothing needs the task's result. It is cancelled, it will
+            # unwind on its own, and `shutdown()` -- which runs from the
+            # app's own teardown, never from a sender -- is where a real
+            # join belongs.
             task, self._task = self._task, None
             task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
 
     async def shutdown(self) -> None:
         """Stop the reader on app teardown. Never raises.
@@ -419,8 +515,19 @@ class ResultHub:
         task.cancel()
         try:
             await task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
+        except asyncio.CancelledError:
+            # The task we just cancelled, not this one. Swallowing our own
+            # cancellation here would strand the shutdown that requested
+            # it, so re-raise if the enclosing task is also being
+            # cancelled.
+            if asyncio.current_task() is not None and (
+                asyncio.current_task().cancelling() > 0
+            ):
+                raise
+        except Exception:  # noqa: BLE001
+            # A reader that already died must not turn a clean shutdown
+            # into a failed one.
+            logger.debug("[Tower][Results] reader had already failed", exc_info=True)
 
     async def _run(self) -> None:
         try:
@@ -471,7 +578,7 @@ class ResultHub:
                     self._snapshot_for, sample.cartridge, sample.result_type,
                     sample.world_id, sample.session_id,
                 )
-            except Exception:
+            except Exception as exc:
                 # One unreadable target must not stop the others, and must
                 # not stop the loop. The producer already turns expected
                 # storage failures into an `unavailable` payload; reaching
@@ -479,7 +586,28 @@ class ResultHub:
                 logger.exception(
                     "[Tower][Results] could not build a snapshot for %s", target
                 )
+                failures = self._failures.get(target, 0) + 1
+                self._failures[target] = failures
+                if failures >= MAX_CONSECUTIVE_TARGET_FAILURES:
+                    # Persistent, not transient. Tell this target's
+                    # subscribers rather than logging into the void
+                    # forever.
+                    reason = (
+                        f"the Tower could not read this cartridge's state "
+                        f"{failures} times in a row; the last failure was "
+                        f"{type(exc).__name__}"
+                    )
+                    for channel in list(self._channels):
+                        try:
+                            channel.fail_target(target, reason)
+                        except Exception:
+                            logger.exception(
+                                "[Tower][Results] could not notify a channel "
+                                "of a persistent target failure"
+                            )
+                    self._failures.pop(target, None)
                 continue
+            self._failures.pop(target, None)
             now = self._clock()
             for channel in list(self._channels):
                 channel.offer(

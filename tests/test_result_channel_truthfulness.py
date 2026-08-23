@@ -88,10 +88,11 @@ def test_frames_observed_is_null_while_live_with_its_reason(monkeypatch, tmp_pat
         progress = payload["progress"]
 
         assert progress["frames_observed"] is None
-        assert "only known once the session stops" in (
+        assert "not knowable yet" in (
             progress["frames_observed_unavailable_reason"]
         )
         assert progress["rejected_by_reason"] is None
+        assert progress["keyframes_accepted_source"] == "event journal"
     finally:
         engine.stop_session()
 
@@ -167,10 +168,12 @@ def test_a_stopped_unbuilt_session_never_claims_a_build_is_running(
 ):
     """`finalizing` would assert something the Tower cannot observe.
 
-    While build() runs, the files are byte-identical to "stopped and never
-    built" and to "stopped and the build crashed". So the state is named
-    for what is visible, and `build_in_progress` is NULL -- not false,
-    which would be a claim that no build is running.
+    A build does rewrite files before its manifest lands -- an adversarial
+    review disproved an earlier "byte-identical" claim here -- but those
+    writes are indistinguishable from a build that made them and then
+    died. So the state is named for what is visible, and
+    `build_in_progress` is NULL, not false, which would be a claim that no
+    build is running.
     """
     root = tmp_path / "worlds"
     world_id, session_id, engine = start_live_world(root, frames=8)
@@ -614,38 +617,40 @@ def test_the_producer_never_reads_an_unchanged_file_twice(built):
     spends answering frames.
     """
     root, world_id, session_id = built
-    calls = {"events": 0, "keyframes": 0}
-    original_events = WorldStore.read_events
+    import tower.results.world_builder as producer_module
+
+    calls = {"journal": 0, "keyframes": 0}
+    original_raw = producer_module.read_raw_jsonl
     original_keyframes = WorldStore.read_keyframes
 
-    def _events(self, *args, **kwargs):
-        calls["events"] += 1
-        return original_events(self, *args, **kwargs)
+    def _raw(path, *args, **kwargs):
+        calls["journal"] += 1
+        return original_raw(path, *args, **kwargs)
 
     def _keyframes(self, *args, **kwargs):
         calls["keyframes"] += 1
         return original_keyframes(self, *args, **kwargs)
 
-    WorldStore.read_events = _events
+    producer_module.read_raw_jsonl = _raw
     WorldStore.read_keyframes = _keyframes
     try:
         producer = WorldBuilderStatusProducer(root, lambda: 0.0)
         producer.snapshot(world_id, session_id)
         first_pass = dict(calls)
-        calls["events"] = calls["keyframes"] = 0
+        calls["journal"] = calls["keyframes"] = 0
         for _ in range(5):
             producer.snapshot(world_id, session_id)
         steady_state = dict(calls)
     finally:
-        WorldStore.read_events = original_events
+        producer_module.read_raw_jsonl = original_raw
         WorldStore.read_keyframes = original_keyframes
 
-    assert first_pass["events"] == 1
+    assert first_pass["journal"] == 1
     # Two on the first pass: once for the keyframe digest, and once inside
     # read_derived's own staleness check while the path length is
     # computed. Both are gated afterwards -- what matters is that five
     # further passes over an unchanged world parse nothing at all.
     assert first_pass["keyframes"] == 2
-    assert steady_state == {"events": 0, "keyframes": 0}, (
+    assert steady_state == {"journal": 0, "keyframes": 0}, (
         f"an unchanged world was re-parsed: {steady_state}"
     )

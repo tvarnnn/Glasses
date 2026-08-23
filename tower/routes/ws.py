@@ -41,6 +41,24 @@ class _ConnectionSender:
         async with self._lock:
             await self._websocket.send_json(payload)
 
+    async def send_bounded(self, payload: dict, *, lock_timeout: float,
+                           send_timeout: float) -> None:
+        """Send with the lock wait and the send itself bounded SEPARATELY.
+
+        Lumping them together let a slow frame send consume a result's
+        whole budget and trigger a spurious "the consumer is too slow"
+        drop -- when the result had not reached the socket at all, it was
+        queued behind the frame path. The two waits mean different things
+        and are reported differently, so they are measured apart.
+        """
+        await asyncio.wait_for(self._lock.acquire(), timeout=lock_timeout)
+        try:
+            await asyncio.wait_for(
+                self._websocket.send_json(payload), timeout=send_timeout
+            )
+        finally:
+            self._lock.release()
+
 
 async def _handle_frame_message(
     websocket: WebSocket,

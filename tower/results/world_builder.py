@@ -38,6 +38,7 @@ import math
 from pathlib import Path
 
 from tower.results.contracts import TIME_BASIS
+from tower.storage import read_raw_jsonl
 from tower.results.envelope import Snapshot, compute_revision
 from tower.world_builder.records import format_distance
 from tower.world_builder.schema import (
@@ -58,13 +59,20 @@ logger = logging.getLogger(__name__)
 # cannot see a process's intent; it can see a lock, a journal and a
 # manifest.
 LIFECYCLE_RECEIVING = "receiving"
-# NOT "finalizing". An independent audit of the on-disk state proved
-# that while build() runs, the files are BYTE-IDENTICAL to "stopped and
-# never built" and to "stopped and the build crashed": build() writes
-# nothing until it finishes and emits no event, and the writer lock is
-# already released by then (engine.stop_session releases before the
-# driver calls build). So Tower cannot observe that work is continuing,
-# and a state named "finalizing" would assert exactly that.
+# NOT "finalizing", and the reason is narrower than an earlier version of
+# this comment claimed.
+#
+# That version said the files are BYTE-IDENTICAL while build() runs. An
+# adversarial review disproved it: build() rewrites edges.jsonl,
+# session.json and world.json BEFORE the manifest lands, so the directory
+# does change. What is true -- and is what matters -- is that those writes
+# are indistinguishable from a build that made them and then DIED. The
+# writer lock is already released (engine.stop_session releases it before
+# the driver calls build), and no event is written, so there is no marker
+# that says "a process is working right now".
+#
+# So Tower cannot observe that work is continuing, and a state named
+# "finalizing" would assert exactly that.
 #
 # This name says only what is visible: capture stopped, and the stored
 # geometry is not current with the keyframes. iOS may render its own
@@ -238,8 +246,20 @@ class WorldBuilderStatusProducer:
         return chosen, self._latest_session(store, chosen, sessions), None
 
     def _most_relevant(self, store, world_ids):
-        """A live world if one exists, else the most recently updated."""
-        live = [wid for wid in world_ids if _lock_holder(store, wid) is not None]
+        """A LIVE world if one exists, else the most recently updated.
+
+        "Live" means a lock held by a process that is still running. An
+        earlier version accepted the mere existence of a lock file, so one
+        leftover lock from a crashed builder permanently hijacked every
+        default subscription -- an adversarial review demonstrated a
+        stale-locked world outranking a newer, cleanly stopped one.
+        """
+        live = [
+            wid
+            for wid in world_ids
+            if (holder := _lock_holder(store, wid)) is not None
+            and holder.get("alive")
+        ]
         candidates = live or world_ids
         best, best_at = None, -math.inf
         for wid in candidates:
@@ -287,6 +307,7 @@ class WorldBuilderStatusProducer:
                 "state": LIFECYCLE_UNAVAILABLE,
                 "evidence": "nothing to read",
                 "reason": reason,
+                **_BUILD_UNOBSERVABLE,
             },
             "progress": None,
             "tracking": None,
@@ -327,11 +348,12 @@ class WorldBuilderStatusProducer:
                 "state": LIFECYCLE_IDLE,
                 "evidence": "the world exists and has no sessions",
                 "reason": None,
+                **_BUILD_UNOBSERVABLE,
             },
             "progress": None,
             "tracking": None,
             "calibration": None,
-            "scale": _scale_block(world),
+            "scale": _scale_block(world, attributable=False),
             "geometry": _geometry_unavailable("this world has no sessions"),
             "trajectory": _trajectory_unavailable("this world has no sessions"),
             "persistence": _persistence_block(world),
@@ -355,7 +377,7 @@ class WorldBuilderStatusProducer:
         events = self._files.read(
             store.events_path(world.world_id, session_id),
             lambda: _summarise_events(
-                store.read_events(world.world_id, session_id)
+                *read_raw_jsonl(store.events_path(world.world_id, session_id))
             ),
         )
         holder = _lock_holder(store, world.world_id)
@@ -391,8 +413,21 @@ class WorldBuilderStatusProducer:
             geometry_current=geometry_current,
             has_manifest=manifest is not None,
         )
-        live = lifecycle["state"] == LIFECYCLE_RECEIVING
-        progress = _progress_block(session, events, live, self._clock())
+        # Which counts are trustworthy is decided by whether the session
+        # was ever STOPPED -- not by whether it is currently `receiving`.
+        #
+        # session.json holds the zeros written at start_session until
+        # stop_session rewrites it, and `failed` and `idle` are both
+        # states in which that never happened. An earlier version keyed
+        # this on `receiving`, so a builder that crashed mid-session
+        # reported `keyframes_accepted: 0, provenance: "measured"` beside
+        # `tracking: good, evidence: the most recent event was
+        # keyframe_accepted` -- the same payload denying and confirming
+        # the same fact. Found by adversarial review.
+        counts_are_final = stopped and session.ended_at is not None
+        progress = _progress_block(
+            session, events, counts_are_final, self._clock()
+        )
         keyframes_now = progress["keyframes_accepted"]
 
         return {
@@ -402,7 +437,14 @@ class WorldBuilderStatusProducer:
             "progress": progress,
             "tracking": _tracking_block(events),
             "calibration": _calibration_block(session),
-            "scale": _scale_block(world),
+            # Scale is attributed to THIS session or not at all. It
+            # lives on the World record and is written by build(), so a
+            # session that was never built would otherwise inherit a
+            # `relative` scale earned by a different session -- an
+            # adversarial review found exactly that, and the same argument
+            # _calibration_block makes about a world-level calibration
+            # state applies here unchanged.
+            "scale": _scale_block(world, attributable=manifest is not None),
             "geometry": _geometry_block(manifest, geometry_current, keyframes_now),
             "trajectory": self._trajectory_block(
                 store, world, session_id, manifest, geometry_current, keyframes_now
@@ -504,10 +546,22 @@ class WorldBuilderStatusProducer:
             # A length with holes in it is not a length.
             return {
                 "available": False,
+                # Interpolating `refused` here used to produce "None of
+                # this session's poses were refused, so the path has
+                # gaps" -- a sentence that states the opposite of its own
+                # conclusion -- in the branch that fires BECAUSE the
+                # figure is missing. Prose shown to a person must not be
+                # assembled from a value the branch exists to handle.
                 "reason": (
-                    f"{refused} of this session's poses were refused, so the "
-                    "path has gaps; a total would draw straight lines across "
-                    "them and count the result as distance travelled"
+                    "this session's build did not record how many poses it "
+                    "refused, so gaps in the path cannot be ruled out"
+                    if refused is None
+                    else (
+                        f"{refused} of this session's poses were refused, so "
+                        "the path has gaps; a total would draw straight lines "
+                        "across them and count the result as distance "
+                        "travelled"
+                    )
                 ),
             }
         segments = manifest.get("segments")
@@ -515,9 +569,15 @@ class WorldBuilderStatusProducer:
             return {
                 "available": False,
                 "reason": (
-                    f"this session has {segments} segments; tracking was lost "
-                    "between them, so their poses share no coordinate frame "
-                    "and a total length would sum incomparable distances"
+                    "this session's build did not record its segment count, "
+                    "so a common coordinate frame cannot be assumed"
+                    if segments is None
+                    else (
+                        f"this session has {segments} segments; tracking was "
+                        "lost between them, so their poses share no "
+                        "coordinate frame and a total length would sum "
+                        "incomparable distances"
+                    )
                 ),
             }
         semantics = SCALE_SEMANTICS.get(world.scale.state)
@@ -646,8 +706,12 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
         return {
             "state": LIFECYCLE_FAILED,
             "evidence": (
-                f"the writer lock is held by pid {holder['pid']}, which is no "
-                "longer running"
+                "a writer lock exists but names no readable process id"
+                if holder.get("unreadable")
+                else (
+                    f"the writer lock is held by pid {holder['pid']}, which is "
+                    "no longer running"
+                )
             ),
             "reason": (
                 "the process building this world exited without stopping its "
@@ -702,12 +766,21 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
     }
 
 
-def _summarise_events(events) -> dict:
+def _summarise_events(events, corrupt_lines: int = 0) -> dict:
     """Everything any block needs from the journal, in fixed size.
 
     Computed once per journal change and cached. Deliberately returns
     scalars: nothing downstream is allowed to hold the event list, so the
     cost of a long session is a few integers rather than the session.
+
+    `corrupt_lines` is carried out rather than discarded. `WorldStore`'s
+    readers drop that count, so a torn journal silently lowered the
+    keyframe total while still labelling it `measured` -- a review
+    demonstrated a count going 4 to 3 with nothing on the wire saying why.
+    A journal is appended without fsync, so ONE torn line at the tail is
+    routine and means "a write is in flight"; several mean corruption.
+    Either way the client is told rather than quietly given a smaller
+    number.
     """
     accepted = 0
     last_tracking = None
@@ -725,35 +798,65 @@ def _summarise_events(events) -> dict:
         "keyframes_accepted": accepted,
         "last_tracking": last_tracking,
         "stopped": stopped,
+        "corrupt_lines": corrupt_lines,
     }
 
 
-def _progress_block(session, events, live: bool, now: float) -> dict:
+def _progress_block(session, events, counts_are_final: bool, now: float) -> dict:
     """What the Tower actually counts, and nothing it does not.
 
-    While a session is live the keyframe count comes from the journal,
-    not from session.json, which still holds the zeros written at
-    start_session. `frames_observed` has no live source at all: an
-    ordinary rejected frame writes no event, so the number simply is not
-    knowable yet and is reported as null with the reason.
+    `counts_are_final` means the session was stopped and its record
+    rewritten. Until then session.json still holds the zeros written at
+    start_session, so the keyframe count comes from the journal instead,
+    and `frames_observed` has no source at all -- an ordinary rejected
+    frame writes no event, so the number is simply not knowable yet.
     """
-    accepted = events["keyframes_accepted"]
     ended = session.ended_at
     elapsed = (ended if ended is not None else now) - session.started_at
+    if elapsed < 0.0:
+        # A clock that stepped backwards. Reported as UNKNOWN rather than
+        # clamped to zero: a session that has been mapping for five
+        # minutes must not become indistinguishable from one that just
+        # started. Clamping turns an impossible value into a plausible
+        # one, which is the worse failure -- and this field is excluded
+        # from the revision, so it would arrive with
+        # `revision_changed: false` telling a client to skip the redraw.
+        mapping_seconds = None
+        clock_note = (
+            "the Tower's wall clock moved backwards during this session, so "
+            "elapsed mapping time cannot be computed"
+        )
+    else:
+        mapping_seconds = elapsed
+        clock_note = None
     return {
-        "keyframes_accepted": accepted if live else session.keyframes_accepted,
-        "keyframes_accepted_provenance": "measured",
-        "frames_observed": None if live else session.frames_observed,
-        "frames_observed_unavailable_reason": (
-            "no event is written for an ordinary rejected frame, so this "
-            "count is only known once the session stops"
-            if live
-            else None
+        "keyframes_accepted": (
+            session.keyframes_accepted
+            if counts_are_final
+            else events["keyframes_accepted"]
         ),
-        "rejected_by_reason": None if live else dict(session.rejected_by_reason),
+        "keyframes_accepted_provenance": "measured",
+        "keyframes_accepted_source": (
+            "session record" if counts_are_final else "event journal"
+        ),
+        "frames_observed": session.frames_observed if counts_are_final else None,
+        "frames_observed_unavailable_reason": (
+            None
+            if counts_are_final
+            else (
+                "no event is written for an ordinary rejected frame, and this "
+                "session's record has not been finalised, so this count is "
+                "not knowable yet"
+            )
+        ),
+        "rejected_by_reason": (
+            dict(session.rejected_by_reason) if counts_are_final else None
+        ),
+        "journal_corrupt_lines": events["corrupt_lines"],
         # On the TOWER's clock, per IOS-to-Tower.md 1.8: "the iPhone's idea
         # of elapsed time is not the Tower's idea of mapping time".
-        "mapping_seconds": max(0.0, elapsed),
+        "mapping_seconds": mapping_seconds,
+        "mapping_seconds_unavailable_reason": clock_note,
         "mapping_clock": "tower",
         "time_basis": TIME_BASIS,
     }
@@ -827,8 +930,30 @@ def _calibration_block(session) -> dict:
     }
 
 
-def _scale_block(world) -> dict:
+def _scale_block(world, *, attributable: bool = True) -> dict:
+    """The world's scale, but only where it can be attributed to a session.
+
+    `attributable` is false for a session this build has produced no
+    geometry for. A scale is EARNED by a build; reporting one for a
+    session that was never built would credit it with another session's
+    reconstruction.
+    """
     scale = world.scale
+    if not attributable:
+        return {
+            "state": SCALE_UNKNOWN,
+            "semantics": None,
+            "meters_per_unit": None,
+            "method": None,
+            "confidence": scale.confidence.value,
+            "unit": None,
+            "allows_metres": False,
+            "unavailable_reason": (
+                "no build has produced geometry for this session, so it has "
+                "no scale of its own; this world's scale was earned by a "
+                "different session"
+            ),
+        }
     return {
         "state": scale.state,
         "semantics": SCALE_SEMANTICS.get(scale.state),
@@ -840,6 +965,7 @@ def _scale_block(world) -> dict:
         # value for a world with no solved pose.
         "unit": None if scale.state == SCALE_UNKNOWN else "world units",
         "allows_metres": scale.allows_metres,
+        "unavailable_reason": None,
     }
 
 
@@ -1005,14 +1131,23 @@ def _artifacts_block(store, world_id, session_id, world) -> dict:
     bytes", and inventing a fetch scheme would be exactly the fabricated
     contract that document refuses to produce.
     """
-    present = False
+    # `present` is TRI-STATE. False is a positive claim that no imagery
+    # exists, and this flag cannot support it: a review found a world with
+    # images_purged=True still holding three JPEGs, while the wire said
+    # `present: false` -- the block's own docstring and the contract both
+    # forbid rendering the flag as "the imagery is gone", and the payload
+    # did exactly that. Null means "not established".
+    present = None
     count = None
-    if session_id is not None and not world.images_purged:
+    if session_id is not None:
         images = store.images_dir(world_id, session_id)
         try:
             if images.exists():
                 count = sum(1 for _ in images.glob("*.jpg"))
                 present = count > 0
+            else:
+                count = 0
+                present = False
         except OSError:
             count = None
     return {
@@ -1060,8 +1195,12 @@ def _lock_holder(store, world_id):
         return None
     pid = holder.get("pid")
     if not isinstance(pid, int):
-        return None
-    return {"pid": pid, "alive": _pid_is_running(pid)}
+        # A lock file exists but names no usable pid. NOT the same as "no
+        # lock": reporting `idle` with "no writer lock is held" would be a
+        # false statement about a file that is right there, and would
+        # downgrade a crashed builder to a healthy-looking idle world.
+        return {"pid": None, "alive": False, "unreadable": True}
+    return {"pid": pid, "alive": _pid_is_running(pid), "unreadable": False}
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -1071,6 +1210,24 @@ def _pid_is_running(pid: int) -> bool:
         return psutil.pid_exists(pid)
     except Exception:  # pragma: no cover - psutil is a hard dependency
         return False
+
+
+# Keys a manifest must carry before it counts as evidence of geometry.
+# `engine.build` writes all of them; a manifest missing any is truncated,
+# hand-edited, or from a writer this build does not understand.
+#
+# Gating on "the file exists" instead let a stripped manifest produce
+# `available: true` with every figure null -- "we have geometry" asserted
+# with nothing to show for it -- which an adversarial review demonstrated.
+REQUIRED_MANIFEST_KEYS = (
+    "input_digest",
+    "session_id",
+    "keyframes",
+    "points",
+    "poses_solved",
+    "poses_refused",
+    "segments",
+)
 
 
 def _read_manifest(store, world_id):
@@ -1096,6 +1253,16 @@ def _read_manifest(store, world_id):
         # store.derived_is_current checks this; nothing else does. A
         # manifest from another schema describes fields whose meaning this
         # build does not know.
+        return None
+    missing = [key for key in REQUIRED_MANIFEST_KEYS if manifest.get(key) is None]
+    if missing:
+        logger.warning(
+            "result channel: derived manifest for %s is missing %s; "
+            "treating it as absent rather than reporting geometry with no "
+            "figures",
+            world_id,
+            missing,
+        )
         return None
     return manifest
 

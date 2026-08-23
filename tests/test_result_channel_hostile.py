@@ -104,8 +104,14 @@ def test_a_manifest_from_another_schema_is_refused(monkeypatch, world):
     _assert_no_fabrication(payload)
 
 
-def test_a_manifest_missing_keys_does_not_invent_them(monkeypatch, world):
-    """Absent figures must arrive as null, never as zero."""
+def test_a_manifest_missing_keys_is_not_evidence_of_geometry(monkeypatch, world):
+    """A manifest that carries no figures does not mean "we have geometry".
+
+    Gating on "the file exists" produced `available: true` with every
+    figure null -- a claim asserted with nothing to show for it -- and a
+    refusal sentence reading "None of this session's poses were refused,
+    so the path has gaps". Both found by adversarial review.
+    """
     root, world_id, _ = world
     store = WorldStore(root)
     path = store.derived_manifest_path(world_id)
@@ -118,9 +124,17 @@ def test_a_manifest_missing_keys_does_not_invent_them(monkeypatch, world):
     geometry = payload["geometry"]
     trajectory = payload["trajectory"]
 
+    assert geometry["available"] is False, (
+        "a manifest with no figures must not assert geometry"
+    )
     assert geometry["element_count"] is None
+    assert geometry["representation"] is None
+    assert trajectory["available"] is False
     assert trajectory["pose_count"] is None
-    assert trajectory["path_length"]["available"] is False
+    assert trajectory["path_length"] is None
+    # And the scale it never earned is not attributed to it either.
+    assert payload["scale"]["state"] == "unknown"
+    assert payload["scale"]["unit"] is None
 
 
 def test_an_unreadable_manifest_is_survived(monkeypatch, world):
@@ -230,7 +244,14 @@ def test_a_backward_clock_never_produces_a_negative_mapping_time(
         path.write_text(json.dumps(data), encoding="utf-8")
 
         payload = _payload(monkeypatch, root)
-        assert payload["progress"]["mapping_seconds"] >= 0.0
+        progress = payload["progress"]
+        # UNKNOWN, not clamped to zero. A session mapping for five minutes
+        # must not become indistinguishable from one that just started --
+        # and because this field is excluded from the revision, a
+        # plausible zero would arrive with `revision_changed: false`,
+        # telling the client to skip the redraw.
+        assert progress["mapping_seconds"] is None
+        assert "backwards" in progress["mapping_seconds_unavailable_reason"]
     finally:
         engine.stop_session()
 
