@@ -205,6 +205,25 @@ and the module container's state does not move.
 
 ---
 
+### 6.1 Long-session resources
+
+A 30-minute session simulated at the real poll rate: 3,600 polls with the
+event journal growing throughout, one subscriber attached.
+
+| Poll | Journal events | Traced memory | Payload size |
+|---|---|---|---|
+| 0 | 1 | 5.7 KiB | 3,173 B |
+| 900 | 91 | 27.8 KiB | 3,173 B |
+| 1,800 | 181 | 33.2 KiB | 3,173 B |
+| 2,700 | 271 | 33.9 KiB | 3,173 B |
+| 3,600 | 360 | **34.3 KiB** | **3,173 B** |
+
+Memory **plateaus** rather than growing with the session, the payload is
+byte-constant regardless of how much has been observed, and the two
+producer caches ended at 3 and 1 entries against caps of 64.
+
+---
+
 ## 7. Privacy posture
 
 - **No imagery crosses the wire.** World Builder keyframes carry

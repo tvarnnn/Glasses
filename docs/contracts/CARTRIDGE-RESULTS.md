@@ -353,6 +353,12 @@ than as a spec.
 | Frame reply, one subscription open | median **3.220 ms**, p95 3.817 ms |
 | Cost of the channel to the frame path | **−0.004 ms (−0.1%)** — noise, over 400 frames per condition in 5 alternating reps |
 
+Over a simulated 30-minute session (3,600 polls, journal growing
+throughout, one subscriber): traced memory went 5.7 KiB → **34.3 KiB and
+plateaued**, and the payload stayed **byte-constant at 3,173 bytes**. Your
+memory cost per subscriber does not grow with how long the Tower has been
+mapping.
+
 Snapshot computation runs in a worker thread, never on the event loop.
 
 **Client responsibilities**
