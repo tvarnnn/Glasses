@@ -339,6 +339,22 @@ phone. This is additive; the six existing message types never trigger it.
 | Poll interval | **0.5 s** | how often the Tower re-reads disk |
 | Heartbeat | **2 s** | how often an unchanged snapshot is re-sent |
 
+### Measured cost
+
+All on this host (Windows 11, CPU-only), so treat them as shape rather
+than as a spec.
+
+| What | Figure |
+|---|---|
+| One snapshot, 7-event journal | **0.75 ms** |
+| One snapshot, 50,000-event journal | **0.73 ms** — flat, because the journal is summarised once per change and the summary is three scalars |
+| The same, without caching | 0.98 ms → **117 ms**, i.e. linear in session length |
+| Frame reply, no subscription | median **3.224 ms**, p95 3.873 ms |
+| Frame reply, one subscription open | median **3.220 ms**, p95 3.817 ms |
+| Cost of the channel to the frame path | **−0.004 ms (−0.1%)** — noise, over 400 frames per condition in 5 alternating reps |
+
+Snapshot computation runs in a worker thread, never on the event loop.
+
 **Client responsibilities**
 
 1. **Read the socket.** One WebSocket is one TCP stream: if you stop

@@ -350,7 +350,7 @@ class WorldBuilderStatusProducer:
         holder = _lock_holder(store, world.world_id)
         manifest = self._files.read(
             store.derived_manifest_path(world.world_id),
-            lambda: _manifest_for(store, world.world_id, session_id),
+            lambda: _read_manifest(store, world.world_id),
         )
         keyframes_current = self._files.read(
             store.keyframes_path(world.world_id, session_id),
@@ -358,9 +358,12 @@ class WorldBuilderStatusProducer:
         )
 
         if manifest is not None and manifest.get("session_id") != session_id:
-            # The cache is keyed on the manifest file, which is shared by
-            # every session in a world. A value cached while reporting on
-            # a different session must not be attributed to this one.
+            # THE session check, and the only one. A world with two built
+            # sessions has ONE manifest, describing whichever built last.
+            # Attributing it to the other session would report one
+            # session's geometry as another's -- a confident wrong answer,
+            # and the reason _read_manifest deliberately does not filter:
+            # its result is cached per FILE, and that file is shared.
             manifest = None
 
         stopped = events['stopped']
@@ -1006,15 +1009,21 @@ def _pid_is_running(pid: int) -> bool:
         return False
 
 
-def _manifest_for(store, world_id, session_id):
-    """The derived manifest, but ONLY if it describes THIS session.
+def _read_manifest(store, world_id):
+    """The world's derived manifest, unfiltered, or None.
 
-    The manifest lives at one path per WORLD while carrying a session_id
-    (store.derived_manifest_path, engine.build). A world with two built
-    sessions therefore has one manifest describing whichever built last.
-    Reporting it for the other session would attribute one session's
-    geometry to another -- a confident wrong answer of exactly the kind
-    the pose-convention machinery exists to prevent.
+    Deliberately NOT filtered by session, despite the manifest carrying a
+    session_id -- the caller does that, and it matters where the check
+    lives. This function is called through a file-fingerprint cache keyed
+    on the manifest PATH, and that path is shared by every session in a
+    world (store.derived_manifest_path). A cached value filtered for one
+    session would be handed to another, which is the exact
+    misattribution the check exists to prevent.
+
+    So: this reads and validates the schema; `_payload` decides whether
+    the manifest describes the session being reported on. An earlier
+    version of this function claimed to do both and did neither after the
+    cache was introduced.
     """
     manifest = store.read_derived_manifest(world_id)
     if manifest is None:
@@ -1024,11 +1033,6 @@ def _manifest_for(store, world_id, session_id):
         # manifest from another schema describes fields whose meaning this
         # build does not know.
         return None
-    if manifest.get("session_id") != session_id:
-        # Kept rather than dropped: the caller re-checks, and returning
-        # the manifest lets one cached read serve every session in a
-        # world instead of one read per session per poll.
-        return manifest
     return manifest
 
 
