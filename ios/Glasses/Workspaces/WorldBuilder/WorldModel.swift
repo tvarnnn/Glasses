@@ -199,6 +199,27 @@ struct WorldTrajectoryReport: Equatable, Sendable {
         }
     }
 
+    /// Whether the path length may be shown **as the labelled figure it is**,
+    /// which is a weaker question than `distanceDisplayable` and has a
+    /// different answer.
+    ///
+    /// The Tower reconstructs monocular RGB, so `.relative` is the best scale
+    /// it can reach and `distanceDisplayable` is correctly false for every
+    /// figure it will ever send. Refusing on that basis alone would mean this
+    /// panel never shows a path length at all — and "2.9 world units", with the
+    /// Tower's own unit attached and its own scale named beside it, is not a
+    /// distance claim. It is the honest rendering of a shape statistic.
+    ///
+    /// The gate is the **unit**, not the scale. A bare number is what
+    /// `ReportedFigure` exists to prevent: without a unit a reader supplies
+    /// their own, and the one they supply is metres. `.unknown` scale is
+    /// excluded separately — the Tower sends no distance figure at all in that
+    /// state, because it could not be labelled.
+    var labelledFigureDisplayable: Bool {
+        guard pathLength != nil, let pathLengthUnit, !pathLengthUnit.isEmpty else { return false }
+        return scale != .unknown
+    }
+
     var hasReport: Bool { poseCount != nil || pathLength != nil }
 }
 
