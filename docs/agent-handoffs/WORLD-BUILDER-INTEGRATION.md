@@ -209,6 +209,22 @@ rendered pinhole scene.
 5. **Then** the resolution question. Only after a baseline walk exists to
    compare against.
 
+The follower has to be started *after* `stream_start`, because the capture
+directory does not exist until then, and its id is only discoverable from
+`/health`. On the Tower host, after pressing Start on the phone:
+
+```powershell
+cd C:\Users\tvllo\Projects\GlassesTower
+$cap = (Invoke-RestMethod http://localhost:8000/health).capture.capture_id
+.venv\Scripts\python.exe scripts/world_build_session.py `
+    --follow-capture data/capture/captures/$cap `
+    --root data/worlds `
+    --intrinsics intrinsics.json `
+    --name "First Room" --rebuild-every 4 --max-idle-polls 1200 --format json
+```
+
+Drop `--intrinsics` and you get §4: keyframes, and no geometry.
+
 Operational notes that cost time to find:
 
 - The capture directory is `<TOWER_CAPTURE_ROOT>/captures/<capture_id>`, **not**
