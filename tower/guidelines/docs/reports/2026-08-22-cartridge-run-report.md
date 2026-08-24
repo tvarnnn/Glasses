@@ -140,7 +140,7 @@ The rejections carry more information than the features.
 | `rapidocr_onnxruntime` | A dry-run showed it installs `opencv-python` beside `opencv-python-headless` |
 | `pytesseract` | Needs a system binary pip cannot install |
 | Dense optical flow | 7.5–8.9× the cost for the same headline |
-| Face detection | Verified absent: no `CascadeClassifier`, no model for `FaceDetectorYN`, no ONNX/XML anywhere under `cv2/` |
+| Face detection | **This conclusion was WRONG and was corrected on 2026-08-23.** Every clause was true -- no `CascadeClassifier`, no model for `FaceDetectorYN`, no ONNX/XML under `cv2/` -- and the search was scoped to `cv2/`. `scikit-image` ships an LBP frontal cascade and its own loader, and `cv2.FaceDetectorYN` is compiled into our OpenCV and needed only a 227 KB weights file. Face redaction now ships; see `2026-08-23-world-builder-mvp-report.md` |
 | Embedding retrieval | No corpus to justify it; BM25's explainability matters more while an answer must be traceable |
 | An LLM summary | No local serving path, and abstractive summary of partial capture is the fabrication the brief forbids |
 | `nearer_than_same_class` | **Shipped, then withdrawn** on a counterexample: two chairs at the same distance, one face-on and one edge-on, differ 2.5× in area |

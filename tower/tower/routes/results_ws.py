@@ -17,7 +17,9 @@ import logging
 from tower.results import registry
 from tower.results.contracts import ENVELOPE_CONTRACT
 from tower.results.publisher import (
+    LOCK_TIMEOUT_S,
     MAX_SUBSCRIPTIONS_PER_CONNECTION,
+    SEND_TIMEOUT_S,
     ConnectionChannel,
     Subscription,
     classify_cursor,
@@ -46,6 +48,7 @@ ERR_CONTRACT_MISMATCH = "contract_mismatch"
 ERR_UNAVAILABLE = "cartridge_unavailable"
 ERR_TOO_MANY = "too_many_subscriptions"
 ERR_UNKNOWN_SUBSCRIPTION = "unknown_subscription"
+ERR_SNAPSHOT_FAILED = "snapshot_failed"
 
 
 async def handle(message: dict, *, websocket, sender, channel_holder) -> None:
@@ -184,9 +187,31 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
     # begins with a complete snapshot".
     import asyncio
 
-    snapshot = await asyncio.to_thread(
-        hub._snapshot_for, cartridge, result_type, world_id, session_id
-    )
+    try:
+        snapshot = await asyncio.to_thread(
+            hub._snapshot_for, cartridge, result_type, world_id, session_id
+        )
+    except Exception as exc:
+        # A subscribe that cannot produce its first snapshot must SAY so.
+        # The outer handler would have logged this and returned, leaving
+        # the client waiting on a reply that was never coming -- the
+        # silent no-op IOS-to-Tower.md 2.2 rules out, and the worst of the
+        # available failures because nothing on either side reports it.
+        logger.exception(
+            "[Tower][Results] could not build the first snapshot for %s/%s",
+            cartridge,
+            result_type,
+        )
+        await _error(
+            sender,
+            ERR_SNAPSHOT_FAILED,
+            f"the Tower could not read this cartridge's state: "
+            f"{type(exc).__name__}",
+            cartridge=cartridge,
+            result_type=result_type,
+            contract=offer["contract"],
+        )
+        return
     subscription.cursor_status = classify_cursor(since, snapshot.revision)
 
     await sender.send(
@@ -267,8 +292,21 @@ class ChannelHolder:
 
     def ensure(self, websocket, sender) -> ConnectionChannel:
         if self._channel is None:
+
+            async def _send(payload):
+                # Bounded on BOTH waits. The push task shares the
+                # connection's send lock with the frame path, so an
+                # unbounded lock wait here would let a slow frame consume
+                # a result's budget and drop a subscription that was
+                # never actually offered to the socket.
+                await sender.send_bounded(
+                    payload,
+                    lock_timeout=LOCK_TIMEOUT_S,
+                    send_timeout=SEND_TIMEOUT_S,
+                )
+
             self._channel = ConnectionChannel(
-                websocket.app.state.result_hub, sender.send, self._clock
+                websocket.app.state.result_hub, _send, self._clock
             )
         return self._channel
 

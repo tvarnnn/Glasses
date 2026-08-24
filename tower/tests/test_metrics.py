@@ -169,3 +169,61 @@ def test_record_frame_processing_error_increments_counter():
     metrics.record_frame_processing_error()
 
     assert metrics.snapshot()["frame_processing_errors"] == 2
+
+
+def test_a_measurement_window_uses_constant_memory():
+    """A window can live as long as the connection, so it must not grow.
+
+    `handoff.md` 9.3: a `stream_stop` MAY NEVER ARRIVE, because a dropped
+    socket produces none. So "until the window closes" can mean "until the
+    connection dies", and one float per frame per measurement is unbounded
+    in principle. Only the mean and the maximum are ever reported and both
+    are O(1) to maintain.
+    """
+    import gc
+    import tracemalloc
+
+    from tower.metrics import SessionMetrics
+
+    def _traced(frames: int) -> int:
+        gc.collect()
+        tracemalloc.start()
+        metrics = SessionMetrics()
+        for index in range(frames):
+            metrics.record_frame(
+                seq=index,
+                byte_count=20_000,
+                receive_to_result_ms=3.2,
+                cv_processing_ms=1.1,
+                stage_ms={"total": 1.1, "decode": 0.4},
+            )
+        gc.collect()
+        current, _ = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        return current, metrics.snapshot()
+
+    small, small_snapshot = _traced(1_000)
+    large, large_snapshot = _traced(50_000)
+
+    assert large < small * 2, (
+        f"memory grew with session length: {small} -> {large} bytes"
+    )
+    # And the figures are unchanged by the accumulator form.
+    for key in (
+        "receive_to_result_ms_avg",
+        "receive_to_result_ms_max",
+        "cv_processing_ms_avg",
+        "stage_ms_avg",
+        "stage_ms_max",
+    ):
+        assert small_snapshot[key] == large_snapshot[key]
+
+
+def test_an_empty_measurement_window_reports_zero_not_an_error():
+    """The reporting contract for a window that saw no frames is unchanged."""
+    from tower.metrics import SessionMetrics
+
+    snapshot = SessionMetrics().snapshot()
+    assert snapshot["receive_to_result_ms_avg"] == 0.0
+    assert snapshot["receive_to_result_ms_max"] == 0.0
+    assert snapshot["stage_ms_avg"] == {}

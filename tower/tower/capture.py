@@ -27,6 +27,7 @@ started and stopped, bounded, purgeable, and visibly recording. It is not
 incidental capture, and it must never become the default path.
 """
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -48,6 +49,15 @@ TIME_BASIS = "tower-receipt"
 END_REASON_STOP = "stop"
 END_REASON_DISCONNECT = "disconnect"
 END_REASON_BOUNDED_LIMIT = "bounded_limit"
+
+# How long after a capture ends by DISCONNECT a new `stream_start` is
+# treated as the same walk continuing.
+#
+# `handoff.md` 6.4: iOS retries on a [0.5, 1, 2, 4, 8] s backoff and gives
+# up after five attempts, which takes roughly 45 s because each attempt can
+# burn a 6 s pong timeout. 90 s is comfortably past the point where iOS has
+# stopped trying, so anything arriving later is genuinely a new walk.
+RESUME_GRACE_SECONDS = 90.0
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +100,11 @@ class CaptureRecorder:
     """
 
     def __init__(self, root, limits: CaptureLimits | None = None, clock=time.time):
+        self._owner = None
+        # The last capture this recorder closed because a socket dropped,
+        # and when. Only ever used to LINK a successor to it; never to
+        # reopen it.
+        self._interrupted: tuple[str, float] | None = None
         from pathlib import Path
 
         self._root = Path(root)
@@ -108,8 +123,56 @@ class CaptureRecorder:
     def capture_dir(self, capture_id: str):
         return self._root / "captures" / capture_id
 
-    def start(self) -> str:
+    @property
+    def owner(self):
+        """Who armed the recording, or None.
+
+        A recorder is a process-global object shared by every connection,
+        but a recording belongs to the connection whose `stream_start`
+        opened it. Without that, one connection's teardown stops another
+        connection's capture -- see `stop`.
+        """
+        return self._owner
+
+    def resumable_capture(self) -> str | None:
+        """The capture a new `stream_start` should declare itself a successor to.
+
+        `handoff.md` 9.3 makes a repeated `stream_start` on a fresh
+        connection the EXPECTED case on this link, not an edge case: iOS
+        re-opens the stream bracket after a reconnect while the camera is
+        still running, and `seq` continues from where it left off. Tower
+        must treat that as one walk.
+
+        This does NOT reopen the old capture. Reopening would leave a
+        capture that can sit open forever if the phone never comes back --
+        and a follower waiting on it would never return, while the result
+        channel reported `receiving` for eternity. The old capture stays
+        closed and durable; the NEW one records that it continues it.
+
+        Lineage is therefore decided by the WRITER, which knows, and
+        written down. A reader is never asked to guess which of several
+        capture directories continues its own.
+        """
+        if self._interrupted is None:
+            return None
+        capture_id, ended_at = self._interrupted
+        if (self._clock() - ended_at) > RESUME_GRACE_SECONDS:
+            self._interrupted = None
+            return None
+        return capture_id
+
+    def start(self, owner=None, continues: str | None = None) -> str:
         capture_id = new_id()
+        self._owner = owner
+        self._continues = continues
+        if continues is not None:
+            logger.info(
+                "[Tower][Capture] recording %s continues %s: a reconnect, not "
+                "a new walk",
+                capture_id,
+                continues,
+            )
+        self._interrupted = None
         self._status = CaptureStatus(
             capture_id=capture_id, started_at=self._clock()
         )
@@ -141,7 +204,16 @@ class CaptureRecorder:
         status = self._status
         now = self._clock()
         if now - status.started_at >= self._limits.max_seconds:
-            self.stop(END_REASON_BOUNDED_LIMIT)
+            (
+                logger.warning(
+                    "[Tower][Capture] capture %s reached a configured bound "
+                    "and stopped itself; this is NOT a client disconnect, and "
+                    "a follower will see the capture close exactly as if it "
+                    "were one",
+                    self._status.capture_id,
+                ),
+                self.stop(END_REASON_BOUNDED_LIMIT),
+            )[1]
             return False
         if status.bytes_written + len(raw_bytes) > self._limits.max_bytes:
             self.stop(END_REASON_BOUNDED_LIMIT)
@@ -187,11 +259,44 @@ class CaptureRecorder:
         status.bytes_written += len(raw_bytes)
         return True
 
-    def stop(self, reason: str = END_REASON_STOP) -> CaptureStatus | None:
+    def stop(self, reason: str = END_REASON_STOP, owner=None) -> CaptureStatus | None:
+        """Close the recording -- but only if the caller owns it.
+
+        `owner=None` is an unconditional stop, which is what an operator
+        or a test wants. A CONNECTION must always pass its own token,
+        because of a race that was measured rather than imagined:
+
+        uvicorn does not learn a WebSocket is dead for 20-40 seconds
+        (ws_ping_interval and ws_ping_timeout are both 20 s), while iOS
+        reconnects in 0.5 s and re-sends `stream_start`. So the ordering
+        on a WiFi hiccup is: the NEW connection arms a recording, and then
+        the OLD connection's `finally` block runs and stops it.
+
+        Measured before this guard existed: the phone streamed on, the
+        Tower answered every frame_result, `/health` said
+        `recording: false`, and ZERO frames reached disk for the rest of
+        the walk. Silently. That is worse than losing the capture -- it
+        looks like success.
+        """
         if self._status is None or not self._status.is_open:
+            return self._status
+        if owner is not None and self._owner is not None and owner != self._owner:
+            logger.info(
+                "[Tower][Capture] ignoring a stop from a superseded connection; "
+                "capture %s belongs to another",
+                self._status.capture_id,
+            )
             return self._status
         self._status.ended_at = self._clock()
         self._status.end_reason = reason
+        self._owner = None
+        # Only a DISCONNECT leaves a walk that might continue. A polite
+        # stream_stop, or a configured bound, ends it deliberately.
+        self._interrupted = (
+            (self._status.capture_id, self._status.ended_at)
+            if reason == END_REASON_DISCONNECT
+            else None
+        )
         write_json_atomic(
             self.capture_dir(self._status.capture_id) / CAPTURE_FILENAME,
             self._manifest(self._status),
@@ -251,10 +356,84 @@ class CaptureRecorder:
             "bytes_written": status.bytes_written,
             "max_seconds": self._limits.max_seconds,
             "max_bytes": self._limits.max_bytes,
+            # The capture this one continues, or null. Set when a
+            # `stream_start` arrives soon after a disconnect, which is the
+            # normal shape of a WiFi hiccup mid-walk.
+            "continues_capture": getattr(self, "_continues", None),
             "retains_raw_imagery": True,
             "redaction": "none",
             "privacy_tags": ["raw-imagery", "first-person", "dataset-recording"],
         }
+
+
+class _JournalTail:
+    """Reads only what has been appended since the last read.
+
+    The obvious implementation re-reads and re-parses the whole journal on
+    every poll, and that is what shipped first. It is O(n) per poll and
+    therefore O(n squared) over a capture: measured at 23.8 ms for a single
+    poll against a full 10,800-line journal, which is roughly 43 seconds of
+    CPU across one 15-minute walk at 4 Hz -- spent in the same process that
+    is trying to run `observe()` on every frame.
+
+    Seeking to a remembered byte offset makes a poll cost the same whether
+    the journal holds ten lines or ten thousand.
+
+    A partial trailing line is expected, not exceptional: the recorder
+    appends without fsync, so a reader can arrive mid-write. The remainder
+    is carried forward and completed on the next poll rather than being
+    discarded as corruption -- which is what `read_raw_jsonl` does for a
+    whole-file read, and what this has to reproduce incrementally.
+    """
+
+    __slots__ = ("_path", "_offset", "_remainder")
+
+    def __init__(self, path) -> None:
+        self._path = path
+        self._offset = 0
+        self._remainder = b""
+
+    def read_new(self) -> list:
+        try:
+            size = self._path.stat().st_size
+        except OSError:
+            return []
+        if size < self._offset:
+            # The file shrank, which for an append-only journal means it
+            # was replaced. Start again rather than reading from a stale
+            # offset into unrelated bytes.
+            self._offset = 0
+            self._remainder = b""
+        if size == self._offset:
+            return []
+
+        try:
+            with self._path.open("rb") as handle:
+                handle.seek(self._offset)
+                chunk = handle.read()
+        except OSError:
+            return []
+        self._offset += len(chunk)
+
+        buffer = self._remainder + chunk
+        lines = buffer.split(b"\n")
+        # The last element is whatever follows the final newline: empty if
+        # the journal ends cleanly, a partial record if a write is in
+        # flight.
+        self._remainder = lines.pop()
+
+        records = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except (ValueError, UnicodeDecodeError):
+                # A line that is complete and still unparseable is real
+                # corruption. Skipped, exactly as a whole-file read would.
+                logger.warning("[Tower][Capture] skipping an unreadable journal line")
+        return records
 
 
 @dataclass(frozen=True)
@@ -289,14 +468,31 @@ class CaptureFollower:
     Bounded by construction (Rule 15): a capture whose manifest never
     closes -- a crashed recorder -- ends the follow after `max_idle_polls`
     quiet polls rather than waiting forever.
+
+    Follows a capture ACROSS a reconnect. When a capture ends by
+    disconnect, the follower waits briefly for a successor -- a capture
+    whose manifest names this one in `continues_capture` -- and continues
+    into it. Without that, a WiFi hiccup ends the mapping session at the
+    hiccup: the follower returns, the driver stops the world session, and
+    the rest of the walk sits in a second directory that nothing reads.
     """
 
-    def __init__(self, directory, *, poll_seconds: float = 0.25, sleep=time.sleep):
+    def __init__(
+        self,
+        directory,
+        *,
+        poll_seconds: float = 0.25,
+        sleep=time.sleep,
+        follow_reconnects: bool = True,
+        resume_grace_seconds: float = RESUME_GRACE_SECONDS,
+    ):
         from pathlib import Path
 
         self._directory = Path(directory)
         self._poll_seconds = poll_seconds
         self._sleep = sleep
+        self._follow_reconnects = follow_reconnects
+        self._resume_grace_seconds = resume_grace_seconds
 
     @property
     def directory(self):
@@ -317,13 +513,11 @@ class CaptureFollower:
 
     def follow(self, *, max_idle_polls: int | None = None):
         journal = self._directory / FRAMES_FILENAME
-        yielded = 0
+        tail = _JournalTail(journal)
         idle_polls = 0
 
         while True:
-            records, _ = read_raw_jsonl(journal)
-            fresh = records[yielded:]
-            yielded = len(records)
+            fresh = tail.read_new()
 
             for record in fresh:
                 frame = self._load(record)
@@ -335,12 +529,26 @@ class CaptureFollower:
             # manifest, so a follower that stopped the instant it saw an
             # end reason would drop whatever landed in between.
             if self.is_closed():
-                final, _ = read_raw_jsonl(journal)
-                for record in final[yielded:]:
+                for record in tail.read_new():
                     frame = self._load(record)
                     if frame is not None:
                         yield frame
-                return
+
+                successor = self._await_successor()
+                if successor is None:
+                    return
+                # Same walk, new directory. Rebind and keep going, so the
+                # driver never learns a reconnect happened and the mapping
+                # session stays continuous.
+                logger.info(
+                    "[Tower][Capture] following %s into %s after a reconnect",
+                    self._directory.name,
+                    successor.name,
+                )
+                self._directory = successor
+                tail = _JournalTail(self._directory / FRAMES_FILENAME)
+                idle_polls = 0
+                continue
 
             if fresh:
                 idle_polls = 0
@@ -350,6 +558,53 @@ class CaptureFollower:
                     return
 
             self._sleep(self._poll_seconds)
+
+    def _ended_by_disconnect(self) -> bool:
+        try:
+            manifest = read_json_closed(self._directory / CAPTURE_FILENAME)
+        except (OSError, ValueError):
+            return False
+        return manifest.get("end_reason") == END_REASON_DISCONNECT
+
+    def _find_successor(self):
+        """A capture whose manifest names this one as its predecessor."""
+        captures_root = self._directory.parent
+        mine = self._directory.name
+        try:
+            entries = list(captures_root.iterdir())
+        except OSError:
+            return None
+        for entry in entries:
+            if not entry.is_dir() or entry.name == mine:
+                continue
+            try:
+                manifest = read_json_closed(entry / CAPTURE_FILENAME)
+            except (OSError, ValueError):
+                continue
+            if manifest.get("continues_capture") == mine:
+                return entry
+        return None
+
+    def _await_successor(self):
+        """Wait out a reconnect, but only for a capture that was CUT OFF.
+
+        A capture that ended politely, or at a configured bound, is
+        finished -- waiting on those would add a fixed delay to the end of
+        every ordinary session for nothing.
+
+        The wait is bounded by the same grace window the recorder uses to
+        decide whether to link a successor at all, so the two cannot
+        disagree about how long a reconnect may take.
+        """
+        if not self._follow_reconnects or not self._ended_by_disconnect():
+            return None
+        polls = max(1, int(self._resume_grace_seconds / max(self._poll_seconds, 1e-6)))
+        for _ in range(polls):
+            successor = self._find_successor()
+            if successor is not None:
+                return successor
+            self._sleep(self._poll_seconds)
+        return None
 
     def _load(self, record: dict) -> FollowedFrame | None:
         relpath = record.get("relpath")

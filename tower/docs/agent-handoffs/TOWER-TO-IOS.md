@@ -1,5 +1,12 @@
 # Tower → iOS Integration Contract
 
+> **2026-08-23 — a structured result channel now exists.** The implemented
+> wire contract lives in **`docs/contracts/CARTRIDGE-RESULTS.md`**, and
+> every requirement in the repo-root `IOS-to-Tower.md` is classified in
+> **`docs/contracts/IOS-TO-TOWER-RECONCILIATION.md`**. Sections 6.1, 6.2,
+> 6.4 and 6.9 below are updated in place; the rest of this document
+> describes surfaces that predate it and is unchanged.
+
 **Audience:** whoever implements or changes the iOS side of the Glasses
 platform (the wearable gateway / capture-and-control plane), and any
 future Tower agent who must not break what iOS already depends on.
@@ -149,6 +156,18 @@ Rules a client can rely on:
   (`detections`, `mean_relative_depth`) is inference, and must never be
   presented as a sensor measurement (Rule 16 / Core Principle 2).
 
+### 1.3b `GET /cartridges` and the result channel — **EXISTS (2026-08-23)**
+
+`GET /cartridges` returns the capability declaration, and the `/ws` socket
+gained `cartridges`, `result_subscribe` and `result_unsubscribe`, replying
+with `result_subscribed`, `cartridge_result`, `result_unsubscribed` and
+`result_error`. An unrecognised message type now also returns
+`protocol_error` instead of being silently logged.
+
+All additive. The six pre-existing message types are byte-identical, and a
+test asserts `frame_result` is unchanged field-for-field with a
+subscription open. Full contract: `docs/contracts/CARTRIDGE-RESULTS.md`.
+
 ### 1.4 What `frame_result` still cannot carry — **the binding constraint**
 
 `metrics` widened the channel; it did not open it. There is still **no
@@ -208,7 +227,15 @@ armed it.
 
 ---
 
-## 3. World Builder: there is no network surface
+## 3. World Builder: the persisted artifact
+
+> **Heading corrected 2026-08-23.** This section was titled "there is no
+> network surface". There is one now -- `docs/contracts/CARTRIDGE-RESULTS.md`
+> -- carrying STATES, COUNTS and SUMMARIES. Everything below still
+> describes the persisted artifact itself: the records, the pose
+> convention, the scale semantics. None of that crosses the wire, and the
+> conventions in 3.6 and 3.7 remain what any future geometry transport
+> would have to honour.
 
 **Stated plainly: no HTTP route and no WebSocket message exposes any
 World Builder data.** World Builder is not registered as a module, has no
@@ -572,11 +599,34 @@ a crashed process does not lock a world forever.
 Each item names the missing capability and where it is blocked. None of
 these are implemented; do not code against them.
 
-### 6.1 Any World Builder transport at all — **BLOCKED**
+### 6.1 Any World Builder transport at all — **RESOLVED 2026-08-23**
 
-There is no route, no message and no push channel for worlds, sessions,
-keyframes, poses, points or events. Four concrete blockers, verified in
-source:
+> **Superseded.** A structured Tower→iOS result channel now exists and
+> World Builder is its first producer. See
+> **`docs/contracts/CARTRIDGE-RESULTS.md`** for the implemented contract
+> and **`docs/contracts/IOS-TO-TOWER-RECONCILIATION.md`** for how every
+> iOS requirement was classified against it.
+>
+> **What this section got wrong**, and it is worth stating because the
+> same conflation is easy to repeat: it treated "a World Builder
+> transport" and "World Builder as a live in-process module" as one thing.
+> They are separable. Every blocker in the table below is a property of
+> the *second*. None of them bear on a READER that never joins the frame
+> path — one that polls what `world_build_session.py` has already
+> persisted and reports it.
+>
+> Still blocked, and correctly so: World Builder (or any cartridge)
+> running as a registered production module, publishing results as it
+> computes them. That is what the four rows below still describe, and it
+> is what Scene Understanding needs, because it persists nothing and so
+> has no file for a reader to read.
+>
+> Also **not** provided, deliberately: keyframes, poses, points, raw
+> events, and imagery. The channel carries states, counts and summaries.
+> `IOS-to-Tower.md` §1.4 marks a pose array NOT REQUESTED, and §5 requires
+> unredacted imagery to be withheld.
+
+The four blockers, which still describe the LIVE MODULE path:
 
 | Location | Gap |
 |---|---|
@@ -589,12 +639,25 @@ The engine is complete behind a clean interface. The future Tower-side
 diff is a small `Module` subclass, one branch in `_build_cv_module`, and
 passing frame metadata through `process()`.
 
-### 6.2 Live progressive world rendering on the phone — **BLOCKED**
+### 6.2 Live progressive world rendering on the phone — **PARTLY RESOLVED 2026-08-23**
 
-V1's honest product statement is *Start → Walk → Stop → the world
-appears*, not *watch it build live on the phone*. The Tower-side half of
-live viewing is addressed in the closeout report; the iOS half remains
-blocked behind §6.1 because there is no transport.
+The transport now exists (§6.1), so *live progressive **state*** is
+available: lifecycle, keyframe count, mapping seconds on the Tower's
+clock, tracking, calibration, and — with
+`world_build_session.py --rebuild-every N` — geometry and trajectory
+figures that update during the walk.
+
+**Live progressive GEOMETRY RENDERING remains blocked**, and on two
+counts rather than one:
+
+1. No geometry data is sent. `element_count` is a count; there are no
+   points and no poses on the wire, because `IOS-to-Tower.md` §1.4 marked
+   a pose array NOT REQUESTED and no representation contract has been
+   agreed.
+2. Without `--rebuild-every`, geometry does not exist until after Stop.
+   `Start → Walk → Stop → the world appears` remains the honest default;
+   `--rebuild-every` is what turns it into *watch it build*, and that is a
+   choice made when the build session is launched, not by the phone.
 
 ### 6.3 A device-keyed calibration profile store — **MISSING**
 
@@ -605,10 +668,13 @@ already carries everything such a store would need
 (`calibrated_width`/`calibrated_height`, `source`, `calibrated_at`,
 `reprojection_rms_px`, `view_count`); only the keyed lookup is absent.
 
-### 6.4 Recording-state indication on the wire — **MISSING**
+### 6.4 Recording-state indication on the wire — **MISSING on the socket,
+AVAILABLE over HTTP**
 
-See §2.3. `06-PRIVACY-DATA.md` requires recording state to be clear;
-today it exists only in the Tower log.
+`GET /health` reports `capture.armed`, `capture.recording`,
+`capture.capture_id` and `capture.frames_written`, so a client can display
+the truth. There is still no push notification of a recording state
+change, and no way to arm it from iOS (§6.11).
 
 ### 6.5 A session identifier on the wire — **MISSING**
 
@@ -672,7 +738,29 @@ the real DAT configuration model is known via `search_dat_docs`. This
 section states the requirement and the measurement; the mechanism is a
 Mac-side question.
 
-### 6.9 A structured result channel — **BLOCKED, with a concrete case**
+### 6.9 A structured result channel — **RESOLVED for persisted state,
+STILL BLOCKED for live per-frame results**
+
+> The envelope, subscription, ordering, coalescing, reconnect and error
+> machinery now exist and are generic — see
+> `docs/contracts/CARTRIDGE-RESULTS.md` §9 for what adding a cartridge
+> costs (one file, one registry entry, one contract id).
+>
+> **The Scene Understanding case below is still unmet**, and the reason is
+> not the wire any more. Scene Understanding is a live in-process state
+> that **persists nothing** — deliberately, and enforced by test. This
+> channel reads persisted state, so there is nothing for it to read, and
+> giving that cartridge a store to make it publishable would pre-empt
+> Environmental Memory's entire reason to exist. It needs the live-module
+> path in §6.1, not this one.
+>
+> What the channel does prove is that the *refusal* requirement below is
+> satisfiable: World Builder's payload carries `available: false` with a
+> prose reason, `null` counts that are never `0`, and
+> `build_in_progress: null` distinguishing "not running" from "cannot
+> tell". A wire that can carry a refusal now demonstrably exists.
+
+The original case, still accurate:
 
 §1.4 says `frame_result` cannot carry a structured object. Scene
 Understanding is what that costs, stated concretely rather than in the
@@ -739,3 +827,12 @@ reports the state, so a client can at least display it truthfully.
    "measured"` (§3.7).
 6. **Never invert a `T_world_camera` pose** (§3.6).
 7. **Refuse an unknown `schema_version`**; never guess (§3.4).
+8. **Contract identifiers on the result channel are opaque strings
+   compared for equality** — never parsed, never ordered, never assumed
+   compatible. Changing one is a deliberate wire break that tells iOS to
+   update the app. See `docs/contracts/CARTRIDGE-RESULTS.md` §2.
+9. **The result channel is a READER.** Nothing in `tower/results/` may
+   write, build, or join the frame path; two boundary tests enforce it.
+10. **No imagery crosses the wire while `redaction` is `"none"`.** An
+    unstated or absent treatment means withhold, with no lenient default
+    (`IOS-to-Tower.md` §5).

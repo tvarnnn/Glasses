@@ -15,7 +15,36 @@ snapshots are the whole design rather than an implementation choice.
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field
+
+
+def json_safe(value):
+    """Replace every non-finite float with None, recursively.
+
+    `NaN` and `Infinity` are not JSON. Python's `json.dumps` emits them as
+    bare `NaN` / `Infinity` because `allow_nan` defaults to True, and
+    Starlette's `send_json` takes that default -- so ONE non-finite float
+    anywhere in a payload makes the ENTIRE message unparseable by a strict
+    decoder. Swift's JSONDecoder is strict. An adversarial review put a
+    `NaN` reprojection RMS from a calibration run on a real socket and
+    watched a conforming parser reject the whole frame: not one field
+    degraded, every `cartridge_result` for that session lost.
+
+    Applied at the envelope boundary rather than at each producer, because
+    the failure is catastrophic and total, and the next cartridge must not
+    have to remember. `None` is already this contract's word for "not
+    established", which is the honest reading of a non-finite measurement.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [json_safe(item) for item in value]
+    return value
 
 from tower.results.contracts import ENVELOPE_CONTRACT, TIME_BASIS
 
@@ -61,7 +90,7 @@ class ResultEnvelope:
     snapshot: bool = True
 
     def to_json_dict(self) -> dict:
-        return {
+        return json_safe({
             "type": "cartridge_result",
             "envelope_contract": self.envelope_contract,
             "subscription_id": self.subscription_id,
@@ -77,7 +106,7 @@ class ResultEnvelope:
             "tower_sent_at": self.tower_sent_at,
             "time_basis": self.time_basis,
             "payload": self.payload,
-        }
+        })
 
 
 @dataclass(frozen=True)
@@ -119,7 +148,7 @@ def compute_revision(payload: dict, volatile_paths: tuple[str, ...] = ()) -> str
     64 bits makes an accidental collision between two states of one
     session not worth reasoning about.
     """
-    reduced = _without(payload, volatile_paths)
+    reduced = json_safe(_without(payload, volatile_paths))
     canonical = json.dumps(reduced, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 

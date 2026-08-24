@@ -30,6 +30,7 @@ from tower.world_builder.keyframes import (
     KeyframePolicy,
     KeyframeSelector,
 )
+from tower.world_builder.redaction import FaceRedactor
 from tower.world_builder.records import (
     CameraIntrinsics,
     Keyframe,
@@ -107,10 +108,20 @@ class WorldBuilderEngine:
         policy: KeyframePolicy | None = None,
         backend_name: str = BACKEND_AUTO,
         clock=time.time,
+        redactor_factory=None,
     ) -> None:
         self._store = store
         self._policy = policy or KeyframePolicy()
         self._backend_name = backend_name
+        # A factory rather than an instance: a redactor holds a loaded
+        # detector, and a session that never starts should not pay for
+        # one. Injectable so a test can drive both halves without a model
+        # file, and so an operator can point at different weights.
+        self._redactor_factory = redactor_factory or FaceRedactor
+        # None until a session starts. `_persist_keyframe` only ever runs
+        # inside one, and a half-built placeholder here would be a worse
+        # failure than an AttributeError if that ever stopped being true.
+        self._redactor = None
         self._clock = clock
 
         self._session: Session | None = None
@@ -165,6 +176,12 @@ class WorldBuilderEngine:
         )
 
         self._session = session
+        self._redactor = self._redactor_factory()
+        if not self._redactor.available:
+            logger.warning(
+                "[Tower][WorldBuilder] persisting UNREDACTED keyframes: %s",
+                self._redactor.unavailable_reason,
+            )
         self._selector = KeyframeSelector(self._policy)
         self._tracker = FrameTracker()
         self._events = EventLog(
@@ -520,11 +537,26 @@ class WorldBuilderEngine:
     ) -> Keyframe:
         session = self._session
         filename = f"{source_seq:08d}.jpg"
+
+        # The privacy transformation, and it happens HERE because this is
+        # the one place every persisted pixel passes through. Before the
+        # write, never after: redacting on read would leave the raw frames
+        # on disk, which is a display filter rather than the
+        # transformation 06-PRIVACY-DATA asks for.
+        #
+        # The bytes the reconstruction later reads are the redacted ones,
+        # and that was measured before it was chosen: at the ~5% of frame a
+        # real face occupies, keyframe acceptance and pose solving are
+        # completely unaffected and the point cloud loses about 9%. See
+        # redaction.py.
+        redaction = self._redactor.redact(raw_bytes)
+        image_bytes = redaction.image_bytes
+
         # Image first, fsynced, THEN the journal line. A journal line
         # pointing at a missing image is corruption; an orphan image is
         # harmless and gets swept.
         self._store.write_keyframe_image(
-            session.world_id, session.session_id, filename, raw_bytes
+            session.world_id, session.session_id, filename, image_bytes
         )
         keyframe = Keyframe(
             keyframe_id=make_keyframe_id(session.session_id, source_seq),
@@ -536,7 +568,7 @@ class WorldBuilderEngine:
             image_relpath=f"images/{filename}",
             width=quality.width,
             height=quality.height,
-            byte_count=len(raw_bytes),
+            byte_count=len(image_bytes),
             segment_index=self._segment_index,
             sharpness=quality.sharpness,
             selection_reason=reason,
@@ -555,6 +587,11 @@ class WorldBuilderEngine:
             ),
         )
         self._store.append_keyframe(session.world_id, keyframe)
+        if self._session.redaction != redaction.label:
+            # The session records what was APPLIED, not what was
+            # configured. A redactor that is present but failing must not
+            # leave the session claiming its imagery was filtered.
+            self._session = replace(self._session, redaction=redaction.label)
         return keyframe
 
     def _note_rejected(self, reason: str) -> None:

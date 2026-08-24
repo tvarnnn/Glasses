@@ -8,6 +8,29 @@ def _avg(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+class _Running:
+    """Mean and maximum of a stream of values, in constant memory."""
+
+    __slots__ = ("count", "total", "maximum")
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.total = 0.0
+        # 0.0 rather than -inf: every existing caller rounds this straight
+        # into a report, and an empty window has always reported 0.0.
+        self.maximum = 0.0
+
+    def add(self, value: float) -> None:
+        self.count += 1
+        self.total += value
+        if value > self.maximum:
+            self.maximum = value
+
+    @property
+    def average(self) -> float:
+        return self.total / self.count if self.count else 0.0
+
+
 class SessionMetrics:
     """Tracks measurements for a single WebSocket connection's frame stream.
 
@@ -114,9 +137,17 @@ class SessionMetrics:
         self._last_source_seq: int | None = None
         self._first_frame_time: float | None = None
         self._last_frame_time: float | None = None
-        self._receive_to_result_ms: list[float] = []
-        self._cv_processing_ms: list[float] = []
-        self._stage_ms: dict[str, list[float]] = {}
+        # Running accumulators, not lists. Only the mean and the max are
+        # ever reported, and both are O(1) to maintain -- while a list
+        # grows one float per frame per measurement for as long as the
+        # window is open. A measurement window ends at stream_stop or at a
+        # disconnect, and `handoff.md` 9.3 says a stream_stop MAY NEVER
+        # ARRIVE, so "as long as the window is open" means "as long as the
+        # connection lives". Small per frame, unbounded in principle, and
+        # free to fix.
+        self._receive_to_result_ms = _Running()
+        self._cv_processing_ms = _Running()
+        self._stage_ms: dict[str, _Running] = {}
 
     def record_frame(
         self,
@@ -155,11 +186,11 @@ class SessionMetrics:
             self.last_tx_seq = tx_seq
         self.frames_received += 1
         self.bytes_received += byte_count
-        self._receive_to_result_ms.append(receive_to_result_ms)
-        self._cv_processing_ms.append(cv_processing_ms)
+        self._receive_to_result_ms.add(receive_to_result_ms)
+        self._cv_processing_ms.add(cv_processing_ms)
         if stage_ms:
             for stage_name, ms in stage_ms.items():
-                self._stage_ms.setdefault(stage_name, []).append(ms)
+                self._stage_ms.setdefault(stage_name, _Running()).add(ms)
 
     def record_frame_processing_error(self) -> None:
         self.frame_processing_errors += 1
@@ -259,15 +290,19 @@ class SessionMetrics:
             # Non-zero means figures above understate what arrived, and in
             # particular that sampling_stride_avg may be overstated.
             "frames_rejected": self.frames_rejected,
-            "receive_to_result_ms_avg": round(_avg(self._receive_to_result_ms), 3),
+            "receive_to_result_ms_avg": round(self._receive_to_result_ms.average, 3),
             "receive_to_result_ms_max": round(
-                max(self._receive_to_result_ms, default=0.0), 3
+                self._receive_to_result_ms.maximum, 3
             ),
-            "cv_processing_ms_avg": round(_avg(self._cv_processing_ms), 3),
+            "cv_processing_ms_avg": round(self._cv_processing_ms.average, 3),
             # Session average, not an instantaneous sample -- see
             # _session_cpu_percent().
             "process_cpu_percent": self._session_cpu_percent(elapsed_s),
             "process_rss_bytes": self._process.memory_info().rss,
-            "stage_ms_avg": {k: round(_avg(v), 3) for k, v in self._stage_ms.items()},
-            "stage_ms_max": {k: round(max(v), 3) for k, v in self._stage_ms.items()},
+            "stage_ms_avg": {
+                k: round(v.average, 3) for k, v in self._stage_ms.items()
+            },
+            "stage_ms_max": {
+                k: round(v.maximum, 3) for k, v in self._stage_ms.items()
+            },
         }

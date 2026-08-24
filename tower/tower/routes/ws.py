@@ -41,6 +41,24 @@ class _ConnectionSender:
         async with self._lock:
             await self._websocket.send_json(payload)
 
+    async def send_bounded(self, payload: dict, *, lock_timeout: float,
+                           send_timeout: float) -> None:
+        """Send with the lock wait and the send itself bounded SEPARATELY.
+
+        Lumping them together let a slow frame send consume a result's
+        whole budget and trigger a spurious "the consumer is too slow"
+        drop -- when the result had not reached the socket at all, it was
+        queued behind the frame path. The two waits mean different things
+        and are reported differently, so they are measured apart.
+        """
+        await asyncio.wait_for(self._lock.acquire(), timeout=lock_timeout)
+        try:
+            await asyncio.wait_for(
+                self._websocket.send_json(payload), timeout=send_timeout
+            )
+        finally:
+            self._lock.release()
+
 
 async def _handle_frame_message(
     websocket: WebSocket,
@@ -249,7 +267,7 @@ def _finalize_stream_measurement(metrics: SessionMetrics, end_reason: str) -> No
     )
 
 
-def _start_capture(websocket) -> None:
+def _start_capture(websocket, owner) -> None:
     """Bound a dataset recording to the existing stream window.
 
     Reuses stream_start/stream_stop rather than adding a message type:
@@ -263,19 +281,29 @@ def _start_capture(websocket) -> None:
                 # window; the recording must follow it, or one capture id
                 # would span two windows and stop identifying which frames
                 # belong to which.
+                #
+                # Unconditional (no owner): this connection is deliberately
+                # taking over, which is different from a dead connection
+                # tearing down a live one.
                 observer.stop(END_REASON_STOP)
-            capture_id = observer.start()
+            capture_id = observer.start(
+                owner=owner, continues=observer.resumable_capture()
+            )
             logger.info("[Tower][Capture] recording started: %s", capture_id)
         except Exception:
             logger.exception("[Tower][Capture] could not start recording")
 
 
-def _stop_capture(websocket, reason: str = END_REASON_STOP) -> None:
+def _stop_capture(websocket, reason: str = END_REASON_STOP, owner=None) -> None:
     for observer in _frame_observers(websocket):
         try:
             if not observer.is_recording:
                 continue
-            status = observer.stop(reason)
+            status = observer.stop(reason, owner=owner)
+            if status is not None and status.is_open:
+                # Refused: the capture belongs to a live connection that
+                # superseded this one.
+                continue
             logger.info(
                 "[Tower][Capture] recording stopped (%s): %s frames, %s bytes",
                 reason,
@@ -292,6 +320,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     active_measurement: SessionMetrics | None = None
     sender = _ConnectionSender(websocket)
     channels = results_ws.ChannelHolder(time.time)
+    # Identity for this connection, used to stop a DEAD socket's teardown
+    # from disarming a LIVE socket's recording. `object()` rather than a
+    # counter: it needs to be unique and comparable, nothing more, and it
+    # never leaves this process.
+    connection_token = object()
     await websocket.accept()
     session.client_connected()
     logger.info("client connected")
@@ -340,7 +373,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 logger.info(
                     "[Tower][Session] stream_start: measurement window opened"
                 )
-                _start_capture(websocket)
+                _start_capture(websocket, connection_token)
             elif message_type == "stream_stop":
                 if active_measurement is not None:
                     _finalize_stream_measurement(
@@ -352,7 +385,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "[Tower][Session] stream_stop received with no active "
                         "measurement window"
                     )
-                _stop_capture(websocket, END_REASON_STOP)
+                _stop_capture(websocket, END_REASON_STOP, owner=connection_token)
             elif message_type in results_ws.RESULT_MESSAGE_TYPES:
                 await results_ws.handle(
                     message,
@@ -399,7 +432,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         # reader polling disk for a client that is gone. close() cannot
         # raise, so nothing below it can be skipped.
         await channels.close()
-        _stop_capture(websocket, END_REASON_DISCONNECT)
+        _stop_capture(
+            websocket, END_REASON_DISCONNECT, owner=connection_token
+        )
         if active_measurement is not None:
             _finalize_stream_measurement(active_measurement, end_reason="disconnect")
         session.client_disconnected()

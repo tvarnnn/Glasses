@@ -8,7 +8,8 @@ import json
 
 import pytest
 
-from tests.result_channel_fixtures import (
+from tests.result_channel_fixtures import (  # noqa: F401
+    _close_result_channel_clients,
     build_world,
     drain,
     make_client,
@@ -22,9 +23,16 @@ from tower.results.contracts import (
 )
 
 
-@pytest.fixture
-def built(tmp_path):
-    root = tmp_path / "worlds"
+@pytest.fixture(scope="module")
+def built(tmp_path_factory):
+    """One real world, built once for the whole module.
+
+    Module-scoped because building it runs the real engine over rendered
+    frames and costs seconds. Nothing here mutates it -- this channel only
+    reads -- so sharing is safe, and a test that needs a world of its own
+    builds one explicitly.
+    """
+    root = tmp_path_factory.mktemp("worlds")
     world_id, session_id = build_world(root)
     return root, world_id, session_id
 
@@ -299,24 +307,33 @@ def test_a_duplicate_subscription_is_independent(monkeypatch, built):
     """Two subscriptions to the same target get their own ids and sequences.
 
     They must not share a slot: one client draining slowly cannot be
-    allowed to consume another's snapshot.
+    allowed to consume another's snapshot. Read as a MULTISET of four
+    messages rather than in a fixed order -- the acknowledgement is
+    written by the receive loop and the envelope by the sender task, and
+    nothing orders those two against each other.
     """
     root, _, _ = built
     client = make_client(monkeypatch, root)
-    with client.websocket_connect("/ws") as ws:
-        first = subscribe(ws)
-        second = subscribe(ws)
-        assert first["subscription_id"] != second["subscription_id"]
-
-        seen = {}
-        for _ in range(2):
-            envelope = drain(ws, expect="cartridge_result")
-            seen[envelope["subscription_id"]] = envelope["seq"]
-
-    assert seen == {
-        first["subscription_id"]: 1,
-        second["subscription_id"]: 1,
+    request = {
+        "type": "result_subscribe",
+        "cartridge": "world_builder",
+        "result_type": "status",
     }
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json(request)
+        ws.send_json(request)
+        messages = [ws.receive_json() for _ in range(4)]
+
+    acks = [m for m in messages if m["type"] == "result_subscribed"]
+    results = [m for m in messages if m["type"] == "cartridge_result"]
+
+    assert len(acks) == 2 and len(results) == 2
+    ids = {ack["subscription_id"] for ack in acks}
+    assert len(ids) == 2, "each subscription must get its own id"
+    assert {r["subscription_id"] for r in results} == ids
+    assert [r["seq"] for r in results] == [1, 1], (
+        "sequences are per subscription, so both start at 1"
+    )
 
 
 # -- errors -------------------------------------------------------------
@@ -388,9 +405,10 @@ def test_a_contract_mismatch_is_refused_not_served(monkeypatch, built):
 def test_subscribing_to_an_unavailable_cartridge_is_refused(monkeypatch):
     client = make_client(monkeypatch, None)
     with client.websocket_connect("/ws") as ws:
-        subscribe(ws)
-        error = drain(ws, expect="result_error")
+        # subscribe() returns the FIRST reply, which here is the refusal.
+        error = subscribe(ws)
 
+    assert error["type"] == "result_error"
     assert error["reason"] == "cartridge_unavailable"
 
 
@@ -474,3 +492,98 @@ def test_the_registry_refuses_every_unoffered_pair(monkeypatch, built):
     assert registry.find_offer(root, "world_builder", "geometry") is None
     assert registry.find_offer(root, "document_memory", "status") is None
     assert registry.find_offer(None, "world_builder", "status")["available"] is False
+
+
+# -- the document and the code must not drift --------------------------
+
+
+def test_the_contract_document_matches_the_code():
+    """A contract document that drifts from the code is worse than none.
+
+    A fresh iOS client is told to implement from `CARTRIDGE-RESULTS.md`
+    without reading Tower's Python. Every number and identifier it quotes
+    is therefore load-bearing, and the only way to keep them honest is to
+    fail a test when they diverge.
+    """
+    import pathlib
+
+    from tower.results.publisher import (
+        DEFAULT_HEARTBEAT_SECONDS,
+        DEFAULT_POLL_SECONDS,
+        MAX_SUBSCRIPTIONS_PER_CONNECTION,
+        SEND_TIMEOUT_S,
+    )
+    from tower.results import contracts
+    from tower.routes import results_ws
+
+    document = pathlib.Path("docs/contracts/CARTRIDGE-RESULTS.md").read_text(
+        encoding="utf-8"
+    )
+
+    for value in (
+        contracts.ENVELOPE_CONTRACT,
+        contracts.WORLD_BUILDER_STATUS_CONTRACT,
+        contracts.CARTRIDGE_WORLD_BUILDER,
+        contracts.RESULT_TYPE_STATUS,
+        contracts.TIME_BASIS,
+    ):
+        assert value in document, f"the contract document never mentions {value!r}"
+
+    for label, value in (
+        ("subscriptions per connection", MAX_SUBSCRIPTIONS_PER_CONNECTION),
+        ("send timeout", SEND_TIMEOUT_S),
+        ("poll interval", DEFAULT_POLL_SECONDS),
+        ("heartbeat", DEFAULT_HEARTBEAT_SECONDS),
+    ):
+        rendered = str(int(value) if float(value).is_integer() else value)
+        assert rendered in document, (
+            f"the document does not state the {label} ({rendered})"
+        )
+
+    # Every error reason a client switches on must be documented.
+    reasons = [
+        getattr(results_ws, name)
+        for name in dir(results_ws)
+        if name.startswith("ERR_")
+    ]
+    assert reasons
+    for reason in reasons:
+        assert reason in document, f"undocumented error reason {reason!r}"
+
+    # And every message type on the wire.
+    for message_type in (
+        results_ws.MSG_CARTRIDGES,
+        results_ws.MSG_SUBSCRIBE,
+        results_ws.MSG_UNSUBSCRIBE,
+        results_ws.MSG_SUBSCRIBED,
+        results_ws.MSG_UNSUBSCRIBED,
+        results_ws.MSG_ERROR,
+    ):
+        assert message_type in document, f"undocumented message {message_type!r}"
+
+
+def test_every_payload_key_is_documented(monkeypatch, built):
+    """A key on the wire that the document never names is a key a consumer
+    has to guess at."""
+    import pathlib
+
+    root, _, _ = built
+    client = make_client(monkeypatch, root)
+    with client.websocket_connect("/ws") as ws:
+        subscribe(ws)
+        envelope = drain(ws, expect="cartridge_result")
+
+    document = pathlib.Path("docs/contracts/CARTRIDGE-RESULTS.md").read_text(
+        encoding="utf-8"
+    )
+    missing = []
+
+    def _walk(node, path=""):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key not in document:
+                    missing.append(f"{path}.{key}")
+                _walk(value, f"{path}.{key}")
+
+    _walk(envelope)
+    assert missing == [], f"undocumented payload keys: {missing}"

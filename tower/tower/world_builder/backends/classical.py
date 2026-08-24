@@ -225,12 +225,42 @@ class ClassicalTwoViewBackend(GeometryBackend):
         if essential is None or essential.shape != (3, 3):
             return refuse(DEGENERACY_NO_CORRESPONDENCE)
 
+        # recoverPose takes `mask` as BOTH input and output: it narrows it
+        # in place with a cheirality test bounded by an undocumented
+        # `distanceThresh` default of 50 baselines. Reading `mask` after
+        # the call therefore does NOT give the epipolar inlier count, and
+        # the field persisted as `inlier_ratio` was measuring cheirality.
+        # Measured, one scene, ORB matches at 640x360:
+        #
+        #   baseline   matches   epipolar inliers   ratio AFTER recoverPose
+        #     0.02 m      1160     1134  (0.978)              0.001
+        #     0.04 m      1145     1103  (0.963)              0.004
+        #     0.06 m      1154     1120  (0.971)              0.098
+        #     0.08 m      1137     1116  (0.982)              0.941
+        #     0.30 m       987      958  (0.971)              0.971
+        #
+        # At short baselines nearly every correspondence is a genuine
+        # epipolar inlier and the reported "inlier ratio" is three orders
+        # of magnitude smaller. It was a measurement of baseline over
+        # depth wearing another field's name -- which also explains two
+        # historical results recorded as facts about geometry.
+        epipolar_mask = mask.copy()
         cheirality, rotation, translation, _ = cv2.recoverPose(
             essential, points_a, points_b, camera_matrix, mask=mask
         )
+        epipolar_kept = epipolar_mask.ravel() > 0
+        epipolar_inliers = int(epipolar_kept.sum())
+        inlier_ratio = epipolar_inliers / matches if matches else 0.0
+
         kept = mask.ravel() > 0
         inliers = int(kept.sum())
-        inlier_ratio = inliers / matches if matches else 0.0
+        # What the gate below has always actually used, now carried in the
+        # field that was already declared for it. `KeyframeEdge`'s own
+        # comment describes `cheirality_fraction` as "the fraction of
+        # correspondences passing recoverPose's cheirality check" -- which
+        # is exactly this, and which the code was instead putting into
+        # `inlier_ratio` while filling this field with something else.
+        cheirality_ratio = inliers / matches if matches else 0.0
         translation = np.asarray(translation, dtype=np.float64).reshape(3)
 
         inlier_a, inlier_b = points_a[kept], points_b[kept]
@@ -244,11 +274,11 @@ class ClassicalTwoViewBackend(GeometryBackend):
         )
         measured = {
             "matches": matches,
-            "inliers": inliers,
+            "inliers": epipolar_inliers,
             "inlier_ratio": inlier_ratio,
             "median_triangulation_deg": angle,
             "median_displacement_px": displacement,
-            "cheirality_fraction": cheirality / inliers if inliers else None,
+            "cheirality_fraction": cheirality_ratio,
             "r_h": homography_ratio(points_a, points_b),
         }
 
@@ -256,16 +286,28 @@ class ClassicalTwoViewBackend(GeometryBackend):
         # rotation recoverPose still returns a confident translation whose
         # direction is meaningless -- measured 62 and 106 degrees of error
         # on pairs that reported no other complaint.
+        # Gated on the CHEIRALITY ratio, which is what this condition has
+        # always used -- the constant is simply named for the wrong thing.
+        # Deliberately unchanged: correcting the reporting is a separate
+        # act from changing which poses are accepted, and the second needs
+        # a sweep this did not have. Note the consequence, measured: a real
+        # sideways strafe at a 4-6 cm baseline recovers direction to within
+        # 2 degrees and is still refused here.
         degenerate = (
             inliers < MIN_INLIERS
-            or inlier_ratio < MIN_INLIER_RATIO
+            or cheirality_ratio < MIN_INLIER_RATIO
             or angle is None
             or angle < MIN_TRIANGULATION_ANGLE_DEG
         )
         if degenerate:
+            # "pure_rotation" overstates what was observed: a low
+            # cheirality ratio means few points are in front of both
+            # cameras within 50 baselines, which a genuine short-baseline
+            # translation also produces. Kept for now because the label is
+            # persisted and consumers switch on it.
             reason = (
                 DEGENERACY_PURE_ROTATION
-                if inlier_ratio < MIN_INLIER_RATIO
+                if cheirality_ratio < MIN_INLIER_RATIO
                 else DEGENERACY_LOW_PARALLAX
             )
             return self._PairResult(

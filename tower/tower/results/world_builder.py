@@ -38,6 +38,7 @@ import math
 from pathlib import Path
 
 from tower.results.contracts import TIME_BASIS
+from tower.storage import read_raw_jsonl
 from tower.results.envelope import Snapshot, compute_revision
 from tower.world_builder.records import format_distance
 from tower.world_builder.schema import (
@@ -58,13 +59,20 @@ logger = logging.getLogger(__name__)
 # cannot see a process's intent; it can see a lock, a journal and a
 # manifest.
 LIFECYCLE_RECEIVING = "receiving"
-# NOT "finalizing". An independent audit of the on-disk state proved
-# that while build() runs, the files are BYTE-IDENTICAL to "stopped and
-# never built" and to "stopped and the build crashed": build() writes
-# nothing until it finishes and emits no event, and the writer lock is
-# already released by then (engine.stop_session releases before the
-# driver calls build). So Tower cannot observe that work is continuing,
-# and a state named "finalizing" would assert exactly that.
+# NOT "finalizing", and the reason is narrower than an earlier version of
+# this comment claimed.
+#
+# That version said the files are BYTE-IDENTICAL while build() runs. An
+# adversarial review disproved it: build() rewrites edges.jsonl,
+# session.json and world.json BEFORE the manifest lands, so the directory
+# does change. What is true -- and is what matters -- is that those writes
+# are indistinguishable from a build that made them and then DIED. The
+# writer lock is already released (engine.stop_session releases it before
+# the driver calls build), and no event is written, so there is no marker
+# that says "a process is working right now".
+#
+# So Tower cannot observe that work is continuing, and a state named
+# "finalizing" would assert exactly that.
 #
 # This name says only what is visible: capture stopped, and the stored
 # geometry is not current with the keyframes. iOS may render its own
@@ -99,12 +107,72 @@ SCALE_SEMANTICS = {
 # Fields whose value advances without anything having happened. Excluded
 # from the change revision so a UI can tell new data from repeated data
 # (IOS-to-Tower.md 1.2).
-VOLATILE_PATHS = ("progress.mapping_seconds",)
+VOLATILE_PATHS = (
+    "progress.mapping_seconds",
+    "world_snapshot.mapping_seconds",
+    # Self-referential rather than volatile: `world_snapshot.revision` IS
+    # the revision, so it cannot be an input to computing it. Excluded so
+    # the hash stays stable when the field is filled in afterwards.
+    "world_snapshot.revision",
+)
 
-# The Tower's own name for what it builds. IOS-to-Tower.md 1.3 asks for
-# exactly this and promises to display it verbatim and never parse it, so
-# it is prose, not an identifier.
+# The Tower's own name for what it builds. `handoff.md` 9.5 says iOS
+# displays this VERBATIM and never matches it against a known set, so it
+# is prose for a person, not an identifier.
 GEOMETRY_REPRESENTATION = "sparse point cloud"
+
+# --- the iOS projection ------------------------------------------------
+#
+# `handoff.md` 16 names the one contract shape that costs the phone
+# nothing: "a self-contained, coarsely-updated world report whose fields
+# map 1:1 onto WorldSnapshot, plus an explicit lifecycle state mapping
+# onto WorldModelState". Everything else in this payload is Tower-native
+# and carries the EVIDENCE for these values; this block is the part iOS
+# decodes.
+#
+# It is a projection, not a second source of truth: it is computed from
+# the same payload in the same pass, so the two cannot disagree, and a
+# test asserts every projected value against the block it came from.
+#
+# Tower deliberately does the mapping. The alternative -- shipping only
+# Tower's vocabulary and asking iOS to translate -- would put this table
+# on the phone, where the knowledge is not, and where getting it wrong is
+# an App Store release rather than a Tower restart.
+
+# WorldModelState cases (handoff.md 8.2). `awaiting_first_update` is
+# deliberately absent: it means "frames are going out and the Tower has
+# said nothing yet", which is a fact about the PHONE's own situation. Only
+# iOS can know it, and it reaches it by not having received a snapshot.
+MODEL_STATE_UNSUPPORTED = "unsupported"
+MODEL_STATE_IDLE = "idle"
+MODEL_STATE_RECEIVING = "receiving"
+MODEL_STATE_FINALIZING = "finalizing"
+MODEL_STATE_FINALIZED = "finalized"
+MODEL_STATE_FAILED = "failed"
+
+_MODEL_STATE_BY_LIFECYCLE = {
+    LIFECYCLE_RECEIVING: MODEL_STATE_RECEIVING,
+    # "capture ended, Tower still working; figures may change" is exactly
+    # what `stopped_unbuilt` means -- the stored figures are not the final
+    # figures. Tower still cannot see whether a build is RUNNING, and
+    # lifecycle.build_in_progress carries that caveat unchanged.
+    LIFECYCLE_STOPPED_UNBUILT: MODEL_STATE_FINALIZING,
+    LIFECYCLE_READY: MODEL_STATE_FINALIZED,
+    LIFECYCLE_FAILED: MODEL_STATE_FAILED,
+    LIFECYCLE_IDLE: MODEL_STATE_IDLE,
+}
+
+# WorldTrackingQuality (handoff.md 8.3). Tower's `unknown` is iOS's
+# `unavailable`; `limited` is never produced -- see _tracking_block.
+_IOS_TRACKING = {
+    TRACKING_GOOD: "good",
+    TRACKING_LOST: "lost",
+    TRACKING_UNKNOWN: "unavailable",
+}
+
+# WorldPersistenceState. Tower always persists, so `session` (meaning
+# "this session only, nothing stored") is unreachable.
+IOS_SCALE_UNKNOWN = "unknown"
 
 
 class _FileCache:
@@ -139,6 +207,15 @@ class _FileCache:
     them is the strongest available mitigation.
     """
 
+    # Bounded, even though a remote client cannot drive it: `resolve`
+    # refuses a world id that is not on disk before anything is cached, so
+    # growth follows the OPERATOR's data, not a subscriber's requests.
+    # Capped anyway. An unbounded-in-principle cache is a latent defect
+    # whether or not today's callers can reach it, and the recovery here
+    # is free -- every entry is a pure function of a file that is still
+    # there, so dropping the lot costs one re-read.
+    MAX_ENTRIES = 64
+
     __slots__ = ("_entries",)
 
     def __init__(self) -> None:
@@ -158,6 +235,8 @@ class _FileCache:
         if cached is not None and cached[0] == fingerprint:
             return cached[1]
         value = reader()
+        if len(self._entries) >= self.MAX_ENTRIES:
+            self._entries.clear()
         self._entries[key] = (fingerprint, value)
         return value
 
@@ -227,8 +306,20 @@ class WorldBuilderStatusProducer:
         return chosen, self._latest_session(store, chosen, sessions), None
 
     def _most_relevant(self, store, world_ids):
-        """A live world if one exists, else the most recently updated."""
-        live = [wid for wid in world_ids if _lock_holder(store, wid) is not None]
+        """A LIVE world if one exists, else the most recently updated.
+
+        "Live" means a lock held by a process that is still running. An
+        earlier version accepted the mere existence of a lock file, so one
+        leftover lock from a crashed builder permanently hijacked every
+        default subscription -- an adversarial review demonstrated a
+        stale-locked world outranking a newer, cleanly stopped one.
+        """
+        live = [
+            wid
+            for wid in world_ids
+            if (holder := _lock_holder(store, wid)) is not None
+            and holder.get("alive")
+        ]
         candidates = live or world_ids
         best, best_at = None, -math.inf
         for wid in candidates:
@@ -268,7 +359,15 @@ class WorldBuilderStatusProducer:
             logger.warning("result channel: world %s unreadable: %s", world_id, exc)
             return self._unavailable(f"world could not be read: {exc}")
 
-    def _unavailable(self, reason: str) -> Snapshot:
+    def _unavailable(self, reason: str, *, supported: bool = True) -> Snapshot:
+        """Nothing to report, and whether that is a Tower limitation.
+
+        `supported=False` is "this Tower cannot serve World Builder at all"
+        -- no world root configured. That maps to iOS's `.unsupported`,
+        which tells a person the Tower cannot do this. Everything else --
+        no worlds yet, an unreadable world -- maps to `.idle`, which does
+        not.
+        """
         payload = {
             "world": None,
             "session": None,
@@ -276,6 +375,7 @@ class WorldBuilderStatusProducer:
                 "state": LIFECYCLE_UNAVAILABLE,
                 "evidence": "nothing to read",
                 "reason": reason,
+                **_BUILD_UNOBSERVABLE,
             },
             "progress": None,
             "tracking": None,
@@ -287,6 +387,11 @@ class WorldBuilderStatusProducer:
             "artifacts": None,
             "time_basis": TIME_BASIS,
         }
+        payload["model_state"] = (
+            MODEL_STATE_IDLE if supported else MODEL_STATE_UNSUPPORTED
+        )
+        payload["model_state_reason"] = reason
+        payload["world_snapshot"] = None
         return Snapshot(
             payload=payload,
             revision=compute_revision(payload, VOLATILE_PATHS),
@@ -302,9 +407,17 @@ class WorldBuilderStatusProducer:
         else:
             payload = self._payload(store, world, session_id)
 
+        _attach_ios_projection(payload)
+
+        revision = compute_revision(payload, VOLATILE_PATHS)
+        if payload.get("world_snapshot") is not None:
+            # iOS holds the revision INSIDE the snapshot (handoff.md 8.3),
+            # so it survives being handed around as one value. It is the
+            # same string the envelope carries.
+            payload["world_snapshot"]["revision"] = revision
         return Snapshot(
             payload=payload,
-            revision=compute_revision(payload, VOLATILE_PATHS),
+            revision=revision,
             volatile_fields=VOLATILE_PATHS,
         )
 
@@ -316,11 +429,12 @@ class WorldBuilderStatusProducer:
                 "state": LIFECYCLE_IDLE,
                 "evidence": "the world exists and has no sessions",
                 "reason": None,
+                **_BUILD_UNOBSERVABLE,
             },
             "progress": None,
             "tracking": None,
             "calibration": None,
-            "scale": _scale_block(world),
+            "scale": _scale_block(world, attributable=False),
             "geometry": _geometry_unavailable("this world has no sessions"),
             "trajectory": _trajectory_unavailable("this world has no sessions"),
             "persistence": _persistence_block(world),
@@ -330,14 +444,27 @@ class WorldBuilderStatusProducer:
 
     def _payload(self, store, world, session_id: str) -> dict:
         session = store.read_session(world.world_id, session_id)
+        # A SUMMARY, not the parsed journal. Two reasons, both measured.
+        #
+        # Memory: caching the parsed list would hold every event dict for
+        # as long as anyone is subscribed -- tens of megabytes for a long
+        # session, in a cache whose whole purpose is to be cheap.
+        #
+        # Time: stat-gating stops the journal being re-PARSED, but the
+        # blocks below scan it, and a scan is O(events) on every poll.
+        # Measured at 50,000 events: 9.26 ms per snapshot when the parsed
+        # list was cached and re-scanned, 0.79 ms when the summary is
+        # cached instead. The parse was never the only cost.
         events = self._files.read(
             store.events_path(world.world_id, session_id),
-            lambda: store.read_events(world.world_id, session_id),
+            lambda: _summarise_events(
+                *read_raw_jsonl(store.events_path(world.world_id, session_id))
+            ),
         )
         holder = _lock_holder(store, world.world_id)
         manifest = self._files.read(
             store.derived_manifest_path(world.world_id),
-            lambda: _manifest_for(store, world.world_id, session_id),
+            lambda: _read_manifest(store, world.world_id),
         )
         keyframes_current = self._files.read(
             store.keyframes_path(world.world_id, session_id),
@@ -345,12 +472,15 @@ class WorldBuilderStatusProducer:
         )
 
         if manifest is not None and manifest.get("session_id") != session_id:
-            # The cache is keyed on the manifest file, which is shared by
-            # every session in a world. A value cached while reporting on
-            # a different session must not be attributed to this one.
+            # THE session check, and the only one. A world with two built
+            # sessions has ONE manifest, describing whichever built last.
+            # Attributing it to the other session would report one
+            # session's geometry as another's -- a confident wrong answer,
+            # and the reason _read_manifest deliberately does not filter:
+            # its result is cached per FILE, and that file is shared.
             manifest = None
 
-        stopped = _last_of(events, "session_stopped") is not None
+        stopped = events['stopped']
         geometry_current = (
             manifest is not None
             and keyframes_current is not None
@@ -364,34 +494,58 @@ class WorldBuilderStatusProducer:
             geometry_current=geometry_current,
             has_manifest=manifest is not None,
         )
-        live = lifecycle["state"] == LIFECYCLE_RECEIVING
+        # Which counts are trustworthy is decided by whether the session
+        # was ever STOPPED -- not by whether it is currently `receiving`.
+        #
+        # session.json holds the zeros written at start_session until
+        # stop_session rewrites it, and `failed` and `idle` are both
+        # states in which that never happened. An earlier version keyed
+        # this on `receiving`, so a builder that crashed mid-session
+        # reported `keyframes_accepted: 0, provenance: "measured"` beside
+        # `tracking: good, evidence: the most recent event was
+        # keyframe_accepted` -- the same payload denying and confirming
+        # the same fact. Found by adversarial review.
+        counts_are_final = stopped and session.ended_at is not None
+        progress = _progress_block(
+            session, events, counts_are_final, self._clock()
+        )
+        keyframes_now = progress["keyframes_accepted"]
 
         return {
             "world": _world_block(world),
             "session": _session_block(session),
             "lifecycle": lifecycle,
-            "progress": _progress_block(session, events, live, self._clock()),
+            "progress": progress,
             "tracking": _tracking_block(events),
             "calibration": _calibration_block(session),
-            "scale": _scale_block(world),
-            "geometry": _geometry_block(manifest, geometry_current),
+            # Scale is attributed to THIS session or not at all. It
+            # lives on the World record and is written by build(), so a
+            # session that was never built would otherwise inherit a
+            # `relative` scale earned by a different session -- an
+            # adversarial review found exactly that, and the same argument
+            # _calibration_block makes about a world-level calibration
+            # state applies here unchanged.
+            "scale": _scale_block(world, attributable=manifest is not None),
+            "geometry": _geometry_block(manifest, geometry_current, keyframes_now),
             "trajectory": self._trajectory_block(
-                store, world, session_id, manifest, geometry_current
+                store, world, session_id, manifest, geometry_current, keyframes_now
             ),
             "persistence": _persistence_block(world),
-            "artifacts": _artifacts_block(store, world.world_id, session_id, world),
+            "artifacts": _artifacts_block(
+                store, world.world_id, session_id, world, session
+            ),
             "time_basis": TIME_BASIS,
         }
 
-    def _trajectory_block(self, store, world, session_id, manifest, current) -> dict:
+    def _trajectory_block(
+        self, store, world, session_id, manifest, current, keyframes_now
+    ) -> dict:
+        # Same reasoning as _geometry_block: a trajectory over the first N
+        # keyframes is a correct answer to an older question, not a wrong
+        # answer, and hiding it makes a live session look idle.
         if manifest is None:
             return _trajectory_unavailable(
                 "no build has run for this session, so no poses exist"
-            )
-        if not current:
-            return _trajectory_unavailable(
-                "the persisted poses are older than the keyframes; a rebuild "
-                "is outstanding"
             )
         revision = compute_revision(
             {
@@ -404,6 +558,17 @@ class WorldBuilderStatusProducer:
         )
         return {
             "available": True,
+            "current": current,
+            "built_from_keyframes": manifest.get("keyframes"),
+            "keyframes_now": keyframes_now,
+            "stale_reason": (
+                None
+                if current
+                else (
+                    "keyframes have been accepted since this build ran; this "
+                    "path covers built_from_keyframes of them"
+                )
+            ),
             # Poses that actually carry a position, which is NOT
             # poses_solved. engine.build counts an ANCHOR as neither
             # solved nor refused, yet an anchor has a translation and is a
@@ -447,7 +612,10 @@ class WorldBuilderStatusProducer:
         value = self._compute_path_length(store, world, session_id, manifest)
         # Replaced, never appended: one entry per (world, session), so the
         # cache is bounded by the number of distinct targets a subscriber
-        # names, not by session length or poll count.
+        # names, not by session length or poll count. Capped for the same
+        # reason as _FileCache -- and recomputing is one file read.
+        if len(self._path_length_cache) >= _FileCache.MAX_ENTRIES:
+            self._path_length_cache.clear()
         self._path_length_cache[key] = (revision, value)
         return value
 
@@ -461,10 +629,22 @@ class WorldBuilderStatusProducer:
             # A length with holes in it is not a length.
             return {
                 "available": False,
+                # Interpolating `refused` here used to produce "None of
+                # this session's poses were refused, so the path has
+                # gaps" -- a sentence that states the opposite of its own
+                # conclusion -- in the branch that fires BECAUSE the
+                # figure is missing. Prose shown to a person must not be
+                # assembled from a value the branch exists to handle.
                 "reason": (
-                    f"{refused} of this session's poses were refused, so the "
-                    "path has gaps; a total would draw straight lines across "
-                    "them and count the result as distance travelled"
+                    "this session's build did not record how many poses it "
+                    "refused, so gaps in the path cannot be ruled out"
+                    if refused is None
+                    else (
+                        f"{refused} of this session's poses were refused, so "
+                        "the path has gaps; a total would draw straight lines "
+                        "across them and count the result as distance "
+                        "travelled"
+                    )
                 ),
             }
         segments = manifest.get("segments")
@@ -472,9 +652,15 @@ class WorldBuilderStatusProducer:
             return {
                 "available": False,
                 "reason": (
-                    f"this session has {segments} segments; tracking was lost "
-                    "between them, so their poses share no coordinate frame "
-                    "and a total length would sum incomparable distances"
+                    "this session's build did not record its segment count, "
+                    "so a common coordinate frame cannot be assumed"
+                    if segments is None
+                    else (
+                        f"this session has {segments} segments; tracking was "
+                        "lost between them, so their poses share no "
+                        "coordinate frame and a total length would sum "
+                        "incomparable distances"
+                    )
                 ),
             }
         semantics = SCALE_SEMANTICS.get(world.scale.state)
@@ -603,8 +789,12 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
         return {
             "state": LIFECYCLE_FAILED,
             "evidence": (
-                f"the writer lock is held by pid {holder['pid']}, which is no "
-                "longer running"
+                "a writer lock exists but names no readable process id"
+                if holder.get("unreadable")
+                else (
+                    f"the writer lock is held by pid {holder['pid']}, which is "
+                    "no longer running"
+                )
             ),
             "reason": (
                 "the process building this world exited without stopping its "
@@ -659,32 +849,97 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
     }
 
 
-def _progress_block(session, events, live: bool, now: float) -> dict:
+def _summarise_events(events, corrupt_lines: int = 0) -> dict:
+    """Everything any block needs from the journal, in fixed size.
+
+    Computed once per journal change and cached. Deliberately returns
+    scalars: nothing downstream is allowed to hold the event list, so the
+    cost of a long session is a few integers rather than the session.
+
+    `corrupt_lines` is carried out rather than discarded. `WorldStore`'s
+    readers drop that count, so a torn journal silently lowered the
+    keyframe total while still labelling it `measured` -- a review
+    demonstrated a count going 4 to 3 with nothing on the wire saying why.
+    A journal is appended without fsync, so ONE torn line at the tail is
+    routine and means "a write is in flight"; several mean corruption.
+    Either way the client is told rather than quietly given a smaller
+    number.
+    """
+    accepted = 0
+    last_tracking = None
+    stopped = False
+    for event in events:
+        kind = event.get("kind")
+        if kind == "keyframe_accepted":
+            accepted += 1
+            last_tracking = kind
+        elif kind == "tracking_lost":
+            last_tracking = kind
+        elif kind == "session_stopped":
+            stopped = True
+    return {
+        "keyframes_accepted": accepted,
+        "last_tracking": last_tracking,
+        "stopped": stopped,
+        "corrupt_lines": corrupt_lines,
+    }
+
+
+def _progress_block(session, events, counts_are_final: bool, now: float) -> dict:
     """What the Tower actually counts, and nothing it does not.
 
-    While a session is live the keyframe count comes from the journal,
-    not from session.json, which still holds the zeros written at
-    start_session. `frames_observed` has no live source at all: an
-    ordinary rejected frame writes no event, so the number simply is not
-    knowable yet and is reported as null with the reason.
+    `counts_are_final` means the session was stopped and its record
+    rewritten. Until then session.json still holds the zeros written at
+    start_session, so the keyframe count comes from the journal instead,
+    and `frames_observed` has no source at all -- an ordinary rejected
+    frame writes no event, so the number is simply not knowable yet.
     """
-    accepted = sum(1 for event in events if event.get("kind") == "keyframe_accepted")
     ended = session.ended_at
     elapsed = (ended if ended is not None else now) - session.started_at
+    if elapsed < 0.0:
+        # A clock that stepped backwards. Reported as UNKNOWN rather than
+        # clamped to zero: a session that has been mapping for five
+        # minutes must not become indistinguishable from one that just
+        # started. Clamping turns an impossible value into a plausible
+        # one, which is the worse failure -- and this field is excluded
+        # from the revision, so it would arrive with
+        # `revision_changed: false` telling a client to skip the redraw.
+        mapping_seconds = None
+        clock_note = (
+            "the Tower's wall clock moved backwards during this session, so "
+            "elapsed mapping time cannot be computed"
+        )
+    else:
+        mapping_seconds = elapsed
+        clock_note = None
     return {
-        "keyframes_accepted": accepted if live else session.keyframes_accepted,
-        "keyframes_accepted_provenance": "measured",
-        "frames_observed": None if live else session.frames_observed,
-        "frames_observed_unavailable_reason": (
-            "no event is written for an ordinary rejected frame, so this "
-            "count is only known once the session stops"
-            if live
-            else None
+        "keyframes_accepted": (
+            session.keyframes_accepted
+            if counts_are_final
+            else events["keyframes_accepted"]
         ),
-        "rejected_by_reason": None if live else dict(session.rejected_by_reason),
+        "keyframes_accepted_provenance": "measured",
+        "keyframes_accepted_source": (
+            "session record" if counts_are_final else "event journal"
+        ),
+        "frames_observed": session.frames_observed if counts_are_final else None,
+        "frames_observed_unavailable_reason": (
+            None
+            if counts_are_final
+            else (
+                "no event is written for an ordinary rejected frame, and this "
+                "session's record has not been finalised, so this count is "
+                "not knowable yet"
+            )
+        ),
+        "rejected_by_reason": (
+            dict(session.rejected_by_reason) if counts_are_final else None
+        ),
+        "journal_corrupt_lines": events["corrupt_lines"],
         # On the TOWER's clock, per IOS-to-Tower.md 1.8: "the iPhone's idea
         # of elapsed time is not the Tower's idea of mapping time".
-        "mapping_seconds": max(0.0, elapsed),
+        "mapping_seconds": mapping_seconds,
+        "mapping_seconds_unavailable_reason": clock_note,
         "mapping_clock": "tower",
         "time_basis": TIME_BASIS,
     }
@@ -701,10 +956,7 @@ def _tracking_block(events) -> dict:
     and is not -- and iOS explicitly refuses a percentage for that same
     reason.
     """
-    last = None
-    for event in events:
-        if event.get("kind") in ("keyframe_accepted", "tracking_lost"):
-            last = event.get("kind")
+    last = events["last_tracking"]
     if last == "tracking_lost":
         return {
             "state": TRACKING_LOST,
@@ -761,8 +1013,30 @@ def _calibration_block(session) -> dict:
     }
 
 
-def _scale_block(world) -> dict:
+def _scale_block(world, *, attributable: bool = True) -> dict:
+    """The world's scale, but only where it can be attributed to a session.
+
+    `attributable` is false for a session this build has produced no
+    geometry for. A scale is EARNED by a build; reporting one for a
+    session that was never built would credit it with another session's
+    reconstruction.
+    """
     scale = world.scale
+    if not attributable:
+        return {
+            "state": SCALE_UNKNOWN,
+            "semantics": None,
+            "meters_per_unit": None,
+            "method": None,
+            "confidence": scale.confidence.value,
+            "unit": None,
+            "allows_metres": False,
+            "unavailable_reason": (
+                "no build has produced geometry for this session, so it has "
+                "no scale of its own; this world's scale was earned by a "
+                "different session"
+            ),
+        }
     return {
         "state": scale.state,
         "semantics": SCALE_SEMANTICS.get(scale.state),
@@ -774,21 +1048,40 @@ def _scale_block(world) -> dict:
         # value for a world with no solved pose.
         "unit": None if scale.state == SCALE_UNKNOWN else "world units",
         "allows_metres": scale.allows_metres,
+        "unavailable_reason": None,
     }
 
 
-def _geometry_block(manifest, current: bool) -> dict:
+def _geometry_block(manifest, current: bool, keyframes_now) -> dict:
+    """Geometry, including geometry that is real but BEHIND.
+
+    An earlier version reported anything not matching the current
+    keyframes as simply unavailable. That is honest and it is too strict,
+    and running the actual product claim showed why: with
+    `world_build_session.py --rebuild-every N`, a build finishes and the
+    very next keyframe makes its output stale, so a walk that was
+    genuinely producing geometry every few keyframes reported **none at
+    all** until it stopped. The whole point of --rebuild-every is to watch
+    the world grow, and the channel was hiding it.
+
+    A build over the first N keyframes is not wrong; it is a correct
+    answer to an older question. So it is reported, with `current: false`
+    and BOTH counts, and a consumer can show real progress while knowing
+    exactly how far behind it is. Hiding it discarded true information;
+    reporting it without the flags would have let a viewer mistake it for
+    the finished world. The flags are the whole difference.
+    """
     if manifest is None:
         return _geometry_unavailable(
             "no build has run for this session, so no geometry exists"
         )
-    if not current:
-        return _geometry_unavailable(
-            "the persisted geometry is older than the keyframes; a rebuild "
-            "is outstanding"
-        )
     return {
         "available": True,
+        # Whether this geometry reflects every keyframe accepted so far.
+        # False is normal DURING a session that rebuilds as it goes.
+        "current": current,
+        "built_from_keyframes": manifest.get("keyframes"),
+        "keyframes_now": keyframes_now,
         # The Tower's own word, displayed verbatim and never parsed
         # (IOS-to-Tower.md 1.3).
         "representation": GEOMETRY_REPRESENTATION,
@@ -826,12 +1119,25 @@ def _geometry_block(manifest, current: bool) -> dict:
         "built_at": manifest.get("built_at"),
         "time_basis": TIME_BASIS,
         "unavailable_reason": None,
+        "stale_reason": (
+            None
+            if current
+            else (
+                "keyframes have been accepted since this build ran; these "
+                "figures are correct for the keyframes named in "
+                "built_from_keyframes and are not the final world"
+            )
+        ),
     }
 
 
 def _geometry_unavailable(reason: str) -> dict:
     return {
         "available": False,
+        "current": False,
+        "built_from_keyframes": None,
+        "keyframes_now": None,
+        "stale_reason": None,
         "representation": None,
         "element_count": None,
         "element_name": None,
@@ -849,8 +1155,14 @@ def _geometry_unavailable(reason: str) -> dict:
 def _trajectory_unavailable(reason: str) -> dict:
     return {
         "available": False,
+        "current": False,
+        "built_from_keyframes": None,
+        "keyframes_now": None,
+        "stale_reason": None,
         "pose_count": None,
+        "poses_solved": None,
         "poses_refused": None,
+        "keyframes": None,
         "segments": None,
         "path_length": None,
         "revision": None,
@@ -886,7 +1198,7 @@ def _persistence_block(world) -> dict:
     }
 
 
-def _artifacts_block(store, world_id, session_id, world) -> dict:
+def _artifacts_block(store, world_id, session_id, world, session=None) -> dict:
     """What imagery exists, and why none of it is offered.
 
     `IOS-to-Tower.md` 5 is the strictest rule in the document: an image
@@ -894,34 +1206,54 @@ def _artifacts_block(store, world_id, session_id, world) -> dict:
     -- withheld", and there is "deliberately no `.probablySafe` and no
     lenient default".
 
-    World Builder keyframe images are written with `redaction: "none"`
-    (records.py Session.redaction, whose comment says "none" is the honest
-    V1 value: no redaction is implemented). They are raw first-person
-    frames. So they are reported as PRESENT and NOT FETCHABLE, and no id
-    or URL is minted for them -- iOS holds "no URL, no id format, and no
-    bytes", and inventing a fetch scheme would be exactly the fabricated
-    contract that document refuses to produce.
+    Since 2026-08-23 keyframes are face-redacted before they are written,
+    and the session records WHICH detector ran at WHICH threshold. That is
+    reported here verbatim rather than being collapsed to a boolean,
+    because the value is a process claim ("this detector's hits were
+    filled") and not an outcome claim ("there are no faces"). Sessions
+    captured before that keep `none` forever.
+
+    They are still reported as NOT FETCHABLE, and no id or URL is minted.
+    A best-effort filter with measured false negatives is not grounds to
+    start shipping first-person imagery over the wire, and iOS holds "no
+    URL, no id format, and no bytes" -- inventing a fetch scheme would be
+    exactly the fabricated contract that document refuses to produce.
     """
-    present = False
+    # `present` is TRI-STATE. False is a positive claim that no imagery
+    # exists, and this flag cannot support it: a review found a world with
+    # images_purged=True still holding three JPEGs, while the wire said
+    # `present: false` -- the block's own docstring and the contract both
+    # forbid rendering the flag as "the imagery is gone", and the payload
+    # did exactly that. Null means "not established".
+    present = None
     count = None
-    if session_id is not None and not world.images_purged:
+    if session_id is not None:
         images = store.images_dir(world_id, session_id)
         try:
             if images.exists():
                 count = sum(1 for _ in images.glob("*.jpg"))
                 present = count > 0
+            else:
+                count = 0
+                present = False
         except OSError:
             count = None
     return {
         "keyframe_images": {
             "present": present,
             "count": count,
-            "redaction": "none",
+            # What the SESSION recorded, not a constant. A hardcoded
+            # "none" survived the arrival of real redaction for exactly as
+            # long as it took someone to look.
+            "redaction": (
+                session.redaction if session is not None else "none"
+            ),
             "fetchable": False,
             "reason": (
-                "these are unredacted first-person frames and no artifact "
-                "transfer contract exists; a consumer must withhold imagery "
-                "whose treatment is not stated"
+                "no artifact transfer contract exists, and these remain "
+                "first-person frames whose redaction is best-effort with "
+                "measured false negatives; a consumer must withhold imagery "
+                "it cannot verify"
             ),
         },
         # The FLAG, reported as a flag. An audit confirmed it deletes
@@ -936,6 +1268,70 @@ def _artifacts_block(store, world_id, session_id, world) -> dict:
             "a declaration that rebuilds are refused for this world, not a "
             "verified deletion of the imagery"
         ),
+    }
+
+
+def _attach_ios_projection(payload: dict) -> None:
+    """Add `model_state` and `world_snapshot` -- the fields iOS decodes.
+
+    Derived from the payload that is already built, so the projection and
+    the evidence beside it cannot drift.
+    """
+    lifecycle = payload["lifecycle"]
+    state = _MODEL_STATE_BY_LIFECYCLE.get(lifecycle["state"], MODEL_STATE_IDLE)
+    payload["model_state"] = state
+    payload["model_state_reason"] = lifecycle.get("reason")
+
+    world = payload.get("world")
+    if world is None:
+        payload["world_snapshot"] = None
+        return
+
+    progress = payload.get("progress") or {}
+    tracking = payload.get("tracking") or {}
+    scale = payload.get("scale") or {}
+    calibration = payload.get("calibration") or {}
+    geometry = payload.get("geometry") or {}
+    trajectory = payload.get("trajectory") or {}
+    persistence = payload.get("persistence") or {}
+
+    scale_word = scale.get("semantics") or IOS_SCALE_UNKNOWN
+    path = trajectory.get("path_length") or {}
+    path_available = bool(path.get("available"))
+
+    payload["world_snapshot"] = {
+        "name": world.get("display_name"),
+        "world_id": world.get("world_id"),
+        "keyframe_count": progress.get("keyframes_accepted"),
+        # The SNAPSHOT's revision, which is the envelope's revision: iOS
+        # compares it for equality to decide whether anything changed.
+        # Filled in by the caller, which is the only place that knows it.
+        "revision": None,
+        "tracking": _IOS_TRACKING.get(tracking.get("state"), "unavailable"),
+        "scale": scale_word,
+        "mapping_seconds": progress.get("mapping_seconds"),
+        "calibration": calibration.get("state") or "unknown",
+        "geometry": {
+            "representation": geometry.get("representation"),
+            "element_count": geometry.get("element_count"),
+            # Never null: iOS uses this to know whether it is looking at a
+            # whole world or a delta, and a null would leave that open.
+            "is_incremental": bool(geometry.get("is_incremental")),
+        },
+        "trajectory": {
+            "pose_count": trajectory.get("pose_count"),
+            "path_length": path.get("value") if path_available else None,
+            "path_length_unit": path.get("unit") if path_available else None,
+            # Carried separately from the snapshot's scale, because
+            # handoff.md 9.6 says every spatial figure carries its own.
+            "scale": (
+                path.get("scale_semantics") if path_available else IOS_SCALE_UNKNOWN
+            ),
+        },
+        "persistence": {
+            "state": persistence.get("state") or "unknown",
+            "revision": persistence.get("revision"),
+        },
     }
 
 
@@ -957,8 +1353,12 @@ def _lock_holder(store, world_id):
         return None
     pid = holder.get("pid")
     if not isinstance(pid, int):
-        return None
-    return {"pid": pid, "alive": _pid_is_running(pid)}
+        # A lock file exists but names no usable pid. NOT the same as "no
+        # lock": reporting `idle` with "no writer lock is held" would be a
+        # false statement about a file that is right there, and would
+        # downgrade a crashed builder to a healthy-looking idle world.
+        return {"pid": None, "alive": False, "unreadable": True}
+    return {"pid": pid, "alive": _pid_is_running(pid), "unreadable": False}
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -970,15 +1370,39 @@ def _pid_is_running(pid: int) -> bool:
         return False
 
 
-def _manifest_for(store, world_id, session_id):
-    """The derived manifest, but ONLY if it describes THIS session.
+# Keys a manifest must carry before it counts as evidence of geometry.
+# `engine.build` writes all of them; a manifest missing any is truncated,
+# hand-edited, or from a writer this build does not understand.
+#
+# Gating on "the file exists" instead let a stripped manifest produce
+# `available: true` with every figure null -- "we have geometry" asserted
+# with nothing to show for it -- which an adversarial review demonstrated.
+REQUIRED_MANIFEST_KEYS = (
+    "input_digest",
+    "session_id",
+    "keyframes",
+    "points",
+    "poses_solved",
+    "poses_refused",
+    "segments",
+)
 
-    The manifest lives at one path per WORLD while carrying a session_id
-    (store.derived_manifest_path, engine.build). A world with two built
-    sessions therefore has one manifest describing whichever built last.
-    Reporting it for the other session would attribute one session's
-    geometry to another -- a confident wrong answer of exactly the kind
-    the pose-convention machinery exists to prevent.
+
+def _read_manifest(store, world_id):
+    """The world's derived manifest, unfiltered, or None.
+
+    Deliberately NOT filtered by session, despite the manifest carrying a
+    session_id -- the caller does that, and it matters where the check
+    lives. This function is called through a file-fingerprint cache keyed
+    on the manifest PATH, and that path is shared by every session in a
+    world (store.derived_manifest_path). A cached value filtered for one
+    session would be handed to another, which is the exact
+    misattribution the check exists to prevent.
+
+    So: this reads and validates the schema; `_payload` decides whether
+    the manifest describes the session being reported on. An earlier
+    version of this function claimed to do both and did neither after the
+    cache was introduced.
     """
     manifest = store.read_derived_manifest(world_id)
     if manifest is None:
@@ -988,11 +1412,16 @@ def _manifest_for(store, world_id, session_id):
         # manifest from another schema describes fields whose meaning this
         # build does not know.
         return None
-    if manifest.get("session_id") != session_id:
-        # Kept rather than dropped: the caller re-checks, and returning
-        # the manifest lets one cached read serve every session in a
-        # world instead of one read per session per poll.
-        return manifest
+    missing = [key for key in REQUIRED_MANIFEST_KEYS if manifest.get(key) is None]
+    if missing:
+        logger.warning(
+            "result channel: derived manifest for %s is missing %s; "
+            "treating it as absent rather than reporting geometry with no "
+            "figures",
+            world_id,
+            missing,
+        )
+        return None
     return manifest
 
 
@@ -1014,8 +1443,3 @@ def _keyframes_digest(store, world_id, session_id):
         return None
 
 
-def _last_of(events, kind):
-    for event in reversed(events):
-        if event.get("kind") == kind:
-            return event
-    return None

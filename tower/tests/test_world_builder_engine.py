@@ -63,8 +63,12 @@ def walk_jpegs(scene, camera_matrix):
     return [ss.encode_jpeg(image) for image in images]
 
 
-def _map_session(store, walk_jpegs, intrinsics, backend=BACKEND_CLASSICAL):
-    engine = WorldBuilderEngine(store, backend_name=backend)
+def _map_session(
+    store, walk_jpegs, intrinsics, backend=BACKEND_CLASSICAL, redactor_factory=None
+):
+    engine = WorldBuilderEngine(
+        store, backend_name=backend, redactor_factory=redactor_factory
+    )
     world_id = engine.create_world("Test Room")
     session_id = engine.start_session(
         world_id,
@@ -358,14 +362,19 @@ class TestPrivacyPosture:
         assert session.retains_raw_imagery is True
         assert "raw-imagery" in session.privacy_tags
 
-    def test_redaction_provenance_is_recorded_as_none(
+    def test_redaction_provenance_records_what_actually_ran(
         self, tmp_path, walk_jpegs, intrinsics
     ):
-        """The un-retrofittable half of any future redaction work.
+        """The un-retrofittable half of redaction work, now that it ships.
 
-        Without this field, the day redaction ships there is no way to
-        tell whether an older session's images were filtered, so every
-        historical session must be assumed unredacted forever.
+        Without this field there would be no way to tell whether an older
+        session's images were filtered, so every historical session would
+        have to be assumed unredacted forever.
+
+        The value names the DETECTOR AND ITS THRESHOLD, not an outcome. A
+        bare "redacted" would invite a reader to infer a completeness the
+        detector cannot support -- it has measured false negatives on
+        heavily occluded and ~90-degree-rotated faces.
         """
         store = WorldStore(tmp_path)
         _, world_id, session_id, _ = _map_session(store, walk_jpegs, intrinsics)
@@ -373,7 +382,33 @@ class TestPrivacyPosture:
         session = store.read_session(world_id, session_id)
         raw = json.loads(store.session_path(world_id, session_id).read_text())
 
-        assert session.redaction == "none"
+        assert session.redaction == raw["redaction"]
+        assert raw["redaction"].startswith("faces-detected-and-filled/")
+        assert "@" in raw["redaction"], "the threshold must be recorded"
+
+        # Never an outcome claim, however the label is composed.
+        for forbidden in ("anonymised", "anonymized", "privacy-safe", "removed"):
+            assert forbidden not in raw["redaction"]
+
+        # And the posture that redaction does NOT change.
+        assert raw["retains_raw_imagery"] is True
+        assert set(raw["privacy_tags"]) == {"raw-imagery", "first-person"}
+
+    def test_a_session_records_none_when_no_redactor_is_available(
+        self, tmp_path, walk_jpegs, intrinsics
+    ):
+        """A Tower with no model must say so, not claim a filter it lacks."""
+        from tower.world_builder.redaction import FaceRedactor
+
+        store = WorldStore(tmp_path)
+        _, world_id, session_id, _ = _map_session(
+            store,
+            walk_jpegs,
+            intrinsics,
+            redactor_factory=lambda: FaceRedactor(path=tmp_path / "absent.onnx"),
+        )
+
+        raw = json.loads(store.session_path(world_id, session_id).read_text())
         assert raw["redaction"] == "none"
 
     def test_purging_a_world_removes_every_keyframe_image(
