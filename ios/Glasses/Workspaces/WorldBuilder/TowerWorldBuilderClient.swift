@@ -254,6 +254,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     private(set) var state: WorldModelState = .idle {
         didSet {
             guard state != oldValue else { return }
+            log(state)
             stateSubject.send(state)
         }
     }
@@ -448,6 +449,43 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         // unchanged snapshot to refresh the fields excluded from the revision
         // hash — from invalidating the view tree for nothing.
         state = next
+    }
+
+    /// One line per **change**, which at the channel's ~2 Hz ceiling and with
+    /// the heartbeat already filtered out by the `didSet` guard is roughly one
+    /// line per keyframe. It exists for the physical session: on a real walk
+    /// this is the only place the mapped state is observable, and "the Tower
+    /// sent a result" (which `TowerClient` logs) is a different claim from
+    /// "this is what the phone made of it".
+    private func log(_ state: WorldModelState) {
+        #if DEBUG
+        let detail: String
+        switch state {
+        case .unsupported(let reason):
+            detail = "unsupported — \(reason)"
+        case .idle:
+            detail = "idle"
+        case .awaitingFirstUpdate:
+            detail = "awaitingFirstUpdate"
+        case .receiving(let snapshot), .finalizing(let snapshot), .finalized(let snapshot):
+            let name: String
+            switch state {
+            case .receiving: name = "receiving"
+            case .finalizing: name = "finalizing"
+            default: name = "finalized"
+            }
+            detail = "\(name) keyframes=\(snapshot.keyframeCount.map(String.init) ?? "-")"
+                + " tracking=\(snapshot.tracking.displayName)"
+                + " scale=\(snapshot.scale.displayName)"
+                + " calibration=\(snapshot.calibration.displayName)"
+                + " geometry=\(snapshot.geometry.elementCount.map(String.init) ?? "-")"
+                + " poses=\(snapshot.trajectory.poseCount.map(String.init) ?? "-")"
+                + " revision=\(snapshot.revision ?? "-")"
+        case .failed(let failure):
+            detail = "failed(\(failure.kind.rawValue)) — \(failure.message)"
+        }
+        print("[Glasses][WorldBuilder] \(detail)")
+        #endif
     }
 
     private func apply(_ error: CartridgeResultError) {
