@@ -102,7 +102,44 @@ process.
 **And no geometry**: `backend_id: "unposed"`, `poses_solved: 0`, `points: 0`,
 `scale_state: "unknown"`. That is correct and is the headline finding — see §4.
 
-### 3.3 The reconnect race, on a real network
+### 3.3 The real Swift app, against the real Tower
+
+Run in the Simulator — which is the actual `TowerClient`, the actual
+`TowerWorldBuilderClient` and the actual decoder, reaching the Windows Tower
+over Tailscale. Only the camera half is missing, and the Simulator says so
+("Meta AI unavailable"). The shell reported **Tower: Connected, Camera: Off**.
+
+Console, in order, with nothing elided:
+
+```
+[Glasses][Init] GlassesConnection created          <- exactly one
+[Glasses][Tower] ping sent / pong validated        <- pong still first
+[Glasses][Tower] receive loop started
+[Glasses][Tower] cartridges sent                   <- after the pong, never before
+[Glasses][Tower] cartridges declared: world_builder/status available=true
+[Glasses][Tower] result_subscribe(world_builder) sent
+[Glasses][Tower] result_subscribed: sub-1 world_builder/status
+[Glasses][Tower] cartridge_result: seq=1 revision=30b6f3ef… coalesced=0
+```
+
+Then a live mapping session was driven underneath the running app, and the
+mapped state followed it:
+
+```
+[Glasses][WorldBuilder] awaitingFirstUpdate
+[Glasses][WorldBuilder] receiving keyframes=2  … geometry=-  poses=-
+[Glasses][WorldBuilder] receiving keyframes=3  … geometry=0  poses=1
+[Glasses][WorldBuilder] receiving keyframes=4 … 10
+[Glasses][WorldBuilder] finalized  keyframes=10 tracking=Good scale=Unknown
+```
+
+**The whole lifecycle, in the real app, from real Tower bytes.** Two details
+worth keeping: `seq` skipped 1 → 3 because seq 2 was an unchanged heartbeat that
+the client correctly did not republish; and `geometry=-` at two keyframes
+against `geometry=0` at three is absent-stays-absent and zero-stays-zero, which
+is the distinction the whole contract turns on.
+
+### 3.4 The reconnect race, on a real network
 
 Socket A streamed 40 frames and was then **aborted with no close frame**, which
 is what WiFi going away looks like. Socket B opened 0.5 s later and sent
@@ -123,14 +160,31 @@ One capture lineage, one follower, one world, one continuously climbing keyframe
 count — the overnight capture-ownership work behaves as described, against a
 real socket rather than a simulated one.
 
-### 3.4 Persistence and reload
+**The zombie window was then covered deliberately.** uvicorn takes 20–40 s to
+notice a dead socket, so the first run's 11-second successor stream was too
+short to prove anything about the teardown. A second run slowed the successor to
+1.3 fps so it streamed for 61 s: the abort landed at t=102, the successor armed
+at t=103, and `recording` stayed **true** until t=168 — three seconds after the
+clean `stream_stop`, and 65 s past the abort. **The superseded connection's
+teardown did not disarm the live recording.**
+
+An intermediate run of that test *did* show `recording` flipping to false
+mid-stream, and it was the driver's own bug rather than the Tower's: the sending
+socket was never read, so its receive buffer filled, the transport stopped being
+drained, the library's keepalive pong went unprocessed and the connection closed
+with 1011 after ~20 s. That is exactly the failure the contract's first client
+responsibility names — *"read the socket"* — and `TowerClient`'s continuous
+receive loop is why the phone does not have it. Worth knowing, because from
+`/health` alone it is indistinguishable from the bug under test.
+
+### 3.5 Persistence and reload
 
 `world_inspect.py` reopened the finished world: same world id, same name, same
 scale state, `pose_status {'anchor': 1, 'solved': 7}`, storage split into
 authoritative vs reclaimable, and the redaction claim recorded as
 `faces-detected-and-filled/yunet-2023mar@0.30`. No missing or corrupt artifacts.
 
-### 3.5 The build
+### 3.6 The build
 
 iOS suite **275 passed, 0 failed**. Debug ✅ and Release ✅, with **warning
 parity** against the pre-integration baseline — the same four, none new. Device
@@ -169,11 +223,11 @@ code.
 
 | Phase | Status |
 |---|---|
-| App running on the physical iPhone | **not done** — the device is paired over the local network and the app installs, but launch was refused: `SBMainWorkspace … Locked`. Nobody unlocked it |
+| App running on the physical iPhone | **not done** — the device is paired over the local network and the app installs, but launch was refused twice: `SBMainWorkspace … Locked`. Nobody unlocked it. The same binary runs correctly in the Simulator (§3.3) |
 | Ray-Ban glasses connected, camera capture | **not done** |
 | Frames from the real camera reaching the Tower | **not done** |
 | Sender FPS / backpressure against the physical baseline | **not done** — the 11.0 fps figure above is this Mac's driver, not the phone's |
-| World Builder against a real room | **not done** |
+| World Builder against a real room | **not done** — the lifecycle end to end is proven (§3.3), but on rendered frames |
 | WiFi interruption with the real phone reconnecting | **not done** — §3.3 proves the Tower half against a real socket; the phone's own reconnect is untested here |
 | Redaction against a real face | **not done** — the mechanism ran and recorded its claim, but a rendered scene contains no faces, so nothing was detected and nothing was proven |
 | Calibration | **not done** — no board has been printed |
