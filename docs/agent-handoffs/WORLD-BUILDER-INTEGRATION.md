@@ -241,6 +241,19 @@ rendered pinhole scene.
 
 ## 6. Exact next steps
 
+**The Tower is already running** on the Windows host, detached, at
+`ws://100.110.156.55:8000/ws` — `capture.armed: true`, `recording: false`, the
+World Builder offer available. To restart it (over SSH, `Start-Process` does not
+survive a non-interactive session; WMI does):
+
+```powershell
+Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+  CommandLine = "cmd.exe /c cd /d C:\Users\tvllo\Projects\GlassesTower && " +
+    "set TOWER_CAPTURE_ROOT=data/capture && set TOWER_WORLD_ROOT=data/worlds && " +
+    ".venv\Scripts\python.exe -m uvicorn tower.main:app --host 0.0.0.0 --port 8000 > tower.log 2>&1"
+}
+```
+
 1. **Unlock the iPhone** and leave it unlocked. Then:
    `xcrun devicectl device process launch --device <id> --console --terminate-existing com.tristanvarner.Glasses`
    Cold-launch checks, all readable from the console: exactly one
