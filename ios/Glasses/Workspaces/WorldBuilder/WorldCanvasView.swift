@@ -101,8 +101,14 @@ struct WorldCanvasView: View {
             unsupported(reason)
 
         case .idle:
-            headline("Not started", systemImage: "cube.transparent")
-            detailText("Start a capture session to begin building a world.")
+            headline("No world yet", systemImage: "cube.transparent")
+            // Not "start a capture session to begin building a world". The
+            // Tower reaches this state by having no world to report, and
+            // capture alone does not create one — reconstruction runs in a
+            // separate Tower process reading the capture from disk, which
+            // this app can neither start nor see. Promising a world in
+            // exchange for a tap would be a claim about the other machine.
+            detailText("The Tower has not reported a world. Frames from a capture session reach it; what it builds from them is its own to start.")
 
         case .awaitingFirstUpdate:
             // The one honest use of a progress indicator: frames really are

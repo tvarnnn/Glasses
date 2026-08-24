@@ -326,6 +326,101 @@ final class WorldBuilderPayloadTests: XCTestCase {
         )
     }
 
+    // MARK: Against the real Tower's bytes
+
+    /// **A payload captured verbatim from a running Tower**, not composed here.
+    ///
+    /// Every other fixture in this file was written from
+    /// `tower/tower/results/world_builder.py` and could therefore be wrong in
+    /// the same way the reading of that file was wrong. This one was taken off
+    /// the wire on 2026-08-24 from `tower.main:app` at
+    /// `world_builder.status/2026-08-23`, after a build that produced 8
+    /// keyframes, 2336 points and 7 solved poses.
+    ///
+    /// The world it describes is **synthetic** — rendered, not photographed —
+    /// which is a fact about the reconstruction and not about the wire. What
+    /// this pins is the encoding: the key names, the nesting, the types, and
+    /// which fields carry `null`.
+    private static let capturedFromTower = """
+        {
+          "name": "Wire Check (synthetic)",
+          "world_id": "d53fa2781dc94339b1c8640ceb50d6a3",
+          "keyframe_count": 8,
+          "revision": "05576f31fec4fb79",
+          "tracking": "good",
+          "scale": "relative",
+          "mapping_seconds": 0.2812764644622803,
+          "calibration": "calibrated",
+          "geometry": {
+            "representation": "sparse point cloud",
+            "element_count": 2336,
+            "is_incremental": false
+          },
+          "trajectory": {
+            "pose_count": 8,
+            "path_length": 6.626530639332543,
+            "path_length_unit": "world units",
+            "scale": "relative"
+          },
+          "persistence": {
+            "state": "saved",
+            "revision": "a8ae1778a260e976"
+          }
+        }
+        """
+
+    func testARealTowerSnapshotDecodesFieldForField() throws {
+        let data = Data(Self.capturedFromTower.utf8)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        let snapshot = WorldBuilderResultDecoder.snapshot(from: json)
+
+        XCTAssertEqual(snapshot.name, "Wire Check (synthetic)")
+        XCTAssertEqual(snapshot.worldID, "d53fa2781dc94339b1c8640ceb50d6a3")
+        XCTAssertEqual(snapshot.keyframeCount, 8)
+        XCTAssertEqual(snapshot.revision, "05576f31fec4fb79")
+        XCTAssertEqual(snapshot.tracking, .good)
+        XCTAssertEqual(snapshot.scale, .relative)
+        XCTAssertEqual(snapshot.calibration, .calibrated)
+        XCTAssertEqual(snapshot.geometry.elementCount, 2336)
+        XCTAssertEqual(snapshot.geometry.representation, "sparse point cloud")
+        XCTAssertEqual(snapshot.trajectory.poseCount, 8)
+        XCTAssertEqual(snapshot.persistence, .saved(revision: "a8ae1778a260e976"))
+        XCTAssertFalse(snapshot.isEmpty)
+
+        // And what a person would actually be shown, which is the assertion
+        // that would catch a decode that "worked" into an unrenderable state.
+        XCTAssertFalse(snapshot.permitsMetricDisplay, "a synthetic relative world claimed metres")
+        XCTAssertTrue(snapshot.trajectory.labelledFigureDisplayable)
+        XCTAssertEqual(
+            ReportedFigure.format(
+                snapshot.trajectory.pathLength ?? 0,
+                unit: snapshot.trajectory.pathLengthUnit
+            ),
+            "6.6 world units"
+        )
+    }
+
+    /// The Tower with no worlds yet, also captured verbatim. `world_snapshot`
+    /// is `null` and `model_state_reason` explains why — and `.idle` must not
+    /// be confused for a world with every field missing.
+    func testARealIdleTowerDecodesToIdleWithNoWorld() throws {
+        let raw = """
+            {"model_state": "idle",
+             "model_state_reason": "no worlds exist under this Tower's world root",
+             "world_snapshot": null}
+            """
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any]
+        )
+        let state = WorldBuilderResultDecoder.modelState(from: json)
+        XCTAssertEqual(state, .idle)
+        XCTAssertNil(state?.snapshot)
+        XCTAssertFalse(state?.hasWorld ?? true)
+        XCTAssertFalse(state?.phase.mayCarryData ?? true)
+    }
+
     // MARK: Revisions
 
     /// A revision is an opaque change identity, and a snapshot supersedes every
