@@ -201,24 +201,50 @@ def test_an_unknown_segment_yields_none(derived_world):
     assert build_segment(store, world_id, session_id, 99) is None
 
 
-def test_sampling_spans_the_whole_cloud_and_is_not_a_prefix():
+def test_sampling_spans_the_whole_cloud_and_is_not_a_prefix(tmp_path, keyframe_factory):
     """The regression that mattered: an integer stride became truncation.
 
-    3,033 points capped at 2,000 must reach past index 1999, or the viewer
-    is being shown one corner of the room and told it is the world.
+    3,033 points capped at 2,000 must reach past index 1999, or the viewer is
+    shown one corner of the room and told it is the world.
+
+    This calls build_segment. A test that recomputes the sampling arithmetic
+    proves only that the arithmetic equals itself.
     """
-    from tower.results.world_builder_geometry import build_segment as _bs  # noqa: F401
+    from tower.world_builder.records import Session, World
+    from tower.world_builder.store import WorldStore, compute_input_digest
+
+    store = WorldStore(tmp_path)
+    world_id, session_id = "wbig", "sbig"
+    store.write_world(World(world_id=world_id, created_at=1.0, updated_at=2.0,
+                            session_ids=(session_id,)))
+    store.write_session(Session(session_id=session_id, world_id=world_id,
+                                started_at=1.0, ended_at=2.0))
+    store.append_keyframe(world_id, keyframe_factory(session_id, 1, 0))
+
+    poses = [{"keyframe_id": f"{session_id}:00000001", "segment_index": 0,
+              "status": "anchor", "degeneracy": "",
+              "rotation": [1.0, 0.0, 0.0, 0.0], "translation": [0.0, 0.0, 0.0]}]
     points = [{"segment_index": 0, "xyz": [float(i), 0.0, 0.0]} for i in range(3033)]
-    poses = []
-    grouped = {0: {"poses": poses, "points": points}}
+    manifest = {
+        "schema_version": 1,
+        "input_digest": compute_input_digest(store.read_keyframes(world_id, session_id)),
+        "built_at": 3.0, "backend_id": "classical-sfm", "session_id": session_id,
+        "keyframes": 1, "poses_solved": 0, "poses_refused": 0, "poses_anchor": 1,
+        "poses_positioned": 0, "points": 3033, "segments": 1,
+        "scale_state": "unknown",
+    }
+    store.write_derived(world_id, session_id, poses=poses, points=points,
+                        manifest=manifest)
 
-    total = len(points)
-    max_points = 2000
-    step = total / max_points
-    sent = [points[int(i * step)] for i in range(max_points)]
+    chunk = build_segment(store, world_id, session_id, 0, max_points=2000)
 
-    assert len(sent) == max_points
-    assert sent[-1]["xyz"][0] > 1999.0, "sampling collapsed to a prefix"
+    assert chunk["points_sent"] == 2000
+    assert chunk["points_total"] == 3033
+    assert chunk["point_sampling"] == "stride"
+    # The load-bearing assertion. An integer stride returned points[0:2000],
+    # whose last x is 1999.0. Spanning the cloud must reach well past that.
+    assert chunk["points"][-1][0] > 1999.0
+    assert len({tuple(p) for p in chunk["points"]}) == 2000, "sampling produced duplicates"
 
 
 def test_max_points_at_or_above_the_total_does_not_sample(derived_world):
