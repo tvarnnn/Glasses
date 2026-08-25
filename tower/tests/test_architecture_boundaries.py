@@ -181,6 +181,27 @@ def test_shared_storage_primitives_have_no_cartridge_dependency():
     assert offenders == []
 
 
+def _code_without_comments_or_strings(path: pathlib.Path) -> str:
+    """Source with every comment and string literal removed.
+
+    Lets a boundary be asserted against what the module DOES rather than
+    what it says. The rule below used to be a substring scan over the raw
+    file, which a comment naming a cartridge could trip -- a false
+    positive that pushes people towards writing evasive prose instead of
+    thinking about the boundary.
+    """
+    import io
+    import tokenize
+
+    source = path.read_text(encoding="utf-8")
+    kept = []
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type in (tokenize.COMMENT, tokenize.STRING):
+            continue
+        kept.append(token.string)
+    return " ".join(kept)
+
+
 def test_world_builder_is_not_registered_as_a_production_module():
     """The integration boundary, asserted rather than assumed.
 
@@ -188,11 +209,71 @@ def test_world_builder_is_not_registered_as_a_production_module():
     (lifecycle hardening), both of which are untriggered or blocked. If
     this test ever fails, someone has crossed that boundary -- which may
     be correct, but must be a deliberate decision rather than a drift.
-    """
-    main = (TOWER / "main.py").read_text(encoding="utf-8")
 
-    assert "world_builder" not in main
+    **What changed, and why this rule is now narrower in one place and
+    stricter in another.** `main.py` supervises a per-capture worker
+    PROCESS (see `capture_workers.py`), and the argv it builds names
+    `scripts/world_build_session.py`. That is a deliberate crossing: the
+    web process now knows that something can be run against a capture.
+
+    It is not registration, and the distinction is the one the module
+    system cares about. A registered module is loaded into this process,
+    joins the frame path, and shares its lifecycle and its failure
+    domain. A supervised child shares none of those -- which is exactly
+    why an expensive rebuild can run repeatedly mid-session without the
+    frame path noticing, the property `docs/agent-handoffs/WORLD-BUILDER.md`
+    section 1 exists to protect.
+
+    So the rule is now: main.py may name a worker as a COMMAND, and may
+    say so in a comment, but must not import the cartridge, must not
+    register it as a module, and must not reach a cartridge's names in
+    executable code. Checked against code with comments and string
+    literals stripped, which is stricter than the old raw substring scan
+    for everything that actually runs.
+    """
+    main = TOWER / "main.py"
+
+    for imported in _imports(main):
+        assert "world_builder" not in imported, (
+            f"main.py imports {imported}: the web process must not import a "
+            "cartridge. Run it as a subprocess or report it through an "
+            "adapter."
+        )
+
+    code = _code_without_comments_or_strings(main)
+    assert "world_builder" not in code, (
+        "main.py reaches a World Builder name in executable code. Naming a "
+        "script path in an argv string is allowed; touching the package is "
+        "not."
+    )
     assert not (TOWER / "modules" / "world_builder.py").exists()
+
+
+def test_the_capture_worker_supervisor_is_cartridge_blind():
+    """The generic half must stay generic, or the next worker inherits this one.
+
+    `capture_workers.py` is shared machinery: the second thing that ever
+    wants to watch a capture -- an offline re-encoder, a Document Memory
+    pass over selected stills -- gets it for free only if it contains no
+    trace of the first. It runs an argv. It must not know what the argv
+    computes.
+
+    Stricter than the module-wide rule above, and deliberately so: this
+    file is new, so there is no legacy to grandfather.
+    """
+    path = TOWER / "capture_workers.py"
+    cartridges = ("world_builder", "world_build", "object_memory",
+                  "document_memory", "scene")
+
+    for imported in _imports(path):
+        for cartridge in cartridges:
+            assert cartridge not in imported, f"capture_workers.py -> {imported}"
+
+    code = _code_without_comments_or_strings(path)
+    for cartridge in cartridges:
+        assert cartridge not in code, (
+            f"capture_workers.py names {cartridge!r} in executable code"
+        )
 
 
 def test_the_experimental_cv_lab_does_not_import_a_cartridge():

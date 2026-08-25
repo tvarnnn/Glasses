@@ -20,7 +20,31 @@ def health(request: Request) -> dict:
         "module_state": container.state.value,
         "module_id": container.descriptor.id,
         "capture": _capture_state(request.app),
+        "capture_workers": _worker_state(request.app),
     }
+
+
+def _worker_state(app) -> dict | None:
+    """Whether anything is turning captures into anything.
+
+    Answers "why isn't World Builder changing?" from another machine.
+    The Tower is normally operated over Tailscale, where a server-side
+    log line is invisible, and on 2026-08-24 the only way to establish
+    that nothing was following the capture was to notice that no world
+    directory had appeared.
+
+    `enabled: false` -- nothing is configured to follow a capture.
+    `workers: []` with `enabled: true` -- configured, nothing running
+    right now, which is correct between walks and wrong during one.
+    """
+    supervisor = getattr(app.state, "capture_workers", None)
+    if supervisor is None:
+        return None
+    try:
+        return {"enabled": supervisor.enabled, "workers": supervisor.status()}
+    except Exception:
+        logger.exception("[Tower][Health] could not read worker state")
+        return {"error": "unavailable"}
 
 
 def _capture_state(app) -> dict | None:

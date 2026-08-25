@@ -267,13 +267,35 @@ def _finalize_stream_measurement(metrics: SessionMetrics, end_reason: str) -> No
     )
 
 
+def _capture_workers(websocket):
+    """Whatever supervises per-capture worker processes, or None.
+
+    Fetched by name rather than injected, and tolerant of absence: most
+    tests in this repository build an app and never set it, and a missing
+    supervisor must mean "nothing follows captures here", not an
+    AttributeError on the frame path.
+
+    This module knows nothing about what a worker computes. It hands over
+    a capture id and a directory; `main.py` decides what that is worth
+    running.
+    """
+    return getattr(websocket.app.state, "capture_workers", None)
+
+
 def _start_capture(websocket, owner) -> None:
     """Bound a dataset recording to the existing stream window.
 
     Reuses stream_start/stream_stop rather than adding a message type:
     the session boundary already exists on the wire, and V1 deliberately
     makes no protocol change.
+
+    A capture id is minted HERE, in this process, at this moment. That is
+    the structural reason attaching a builder used to be a manual step:
+    the id does not exist until the phone connects, so nothing could be
+    launched in advance holding it. The process that mints it hands it
+    over.
     """
+    supervisor = _capture_workers(websocket)
     for observer in _frame_observers(websocket):
         try:
             if observer.is_recording:
@@ -286,24 +308,55 @@ def _start_capture(websocket, owner) -> None:
                 # taking over, which is different from a dead connection
                 # tearing down a live one.
                 observer.stop(END_REASON_STOP)
-            capture_id = observer.start(
-                owner=owner, continues=observer.resumable_capture()
-            )
+            # Read before `start`, which clears it. The supervisor needs
+            # the same lineage the manifest records, or it cannot tell a
+            # reconnect from a new walk and starts a second builder on
+            # one lineage.
+            continues = observer.resumable_capture()
+            capture_id = observer.start(owner=owner, continues=continues)
             logger.info("[Tower][Capture] recording started: %s", capture_id)
         except Exception:
             logger.exception("[Tower][Capture] could not start recording")
+            continue
+        _offer_capture_opened(
+            supervisor, capture_id, observer.capture_dir(capture_id), continues
+        )
+
+
+def _offer_capture_opened(supervisor, capture_id, capture_dir, continues) -> None:
+    """Tell the supervisor a capture exists. Never let it cost the stream.
+
+    Isolated for the same reason `_record_capture` isolates each
+    observer: building a world is a side errand, and the connection
+    answering frames must not end because a subprocess could not be
+    started.
+    """
+    if supervisor is None:
+        return
+    try:
+        supervisor.capture_opened(capture_id, capture_dir, continues=continues)
+    except Exception:
+        logger.exception(
+            "[Tower][Capture] could not attach a worker to capture %s; the "
+            "recording continues, but nothing may be building a world from it",
+            capture_id,
+        )
 
 
 def _stop_capture(websocket, reason: str = END_REASON_STOP, owner=None) -> None:
+    supervisor = _capture_workers(websocket)
     for observer in _frame_observers(websocket):
+        closed_id = None
         try:
             if not observer.is_recording:
                 continue
             status = observer.stop(reason, owner=owner)
             if status is not None and status.is_open:
                 # Refused: the capture belongs to a live connection that
-                # superseded this one.
+                # superseded this one. Its worker belongs to that
+                # connection too, and must not be told its capture ended.
                 continue
+            closed_id = status.capture_id
             logger.info(
                 "[Tower][Capture] recording stopped (%s): %s frames, %s bytes",
                 reason,
@@ -312,6 +365,17 @@ def _stop_capture(websocket, reason: str = END_REASON_STOP, owner=None) -> None:
             )
         except Exception:
             logger.exception("[Tower][Capture] could not stop recording cleanly")
+        if closed_id is None:
+            continue
+        try:
+            if supervisor is not None:
+                supervisor.capture_closed(closed_id)
+        except Exception:
+            logger.exception(
+                "[Tower][Capture] could not notify the worker supervisor that "
+                "capture %s closed",
+                closed_id,
+            )
 
 
 @router.websocket("/ws")
