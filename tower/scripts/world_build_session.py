@@ -35,11 +35,41 @@ resolution the intrinsics stay unknown, the unposed backend runs, and the
 engine honestly produces no poses. There is no flag that invents a focal
 length, and nothing rescales a calibration from another resolution.
 
+WHEN THE LOOKUP HAPPENS, AND WHY THAT IS THE HARD PART
+
+The mapping session does not open until a frame has actually been
+observed. That ordering is not tidiness; it is the fix for a bug that
+cost the 2026-08-25 physical walk.
+
+The Tower does not wait for a frame before attaching a builder. It
+attaches at `stream_start`, from `_start_capture`, on the line after the
+capture id is minted -- so on the live path this process routinely opens
+against a capture directory whose journal has no rows in it yet. This
+file used to resolve intrinsics right there, get "resolution not
+observed", and freeze `unknown()` into the session record. The 360x640
+frames arrived about a second later, a 360x640 calibration was sitting
+in the store the whole time, and nothing ever looked again: 75 keyframes,
+`backend: unposed`, `downgraded_from: classical`, zero poses.
+
+It was not a race that could be tuned away by starting later. Importing
+this module with OpenCV takes ~135ms on the Tower host and the first
+frame lands ~1s after `stream_start`, so the worker won every time.
+
+The session's intrinsics are a property of the PIXELS, so the session
+cannot honestly be opened before a pixel exists. The world is created
+immediately -- it costs nothing and gives the result channel something to
+report -- and then this process blocks on the first frame, measures it,
+and asks the store about the size it actually saw. A capture that closes
+without ever delivering a frame ends that wait and opens an empty session
+rather than hanging.
+
     .venv\\Scripts\\python.exe scripts/world_build_session.py --synthetic --name "Test Room"
     .venv\\Scripts\\python.exe scripts/world_build_session.py --frames data/capture/xyz
 """
 
 import argparse
+import io
+import itertools
 import json
 import logging
 import sys
@@ -50,7 +80,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tower.capture import CaptureFollower  # noqa: E402
-from tower.world_builder.backends import BACKEND_AUTO, BACKEND_NAMES  # noqa: E402
+from tower.world_builder.backends import (  # noqa: E402
+    BACKEND_AUTO,
+    BACKEND_NAMES,
+    select_backend,
+)
 from tower.world_builder.engine import WorldBuilderEngine  # noqa: E402
 from tower.world_builder.intrinsics_store import IntrinsicsStore  # noqa: E402
 from tower.world_builder.records import (  # noqa: E402
@@ -79,6 +113,14 @@ class ObservedFrame:
     wire_seq: int | None = None
     tx_seq: int | None = None
     received_at: float | None = None
+    # The size the RECORDER measured off this frame after decoding it,
+    # when the source knows it. Carried on the frame rather than looked
+    # up from the capture again, because the whole failure this guards
+    # against was asking a directory a question about a frame that had
+    # not been written into it yet. None means the source did not say,
+    # and `observed_size_of` decodes the bytes instead.
+    width: int | None = None
+    height: int | None = None
 
 
 def load_frames(directory: Path) -> list[ObservedFrame]:
@@ -91,33 +133,48 @@ def load_frames(directory: Path) -> list[ObservedFrame]:
     ]
 
 
-def observed_size_from_capture(directory: Path) -> tuple[int, int] | None:
-    """The frame size a capture is actually recording, from its journal.
+def first_observed_frame(frames):
+    """Take the first frame off a source, and hand back the whole run.
 
-    The journal is the honest source: the recorder writes the DECODED
-    width and height of each frame it stored. `capture.json` records what
-    the sender declared, and on 2026-08-24 the declaration and the pixels
-    disagreed.
+    This is where the live path now WAITS. `follow_capture` is a
+    generator that polls, so `next` blocks until the recorder appends a
+    line or gives up on the capture -- which is exactly the wait that
+    makes the resolution knowable.
 
-    Returns None when the capture has not written a frame yet -- which is
-    a real state on the live path, since the builder can attach before
-    the first frame lands. None means "not observed", never a default.
+    Returns `(first, frames)` where `frames` still yields that first
+    frame: nothing may be consumed for measurement and then dropped, or
+    the session silently starts one frame into the walk. `(None, empty)`
+    when the source ends without ever producing one, which is a real
+    state -- a phone that connects and drops -- and must not hang.
     """
-    path = directory / "frames.jsonl"
+    iterator = iter(frames)
+    first = next(iterator, None)
+    if first is None:
+        return None, iter(())
+    return first, itertools.chain((first,), iterator)
+
+
+def observed_size_of(frame: ObservedFrame) -> tuple[int, int] | None:
+    """The size of one frame, preferring what the recorder measured.
+
+    The recorder decodes every frame it stores and journals the resulting
+    width and height, so on the live path the answer is already in hand
+    and costs nothing. Falling back to decoding the payload covers a
+    source that carries no metadata at all.
+
+    Never guesses. None means "this frame did not say and could not be
+    read", and the caller turns that into unknown intrinsics rather than
+    into a default resolution.
+    """
+    if isinstance(frame.width, int) and isinstance(frame.height, int):
+        return (frame.width, frame.height)
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                width, height = record["width"], record["height"]
-                if isinstance(width, int) and isinstance(height, int):
-                    return (width, height)
-                return None
-    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        from PIL import Image
+
+        with Image.open(io.BytesIO(frame.payload)) as image:
+            return image.size
+    except Exception:  # noqa: BLE001 -- an undecodable frame is not fatal here
         return None
-    return None
 
 
 def observed_size_from_frames(directory: Path) -> tuple[int, int] | None:
@@ -192,6 +249,8 @@ def follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls):
             wire_seq=frame.wire_seq,
             tx_seq=frame.tx_seq,
             received_at=frame.received_at,
+            width=frame.width,
+            height=frame.height,
         )
 
 
@@ -316,8 +375,22 @@ def main(argv=None) -> int:
 
     # Keyed by the resolution frames MEASURE at, never by --width/--height.
     intrinsics_store = IntrinsicsStore(args.root)
+    # Absolute, always, and before anything else. `--root data/world_builder`
+    # resolves against THIS process's working directory, which the Tower
+    # sets to TOWER_ROOT rather than inheriting from the shell that
+    # started it. A relative path printed as-is cannot show that the
+    # store and the calibrator disagreed about which directory they meant.
+    logger.info(
+        "[Tower][WorldBuilder] world root %s (cwd %s) -- calibrations on "
+        "file: %s",
+        args.root.resolve(),
+        Path.cwd(),
+        ", ".join(f"{w}x{h}" for w, h in intrinsics_store.list_resolutions())
+        or "NONE",
+    )
 
     capture_id = None
+    synthetic_intrinsics = None
     if args.follow_capture:
         frames = follow_capture(
             args.follow_capture,
@@ -329,13 +402,8 @@ def main(argv=None) -> int:
         # The sender chooses the stream size and DAT may change it
         # mid-walk. This process measures each frame; it declares nothing.
         declared_size = None
-        intrinsics = resolve_intrinsics(
-            intrinsics_store,
-            observed_size_from_capture(args.follow_capture),
-            frame_source=frame_source,
-        )
     elif args.synthetic:
-        frames, intrinsics = synthetic_frames(
+        frames, synthetic_intrinsics = synthetic_frames(
             args.synthetic_frames, args.width, args.height
         )
         frame_source = "synthetic"
@@ -347,10 +415,53 @@ def main(argv=None) -> int:
         # A directory of jpegs whose size was decided by whatever wrote
         # them. Measured per keyframe, not declared here.
         declared_size = None
+
+    # The world BEFORE the wait below, not after. Creating it is a couple
+    # of small writes and it is what the result channel looks for, so a
+    # Tower whose phone has connected but not yet sent a frame reports a
+    # world that exists and is empty rather than no world at all.
+    store = WorldStore(args.root)
+    engine = WorldBuilderEngine(store, backend_name=args.backend)
+    world_id = args.world or engine.create_world(args.name)
+
+    # Only now, with somewhere to put the answer, ask what size the
+    # frames are -- and on the live path, wait until there IS a frame to
+    # ask about. See "WHEN THE LOOKUP HAPPENS" in the module docstring.
+    if args.synthetic:
+        intrinsics = synthetic_intrinsics
+        observed_size = declared_size
+    elif args.follow_capture:
+        first, frames = first_observed_frame(frames)
+        if first is None:
+            # The capture closed, or gave up, without a single frame.
+            # Not an error: it is a phone that connected and dropped. The
+            # session still opens, honestly empty.
+            logger.warning(
+                "[Tower][WorldBuilder] capture %s delivered no frames, so no "
+                "resolution was ever observed and no calibration was looked "
+                "up. This session will be empty.",
+                capture_id,
+            )
+            observed_size = None
+        else:
+            observed_size = observed_size_of(first)
+            logger.info(
+                "[Tower][WorldBuilder] first frame of capture %s observed at "
+                "%s (source_seq=%s); resolving intrinsics against THAT, not "
+                "against anything declared",
+                capture_id,
+                f"{observed_size[0]}x{observed_size[1]}"
+                if observed_size
+                else "an unreadable size",
+                first.source_seq,
+            )
         intrinsics = resolve_intrinsics(
-            intrinsics_store,
-            observed_size_from_frames(args.frames),
-            frame_source=frame_source,
+            intrinsics_store, observed_size, frame_source=frame_source
+        )
+    else:
+        observed_size = observed_size_from_frames(args.frames)
+        intrinsics = resolve_intrinsics(
+            intrinsics_store, observed_size, frame_source=frame_source
         )
 
     # An explicit file always wins over the store: it is the escape hatch
@@ -371,10 +482,6 @@ def main(argv=None) -> int:
             intrinsics.calibrated_width,
             intrinsics.calibrated_height,
         )
-
-    store = WorldStore(args.root)
-    engine = WorldBuilderEngine(store, backend_name=args.backend)
-    world_id = args.world or engine.create_world(args.name)
 
     session_id = engine.start_session(
         world_id,
@@ -398,18 +505,40 @@ def main(argv=None) -> int:
         capture_id=capture_id,
     )
 
+    # Everything a physical run needs in order to answer "is calibration
+    # active?" without opening a session record afterwards, on one line.
+    # After the 2026-08-25 walk the answer existed only on disk, hours
+    # later: the log said `intrinsics=unknown` and nothing about which
+    # resolution had been observed or which file had been consulted, so
+    # "the calibration is wrong" and "the calibration was never read"
+    # looked identical.
+    #
+    # `announce=False` because the engine announces the selection itself
+    # a few lines from now, in `_open_live_solve`. This asks the same
+    # deterministic function what it will decide; it does not decide.
+    selection = select_backend(args.backend, intrinsics, announce=False)
     logger.info(
         "[Tower][WorldBuilder] session %s in world %s: source=%s capture=%s "
-        "root=%s backend=%s intrinsics=%s rebuild_every=%s",
+        "root=%s observed=%s calibration=%s intrinsics=%s backend=%s "
+        "(requested %s) rebuild_every=%s",
         session_id,
         world_id,
         frame_source,
         capture_id,
-        args.root,
-        args.backend,
+        args.root.resolve(),
+        f"{observed_size[0]}x{observed_size[1]}" if observed_size else "UNOBSERVED",
+        intrinsics_store.path_for(*observed_size) if observed_size else "not consulted",
         intrinsics.source,
+        selection.backend.capabilities.backend_id,
+        args.backend,
         args.rebuild_every,
     )
+    if selection.was_downgraded:
+        logger.warning(
+            "[Tower][WorldBuilder] backend downgraded from %s: %s",
+            selection.downgraded_from,
+            selection.downgrade_reason,
+        )
 
     started = time.perf_counter()
     rebuilds = 0
