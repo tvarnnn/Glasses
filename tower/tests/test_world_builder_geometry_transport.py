@@ -259,3 +259,90 @@ def test_max_points_below_one_is_refused_rather_than_dividing_by_zero(derived_wo
     store, world_id, session_id = derived_world
     with pytest.raises(ValueError):
         build_segment(store, world_id, session_id, 0, max_points=0)
+
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from tower.routes import geometry as geometry_routes
+
+
+def _client(store) -> TestClient:
+    app = FastAPI()
+    app.include_router(geometry_routes.router)
+    app.state.world_root = store.root
+    return TestClient(app)
+
+
+def test_the_manifest_route_serves_the_adapters_output(derived_world):
+    store, world_id, session_id = derived_world
+    response = _client(store).get(
+        f"/worlds/{world_id}/geometry/manifest", params={"session_id": session_id}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["contract"] == "world_builder.geometry/2026-08-25"
+    assert body["segment_count"] == 2
+
+
+def test_the_segment_route_serves_one_chunk(derived_world):
+    store, world_id, session_id = derived_world
+    response = _client(store).get(
+        f"/worlds/{world_id}/geometry/segment/0", params={"session_id": session_id}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["segment_index"] == 0
+
+
+def test_max_points_reaches_the_adapter(derived_world):
+    store, world_id, session_id = derived_world
+    response = _client(store).get(
+        f"/worlds/{world_id}/geometry/segment/0",
+        params={"session_id": session_id, "max_points": 1},
+    )
+
+    body = response.json()
+    assert body["points_sent"] == 1
+    assert body["points_total"] == 2
+
+
+def test_an_unknown_world_is_404_and_not_an_empty_world(derived_world):
+    store, _, session_id = derived_world
+    response = _client(store).get(
+        "/worlds/nope/geometry/manifest", params={"session_id": session_id}
+    )
+
+    assert response.status_code == 404
+
+
+def test_an_unknown_segment_is_404(derived_world):
+    store, world_id, session_id = derived_world
+    response = _client(store).get(
+        f"/worlds/{world_id}/geometry/segment/99", params={"session_id": session_id}
+    )
+
+    assert response.status_code == 404
+
+
+def test_max_points_below_one_is_rejected_by_the_api(derived_world):
+    """422 at the edge, not a 500 from the adapter's ValueError."""
+    store, world_id, session_id = derived_world
+    response = _client(store).get(
+        f"/worlds/{world_id}/geometry/segment/0",
+        params={"session_id": session_id, "max_points": 0},
+    )
+    assert response.status_code == 422
+
+
+def test_the_routes_are_sync_so_fastapi_runs_them_off_the_event_loop():
+    """A 1 MB read plus a hash must never block the frame path.
+
+    A `def` endpoint is run in FastAPI's threadpool; an `async def` one is
+    not. This is the whole mechanism, so it is pinned.
+    """
+    import inspect
+
+    assert not inspect.iscoroutinefunction(geometry_routes.geometry_manifest)
+    assert not inspect.iscoroutinefunction(geometry_routes.geometry_segment)

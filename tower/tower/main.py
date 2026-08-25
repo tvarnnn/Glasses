@@ -15,7 +15,7 @@ from tower.modules.base import Module
 from tower.modules.container import ModuleContainer
 from tower.modules.experimental_cv import ExperimentalCVModule
 from tower.results import build_hub
-from tower.routes import cartridges, health, ws
+from tower.routes import cartridges, geometry, health, ws
 from tower.session import ConnectionTracker
 
 logger = logging.getLogger(__name__)
@@ -196,6 +196,7 @@ def create_app() -> FastAPI:
     asyncio.run(app.state.module_container.load_and_start())
     app.include_router(health.router)
     app.include_router(cartridges.router)
+    app.include_router(geometry.router)
     app.include_router(ws.router)
     return app
 

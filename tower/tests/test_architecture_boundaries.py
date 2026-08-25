@@ -68,9 +68,18 @@ def test_shared_code_does_not_import_a_cartridge():
 # must not inherit one cartridge's assumptions. An adapter named after its
 # cartridge cannot leak assumptions into the next one, because the next
 # one gets its own file.
+#
+#   tower/results/world_builder_geometry.py
+#                                    the geometry adapter for that same
+#                                    cartridge. Separate from the status
+#                                    adapter because it answers a different
+#                                    question over a different transport --
+#                                    HTTP, because the status socket shares
+#                                    its send lock with the frame path.
 _RESULT_CHANNEL_ADAPTERS = frozenset(
     {
         TOWER / "results" / "world_builder.py",
+        TOWER / "results" / "world_builder_geometry.py",
         TOWER / "results" / "__init__.py",
     }
 )

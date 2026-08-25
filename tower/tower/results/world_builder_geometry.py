@@ -21,7 +21,7 @@ from collections import Counter
 
 from tower.world_builder.records import World
 from tower.world_builder.schema import POSE_CONVENTION
-from tower.world_builder.store import WorldStoreError
+from tower.world_builder.store import WorldStore, WorldStoreError
 
 GEOMETRY_CONTRACT = "world_builder.geometry/2026-08-25"
 
@@ -91,6 +91,17 @@ def _revision_over(hashes: list[str]) -> str:
     """
     canonical = json.dumps(hashes, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def store_from_root(root) -> WorldStore:
+    """Construct a `WorldStore` for a configured world root.
+
+    Lives here, not in `tower/routes/geometry.py`, so the route imports
+    only this adapter and never reaches `tower.world_builder` directly --
+    the same rule that keeps `tower/results/world_builder.py` as the sole
+    place outside this file that knows a `WorldStore` exists.
+    """
+    return WorldStore(root)
 
 
 def _read(store, world_id: str, session_id: str):
