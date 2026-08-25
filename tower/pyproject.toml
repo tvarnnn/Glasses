@@ -59,3 +59,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["tower*"]
+
+[tool.pytest.ini_options]
+markers = [
+    # End-to-end tests that spawn a real subprocess and build a real
+    # world. Slow on purpose: a fast version would fake the spawn, and a
+    # faked spawn is exactly what let the 2026-08-24 lifecycle gap exist.
+    "slow: spawns real processes and builds real worlds",
+]
