@@ -180,13 +180,21 @@ def build_segment(
     total = len(points)
     sampling = "none"
     sent = points
-    if max_points is not None and total > max_points:
-        # Stride rather than head: a prefix of a point cloud is a corner of
-        # the room, and would read as a smaller world rather than a
-        # coarser one.
-        stride = max(1, total // max_points)
-        sent = points[::stride][:max_points]
-        sampling = "stride"
+    if max_points is not None:
+        if max_points < 1:
+            raise ValueError("max_points must be at least 1")
+        if total > max_points:
+            # Evenly spaced across the WHOLE cloud, never a prefix: a prefix
+            # is one corner of the room and would read as a smaller world
+            # rather than a coarser one.
+            #
+            # An INTEGER stride cannot do this. `total // max_points`
+            # collapses to 1 whenever max_points > total/2 -- so capping
+            # 3,033 points at 2,000 would return points[0:2000], which is
+            # exactly the truncation this comment claims to avoid.
+            step = total / max_points
+            sent = [points[int(i * step)] for i in range(max_points)]
+            sampling = "stride"
 
     return {
         "contract": GEOMETRY_CONTRACT,

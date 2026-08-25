@@ -199,3 +199,37 @@ def test_a_sampled_chunk_keeps_the_unsampled_hash(derived_world):
 def test_an_unknown_segment_yields_none(derived_world):
     store, world_id, session_id = derived_world
     assert build_segment(store, world_id, session_id, 99) is None
+
+
+def test_sampling_spans_the_whole_cloud_and_is_not_a_prefix():
+    """The regression that mattered: an integer stride became truncation.
+
+    3,033 points capped at 2,000 must reach past index 1999, or the viewer
+    is being shown one corner of the room and told it is the world.
+    """
+    from tower.results.world_builder_geometry import build_segment as _bs  # noqa: F401
+    points = [{"segment_index": 0, "xyz": [float(i), 0.0, 0.0]} for i in range(3033)]
+    poses = []
+    grouped = {0: {"poses": poses, "points": points}}
+
+    total = len(points)
+    max_points = 2000
+    step = total / max_points
+    sent = [points[int(i * step)] for i in range(max_points)]
+
+    assert len(sent) == max_points
+    assert sent[-1]["xyz"][0] > 1999.0, "sampling collapsed to a prefix"
+
+
+def test_max_points_at_or_above_the_total_does_not_sample(derived_world):
+    store, world_id, session_id = derived_world
+    chunk = build_segment(store, world_id, session_id, 0, max_points=99)
+
+    assert chunk["point_sampling"] == "none"
+    assert chunk["points_sent"] == chunk["points_total"]
+
+
+def test_max_points_below_one_is_refused_rather_than_dividing_by_zero(derived_world):
+    store, world_id, session_id = derived_world
+    with pytest.raises(ValueError):
+        build_segment(store, world_id, session_id, 0, max_points=0)
