@@ -233,12 +233,65 @@ world instead of the live one. That is the Tower half of iOS's
    seen a printed board.
 3. **Whether the delivered resolution supports reconstruction.** All
    figures here are 640×360 renders.
-4. **Whether a real walk segments.** A geometry audit reported 9 segments
-   on its own synthetic tour from spurious `blurred` rejections cascading
-   into `tracking_lost`; an independent realistic walk here produced
-   **1 segment, 64 keyframes, `scale: relative`, zero blurred, zero
-   losses**, under the same shipped policy. **The two do not agree, and
-   the thresholds were therefore left alone.** A real walk settles it.
+4. ~~**Whether a real walk segments.**~~ **Settled, 2026-08-24.** It
+   segments badly: the first physical walk produced **36 segments over
+   1395 frames**, 155 keyframes, 10 of them alone in a segment. All 1395
+   frames were replayed through the *real* `FrameTracker` and the *real*
+   `KeyframeSelector`, reproducing the run bit-identically (same
+   keyframes, same 35 losses, same rejection histogram, zero delta
+   against every persisted `sharpness`, `survival_ratio` and
+   `overlap_ratio`), so the numbers below are measurements and not
+   simulations.
+
+   **The stated suspect was wrong.** Blur was not cascading into
+   `tracking_lost`; it was *masking* losses that had already happened.
+   77% of `blurred` rejections occur when `survival_ratio` is already
+   below 0.15. Loosening the blur gate makes segmentation monotonically
+   **worse** — `min_sharpness_ratio` 0.45 gives 43 segments, turning it
+   off gives 49 — and moving the survival/overlap gates ahead of blur
+   gives 40, against the 36-segment baseline.
+
+   **The real defect:** `overlap_ratio` is not an independent signal from
+   `survival_ratio`. On real footage the two are equal in 1283 of 1358
+   frames (max gap 0.029), because tracks *die* rather than leave frame.
+   The `overlap_floor` rescue at 0.45, sitting above a survival reject at
+   0.35, could therefore only fire in the band `survival` ∈ [0.35, 0.45)
+   — 36 frames out of 1395, 28 of which were already being accepted for
+   parallax. The gate written to guarantee "a usable weak link beats a
+   broken chain" was very nearly dead.
+
+   **Acted on:** the window is widened from the *top*, not the bottom —
+   `min_overlap_ratio` 0.45 → 0.75, `min_survival_ratio` 0.35 → 0.20,
+   `loss_survival_ratio` 0.15 → 0.05, giving **20 segments, 260
+   keyframes, 4 single-keyframe segments**. Blur thresholds and gate
+   order are unchanged, deliberately. The evidence lives in the comments
+   at the constants in `tower/world_builder/keyframes.py`.
+
+   **Still not known**, and the reason these are a hypothesis rather than
+   tuned constants: this is one walk, one room, one wearer, one lighting
+   condition. It costs +68% keyframes, which is unbudgeted for storage,
+   for the 20.5 ms/keyframe of face redaction on the write path, and for
+   build time. And it shifts the dominant promotion path from parallax to
+   track-decay (`overlap_floor` accepts 28/155 → 198/260), whose effect
+   on triangulation quality is **unmeasured** — this world has no poses
+   to check against (intrinsics unknown → unposed backend → 0 solved
+   poses). An ORB + fundamental-matrix proxy says the extra pairs are not
+   garbage (median inlier ratio 0.627 → 0.649, no pair below
+   `MIN_INLIERS`); that is not the same as saying the reconstruction is
+   better. A second walk in a different space should reproduce the
+   ordering before these are treated as settled.
+
+   Note also why the old disagreement existed, because it generalises:
+   the synthetic renderer is a perfect pinhole, so its tracks neither die
+   nor leave frame and `survival_ratio` barely enters the rescue band.
+   Re-measured under both policies, the two sequences the shipped test
+   exercises accept **exactly the same** number of keyframes (5 for
+   `pure_rotation(10)`, 4 for `strafe(10)`), a longer
+   `forward_walk(30)` moves only 2 → 4, and **neither policy loses
+   tracking even once** on any of them. Segmentation is the thing being
+   fixed and synthetic footage does not exhibit it at all — which is why
+   1 synthetic segment and 9 audited segments could disagree for so long
+   and why neither could settle it.
 5. **Whether redaction fires on real faces at real distances.**
 6. **Whether the reconnect path works against a real WiFi drop** rather
    than a simulated one.
