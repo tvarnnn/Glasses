@@ -25,6 +25,10 @@ whole submap; a per-frame interface cannot express relative geometry at
 all. Poses come back in the window's own local frame; placing that frame
 into the world is the caller's job, so the backend never sees a world
 coordinate.
+
+There is a second, narrower entry point: begin/extend/snapshot/reset.
+It exists for cost, not for semantics -- see the comment on
+GeometryBackend.begin.
 """
 
 from abc import ABC, abstractmethod
@@ -107,6 +111,22 @@ class PointBlock:
 
 
 @dataclass(frozen=True)
+class Extension:
+    """What one keyframe added to a live solve.
+
+    `pose` is that keyframe's own estimate. `new_points` is only the
+    structure this keyframe created, never the whole map, so a live
+    viewer can append instead of re-reading. Both are conveniences:
+    snapshot() stays authoritative, because a backend that re-solves
+    cannot promise the earlier poses it already returned are still
+    current, and this type deliberately does not claim they are.
+    """
+
+    pose: PoseEstimate
+    new_points: PointBlock | None = None
+
+
+@dataclass(frozen=True)
 class GeometryEstimate:
     """Everything a backend produces for one window."""
 
@@ -130,6 +150,93 @@ class GeometryBackend(ABC):
     def estimate_window(
         self, window: Sequence[KeyframeInput]
     ) -> GeometryEstimate: ...
+
+    # -- the incremental seam --------------------------------------------
+    #
+    # estimate_window() is a from-scratch solve, and build() called it on
+    # every rebuild. Measured on this host, classical backend only, images
+    # already in RAM, 480x360 synthetic strafe:
+    #
+    #     keyframes     total     per kf
+    #         4        27.6 ms    6.89 ms
+    #         8        54.9 ms    6.87 ms
+    #        16       133.2 ms    8.33 ms
+    #        32       302.7 ms    9.46 ms
+    #        64       641.2 ms   10.02 ms
+    #
+    # Roughly O(N^1.2) for ONE solve, so a walk rebuilt every k keyframes
+    # paid O(N^2/k) and asking for MORE live updates cost strictly more
+    # than the walk. Total backend work over a walk at --rebuild-every 4,
+    # measured the same way:
+    #
+    #     keyframes    re-solving    extending
+    #        16           360 ms       152 ms
+    #        32          1325 ms       316 ms
+    #        64          5920 ms       777 ms
+    #
+    # That is why the rebuild cadence defaulted to zero, and why nothing
+    # appeared on the 2026-08-24 walk until it had ended.
+    #
+    # These four methods carry one solve across many calls, so a rebuild
+    # is a flush rather than a re-solve. They are an OPTIMISATION and
+    # nothing else: for the same keyframes in the same order, extending
+    # then snapshotting must equal estimate_window() over the whole
+    # sequence, and tests/test_world_builder_incremental.py pins that
+    # bit-for-bit against estimate_window as the oracle.
+    #
+    # The default implementation below buffers and re-solves. It is
+    # correct for every backend and quadratic for every backend; it
+    # exists so a future pointmap backend, which genuinely reasons over a
+    # whole submap and cannot be extended one frame at a time, can be
+    # dropped in without the engine learning anything about it. A backend
+    # whose solve is already forward-only should override all four.
+
+    def begin(self, intrinsics: CameraIntrinsics) -> None:
+        """Bind intrinsics and start a fresh incremental solve.
+
+        Must raise exactly where prepare() raises: an incremental path is
+        not a way to get geometry out of a camera nobody calibrated.
+        """
+        self.prepare(intrinsics)
+        self.reset()
+
+    def reset(self) -> None:
+        """Discard the incremental solve; a new segment starts a new one.
+
+        Segments do not share a coordinate frame or a unit, so carrying
+        state across one would be worse than useless -- it would look
+        like continuity.
+        """
+        self._incremental_window: list[KeyframeInput] = []
+        self._incremental_estimate: GeometryEstimate | None = None
+
+    def extend(self, frame: KeyframeInput) -> Extension:
+        window = self._incremental_buffer()
+        window.append(frame)
+        estimate = self.estimate_window(tuple(window))
+        self._incremental_estimate = estimate
+        pose = (
+            estimate.poses[-1]
+            if estimate.poses
+            else PoseEstimate(keyframe_id=frame.keyframe_id)
+        )
+        # No new_points from the default path on purpose. A re-solve can
+        # rebuild the entire cloud, so "the points this frame added" is
+        # not a question it can answer; claiming a suffix of the new
+        # cloud is new would be a guess dressed as a delta.
+        return Extension(pose=pose)
+
+    def snapshot(self) -> GeometryEstimate:
+        """Everything solved since begin()/reset(). Must not mutate state."""
+        estimate = getattr(self, "_incremental_estimate", None)
+        return estimate if estimate is not None else GeometryEstimate(poses=())
+
+    def _incremental_buffer(self) -> list[KeyframeInput]:
+        window = getattr(self, "_incremental_window", None)
+        if window is None:
+            window = []
+            self._incremental_window = window
+        return window
 
     def release(self) -> None:
         """Free any held resource. Default no-op; must not raise."""

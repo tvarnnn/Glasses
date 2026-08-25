@@ -8,9 +8,17 @@ and on acceptance persists one keyframe. It never calls a geometry
 backend.
 
 ``build()`` runs at stop time, reads the persisted keyframe journal back,
-and does the expensive reconstruction. It is never reachable from the
-frame path, which is what keeps a multi-second reconstruction off the
-event loop.
+and writes the reconstruction. It is never reachable from the frame
+path, which is what keeps a multi-second write off the event loop.
+
+It used to be a full re-solve as well -- re-reading every keyframe,
+re-decoding every JPEG and re-detecting features on all N -- which made
+a walk rebuilt every k keyframes cost O(N^2/k), so asking for MORE live
+updates cost more than the walk. It now extends one live solve as each
+keyframe is accepted (see _LiveSolve) and a rebuild is a flush. The
+from-scratch path is still here and still correct: it is what a cold
+rebuild, a re-derive, and any keyframe set this engine did not itself
+observe fall back to.
 
 That split is also why live-versus-offline is a *driver* choice rather
 than an architecture choice: the offline script calls exactly the same
@@ -130,6 +138,10 @@ class WorldBuilderEngine:
         self._events: EventLog | None = None
         self._segment_index = 0
         self._rejected: dict[str, int] = {}
+        # Survives stop_session() on purpose: the usual order is
+        # observe... stop_session() build(), and throwing the solve away
+        # at stop would put the whole cost straight back.
+        self._live: _LiveSolve | None = None
 
     # -- lifecycle -----------------------------------------------------
 
@@ -190,6 +202,7 @@ class WorldBuilderEngine:
         self._segment_index = 0
         self._rejected = {}
         self._events.append("session_started", {"frame_source": frame_source})
+        self._open_live_solve(session)
         return session.session_id
 
     def observe(
@@ -230,6 +243,8 @@ class WorldBuilderEngine:
             self._tracker.reset()
             self._selector.note_lost()
             self._segment_index += 1
+            if self._live is not None:
+                self._live.close_segment(self._segment_index)
             self._note_rejected(decision.reason)
             self._events.append(
                 "tracking_lost", {"segment_index": self._segment_index}
@@ -240,7 +255,7 @@ class WorldBuilderEngine:
             self._note_rejected(decision.reason)
             return self._result(decision.outcome, decision.reason)
 
-        keyframe = self._persist_keyframe(
+        keyframe, image_bytes = self._persist_keyframe(
             gray_shape=gray.shape,
             raw_bytes=raw_bytes,
             received_at=received_at,
@@ -251,6 +266,20 @@ class WorldBuilderEngine:
             motion=motion,
             reason=decision.reason,
         )
+        if self._live is not None:
+            # The REDACTED bytes, because those are what landed on disk
+            # and therefore what build() decodes. Feeding `gray` here
+            # would solve against pixels no rebuild can ever reproduce --
+            # redaction costs about 9% of the point cloud when a face is
+            # in frame, so the two would quietly disagree. `is` because
+            # redact() hands back the very object it was given whenever
+            # it changed nothing, which is the overwhelmingly common case
+            # and makes this free.
+            self._live.extend(
+                keyframe.keyframe_id,
+                gray if image_bytes is raw_bytes else decode_gray(image_bytes),
+            )
+
         self._tracker.set_reference(gray)
         self._selector.note_accepted()
         self._session = replace(
@@ -344,6 +373,10 @@ class WorldBuilderEngine:
         # doubles, triples, and so on.
         self._store.clear_edges(world_id, session_id)
 
+        # Segment -> (keyframe ids fed, estimate). Empty for a cold
+        # rebuild, a different session, or a live solve that gave up.
+        solved_live = self._live_estimates(world_id, session_id, session, backend)
+
         poses_solved = poses_refused = 0
         # Counted, not derived by subtraction. `keyframes - poses_refused`
         # silently promotes every anchor to a camera position, and an
@@ -368,14 +401,28 @@ class WorldBuilderEngine:
             members = [k for k in keyframes if k.segment_index == segment]
             if not members:
                 continue
-            window = [
-                KeyframeInput(
-                    keyframe_id=keyframe.keyframe_id,
-                    image_gray=self._load_gray(world_id, session_id, keyframe),
-                )
-                for keyframe in members
-            ]
-            estimate = backend.estimate_window(window)
+            member_ids = tuple(keyframe.keyframe_id for keyframe in members)
+            carried = solved_live.get(segment)
+            if carried is not None and carried[0] == member_ids:
+                # The flush. Nothing is re-read, re-decoded or re-solved;
+                # this is the same estimate estimate_window() would
+                # return, which tests/test_world_builder_incremental.py
+                # pins bit-for-bit.
+                estimate = carried[1]
+            else:
+                # Whatever this engine did not observe itself: a cold
+                # rebuild, a re-derive, a session whose journal no longer
+                # matches what was fed. Ids are compared rather than
+                # counted because a matching count with different
+                # keyframes is exactly the failure worth catching.
+                window = [
+                    KeyframeInput(
+                        keyframe_id=keyframe.keyframe_id,
+                        image_gray=self._load_gray(world_id, session_id, keyframe),
+                    )
+                    for keyframe in members
+                ]
+                estimate = backend.estimate_window(window)
 
             segment_solved = 0
             segment_anchors = 0
@@ -507,6 +554,59 @@ class WorldBuilderEngine:
 
     # -- internals -----------------------------------------------------
 
+    def _open_live_solve(self, session) -> None:
+        """Start the solve that observe() will extend.
+
+        Backend selection is deterministic in (name, intrinsics), so the
+        instance chosen here is the same one build() would choose; build()
+        re-checks both anyway before trusting anything this produces.
+        """
+        if self._live is not None:
+            self._live.release()
+            self._live = None
+        try:
+            selection = select_backend(self._backend_name, session.intrinsics)
+            backend = selection.backend
+            backend.begin(session.intrinsics)
+        except Exception:
+            # A live solve is an optimisation. Losing it must never cost
+            # the session its keyframes -- build() still has the
+            # from-scratch path, and it will raise there, loudly, with
+            # the whole journal in hand.
+            logger.exception(
+                "[Tower][WorldBuilder] live geometry unavailable for session "
+                "%s; build() will solve from scratch",
+                session.session_id,
+            )
+            return
+        self._live = _LiveSolve(
+            world_id=session.world_id,
+            session_id=session.session_id,
+            backend=backend,
+            intrinsics=session.intrinsics,
+            segment_index=self._segment_index,
+        )
+
+    def _live_estimates(self, world_id, session_id, session, backend) -> dict:
+        """What the live solve has, if it is still the right answer.
+
+        Every one of these is a way the carried solve could be answering
+        a question nobody asked: a different world, a different session,
+        intrinsics rewritten since the session opened, or a backend
+        selection that has since changed. Any of them and the whole thing
+        is discarded rather than partially believed.
+        """
+        live = self._live
+        if live is None or not live.usable:
+            return {}
+        if live.world_id != world_id or live.session_id != session_id:
+            return {}
+        if live.intrinsics != session.intrinsics:
+            return {}
+        if live.backend_id != backend.capabilities.backend_id:
+            return {}
+        return live.estimates()
+
     def _pose_row(self, keyframe, pose, segment) -> dict:
         """Convert a backend pose into the persisted T_world_camera contract.
 
@@ -566,7 +666,7 @@ class WorldBuilderEngine:
     def _persist_keyframe(
         self, *, gray_shape, raw_bytes, received_at, source_seq, wire_seq,
         tx_seq, quality, motion, reason,
-    ) -> Keyframe:
+    ) -> tuple[Keyframe, bytes]:
         session = self._session
         filename = f"{source_seq:08d}.jpg"
 
@@ -624,7 +724,9 @@ class WorldBuilderEngine:
             # configured. A redactor that is present but failing must not
             # leave the session claiming its imagery was filtered.
             self._session = replace(self._session, redaction=redaction.label)
-        return keyframe
+        # The bytes as well as the record: they are what the live solve
+        # must see, because they are what a rebuild will read back.
+        return keyframe, image_bytes
 
     def _note_rejected(self, reason: str) -> None:
         self._rejected[reason] = self._rejected.get(reason, 0) + 1
@@ -636,6 +738,109 @@ class WorldBuilderEngine:
             keyframe_id=keyframe_id,
             frames_observed=self._session.frames_observed,
             keyframes_accepted=self._session.keyframes_accepted,
+        )
+
+
+class _LiveSolve:
+    """One geometry solve carried across observe() calls.
+
+    The whole reason this class exists is a cost measurement. build()
+    re-solved from scratch every time, at roughly O(N^1.2) in the backend
+    alone -- 303 ms for 32 keyframes and 641 ms for 64, extrapolating to
+    about 2 s at the 155 keyframes of the 2026-08-24 physical walk, plus
+    a JPEG decode per keyframe on top. A walk rebuilt every k keyframes
+    therefore paid O(N^2/k): 5.9 s of backend work over 64 keyframes at
+    --rebuild-every 4, against 0.8 s for the same walk extended. Turning
+    the live updates UP made the whole session slower, which is why the
+    cadence defaulted to zero and why nothing appeared until a walk had
+    ended.
+
+    A segment gets exactly one solve, and it never crosses a
+    tracking_lost: segments do not share a coordinate frame or a unit,
+    they are independent windows today, and they must stay so. Closing a
+    segment freezes its estimate and resets the backend.
+
+    Nothing here is allowed to cost the session a keyframe. Every backend
+    call is guarded, and a solve that fails simply stops offering
+    answers; build() then does what it always did.
+    """
+
+    def __init__(self, *, world_id, session_id, backend, intrinsics, segment_index):
+        self.world_id = world_id
+        self.session_id = session_id
+        self.backend = backend
+        self.intrinsics = intrinsics
+        self.backend_id = backend.capabilities.backend_id
+        self.usable = True
+        self._segment_index = segment_index
+        self._open: list[str] = []
+        self._frozen: dict[int, tuple[tuple[str, ...], object]] = {}
+
+    def extend(self, keyframe_id: str, gray) -> None:
+        if not self.usable:
+            return
+        try:
+            self.backend.extend(
+                KeyframeInput(keyframe_id=keyframe_id, image_gray=gray)
+            )
+        except Exception:
+            self._give_up("extending")
+            return
+        self._open.append(keyframe_id)
+
+    def close_segment(self, segment_index: int) -> None:
+        if not self.usable:
+            return
+        try:
+            if self._open:
+                self._frozen[self._segment_index] = (
+                    tuple(self._open),
+                    self.backend.snapshot(),
+                )
+            self.backend.reset()
+        except Exception:
+            self._give_up("closing a segment of")
+            return
+        self._open = []
+        self._segment_index = segment_index
+
+    def estimates(self) -> dict:
+        """Frozen segments plus a live view of the open one.
+
+        Non-destructive: a mid-walk rebuild reads this and the walk keeps
+        extending the same solve afterwards. If it were destructive,
+        watching a world build would change the world.
+        """
+        if not self.usable:
+            return {}
+        carried = dict(self._frozen)
+        if self._open:
+            try:
+                carried[self._segment_index] = (
+                    tuple(self._open),
+                    self.backend.snapshot(),
+                )
+            except Exception:
+                self._give_up("snapshotting")
+                return {}
+        return carried
+
+    def release(self) -> None:
+        self.usable = False
+        try:
+            self.backend.release()
+        except Exception:
+            logger.exception("[Tower][WorldBuilder] backend release failed")
+
+    def _give_up(self, doing: str) -> None:
+        self.usable = False
+        self._frozen = {}
+        self._open = []
+        logger.exception(
+            "[Tower][WorldBuilder] live geometry gave up %s session %s; "
+            "build() will solve from scratch",
+            doing,
+            self.session_id,
         )
 
 

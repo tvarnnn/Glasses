@@ -27,6 +27,7 @@ import numpy as np
 
 from tower.world_builder.backend import (
     BackendCapabilities,
+    Extension,
     GeometryBackend,
     GeometryEstimate,
     KeyframeInput,
@@ -81,6 +82,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
 
     def __init__(self) -> None:
         self._camera_matrix: np.ndarray | None = None
+        self._chain: _Chain | None = None
 
     def prepare(self, intrinsics: CameraIntrinsics) -> None:
         camera_matrix = intrinsics.camera_matrix()
@@ -95,6 +97,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
 
     def release(self) -> None:
         self._camera_matrix = None
+        self._chain = None
 
     def estimate_window(
         self, window: Sequence[KeyframeInput]
@@ -179,6 +182,131 @@ class ClassicalTwoViewBackend(GeometryBackend):
             else None
         )
         return GeometryEstimate(poses=tuple(poses), points=block)
+
+    # -- the incremental seam -------------------------------------------
+    #
+    # estimate_window() above is already strictly forward-only: frame i is
+    # solved by _extend() against features[i-1] and the accumulated
+    # landmarks, and never looks forward. There is no bundle adjustment
+    # and no loop closure -- BA was implemented and measured at 0.00%
+    # drift improvement at 16, 32 and 104 keyframes, because the
+    # observation graph is a chain whose median covisibility span is 1
+    # (docs/agent-handoffs/WORLD-BUILDER.md section 10).
+    #
+    # So `absolute`, `landmarks` and `observed` really are the entire
+    # carried state, and the only reason a rebuild re-paid for all of it
+    # was that they were local variables. _Chain is those three promoted
+    # to instance state, and nothing else.
+    #
+    # The methods below reuse the SAME _estimate_pair and _extend helpers
+    # estimate_window uses, so the two paths cannot drift in their
+    # geometry. What they deliberately do NOT share is the orchestration:
+    # an oracle that delegates to the thing it is checking checks
+    # nothing, and tests/test_world_builder_incremental.py checks this
+    # one bit-for-bit.
+
+    def begin(self, intrinsics: CameraIntrinsics) -> None:
+        self.prepare(intrinsics)
+        self.reset()
+
+    def reset(self) -> None:
+        self._chain = _Chain()
+
+    def extend(self, frame: KeyframeInput) -> Extension:
+        if self._camera_matrix is None:
+            raise RuntimeError("begin() must be called before extend()")
+        if self._chain is None:
+            self._chain = _Chain()
+        chain = self._chain
+        index = chain.count
+
+        if chain.broken is not None:
+            # estimate_window() stops chaining at the first refusal and
+            # marks every later frame unavailable carrying THAT frame's
+            # degeneracy. Latched here for the same reason and with the
+            # same value. It skips detection too: estimate_window
+            # computes those descriptors up front and then never reads
+            # them, so not computing them changes no output.
+            pose = PoseEstimate(
+                keyframe_id=frame.keyframe_id,
+                status=POSE_STATUS_UNAVAILABLE,
+                degeneracy=chain.broken,
+            )
+            chain.poses.append(pose)
+            chain.count += 1
+            return Extension(pose=pose)
+
+        features = detect_and_describe(frame.image_gray)
+        new_points: list = []
+
+        if index == 0:
+            pose = PoseEstimate(
+                keyframe_id=frame.keyframe_id, status=POSE_STATUS_ANCHOR
+            )
+            # World frame == first keyframe's camera frame.
+            chain.absolute[0] = (np.eye(3), np.zeros(3))
+        elif index == 1:
+            pair = self._estimate_pair(
+                chain.previous_features, features, frame.keyframe_id
+            )
+            pose = pair.estimate
+            if pose.status != POSE_STATUS_SOLVED:
+                chain.broken = pose.degeneracy
+            else:
+                chain.absolute[1] = (pose.rotation, pose.translation)
+                chain.landmarks.extend(pair.points)
+                new_points = pair.points
+                for offset, (index_a, index_b) in enumerate(
+                    pair.inlier_index_pairs
+                ):
+                    chain.observed[(0, index_a)] = offset
+                    chain.observed[(1, index_b)] = offset
+        else:
+            pose, triangulated, new_observed, reobserved = self._extend(
+                chain.previous_features,
+                features,
+                index - 1,
+                index,
+                chain.absolute,
+                chain.landmarks,
+                chain.observed,
+                frame.keyframe_id,
+            )
+            if pose.status != POSE_STATUS_SOLVED:
+                chain.broken = pose.degeneracy
+            else:
+                chain.absolute[index] = (pose.rotation, pose.translation)
+                chain.observed.update(reobserved)
+                base = len(chain.landmarks)
+                chain.landmarks.extend(triangulated)
+                new_points = triangulated
+                for key, offset in new_observed.items():
+                    chain.observed[key] = base + offset
+
+        chain.poses.append(pose)
+        chain.count += 1
+        chain.previous_features = features
+        if chain.broken is None:
+            chain.forget_before(index)
+        return Extension(
+            pose=pose,
+            new_points=(
+                PointBlock(xyz=np.asarray(new_points, dtype=np.float32))
+                if new_points
+                else None
+            ),
+        )
+
+    def snapshot(self) -> GeometryEstimate:
+        chain = self._chain
+        if chain is None or chain.count == 0:
+            return GeometryEstimate(poses=())
+        block = (
+            PointBlock(xyz=np.asarray(chain.landmarks, dtype=np.float32))
+            if chain.landmarks
+            else None
+        )
+        return GeometryEstimate(poses=tuple(chain.poses), points=block)
 
     # -- helpers --------------------------------------------------------
 
@@ -510,3 +638,55 @@ class ClassicalTwoViewBackend(GeometryBackend):
             new_observed[(previous_index, index_p)] = landmark
             new_observed[(current_index, index_c)] = landmark
         return new_points, new_observed
+
+
+class _Chain:
+    """The carried state of one forward-only solve, and nothing else.
+
+    Exactly the three locals estimate_window() builds -- `absolute`,
+    `landmarks`, `observed` -- plus the poses emitted so far and the
+    latch recording where the chain stopped. If anything else ever has
+    to live here, this backend has stopped being forward-only, and the
+    equivalence test is the thing that will say so.
+    """
+
+    __slots__ = (
+        "absolute",
+        "broken",
+        "count",
+        "landmarks",
+        "observed",
+        "poses",
+        "previous_features",
+    )
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.previous_features = None
+        self.absolute: dict[int, tuple] = {}
+        self.landmarks: list = []
+        # (frame index, feature index) -> landmark index.
+        self.observed: dict[tuple[int, int], int] = {}
+        self.poses: list[PoseEstimate] = []
+        # Degeneracy of the first frame that refused, or None.
+        self.broken: str | None = None
+
+    def forget_before(self, index: int) -> None:
+        """Drop observations no later step can reach.
+
+        _extend() reads exactly one key shape, `observed[(previous, f)]`,
+        so once frame `index` is solved nothing will ever look up a frame
+        older than it. estimate_window() keeps them all because it is
+        over in one call. A live solve is not over, and unpruned this
+        dict grows by roughly two entries per ORB match per keyframe.
+
+        Measured, 480x360 synthetic walk, retained `observed` unpruned
+        against pruned: 26.1 MB vs 0.15 MB at 155 keyframes, 142.9 MB vs
+        0.15 MB at 1000. Pruned it is flat, because what survives is one
+        frame's features. It changes no output -- which is a claim the
+        equivalence test exists to check, not one it is asked to
+        tolerate.
+        """
+        self.observed = {
+            key: value for key, value in self.observed.items() if key[0] == index
+        }
