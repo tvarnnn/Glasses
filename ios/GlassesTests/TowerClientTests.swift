@@ -1345,7 +1345,7 @@ final class TowerClientTests: XCTestCase {
 
     // MARK: - 20. The result channel
 
-    private static let worldBuilderContract = "world_builder.status/2026-08-23"
+    private static let worldBuilderContract = "world_builder.status/2026-08-25"
 
     private var declarationJSON: String {
         """

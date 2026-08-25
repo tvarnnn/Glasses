@@ -106,7 +106,8 @@ struct WorldBuilderWorkspaceView: View {
                 state: world.state,
                 availability: world.availability(isTowerReachable: isTowerReachable),
                 explanation: world.unavailableExplanation(isTowerReachable: isTowerReachable),
-                inspection: world.inspection
+                inspection: world.inspection,
+                sessionBinding: world.sessionBinding
             )
 
             #if DEBUG

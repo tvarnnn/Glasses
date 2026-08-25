@@ -76,14 +76,25 @@ final class TowerClient: NSObject, ObservableObject {
     /// Republished at the reply rate, like `frameResultCount` beside it.
     @Published private(set) var latestFrameResult: TowerFrameResult?
 
+    #endif
+
     /// True between a sent `stream_start` and the matching `stream_stop`.
     /// `sendFrame` will not forward anything while this is false, so a frame
     /// captured in the brief window after `stopCameraSession()` fires (but
     /// before DAT actually tears the stream down) can never reach the Tower.
-    /// `@Published` for the developer surface only — the send path still reads
-    /// the stored value directly and its semantics are unchanged.
+    ///
+    /// **Not `#if DEBUG`, while everything that writes it is.** The two
+    /// functions that set it — `sendStreamStart()` and `sendStreamStop()` —
+    /// live in the DEBUG-only frame path, so in a Release build this is
+    /// permanently `false`, which is the truth about a build with no capture
+    /// control on any screen.
+    ///
+    /// It is readable in both configurations because `TowerWorldBuilderClient`
+    /// needs it: "this phone has a capture open" is a fact about the phone's
+    /// own situation, and it is what `WorldSessionGate` compares the Tower's
+    /// session against. A Release build asks the same question and correctly
+    /// gets "no", rather than the question being unaskable there.
     @Published private(set) var isStreamingToTower = false
-    #endif
 
     /// How much outbound latency a frame may carry before the window that
     /// admitted it is considered oversized.

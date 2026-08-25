@@ -5,14 +5,16 @@ Rewrite stale parts; git history is the record of how it got here.
 
 **Branch:** `ios/world-builder-integration`
 **Base:** `main` @ `35214a1`
-**Tower source integrated:** `integration/cartridge-result-channel-v1` @ `258a1fa`
-**Last updated:** 2026-08-24
+**Tower source integrated:** `integration/world-builder-lifecycle-v1` @ `71db9c0`
+**Last updated:** 2026-08-25
 
-**Status: DEGRADED, and the reason is precise.** Everything from the phone's
-socket outward is proven against a running Tower over a real network. Nothing
-has yet met the Ray-Ban camera, DAT, or a physical room — the iPhone was locked
-and unattended for the whole of this pass, so no build ran on it. §5 is the
-list, and §6 is what a person has to do to close it.
+**Status: the app and the Tower speak the same contract again, and the world on
+screen is now bound to the capture that produced it.** The Tower's lifecycle
+automation is physically proven — a walk on 2026-08-25 recorded a capture, had
+a builder attached to it automatically, and rebuilt live every 4 keyframes. The
+iOS half of that walk is what §8 is about: the contract identifier moved to
+`world_builder.status/2026-08-25`, the phone was refusing it, and it no longer
+does. What has **not** been re-run on hardware since is in §5.
 
 Read the boundary itself in **`docs/contracts/WORLD-BUILDER-IOS.md`**. This
 document is about evidence: what was run, against what, and what it proved.
@@ -276,33 +278,24 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
 5. **Then** the resolution question. Only after a baseline walk exists to
    compare against.
 
-The follower has to be started *after* `stream_start`, because the capture
-directory does not exist until then, and its id is only discoverable from
-`/health`. On the Tower host, after pressing Start on the phone:
+**The manual follower step is gone.** On
+`integration/world-builder-lifecycle-v1` the Tower attaches a builder to every
+capture itself, at the moment the capture id is minted, one per capture
+*lineage* so a reconnect does not fork the walk (`tower/capture_workers.py`,
+`tower/routes/ws.py`, `tower/main.py`). No capture-id lookup, no
+`world_build_session.py` to start by hand, and `--rebuild-every 4` rather than
+the script's own default of `0` — which is why geometry now appears mid-walk
+instead of only after Stop.
 
-```powershell
-cd C:\Users\tvllo\Projects\GlassesTower
-$cap = (Invoke-RestMethod http://localhost:8000/health).capture.capture_id
-.venv\Scripts\python.exe scripts/world_build_session.py `
-    --follow-capture data/capture/captures/$cap `
-    --root data/worlds `
-    --intrinsics intrinsics.json `
-    --name "First Room" --rebuild-every 4 --max-idle-polls 1200 --format json
-```
+What still has to be set, and both fail silently when unset:
+`TOWER_CAPTURE_ROOT` and `TOWER_WORLD_ROOT`. The Tower now says so at startup,
+in three lines, and `/health` carries a `capture_workers` block answering "is
+anything following this capture?" from another machine.
 
-Drop `--intrinsics` and you get §4: keyframes, and no geometry.
-
-Operational notes that cost time to find:
-
-- The capture directory is `<TOWER_CAPTURE_ROOT>/captures/<capture_id>`, **not**
-  `<TOWER_CAPTURE_ROOT>/<capture_id>`.
-- `world_build_session.py --root` defaults to `data/world_builder` and must be
-  passed `data/worlds` to match `TOWER_WORLD_ROOT`, or the builder writes where
-  the result channel is not reading.
-- `--follow-capture` requires the directory to already exist, so start the
-  follower after `stream_start`. Pointing it at a missing directory still
-  creates a world and starts a session before failing, which lands the channel
-  in `failed` with an accurate but confusing reason.
+Calibration is still the thing standing between a walk and a reconstruction
+(§4). Without intrinsics the backend downgrades to `unposed` and the honest
+result is keyframes, segment origins, and no geometry at all — which the phone
+now renders as exactly that. See §8.
 
 ---
 
@@ -321,3 +314,57 @@ Operational notes that cost time to find:
 - The synthetic worlds this pass created are still in the Tower's world root and
   are self-labelling: their session records carry
   `frame_source: "synthetic"` or a `live-capture` from rendered frames.
+
+---
+
+## 8. The 2026-08-25 pass: the contract, and whose world is on screen
+
+**What the phone was showing.** *"The Tower offers a World Builder contract this
+version of the app does not understand (world_builder.status/2026-08-25)."* That
+message was correct and the refusal was the Tower's, deliberately: the
+identifier moved because `trajectory.pose_count` changed **meaning**, and
+serving the old id would have been a lie about compatibility.
+
+**What changed on the wire, established from the Tower branch rather than from
+its handoff:**
+
+| Change | Where |
+|---|---|
+| `world_builder.status/2026-08-23` → `/2026-08-25` | `tower/results/contracts.py` |
+| `trajectory.pose_count` now read from the manifest's `poses_positioned` | `tower/results/world_builder.py::_pose_count` |
+| `trajectory.poses_anchor` added | `tower/results/world_builder.py::_trajectory_block` |
+| **Nothing else.** No new message type, no envelope change, no `stream_started` | `git diff 35214a1..71db9c0 -- tower/` |
+
+`poses_anchor` and `segments` live in the payload's own `trajectory` block, not
+in `world_snapshot.trajectory` — `_attach_ios_projection` carries four keys
+across and drops the rest — so iOS reads that one evidence block for those two
+figures, and only those.
+
+**What iOS now does, in order of how much it matters:**
+
+1. **A world from another capture is no longer rendered as this session's.**
+   `WorldSessionGate` compares the phone's own capture bracket against the
+   payload's `session` block; a snapshot that is not a live capture with a
+   capture directory, while a bracket is open, renders as *waiting* with a
+   sentence saying why. This is the 2026-08-24 LIVE-beside-"Capture has ended"
+   defect, closed. `docs/contracts/WORLD-BUILDER-IOS.md` §9 has the table and
+   the reasoning, including what it deliberately is **not** (an id comparison —
+   the phone does not know its own capture id, and `stream_started` is
+   unimplemented Tower-side).
+2. **Anchors are no longer counted as camera positions.** Three separate rows —
+   Camera poses, Segment origins, Segments — never summed, plus the sentence an
+   uncalibrated walk needs. §8 of the boundary document.
+3. `TowerClient.isStreamingToTower` moved out of `#if DEBUG` (the two functions
+   that *write* it did not), because "this phone has a capture open" is the
+   phone's half of the binding and a Release build must be able to answer it —
+   with `false`, which is the truth about a build with no capture control.
+
+**Unchanged, and checked:** one socket, one subscription per connection,
+`TowerClient`/`TowerWorldBuilderClient` separation, cartridge-blind transport,
+`frame_result` byte-for-byte, absent-vs-zero, the resubscribe budget, and the
+reconnect path. **Tower code: not touched.** No contract defect was found.
+
+**Verification run:** full iOS suite green on iPhone 17 Pro (iOS 26.5); Debug
+and Release both build; Debug builds and signs for the physical device. 16 new
+tests, of which the load-bearing one is
+`testAWorldFromAnEarlierCaptureIsNotShownAsThisSessionsResult`.

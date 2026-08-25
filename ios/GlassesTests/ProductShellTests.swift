@@ -441,7 +441,7 @@ final class CartridgeIntegrationTests: XCTestCase {
     /// This test used to assert both tables were empty, and its own comment
     /// said that the first real contract landing should make it fail as a
     /// signal to review every consumer. That happened: the Tower now declares
-    /// `world_builder.status/2026-08-23` over the socket, and every consumer
+    /// `world_builder.status/2026-08-25` over the socket, and every consumer
     /// was reviewed. What it pins now is the same property in its new form —
     /// **exactly one contract is implemented, and it is that one** — so a
     /// second one appearing is still a review and not a silent widening.

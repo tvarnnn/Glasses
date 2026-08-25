@@ -21,7 +21,23 @@ enum WorldBuilderResultContract {
     /// in `TowerCapabilities`.
     static let towerCartridge = "world_builder"
     static let resultType = "status"
-    static let identifier = "world_builder.status/2026-08-23"
+
+    /// Adopted deliberately, and **not** because a field was added.
+    ///
+    /// `world_builder.status/2026-08-25` supersedes `.../2026-08-23` because
+    /// `trajectory.pose_count` changed *meaning*: it was
+    /// `keyframes - poses_refused`, which counts a segment anchor — identity
+    /// rotation at the origin, by construction — as a camera position. On the
+    /// 2026-08-24 physical walk that reported 36 camera poses from a build
+    /// whose manifest read `poses_solved: 0, points: 0, segments: 36`.
+    ///
+    /// The Tower refused the old identifier rather than quietly serving a
+    /// figure that means something different, which is what put *"The Tower
+    /// offers a World Builder contract this version of the app does not
+    /// understand"* on the phone. `WorldTrajectoryReport` is where the new
+    /// meaning is honoured; adopting the string without that would be the
+    /// silent widening the refusal existed to prevent.
+    static let identifier = "world_builder.status/2026-08-25"
 }
 
 // MARK: - Payload decoding
@@ -34,10 +50,23 @@ enum WorldBuilderResultContract {
 /// Because the Tower does it. `model_state` names a `WorldModelState` case and
 /// `world_snapshot` is shaped onto `WorldSnapshot` field for field — deliberately,
 /// so that the translation table lives on the machine where changing it is a
-/// restart rather than an App Store release. Everything else in the payload is
-/// Tower-native evidence for those two values; this decoder reads neither, and
-/// a reader looking for where the `lifecycle`/`progress`/`geometry` blocks are
-/// consumed will correctly find that they are not.
+/// restart rather than an App Store release.
+///
+/// ## The two evidence blocks that are read, and why only those two
+///
+/// Everything else in the payload is Tower-native evidence for those two
+/// values, and a reader looking for where `lifecycle`, `progress`, `world`,
+/// `tracking`, `calibration`, `scale`, `geometry`, `persistence` or `artifacts`
+/// are consumed will correctly find that they are not. Two exceptions, each for
+/// something the projection cannot carry:
+///
+/// - **`trajectory`**, for `poses_anchor` and `segments`. The projection keeps
+///   `pose_count` and drops both, and those are exactly what separates a walk
+///   that positioned 36 cameras from one that produced 36 segment origins and
+///   positioned none.
+/// - **`session`**, for `capture_id`, `ended_at` and `frame_source`. Not a
+///   figure and never drawn as one — it answers *whose world this is*, which
+///   `world_snapshot` cannot, and which `WorldSessionGate` needs.
 ///
 /// ## What it refuses to do
 ///
@@ -59,7 +88,13 @@ enum WorldBuilderResultDecoder {
         // default `MainActor` isolation.
         var snapshot: WorldSnapshot?
         if let raw = payload["world_snapshot"] as? [String: Any] {
-            snapshot = self.snapshot(from: raw)
+            // The payload's own `trajectory` block, which carries the two
+            // figures `world_snapshot.trajectory` does not: `poses_anchor` and
+            // `segments`. See `snapshot(from:trajectoryEvidence:)`.
+            snapshot = self.snapshot(
+                from: raw,
+                trajectoryEvidence: payload["trajectory"] as? [String: Any]
+            )
         }
 
         switch word {
@@ -116,10 +151,23 @@ enum WorldBuilderResultDecoder {
     /// error: a snapshot that lost its geometry block still carries a truthful
     /// keyframe count, and refusing the whole thing would show less than the
     /// Tower said.
-    static func snapshot(from json: [String: Any]) -> WorldSnapshot {
+    static func snapshot(
+        from json: [String: Any],
+        trajectoryEvidence: [String: Any]? = nil
+    ) -> WorldSnapshot {
         let geometry = json["geometry"] as? [String: Any] ?? [:]
         let trajectory = json["trajectory"] as? [String: Any] ?? [:]
         let persistence = json["persistence"] as? [String: Any] ?? [:]
+        // The Tower projects `world_snapshot.trajectory` from its own
+        // `trajectory` block but carries only four of its keys across.
+        // `poses_anchor` and `segments` stay behind, and they are precisely
+        // what distinguishes "36 segment origins" from "36 camera poses" —
+        // the distinction `world_builder.status/2026-08-25` was cut for. So
+        // this one evidence block is read, and only for figures the projection
+        // does not carry. `?? [:]` rather than a refusal: a payload without it
+        // still has a truthful snapshot, and the two extra figures are simply
+        // absent.
+        let evidence = trajectoryEvidence ?? [:]
 
         return WorldSnapshot(
             name: json["name"] as? String,
@@ -137,6 +185,13 @@ enum WorldBuilderResultDecoder {
             ),
             trajectory: WorldTrajectoryReport(
                 poseCount: trajectory["pose_count"] as? Int,
+                // Never folded into the count above. An anchor is definitional
+                // — identity rotation, zero translation — and adding the two
+                // is the arithmetic the contract moved to stop.
+                posesAnchor: evidence["poses_anchor"] as? Int,
+                posesSolved: evidence["poses_solved"] as? Int,
+                posesRefused: evidence["poses_refused"] as? Int,
+                segments: evidence["segments"] as? Int,
                 pathLength: trajectory["path_length"] as? Double,
                 pathLengthUnit: trajectory["path_length_unit"] as? String,
                 // Carried separately from the snapshot's own scale: a spatial
@@ -148,6 +203,24 @@ enum WorldBuilderResultDecoder {
                 state: persistence["state"] as? String,
                 revision: persistence["revision"] as? String
             )
+        )
+    }
+
+    /// The payload's `session` block → `WorldSessionReport`, or `nil`.
+    ///
+    /// `nil` for `"session": null`, which the Tower sends for a world that has
+    /// no sessions and for a payload with no world at all. Absent, not empty:
+    /// a `WorldSessionReport` with every field `nil` would claim a session
+    /// exists whose capture is unknown, and the gate would then have to tell
+    /// that apart from a real one.
+    static func session(from payload: [String: Any]) -> WorldSessionReport? {
+        guard let json = payload["session"] as? [String: Any] else { return nil }
+        return WorldSessionReport(
+            sessionID: json["session_id"] as? String,
+            captureID: json["capture_id"] as? String,
+            endedAt: json["ended_at"] as? Double,
+            endReason: json["end_reason"] as? String,
+            frameSource: json["frame_source"] as? String
         )
     }
 
@@ -251,6 +324,9 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
 
     let cartridgeID = "world-build"
 
+    /// What the workspace draws. **Already gated**: a snapshot the phone could
+    /// not establish as this session's never reaches here as a result. See
+    /// `WorldSessionGate`.
     private(set) var state: WorldModelState = .idle {
         didSet {
             guard state != oldValue else { return }
@@ -259,13 +335,42 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         }
     }
 
+    /// What the phone established about the last snapshot it was sent.
+    ///
+    /// Published separately from `state` because the two change independently:
+    /// closing the capture bracket changes the binding while the Tower's words
+    /// are unchanged, and a foreign snapshot arriving changes the binding while
+    /// `state` stays `.awaitingFirstUpdate`. The view needs both — one decides
+    /// what is drawn, the other decides what is *said* about why.
+    private(set) var sessionBinding: WorldSessionBinding = .none {
+        didSet {
+            guard sessionBinding != oldValue else { return }
+            logBinding()
+            bindingSubject.send(sessionBinding)
+        }
+    }
+
     var stateUpdates: AnyPublisher<WorldModelState, Never> {
         stateSubject.eraseToAnyPublisher()
     }
 
+    var bindingUpdates: AnyPublisher<WorldSessionBinding, Never> {
+        bindingSubject.eraseToAnyPublisher()
+    }
+
     private let stateSubject = PassthroughSubject<WorldModelState, Never>()
+    private let bindingSubject = PassthroughSubject<WorldSessionBinding, Never>()
     private let tower: TowerClient
     private var cancellables: Set<AnyCancellable> = []
+
+    /// The last thing the Tower said, before the gate.
+    ///
+    /// Kept because the binding has two inputs and only one of them arrives on
+    /// the result channel: the phone's bracket opens and closes on its own
+    /// clock, and when it does the same payload has to be re-judged. Storing
+    /// the decoded pair rather than the raw dictionary keeps the decode on the
+    /// arrival path, where a failure is still attributable to a message.
+    private var lastReport: (state: WorldModelState, session: WorldSessionReport?)?
 
     /// The open subscription on the **current** socket, or `nil`. Cleared on
     /// every disconnect because the Tower's ids are per connection.
@@ -311,6 +416,21 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
 
         tower.cartridgeResults
             .sink { [weak self] event in self?.handle(event) }
+            .store(in: &cancellables)
+
+        // The phone's own half of the binding. `isStreamingToTower` is true
+        // between a sent `stream_start` and its `stream_stop`, which is exactly
+        // "this phone has a capture open" — and it is permanently false in a
+        // Release build, which has no capture control and therefore never has
+        // a session of its own to bind a world to.
+        //
+        // `.receive(on:)` for the reason the two sinks above give: a
+        // `@Published` publisher fires from `willSet`, so a sink that reads the
+        // property would see the value before the change.
+        tower.$isStreamingToTower
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.rejudgeLastReport() }
             .store(in: &cancellables)
     }
 
@@ -379,6 +499,12 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         }
 
         isSubscribing = true
+        // A new subscription is answered with a complete snapshot, so whatever
+        // was held describes a socket that is gone. Cleared together with the
+        // state it produced, so a bracket opening in the window before that
+        // snapshot arrives cannot re-publish it over the wait.
+        lastReport = nil
+        sessionBinding = bindingWithNoReport
         state = .awaitingFirstUpdate
         tower.subscribeToResults(
             cartridge: offer.cartridge,
@@ -432,6 +558,12 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
 
     private func apply(_ envelope: CartridgeResultEnvelope) {
         guard let next = WorldBuilderResultDecoder.modelState(from: envelope.payload) else {
+            // A payload that could not be read is not a world of unknown
+            // ownership — there is nothing to judge — so the gate is bypassed
+            // and the last report is cleared rather than left to be re-judged
+            // against a bracket change later.
+            lastReport = nil
+            sessionBinding = bindingWithNoReport
             state = .failed(
                 CartridgeFailure(
                     kind: .undecodableResponse,
@@ -444,11 +576,53 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             )
             return
         }
+        lastReport = (next, WorldBuilderResultDecoder.session(from: envelope.payload))
+        publishLastReport()
+    }
+
+    /// Re-runs the gate over the last thing the Tower said, because the phone's
+    /// half of the binding changed.
+    ///
+    /// A no-op before the first snapshot: with nothing to judge there is
+    /// nothing to say, and `state` is already whatever `subscribeIfPossible`
+    /// left it as.
+    private func rejudgeLastReport() {
+        guard lastReport != nil else {
+            sessionBinding = bindingWithNoReport
+            return
+        }
+        publishLastReport()
+    }
+
+    /// The binding when there is nothing to judge yet.
+    ///
+    /// Not a hardcoded `.none`: a bracket can be open with no snapshot behind
+    /// it — the seconds after Start, and the whole of a resubscribe — and
+    /// `.awaiting` is the truthful word for that. Routed through the gate so
+    /// there is still exactly one place that decides.
+    private var bindingWithNoReport: WorldSessionBinding {
+        WorldSessionGate.binding(
+            isCaptureBracketOpen: tower.isStreamingToTower,
+            session: nil,
+            modelState: .awaitingFirstUpdate
+        )
+    }
+
+    private func publishLastReport() {
+        guard let report = lastReport else { return }
+        let binding = WorldSessionGate.binding(
+            isCaptureBracketOpen: tower.isStreamingToTower,
+            session: report.session,
+            modelState: report.state
+        )
+        // Before the state, so a subscriber woken by `stateUpdates` that reads
+        // `sessionBinding` sees the binding that produced it.
+        sessionBinding = binding
         // Assigned unconditionally; the `didSet` publishes only on a real
         // change. That is what keeps the ~2 s heartbeat — which re-sends an
         // unchanged snapshot to refresh the fields excluded from the revision
         // hash — from invalidating the view tree for nothing.
-        state = next
+        state = WorldSessionGate.presented(report.state, binding: binding)
     }
 
     /// One line per **change**, which at the channel's ~2 Hz ceiling and with
@@ -479,13 +653,42 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
                 + " scale=\(snapshot.scale.displayName)"
                 + " calibration=\(snapshot.calibration.displayName)"
                 + " geometry=\(snapshot.geometry.elementCount.map(String.init) ?? "-")"
+                // Both, always, and never summed: on an uncalibrated walk the
+                // pair reads `poses=0 anchors=36`, which is the whole of what
+                // the 2026-08-25 contract corrected.
                 + " poses=\(snapshot.trajectory.poseCount.map(String.init) ?? "-")"
+                + " anchors=\(snapshot.trajectory.posesAnchor.map(String.init) ?? "-")"
+                + " segments=\(snapshot.trajectory.segments.map(String.init) ?? "-")"
                 + " revision=\(snapshot.revision ?? "-")"
         case .failed(let failure):
             detail = "failed(\(failure.kind.rawValue)) — \(failure.message)"
         }
-        print("[Glasses][WorldBuilder] \(detail)")
+        print("[Glasses][WorldBuilder] \(detail) binding=\(bindingDescription)")
         #endif
+    }
+
+    /// One line per binding change, beside the one per state change.
+    ///
+    /// Separate because the two move independently, and a binding flip with no
+    /// state change is the interesting case on a physical walk: `.awaiting` →
+    /// `.foreign` means the Tower answered with somebody else's world, and the
+    /// screen says "waiting" either way.
+    private func logBinding() {
+        #if DEBUG
+        print("[Glasses][WorldBuilder] binding=\(bindingDescription)")
+        #endif
+    }
+
+    /// The binding, for the log line. Names the capture when the Tower named
+    /// one, because on a physical walk "foreign" is only actionable beside
+    /// *which* capture the Tower answered with.
+    private var bindingDescription: String {
+        switch sessionBinding {
+        case .none: return "none"
+        case .awaiting: return "awaiting"
+        case .bound(let id): return "bound(\(id))"
+        case .foreign(let id): return "FOREIGN(\(id ?? "no capture"))"
+        }
     }
 
     private func apply(_ error: CartridgeResultError) {

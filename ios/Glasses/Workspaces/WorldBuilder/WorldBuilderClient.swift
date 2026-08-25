@@ -52,6 +52,19 @@ protocol WorldBuilderClient: CartridgeClient {
 
     /// Every state after the one `state` held when the view model was built.
     var stateUpdates: AnyPublisher<WorldModelState, Never> { get }
+
+    /// What this client has established about whether the world it is
+    /// reporting belongs to the capture the phone currently has open.
+    ///
+    /// Paired with `state` rather than folded into it because the two answer
+    /// different questions and change on different clocks. `state` is *what to
+    /// draw*; this is *why*, and a client with no transport under it honestly
+    /// has nothing to say about either — hence the `.none` default.
+    var sessionBinding: WorldSessionBinding { get }
+
+    /// Every binding after the one `sessionBinding` held when the view model
+    /// was built.
+    var bindingUpdates: AnyPublisher<WorldSessionBinding, Never> { get }
 }
 
 extension WorldBuilderClient {
@@ -61,6 +74,15 @@ extension WorldBuilderClient {
     /// day a real client replaces this and a completed publisher would have
     /// already torn the subscription down.
     var stateUpdates: AnyPublisher<WorldModelState, Never> {
+        Empty(completeImmediately: false).eraseToAnyPublisher()
+    }
+
+    /// A client that is not watching a capture cannot be looking at the wrong
+    /// one. `.none` is the correct constant for every client with no transport,
+    /// and for a Release build, which has no capture control at all.
+    var sessionBinding: WorldSessionBinding { .none }
+
+    var bindingUpdates: AnyPublisher<WorldSessionBinding, Never> {
         Empty(completeImmediately: false).eraseToAnyPublisher()
     }
 }
@@ -135,6 +157,13 @@ final class WorldBuilderViewModel: ObservableObject {
     /// there is no stored world to open.
     @Published private(set) var inspection: WorldInspectionMode = .live
 
+    /// Whether the world on screen belongs to the capture the phone has open.
+    ///
+    /// Republished rather than derived, for the reason `state` is: the client
+    /// owns the judgment, and a view model that recomputed it would be a second
+    /// answer able to disagree with the one the state was gated on.
+    @Published private(set) var sessionBinding: WorldSessionBinding
+
     private let client: any WorldBuilderClient
     private var cancellables: Set<AnyCancellable> = []
 
@@ -149,10 +178,16 @@ final class WorldBuilderViewModel: ObservableObject {
     init(client: any WorldBuilderClient) {
         self.client = client
         self.state = client.state
+        self.sessionBinding = client.sessionBinding
 
         client.stateUpdates
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in self?.state = state }
+            .store(in: &cancellables)
+
+        client.bindingUpdates
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] binding in self?.sessionBinding = binding }
             .store(in: &cancellables)
     }
 

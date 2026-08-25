@@ -341,6 +341,13 @@ final class WorldBuilderPayloadTests: XCTestCase {
     /// which is a fact about the reconstruction and not about the wire. What
     /// this pins is the encoding: the key names, the nesting, the types, and
     /// which fields carry `null`.
+    ///
+    /// It was taken at `world_builder.status/2026-08-23`, and it is kept at that
+    /// vintage on purpose: `world_snapshot`'s own keys did not change when the
+    /// identifier moved to `.../2026-08-25` — `poses_anchor` and `segments` were
+    /// added to the payload's separate `trajectory` block, not to this one — so
+    /// these bytes remain a valid encoding of a snapshot, and the fact that they
+    /// still decode is itself the assertion.
     private static let capturedFromTower = """
         {
           "name": "Wire Check (synthetic)",
@@ -444,7 +451,7 @@ final class WorldBuilderPayloadTests: XCTestCase {
 @MainActor
 final class TowerWorldBuilderClientTests: XCTestCase {
 
-    private static let contract = "world_builder.status/2026-08-23"
+    private static let contract = "world_builder.status/2026-08-25"
 
     private func url(port: UInt16) -> URL { URL(string: "ws://127.0.0.1:\(port)/")! }
 
@@ -1005,5 +1012,643 @@ final class TowerWorldBuilderClientTests: XCTestCase {
             .noContract,
             "the client answered from something other than the graph's connection"
         )
+    }
+}
+
+// MARK: - The 2026-08-25 contract: anchors, segments, and whose world this is
+
+/// What changed on the wire between `world_builder.status/2026-08-23` and
+/// `world_builder.status/2026-08-25`, and the gate that decides whether a
+/// snapshot describes the capture this phone has open.
+///
+/// Every fixture here was written from
+/// `tower/docs/contracts/CARTRIDGE-RESULTS.md` §10 and
+/// `tower/tower/results/world_builder.py` on
+/// `integration/world-builder-lifecycle-v1`, not from a summary of either.
+@MainActor
+final class WorldBuilderContract20260825Tests: XCTestCase {
+
+    // MARK: The identifier
+
+    /// The identifier moved because **a field changed meaning**, not because a
+    /// field was added. Pinning the old one now would ask the Tower for a
+    /// `pose_count` that counts something else.
+    func testThisBuildImplementsTheContractTheTowerNowOffers() {
+        XCTAssertEqual(WorldBuilderResultContract.identifier, "world_builder.status/2026-08-25")
+        XCTAssertEqual(TowerCapabilities.supported, ["world_builder.status/2026-08-25"])
+        XCTAssertFalse(
+            TowerCapabilities.supported.contains("world_builder.status/2026-08-23"),
+            """
+            the superseded contract is still claimed. Its `pose_count` was \
+            `keyframes - poses_refused`, which promoted every segment anchor \
+            to a camera position.
+            """
+        )
+    }
+
+    // MARK: Positioned poses versus anchors
+
+    /// The trajectory block of the 2026-08-24 walk, as the new producer would
+    /// report it: a `unposed` build with no intrinsics, which solved nothing.
+    ///
+    /// `pose_count: 0` beside `poses_anchor: 36` is the whole correction. The
+    /// old contract reported 36 here and a phone displayed "Camera poses: 36"
+    /// for a reconstruction that positioned no camera at all.
+    private static let uncalibratedWalkTrajectory: [String: Any] = [
+        "available": true,
+        "current": true,
+        "built_from_keyframes": 155,
+        "keyframes_now": 155,
+        "stale_reason": NSNull(),
+        "pose_count": 0,
+        "poses_solved": 0,
+        "poses_refused": 119,
+        "poses_anchor": 36,
+        "keyframes": 155,
+        "segments": 36,
+        "path_length": ["available": false, "reason": "the session has more than one segment"],
+        "revision": "4a1f",
+        "provenance": "inferred",
+        "confidence": NSNull(),
+        "unavailable_reason": NSNull(),
+    ]
+
+    private func snapshotJSON(poseCount: Any = 0) -> [String: Any] {
+        [
+            "name": NSNull(),
+            "world_id": "w-uncalibrated",
+            "keyframe_count": 155,
+            "revision": "r1",
+            "tracking": "good",
+            "scale": "relative",
+            "mapping_seconds": 411.2,
+            "calibration": "uncalibrated",
+            "geometry": [
+                "representation": "sparse point cloud",
+                "element_count": 0,
+                "is_incremental": false,
+            ],
+            "trajectory": [
+                "pose_count": poseCount,
+                "path_length": NSNull(),
+                "path_length_unit": NSNull(),
+                "scale": "unknown",
+            ],
+            "persistence": ["state": "saved", "revision": "p1"],
+        ]
+    }
+
+    func testAnUncalibratedWalkReadsAsSegmentOriginsAndNoTrajectory() {
+        let snapshot = WorldBuilderResultDecoder.snapshot(
+            from: snapshotJSON(),
+            trajectoryEvidence: Self.uncalibratedWalkTrajectory
+        )
+
+        XCTAssertEqual(snapshot.trajectory.poseCount, 0, "a positioned-pose count of zero was lost")
+        XCTAssertEqual(snapshot.trajectory.posesAnchor, 36)
+        XCTAssertEqual(snapshot.trajectory.posesSolved, 0)
+        XCTAssertEqual(snapshot.trajectory.posesRefused, 119)
+        XCTAssertEqual(snapshot.trajectory.segments, 36)
+        XCTAssertTrue(
+            snapshot.trajectory.isAnchorsOnly,
+            "36 anchors with no solved pose did not read as origins-without-a-trajectory"
+        )
+        XCTAssertFalse(
+            snapshot.trajectory.hasPositionedPoses,
+            "a build that positioned no camera claimed a camera path"
+        )
+    }
+
+    /// `null` and `0` are different claims all the way to the screen: one is
+    /// "the Tower did not say", the other is "the Tower counted none".
+    func testAnAbsentTrajectoryIsNotAZeroedOne() {
+        let absent: [String: Any] = [
+            "available": false,
+            "current": false,
+            "built_from_keyframes": NSNull(),
+            "keyframes_now": NSNull(),
+            "stale_reason": NSNull(),
+            "pose_count": NSNull(),
+            "poses_solved": NSNull(),
+            "poses_refused": NSNull(),
+            "poses_anchor": NSNull(),
+            "keyframes": NSNull(),
+            "segments": NSNull(),
+            "path_length": NSNull(),
+            "revision": NSNull(),
+            "provenance": NSNull(),
+            "confidence": NSNull(),
+            "unavailable_reason": "no build has run for this session, so no poses exist",
+        ]
+        var json = snapshotJSON(poseCount: NSNull())
+        json["trajectory"] = [
+            "pose_count": NSNull(), "path_length": NSNull(),
+            "path_length_unit": NSNull(), "scale": "unknown",
+        ]
+
+        let snapshot = WorldBuilderResultDecoder.snapshot(from: json, trajectoryEvidence: absent)
+        XCTAssertNil(snapshot.trajectory.poseCount)
+        XCTAssertNil(snapshot.trajectory.posesAnchor)
+        XCTAssertNil(snapshot.trajectory.segments)
+        XCTAssertFalse(snapshot.trajectory.isAnchorsOnly, "silence was read as zero anchors")
+    }
+
+    /// The evidence blocks are optional on the wire only in the sense that a
+    /// payload without a world has none. A snapshot decoded without them must
+    /// still carry everything the snapshot itself said.
+    func testASnapshotDecodedWithoutTheEvidenceBlockKeepsItsOwnFigures() {
+        let snapshot = WorldBuilderResultDecoder.snapshot(from: snapshotJSON(poseCount: 4))
+        XCTAssertEqual(snapshot.trajectory.poseCount, 4)
+        XCTAssertNil(snapshot.trajectory.posesAnchor)
+        XCTAssertNil(snapshot.trajectory.segments)
+    }
+
+    // MARK: The session block
+
+    private func sessionJSON(
+        captureID: Any = "6bf1c84c92f94fb68db62d5ba24c3ad2",
+        endedAt: Any = NSNull(),
+        endReason: Any = NSNull(),
+        frameSource: String = "live-capture"
+    ) -> [String: Any] {
+        [
+            "session_id": "s1",
+            "started_at": 1787463000.0,
+            "ended_at": endedAt,
+            "end_reason": endReason,
+            "frame_source": frameSource,
+            "capture_id": captureID,
+            "retains_raw_imagery": true,
+        ]
+    }
+
+    func testTheSessionBlockNamesTheCaptureTheWorldWasBuiltFrom() {
+        let report = WorldBuilderResultDecoder.session(from: ["session": sessionJSON()])
+        XCTAssertEqual(report?.sessionID, "s1")
+        XCTAssertEqual(report?.captureID, "6bf1c84c92f94fb68db62d5ba24c3ad2")
+        XCTAssertEqual(report?.frameSource, "live-capture")
+        XCTAssertFalse(report?.hasEnded ?? true)
+        XCTAssertTrue(report?.isLiveCapture ?? false)
+
+        // A world with no sessions sends `session: null`, which is absent and
+        // not an empty session.
+        XCTAssertNil(WorldBuilderResultDecoder.session(from: ["session": NSNull()]))
+        XCTAssertNil(WorldBuilderResultDecoder.session(from: [:]))
+    }
+
+    func testAStoppedSessionCarriesItsEndAndItsReason() {
+        let report = WorldBuilderResultDecoder.session(
+            from: ["session": sessionJSON(endedAt: 1787463122.0, endReason: "disconnect")]
+        )
+        XCTAssertEqual(report?.endedAt, 1787463122.0)
+        XCTAssertEqual(report?.endReason, "disconnect")
+        XCTAssertTrue(report?.hasEnded ?? false)
+    }
+
+    // MARK: The gate
+
+    private var ours: WorldSessionReport {
+        WorldBuilderResultDecoder.session(from: ["session": sessionJSON()])!
+    }
+
+    private var finishedEarlier: WorldSessionReport {
+        WorldBuilderResultDecoder.session(
+            from: ["session": sessionJSON(
+                captureID: "2e6cff0d1a3b4c5d6e7f8091a2b3c4d5",
+                endedAt: 1787462800.0,
+                endReason: "disconnect"
+            )]
+        )!
+    }
+
+    /// **The load-bearing negative, and the 2026-08-24 bug.**
+    ///
+    /// On that walk the phone showed camera LIVE and "Capture has ended." at
+    /// the same time, with frozen figures: the result channel had answered with
+    /// the most recently updated world, which was a finished one from earlier.
+    /// A snapshot describing a capture that is not the one this phone has open
+    /// is not this session's result, whatever the Tower calls its state.
+    func testAWorldFromAnEarlierCaptureIsNotShownAsThisSessionsResult() {
+        let snapshot = WorldSnapshot(worldID: "w-old", keyframeCount: 143)
+        let binding = WorldSessionGate.binding(
+            isCaptureBracketOpen: true,
+            session: finishedEarlier,
+            modelState: .finalized(snapshot)
+        )
+        XCTAssertEqual(binding, .foreign(captureID: "2e6cff0d1a3b4c5d6e7f8091a2b3c4d5"))
+
+        let presented = WorldSessionGate.presented(.finalized(snapshot), binding: binding)
+        XCTAssertEqual(presented, .awaitingFirstUpdate)
+        XCTAssertFalse(presented.hasWorld, "a foreign world was rendered as this session's")
+    }
+
+    /// A live capture, still open, with a capture directory behind it, while
+    /// this phone's bracket is open: that is this session's world.
+    func testTheLiveCaptureThisPhoneOpenedBindsAndIsRendered() {
+        let snapshot = WorldSnapshot(worldID: "w-live", keyframeCount: 44)
+        let binding = WorldSessionGate.binding(
+            isCaptureBracketOpen: true,
+            session: ours,
+            modelState: .receiving(snapshot)
+        )
+        XCTAssertEqual(binding, .bound(captureID: "6bf1c84c92f94fb68db62d5ba24c3ad2"))
+        XCTAssertEqual(
+            WorldSessionGate.presented(.receiving(snapshot), binding: binding),
+            .receiving(snapshot)
+        )
+    }
+
+    /// Bracket open, and the Tower has resolved no session at all — the state
+    /// between `stream_start` and the follower creating its world. "Frames are
+    /// going out and nothing has reported a world" is `.awaitingFirstUpdate`,
+    /// which is the one state only the phone can know.
+    func testABracketWithNoSessionBehindItIsWaitingAndNotIdle() {
+        let binding = WorldSessionGate.binding(
+            isCaptureBracketOpen: true, session: nil, modelState: .idle
+        )
+        XCTAssertEqual(binding, .awaiting(captureID: nil))
+        XCTAssertEqual(WorldSessionGate.presented(.idle, binding: binding), .awaitingFirstUpdate)
+    }
+
+    /// A recorded or synthetic session is never the capture this phone opened,
+    /// however live the Tower says it is.
+    func testASessionFedFromDiskIsNeverThisPhonesCapture() {
+        for source in ["recorded-capture", "synthetic", "unknown"] {
+            let session = WorldBuilderResultDecoder.session(
+                from: ["session": sessionJSON(captureID: NSNull(), frameSource: source)]
+            )!
+            let binding = WorldSessionGate.binding(
+                isCaptureBracketOpen: true,
+                session: session,
+                modelState: .receiving(WorldSnapshot())
+            )
+            XCTAssertEqual(binding, .foreign(captureID: nil), "\(source) was bound to this phone")
+        }
+    }
+
+    /// With no bracket open the phone has nothing to compare against, so the
+    /// Tower's own state is the whole answer — which is what makes Stop, and a
+    /// Release build with no capture control at all, behave exactly as before.
+    func testWithNoBracketOpenTheTowersOwnStateIsWhatIsShown() {
+        let snapshot = WorldSnapshot(worldID: "w1", keyframeCount: 44)
+        for state in [
+            WorldModelState.idle,
+            .receiving(snapshot),
+            .finalizing(snapshot),
+            .finalized(snapshot),
+        ] {
+            let binding = WorldSessionGate.binding(
+                isCaptureBracketOpen: false, session: finishedEarlier, modelState: state
+            )
+            XCTAssertEqual(binding, WorldSessionBinding.none)
+            XCTAssertEqual(WorldSessionGate.presented(state, binding: binding), state)
+        }
+    }
+
+    /// The gate decides *whose world this is*. It must never decide whether the
+    /// Tower is broken: `.unsupported` and `.failed` are reports about the other
+    /// machine, and swallowing either into "waiting" would hide a real fault
+    /// behind a spinner.
+    func testTheGateNeverSwallowsAWordAboutTheTowerItself() {
+        let unsupported = WorldModelState.unsupported(reason: "no world root is configured")
+        let failed = WorldModelState.failed(
+            CartridgeFailure(kind: .towerReportedFailure, message: "the builder died")
+        )
+        for binding in [
+            WorldSessionBinding.foreign(captureID: "other"),
+            .awaiting(captureID: nil),
+        ] {
+            XCTAssertEqual(WorldSessionGate.presented(unsupported, binding: binding), unsupported)
+            XCTAssertEqual(WorldSessionGate.presented(failed, binding: binding), failed)
+        }
+    }
+}
+
+// MARK: - The gate over a real socket
+
+/// The session gate as the physical iPhone exercises it: a bracket opened by
+/// `stream_start`, snapshots arriving on the result channel, and Stop.
+@MainActor
+final class TowerWorldBuilderSessionBindingTests: XCTestCase {
+
+    /// Written out rather than read from `WorldBuilderResultContract`, so this
+    /// suite pins the string the Tower actually offers instead of agreeing with
+    /// whatever the app happens to hold.
+    private static let contract = "world_builder.status/2026-08-25"
+    private static let ourCapture = "6bf1c84c92f94fb68db62d5ba24c3ad2"
+    private static let earlierCapture = "2e6cff0d1a3b4c5d6e7f8091a2b3c4d5"
+
+    private func url(port: UInt16) -> URL { URL(string: "ws://127.0.0.1:\(port)/")! }
+
+    private func serve(_ server: MockTowerServer, contract: String = "world_builder.status/2026-08-25") {
+        server.onText = { text in
+            guard
+                let data = text.data(using: .utf8),
+                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let type = json["type"] as? String
+            else { return }
+            switch type {
+            case "ping":
+                server.send(text: #"{"type":"pong"}"#)
+            case "cartridges":
+                server.send(text: """
+                    {"type":"cartridges",
+                     "envelope_contract":"cartridge_results.envelope/2026-08-23",
+                     "cartridges":[{"cartridge":"world_builder","result_type":"status",
+                        "contract":"\(contract)","available":true,
+                        "unavailable_reason":null,"snapshot_only":true}],
+                     "not_offered":[]}
+                    """)
+            case "result_subscribe":
+                server.send(text: """
+                    {"type":"result_subscribed",
+                     "envelope_contract":"cartridge_results.envelope/2026-08-23",
+                     "subscription_id":"sub-1","cartridge":"world_builder",
+                     "result_type":"status","contract":"\(contract)",
+                     "snapshot_only":true,"world_id":null,"session_id":null,
+                     "cursor_status":"absent"}
+                    """)
+            default:
+                break
+            }
+        }
+    }
+
+    /// A whole payload, evidence blocks included — which is what the Tower
+    /// actually sends and what the gate reads.
+    private func snapshotMessage(
+        seq: Int,
+        modelState: String,
+        worldID: String,
+        keyframes: Int,
+        revision: String,
+        captureID: String?,
+        endedAt: Double?,
+        frameSource: String = "live-capture",
+        geometryElements: Int?,
+        poseCount: Int?,
+        posesAnchor: Int?,
+        segments: Int?
+    ) -> String {
+        func number(_ value: Int?) -> String { value.map(String.init) ?? "null" }
+        let capture = captureID.map { "\"\($0)\"" } ?? "null"
+        let ended = endedAt.map { String($0) } ?? "null"
+        return """
+            {"type":"cartridge_result",
+             "envelope_contract":"cartridge_results.envelope/2026-08-23",
+             "subscription_id":"sub-1","cartridge":"world_builder","result_type":"status",
+             "contract":"\(Self.contract)","seq":\(seq),"revision":"\(revision)",
+             "revision_changed":true,"coalesced":0,"cursor_status":null,
+             "snapshot":true,"tower_sent_at":1787463092.9,"time_basis":"tower-receipt",
+             "payload":{
+               "session":{"session_id":"s-\(worldID)","started_at":1787463000.0,
+                          "ended_at":\(ended),"end_reason":null,
+                          "frame_source":"\(frameSource)","capture_id":\(capture),
+                          "retains_raw_imagery":true},
+               "trajectory":{"available":true,"current":true,
+                             "built_from_keyframes":\(keyframes),"keyframes_now":\(keyframes),
+                             "stale_reason":null,"pose_count":\(number(poseCount)),
+                             "poses_solved":0,"poses_refused":0,
+                             "poses_anchor":\(number(posesAnchor)),
+                             "keyframes":\(keyframes),"segments":\(number(segments)),
+                             "path_length":{"available":false,"reason":"more than one segment"},
+                             "revision":"t-\(revision)","provenance":"inferred",
+                             "confidence":null,"unavailable_reason":null},
+               "model_state":"\(modelState)","model_state_reason":null,
+               "world_snapshot":{"name":null,"world_id":"\(worldID)",
+                 "keyframe_count":\(keyframes),"revision":"\(revision)",
+                 "tracking":"good","scale":"relative","mapping_seconds":12.5,
+                 "calibration":"uncalibrated",
+                 "geometry":{"representation":"sparse point cloud",
+                             "element_count":\(number(geometryElements)),
+                             "is_incremental":false},
+                 "trajectory":{"pose_count":\(number(poseCount)),"path_length":null,
+                               "path_length_unit":null,"scale":"unknown"},
+                 "persistence":{"state":"saved","revision":"p1"}}}}
+            """
+    }
+
+    private func expect(
+        _ message: @autoclosure () -> String = "the condition was never met",
+        timeout: TimeInterval = 3,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ condition: @MainActor () -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        var met = false
+        while Date() < deadline {
+            if condition() { met = true; break }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        XCTAssertTrue(met || condition(), message(), file: file, line: line)
+    }
+
+    /// **The physical bug, end to end.** The bracket is open, the Tower answers
+    /// with a finished world from an earlier capture, and the phone must show
+    /// "waiting" — never a frozen world beside a live camera.
+    func testAFinishedWorldFromAnotherCaptureIsNotRenderedWhileThisPhoneStreams() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        serve(server)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        let client = TowerWorldBuilderClient(tower: tower)
+        tower.connect(to: url(port: port))
+        await expect { client.state == .awaitingFirstUpdate }
+
+        tower.sendStreamStart()
+        await expect { tower.isStreamingToTower }
+
+        server.send(text: snapshotMessage(
+            seq: 1, modelState: "finalized", worldID: "w-earlier", keyframes: 143,
+            revision: "r1", captureID: Self.earlierCapture, endedAt: 1787462800.0,
+            geometryElements: 0, poseCount: 0, posesAnchor: 36, segments: 36
+        ))
+        await expect { client.sessionBinding == .foreign(captureID: Self.earlierCapture) }
+
+        XCTAssertEqual(
+            client.state, .awaitingFirstUpdate,
+            "a finished world from another capture was rendered as this session's"
+        )
+        XCTAssertFalse(client.state.hasWorld)
+
+        tower.sendStreamStop()
+        tower.disconnect()
+    }
+
+    /// Goal of the whole lifecycle change: while the wearer walks, the world
+    /// grows on screen. Keyframes climb and geometry appears mid-walk, because
+    /// the Tower now rebuilds every four keyframes instead of once at the end.
+    func testTheWorldGrowsOnScreenWhileTheBracketIsOpen() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        serve(server)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        let client = TowerWorldBuilderClient(tower: tower)
+        tower.connect(to: url(port: port))
+        await expect { client.state == .awaitingFirstUpdate }
+
+        tower.sendStreamStart()
+        await expect { tower.isStreamingToTower }
+
+        // Four live rebuilds of the capture this phone opened.
+        for (index, keyframes) in [28, 32, 36, 40].enumerated() {
+            server.send(text: snapshotMessage(
+                seq: index + 1, modelState: "receiving", worldID: "w-live",
+                keyframes: keyframes, revision: "r\(keyframes)",
+                captureID: Self.ourCapture, endedAt: nil,
+                geometryElements: 0, poseCount: 0, posesAnchor: 3, segments: 3
+            ))
+            await expect { client.state.snapshot?.keyframeCount == keyframes }
+            XCTAssertTrue(client.state.isReceivingUpdates, "a live rebuild stopped reading as live")
+        }
+
+        XCTAssertEqual(client.sessionBinding, .bound(captureID: Self.ourCapture))
+        XCTAssertEqual(client.state.snapshot?.trajectory.posesAnchor, 3)
+        XCTAssertEqual(client.state.snapshot?.trajectory.segments, 3)
+        XCTAssertEqual(
+            client.state.snapshot?.trajectory.poseCount, 0,
+            "an uncalibrated walk reported camera positions it did not have"
+        )
+
+        tower.sendStreamStop()
+        tower.disconnect()
+    }
+
+    /// Stop closes the bracket, and the Tower's own words are then the whole
+    /// answer: `stopped_unbuilt` is `.finalizing`, `ready` is `.finalized`.
+    func testStopThenFinalizingThenFinalized() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        serve(server)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        let client = TowerWorldBuilderClient(tower: tower)
+        tower.connect(to: url(port: port))
+        await expect { client.state == .awaitingFirstUpdate }
+
+        tower.sendStreamStart()
+        await expect { tower.isStreamingToTower }
+        server.send(text: snapshotMessage(
+            seq: 1, modelState: "receiving", worldID: "w-live", keyframes: 44,
+            revision: "r44", captureID: Self.ourCapture, endedAt: nil,
+            geometryElements: 0, poseCount: 0, posesAnchor: 3, segments: 3
+        ))
+        await expect { client.state.isReceivingUpdates }
+
+        tower.sendStreamStop()
+        await expect { client.sessionBinding == WorldSessionBinding.none }
+
+        server.send(text: snapshotMessage(
+            seq: 2, modelState: "finalizing", worldID: "w-live", keyframes: 44,
+            revision: "r45", captureID: Self.ourCapture, endedAt: 1787463122.0,
+            geometryElements: 0, poseCount: 0, posesAnchor: 3, segments: 3
+        ))
+        await expect {
+            if case .finalizing = client.state { return true }
+            return false
+        }
+        XCTAssertFalse(client.state.isReceivingUpdates)
+
+        server.send(text: snapshotMessage(
+            seq: 3, modelState: "finalized", worldID: "w-live", keyframes: 44,
+            revision: "r46", captureID: Self.ourCapture, endedAt: 1787463122.0,
+            geometryElements: 812, poseCount: 41, posesAnchor: 3, segments: 3
+        ))
+        await expect {
+            if case .finalized = client.state { return true }
+            return false
+        }
+        XCTAssertEqual(client.state.phase, .settled)
+        XCTAssertEqual(client.state.snapshot?.geometry.elementCount, 812)
+        XCTAssertEqual(client.state.snapshot?.trajectory.poseCount, 41)
+
+        tower.disconnect()
+    }
+
+    /// The binding has two inputs and only one of them arrives on the wire.
+    /// Pressing Start re-judges the snapshot already on screen: a finished
+    /// world that was a legitimate thing to show a moment ago stops being one
+    /// the instant this phone opens a capture of its own.
+    func testPressingStartRejudgesTheWorldAlreadyOnScreen() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        serve(server)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        let client = TowerWorldBuilderClient(tower: tower)
+        tower.connect(to: url(port: port))
+        await expect { client.state == .awaitingFirstUpdate }
+
+        // No bracket: the Tower's own state is the whole answer, and a finished
+        // world is a perfectly good thing to be looking at.
+        server.send(text: snapshotMessage(
+            seq: 1, modelState: "finalized", worldID: "w-earlier", keyframes: 143,
+            revision: "r1", captureID: Self.earlierCapture, endedAt: 1787462800.0,
+            geometryElements: 2336, poseCount: 137, posesAnchor: 6, segments: 6
+        ))
+        await expect {
+            if case .finalized = client.state { return true }
+            return false
+        }
+        XCTAssertEqual(client.sessionBinding, WorldSessionBinding.none)
+
+        // Start. Nothing new arrives from the Tower, and the same snapshot must
+        // stop being rendered as this session's.
+        tower.sendStreamStart()
+        await expect { client.state == .awaitingFirstUpdate }
+        XCTAssertEqual(client.sessionBinding, .foreign(captureID: Self.earlierCapture))
+
+        // Stop, and it is a saved world again rather than a wrong one.
+        tower.sendStreamStop()
+        await expect {
+            if case .finalized = client.state { return true }
+            return false
+        }
+        XCTAssertEqual(client.state.snapshot?.keyframeCount, 143)
+        XCTAssertEqual(client.sessionBinding, WorldSessionBinding.none)
+
+        tower.disconnect()
+    }
+
+    /// A Tower still offering the superseded contract is not decoded on a
+    /// guess. `.unsupportedContract` tells a person to update the app — which
+    /// is exactly the message the physical iPhone showed for the *new* contract
+    /// before this change, with the two identifiers the other way round.
+    func testTheSupersededContractIsNeitherSubscribedToNorDecoded() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = MessageRecorder()
+        serve(server, contract: "world_builder.status/2026-08-23")
+        let inner = server.onText
+        server.onText = { text in
+            recorder.record(text)
+            inner?(text)
+        }
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        let client = TowerWorldBuilderClient(tower: tower)
+        tower.connect(to: url(port: port))
+        await expect { tower.cartridgeDeclaration != nil }
+        try? await Task.sleep(nanoseconds: 250_000_000)
+
+        XCTAssertFalse(
+            recorder.all.contains { $0.contains("result_subscribe") },
+            "the client subscribed against the superseded contract"
+        )
+        XCTAssertEqual(
+            client.availability(isTowerReachable: true).forcedPhase,
+            .unsupported,
+            "the superseded contract was treated as one this build implements"
+        )
+
+        tower.disconnect()
     }
 }

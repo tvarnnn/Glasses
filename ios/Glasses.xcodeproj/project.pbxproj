@@ -7,7 +7,6 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		D7881F037A369AE591F64540 /* WorldBuilderIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3014A1B5D2A01699D4E7403 /* WorldBuilderIntegrationTests.swift */; };
 		208C315C24B46F6FEC34B682 /* MWDATCamera in Frameworks */ = {isa = PBXBuildFile; productRef = 69A44D66C3F5ABDE23B6FE2C /* MWDATCamera */; };
 		241A00E73BC38F81C53AD3EE /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B1FC178F43D5AD1315AFD45C /* Foundation.framework */; };
 		3BFF591BCC38E53334D7805F /* MockTowerServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7687C89BFB8192F1673EBEB1 /* MockTowerServer.swift */; };
@@ -15,6 +14,7 @@
 		D7881F007A369AE591F6453D /* TowerClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3014A185D2A01699D4E7400 /* TowerClientTests.swift */; };
 		D7881F017A369AE591F6453E /* ProductShellTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3014A195D2A01699D4E7401 /* ProductShellTests.swift */; };
 		D7881F027A369AE591F6453F /* SenderPipelineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3014A1A5D2A01699D4E7402 /* SenderPipelineTests.swift */; };
+		D7881F037A369AE591F64540 /* WorldBuilderIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3014A1B5D2A01699D4E7403 /* WorldBuilderIntegrationTests.swift */; };
 		DAC121D4D405EEA501D3CE47 /* MWDATMockDevice in Frameworks */ = {isa = PBXBuildFile; productRef = AA6211B5720FCB42F8A57614 /* MWDATMockDevice */; };
 /* End PBXBuildFile section */
 
@@ -29,7 +29,6 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-		E3014A1B5D2A01699D4E7403 /* WorldBuilderIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldBuilderIntegrationTests.swift; sourceTree = "<group>"; };
 		6A04FA35303507A5001B7C01 /* Glasses.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Glasses.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		7687C89BFB8192F1673EBEB1 /* MockTowerServer.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MockTowerServer.swift; sourceTree = "<group>"; };
 		9D934BA2F3095D85C74F7364 /* GlassesTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GlassesTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -37,6 +36,7 @@
 		E3014A185D2A01699D4E7400 /* TowerClientTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TowerClientTests.swift; sourceTree = "<group>"; };
 		E3014A195D2A01699D4E7401 /* ProductShellTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ProductShellTests.swift; sourceTree = "<group>"; };
 		E3014A1A5D2A01699D4E7402 /* SenderPipelineTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SenderPipelineTests.swift; sourceTree = "<group>"; };
+		E3014A1B5D2A01699D4E7403 /* WorldBuilderIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldBuilderIntegrationTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
