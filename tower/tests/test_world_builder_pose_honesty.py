@@ -151,3 +151,65 @@ def test_the_manifest_records_how_many_anchors_there_were(built):
     manifest = store.read_derived_manifest(world_id)
     assert manifest["poses_anchor"] == manifest["segments"]
     assert manifest["poses_anchor"] > 0
+
+
+# -- the downgrade is loud once, not once per rebuild ------------------
+
+
+def test_the_backend_downgrade_is_announced_exactly_once_per_session(
+    tmp_path, caplog
+):
+    """Loud once is the point; loud sixty times is what hides it.
+
+    Selection stopped being a once-per-session event when `build()`
+    became a flush that runs on every rebuild, and the Tower now attaches
+    a follower rebuilding every four keyframes. A 260-keyframe walk --
+    which is what the current keyframe policy produces on the 2026-08-24
+    footage -- would emit sixty-six identical warnings, and the operator
+    reading a log for "why is there no geometry?" would be scrolling past
+    the answer.
+
+    The SELECTION is unchanged either way. `downgraded_from` and
+    `downgrade_reason` are still recorded on the session, which is where
+    a machine reads them; the log line is for a person, once.
+    """
+    import cv2
+    import numpy as np
+
+    from tower.world_builder.engine import WorldBuilderEngine
+    from tower.world_builder.store import WorldStore
+
+    store = WorldStore(tmp_path)
+    engine = WorldBuilderEngine(store)
+    world_id = engine.create_world()
+
+    rng = np.random.default_rng(3)
+    with caplog.at_level("WARNING"):
+        session_id = engine.start_session(world_id, frame_source="test")
+        rebuilds = 0
+        for index in range(12):
+            image = rng.integers(0, 255, (360, 640, 3), dtype=np.uint8)
+            ok, buffer = cv2.imencode(".jpg", image)
+            assert ok
+            engine.observe(buffer.tobytes(), source_seq=index + 1)
+            if (index + 1) % 2 == 0:
+                engine.build(world_id, session_id)
+                rebuilds += 1
+        engine.stop_session()
+        engine.build(world_id, session_id)
+
+    assert rebuilds >= 3, "this test needs several rebuilds to mean anything"
+    announcements = [
+        record
+        for record in caplog.records
+        if "backend selected unposed" in record.getMessage()
+    ]
+    assert len(announcements) == 1, (
+        f"{len(announcements)} identical downgrade warnings across "
+        f"{rebuilds} rebuilds; it should be announced once, at session start"
+    )
+
+    # And the machine-readable record is untouched by the quieting.
+    session = store.read_session(world_id, session_id)
+    assert session.backend_downgraded_from == "classical"
+    assert "intrinsics" in session.backend_downgrade_reason

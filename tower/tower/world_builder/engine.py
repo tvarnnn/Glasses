@@ -340,7 +340,15 @@ class WorldBuilderEngine:
         session = self._store.read_session(world_id, session_id)
         keyframes = self._store.read_keyframes(world_id, session_id)
         _require_matching_resolution(session, keyframes)
-        selection = select_backend(self._backend_name, session.intrinsics)
+        # Silent here, deliberately. `_open_live_solve` already announced
+        # this at session start, where an operator can still act on it,
+        # and build() now runs once per rebuild -- so announcing here
+        # turns one actionable warning into one per rebuild. The
+        # selection itself is unchanged and still recorded on the
+        # session below.
+        selection = select_backend(
+            self._backend_name, session.intrinsics, announce=False
+        )
         backend = selection.backend
         backend.prepare(session.intrinsics)
 
