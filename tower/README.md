@@ -22,21 +22,42 @@ recorded footage; their measured results and validity limits are in
 
 ## Environment Setup
 
-Requires Python 3.12.
+Requires Python 3.12. One command, from the tower root:
 
 ```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
+powershell -NoProfile -File scripts\setup_tower.ps1
 ```
 
-## Installing Dependencies
+It is idempotent — safe to re-run any time as a health check. It creates
+`.venv` only if missing, installs the package and its `dev` extra, verifies
+that the install actually landed and that `tower.main:app` imports, writes a
+`.env` if there isn't one (never overwriting yours), reports the firewall
+rule and your LAN address, and prints an actionable fix for anything it
+can't do itself. It never deletes a venv, never installs the `ml`/`ocr`
+extras, and never touches the firewall.
+
+Two things it pins on purpose:
+
+- **`py -3.12`, not `py`.** On this machine the bare launcher resolves to
+  Python 3.14, which builds a venv that installs cleanly enough to look
+  fine and then fails later on a wheel with no 3.14 build.
+- **`.venv\Scripts\python.exe -m pip`, not `pip`.** Nothing in this repo's
+  scripts depends on `Activate.ps1` having been run. A bare `pip` in an
+  unactivated shell installs into the system Python and leaves the venv
+  untouched, which looks exactly like the install having failed for no
+  reason.
+
+If you'd rather do it by hand, that is the same as:
 
 ```powershell
-pip install -e ".[dev]"
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
 This installs FastAPI, Uvicorn, Pillow, OpenCV (headless), NumPy, psutil,
-and the test dependencies (pytest, httpx, websockets).
+and the test dependencies (pytest, **httpx2**, websockets). It is `httpx2`,
+not `httpx`, deliberately — see the comment on that line in
+`pyproject.toml` before "correcting" it.
 
 ## Model-Backed Experiments (Optional)
 
@@ -116,28 +137,84 @@ The first time the `depth` experiment loads, it downloads MiDaS-small's weights
 ## Running the Tests
 
 ```powershell
-pytest
+.venv\Scripts\python.exe -m pytest
 ```
 
 ## Starting the Server
 
 ```powershell
-python -m uvicorn tower.main:app --host 0.0.0.0 --port 8000
+powershell -NoProfile -File scripts\start_tower.ps1
 ```
 
-Configuration is read from environment variables (all optional):
+That is the whole normal flow — one command, one terminal. The script
+preflights the venv, diagnoses whatever owns the port instead of failing
+with `[WinError 10048]`, prints the configuration that will actually be in
+effect, and runs uvicorn from the tower root.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `-Port` | `8000` | Port to listen on |
+| `-BindHost` | `0.0.0.0` | Interface to bind. Named `-BindHost` because `$Host` is an automatic PowerShell variable |
+| `-Reload` | off | uvicorn auto-reload |
+| `-Force` | off | If the port is held, try to stop the owning process. Off by default; the script always prints the `Stop-Process` command whether or not you pass it |
+
+The equivalent by hand:
+
+```powershell
+.venv\Scripts\python.exe -m uvicorn tower.main:app --host 0.0.0.0 --port 8000 --env-file .env
+```
+
+Three things about that line are load-bearing:
+
+- **Run it from the tower root.** `tower/world_builder/redaction.py` resolves
+  the YuNet weights relative to the process CWD. Start the server from
+  anywhere else and face redaction is silently disabled — nothing fails,
+  keyframes just honestly record their redaction as `none`.
+- **`--host` is not optional.** uvicorn's own default host is `127.0.0.1`,
+  not `0.0.0.0`. Omit `--host` and every check from this machine passes
+  while the phone cannot connect at all.
+- **Never `--factory`.** `tower/main.py` calls `create_app()` at import, and
+  `create_app()` starts the module container. The factory form would build a
+  second one.
+
+Configuration is read from environment variables, all optional. Put them in
+`.env` (gitignored; `scripts\setup_tower.ps1` writes a starting one) and
+uvicorn's `--env-file` loads them in `Config.__init__`, before the app is
+imported, so they reach `get_settings()`.
 
 | Variable          | Default   | Purpose                                   |
 |-------------------|-----------|--------------------------------------------|
-| `TOWER_HOST`       | `0.0.0.0` | Interface to bind to                       |
-| `TOWER_PORT`       | `8000`    | Port to listen on                          |
-| `TOWER_DEV_MODE`   | `true`    | Enables debug-level logging                |
+| `TOWER_HOST`       | `0.0.0.0` | **Not wired to anything.** `tower/config.py` reads it into `Settings` and nothing reads it back; setting it binds nothing. Use `-BindHost` / `--host` |
+| `TOWER_PORT`       | `8000`    | **Not wired to anything**, same as `TOWER_HOST`. Use `-Port` / `--port` |
+| `TOWER_DEV_MODE`   | `true`    | Enables debug-level logging. Does **not** control the per-frame `[Tower][Frame]` lines, which are INFO and always on |
 | `TOWER_CV_EXPERIMENT` | `baseline` | Active CV experiment: `baseline`, `edge_detection`, `frame_quality`, `feature_detection`, `optical_flow`, `redaction_impact`, `object_detection`, `depth` |
 | `TOWER_CV_DEVICE`   | `auto`    | Device for model-backed experiments (`auto`, `cpu`, or `cuda`) |
-| `TOWER_CAPTURE_ROOT` | *(unset)* | Arms the raw dataset recorder at this path. **Unset means no recording, ever.** Arming is not recording: nothing is written until a `stream_start` arrives, and `GET /health` reports the state |
+| `TOWER_CAPTURE_ROOT` | *(unset)* | Arms the raw dataset recorder at this path. **Unset means no recording, ever.** Arming is not recording: nothing is written until a `stream_start` arrives, and `GET /health` reports the state. Use `data` — `tower/capture.py` appends `captures/<id>` itself |
+| `TOWER_WORLD_ROOT` | *(unset)* | Where World Builder worlds are stored. **Unset means iOS sees World Builder as unsupported.** Use `data/world_builder` — `tower/world_builder/store.py` appends `worlds/<id>` itself, and the value must equal `DEFAULT_ROOT` in `scripts/world_build_session.py` or the result channel reads a different tree than the builder writes |
 
-The server binds to `0.0.0.0` by default so it is reachable from other
-devices on the LAN, not just `localhost`.
+The server does **not** bind `0.0.0.0` unless you say so: `TOWER_HOST` is
+inert, and uvicorn's own default is `127.0.0.1`. `scripts\start_tower.ps1`
+defaults `-BindHost` to `0.0.0.0` so it is reachable from other devices on
+the LAN, and by-hand invocations must pass `--host 0.0.0.0` themselves.
+
+### When the port is already in use
+
+`scripts\start_tower.ps1` resolves the owning PID, its process name, and its
+command line, and says whether it looks like our own stale uvicorn (its
+command line names `tower.main:app`). It then prints `Stop-Process -Id <pid>`
+and stops. Pass `-Force` to have it try the kill itself; if that comes back
+access-denied — which happens when the stale server was started from a shell
+with different privileges — it prints the elevation instruction rather than a
+raw exception.
+
+### World Builder while the tower runs
+
+The Tower attaches a World Builder follower to each capture itself. You do
+not need a second terminal and you do not need to run
+`scripts/world_build_session.py` by hand in the normal flow. That script
+remains available as a fallback and as an offline diagnostic — for rebuilding
+a world from an already-recorded capture — and when you do run it manually,
+run it from the tower root for the redaction reason above.
 
 ## LAN Access
 
@@ -194,8 +271,9 @@ Expected output:
 
 ## Testing the WebSocket
 
-Install the `websockets` package in the venv (`pip install websockets`),
-then run a small test script:
+`websockets` is already part of the `dev` extra, so
+`scripts\setup_tower.ps1` has installed it. Run a small test script with the
+venv interpreter:
 
 ```python
 import asyncio
