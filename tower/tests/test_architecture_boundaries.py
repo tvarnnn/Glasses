@@ -45,7 +45,15 @@ def test_shared_code_does_not_import_a_cartridge():
         if path in _RESULT_CHANNEL_ADAPTERS:
             continue
         for name in _imports(path):
-            if "world_builder" in name:
+            # A bare `"world_builder" in name` also matches
+            # tower.results.world_builder_geometry -- the ADAPTER, not the
+            # cartridge, and a file this rule must let a non-adapter import.
+            # That false positive once pushed a fix into restyling the
+            # import rather than the boundary; match the qualified package
+            # path instead, mirroring the predicate
+            # test_the_result_channel_core_is_cartridge_blind already uses
+            # below.
+            if "tower.world_builder" in name:
                 offenders.append(f"{path} -> {name}")
 
     assert offenders == []
