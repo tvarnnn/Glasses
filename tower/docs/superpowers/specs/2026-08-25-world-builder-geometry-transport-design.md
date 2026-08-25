@@ -300,9 +300,20 @@ it is stable exactly when the segment is.
 ### 4.2 Explicitly out of scope here
 
 Segment registration, covisibility, loop closure, bundle adjustment, metric
-scale, higher-resolution capture, and imagery transport. Each is tracked
-separately. The repo's own guidance stands: BA measured 0.00% drift improvement
-because the observation graph is a chain, so **covisibility comes before BA**.
+scale, tracking continuity, higher-resolution capture, and imagery transport.
+
+**This is the scope boundary for the geometry-transport implementation, not
+the end state of World Builder.** Every item above remains subsequent World
+Builder work and is expected to happen; none is abandoned or deferred
+indefinitely. The boundary exists so this contract can be frozen and shipped
+against today's reconstruction, and so the renderer built on it does not have
+to change when the reconstruction improves — which is precisely what §3.4
+guarantees.
+
+Known ordering constraint for that later work: BA measured 0.00% drift
+improvement because the observation graph is a chain with median covisibility
+span 1, so **covisibility comes before bundle adjustment**
+(`WORLD-BUILDER.md:452-461`).
 
 ---
 
