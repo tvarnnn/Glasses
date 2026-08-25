@@ -148,18 +148,43 @@ def test_the_result_channel_never_writes():
     assert offenders == []
 
 
+# Every cartridge package under tower/. The rule below is applied to
+# every ORDERED PAIR of these, which is the point: the version that
+# checked only world_builder -> object_memory left five of the six pairs
+# unguarded, including both directions between the two cartridges most
+# likely to want each other (object_memory and world_builder, for "where
+# did I leave my keys").
+_CARTRIDGE_PACKAGES = ("world_builder", "object_memory", "document_memory", "scene")
+
+
 def test_a_cartridge_does_not_import_another_cartridge():
     """Rule 6: modules own their data.
 
     A shared VOCABULARY may be promoted to tower/ (Confidence was), but one
     cartridge reaching into another's namespace couples their schemas: a
     change on one side silently invalidates persisted records on the other.
+
+    Symmetric and exhaustive, deliberately. The asymmetric version could
+    not have caught the import a spatial-context feature actually wants,
+    which is `object_memory` reaching into `world_builder` -- the
+    direction it did not check. When two cartridges genuinely need to
+    meet, they meet outside `tower/`: a script joining them by a frame
+    identity that shared transport owns is not a coupling, because
+    neither package learns the other's record shapes.
     """
     offenders = []
-    for path in (TOWER / "world_builder").rglob("*.py"):
-        for name in _imports(path):
-            if "object_memory" in name:
-                offenders.append(f"{path} -> {name}")
+    for package in _CARTRIDGE_PACKAGES:
+        directory = TOWER / package
+        if not directory.exists():
+            continue
+        others = [other for other in _CARTRIDGE_PACKAGES if other != package]
+        for path in directory.rglob("*.py"):
+            if "__pycache__" in path.parts:
+                continue
+            for name in _imports(path):
+                for other in others:
+                    if f"tower.{other}" in name or name.startswith(f"{other}."):
+                        offenders.append(f"{path} -> {name}")
 
     assert offenders == []
 
