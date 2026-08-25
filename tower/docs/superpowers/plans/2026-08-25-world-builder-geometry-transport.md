@@ -481,6 +481,7 @@ from collections import Counter
 
 from tower.world_builder.records import World
 from tower.world_builder.schema import POSE_CONVENTION
+from tower.world_builder.store import WorldStoreError
 
 GEOMETRY_CONTRACT = "world_builder.geometry/2026-08-25"
 
@@ -541,6 +542,17 @@ def _grouped(derived: dict) -> dict[int, dict]:
     return segments
 
 
+def _revision_over(hashes: list[str]) -> str:
+    """A rollup identity for the whole session's geometry.
+
+    Separate from `segment_content_hash` on purpose: that function's input
+    IS a segment, and reusing it here would hash fabricated rows and claim
+    they were geometry.
+    """
+    canonical = json.dumps(hashes, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
 def _read(store, world_id: str, session_id: str):
     """Return `(world, derived, grouped)` or `None` if anything is absent.
 
@@ -549,7 +561,7 @@ def _read(store, world_id: str, session_id: str):
     """
     try:
         world: World = store.read_world(world_id)
-    except (FileNotFoundError, KeyError, ValueError):
+    except WorldStoreError:
         return None
     derived = store.read_derived(world_id, session_id)
     if derived is None:
@@ -589,9 +601,7 @@ def build_manifest(store, world_id: str, session_id: str) -> dict | None:
         "contract": GEOMETRY_CONTRACT,
         "world_id": world_id,
         "session_id": session_id,
-        "geometry_revision": segment_content_hash(
-            [], [{"h": s["content_hash"]} for s in segments]
-        ),
+        "geometry_revision": _revision_over([s["content_hash"] for s in segments]),
         "pose_convention": dict(world.pose_convention or POSE_CONVENTION),
         "scale": {
             "state": world.scale.state,
@@ -1029,8 +1039,9 @@ cd tower
 ./.venv/Scripts/python.exe -m pytest -q
 ```
 
-Expected: **1202 passed, 32 skipped** (1178 baseline + 6 from Task 1 + 18 from
-Tasks 2–4). Zero failures. If `test_the_result_channel_core_is_cartridge_blind`
+Expected: **1208 passed, 32 skipped** (1178 baseline + 6 from Task 1 + 10 from
+Task 2 + 8 from Task 3 + 6 from Task 4). Zero failures. Treat the total as an
+expectation, not a gate: assert zero failures and record the actual number. If `test_the_result_channel_core_is_cartridge_blind`
 fails, read which file it names before touching anything.
 
 - [ ] **Step 7: Commit**
@@ -1122,7 +1133,7 @@ cd tower
 ./.venv/Scripts/python.exe -m pytest -q
 ```
 
-Expected: 1203 passed, 32 skipped. If a result-channel truthfulness test fails,
+Expected: 1209 passed, 32 skipped. If a result-channel truthfulness test fails,
 read it — several assert on `pose_count` and one may have encoded the fallback.
 If a test asserted the old arithmetic, that test was wrong and should be updated
 with a comment saying why.
@@ -2220,7 +2231,7 @@ cd tower
 ./.venv/Scripts/python.exe -m pytest -q
 ```
 
-Expected: **1203 passed, 32 skipped, 0 failed**, against a 1178-passing baseline.
+Expected: **1209 passed, 32 skipped, 0 failed**, against a 1178-passing baseline.
 
 After Task 9, the honest status is:
 
