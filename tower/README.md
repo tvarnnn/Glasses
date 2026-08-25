@@ -191,6 +191,8 @@ imported, so they reach `get_settings()`.
 | `TOWER_CV_DEVICE`   | `auto`    | Device for model-backed experiments (`auto`, `cpu`, or `cuda`) |
 | `TOWER_CAPTURE_ROOT` | *(unset)* | Arms the raw dataset recorder at this path. **Unset means no recording, ever.** Arming is not recording: nothing is written until a `stream_start` arrives, and `GET /health` reports the state. Use `data` — `tower/capture.py` appends `captures/<id>` itself |
 | `TOWER_WORLD_ROOT` | *(unset)* | Where World Builder worlds are stored. **Unset means iOS sees World Builder as unsupported.** Use `data/world_builder` — `tower/world_builder/store.py` appends `worlds/<id>` itself, and the value must equal `DEFAULT_ROOT` in `scripts/world_build_session.py` or the result channel reads a different tree than the builder writes |
+| `TOWER_WORLD_AUTOBUILD` | `true` | Whether each capture automatically gets a World Builder follower attached. Only has an effect when `TOWER_WORLD_ROOT` is set. Turn it off to keep reporting existing worlds while building no new ones — useful when reprocessing a recorded capture offline, and the escape hatch if auto-attach misbehaves |
+| `TOWER_WORLD_REBUILD_EVERY` | `4` | Keyframes between mid-walk rebuilds in the attached follower. **Deliberately not the script's own default of `0`**, which means "build once, at the end" — correct for a batch reprocess and wrong for a live walk. `0` here is why the 2026-08-24 test showed a climbing keyframe count and no geometry at all until the capture closed |
 
 The server does **not** bind `0.0.0.0` unless you say so: `TOWER_HOST` is
 inert, and uvicorn's own default is `127.0.0.1`. `scripts\start_tower.ps1`
@@ -215,6 +217,79 @@ not need a second terminal and you do not need to run
 remains available as a fallback and as an offline diagnostic — for rebuilding
 a world from an already-recorded capture — and when you do run it manually,
 run it from the tower root for the redaction reason above.
+
+## A physical World Builder session, start to finish
+
+The whole flow, once `scripts\setup_tower.ps1` has been run on this
+machine:
+
+```powershell
+powershell -NoProfile -File scripts\start_tower.ps1
+```
+
+Then, on the phone: open World Builder, press Start, walk, press Stop.
+
+That is all of it. There is no second terminal, no capture directory to
+inspect, and no UUID to copy. The Tower mints a capture id at
+`stream_start` and attaches a follower to it in the same breath
+(`tower/capture_workers.py`); the follower rebuilds every four keyframes
+so the world grows during the walk; and when the capture closes the
+follower finalises, persists, and exits, and the Tower reaps it.
+
+### What you should see in the Tower's console
+
+The follower's output is inherited, deliberately, so one terminal shows
+the whole story:
+
+```
+[Tower][Capture] recording started: 6bf1c84c92f94fb68db62d5ba24c3ad2
+[Tower][Worker]  started pid 49784 for capture 6bf1c84c... : ... --follow-capture ...
+[Tower][WorldBuilder] session 29da45bf... in world b1abcdb8...: source=live-capture
+                      capture=6bf1c84c... backend=auto intrinsics=unknown rebuild_every=4
+[Tower][WorldBuilder] rebuild 1: 2 keyframes -> 0 positioned poses, 0 points, 1 segments
+...
+[Tower][Capture] recording stopped (stop): 24 frames, 6521938 bytes
+[Tower][Worker]  capture 6bf1c84c... closed; worker pid 49784 continues until it
+                 observes completion
+[Tower][WorldBuilder] session ... finished: backend=unposed (downgraded_from=classical),
+                      0 solved poses, 0 points, scale=unknown
+[Tower][Worker]  worker pid 49784 finished after 0.8s
+```
+
+`GET /health` answers the same question remotely, which matters because
+this Tower is normally operated from another machine:
+
+```json
+{"capture": {"armed": true, "recording": true, "capture_id": "6bf1c84c..."},
+ "capture_workers": {"enabled": true, "workers": [{"capture_id": "6bf1c84c...", "pid": 49784}]}}
+```
+
+### Zero poses and zero points is the CORRECT result today
+
+Until the camera is calibrated you should expect exactly this, and it is
+not a fault:
+
+```
+calibration  uncalibrated      scale   unknown
+poses        0                 points  0
+```
+
+No intrinsics exist for the Ray-Ban camera, so `BACKEND_AUTO` selects the
+backend that withholds every pose rather than inventing a focal length,
+and it now says so loudly in the log. Keyframes, tracking, segments and
+the persisted world are all real. See `docs/CALIBRATION.md` for the
+physical procedure that changes this.
+
+### Troubleshooting
+
+| Symptom | Where to look |
+|---|---|
+| iOS shows World Builder unsupported | `TOWER_WORLD_ROOT` unset. The startup banner warns about this |
+| Frames arrive, nothing is recorded | `TOWER_CAPTURE_ROOT` unset. `/health` shows `"capture": null` |
+| A capture exists, no world appears | `/health` → `capture_workers`. `enabled: false` means autobuild is off; an empty `workers` list during a walk means the follower died, and it logs its exit code and argv |
+| Keyframes climb, geometry stays absent | Expected mid-walk before the first rebuild. If it never appears, check `TOWER_WORLD_REBUILD_EVERY` is not `0` |
+| Poses and points are 0 | Uncalibrated. See above |
+| The world stops growing while the camera is live | Check the capture manifests under `<capture root>/captures/`. A gap longer than 90 s between captures is a new walk by design, and gets its own world |
 
 ## LAN Access
 
