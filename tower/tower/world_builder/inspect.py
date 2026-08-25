@@ -212,6 +212,26 @@ class WorldView:
         }
 
 
+def _downgrade_report(view: SessionView) -> str:
+    """"Not downgraded" and "never built" are different answers.
+
+    `backend_downgraded_from` is None in both cases, and rendering both
+    as "unknown" is how a session that ran the calibrated backend cleanly
+    came out reading `downgraded_from unknown` -- which an operator
+    checking a fresh calibration reads as a downgrade from a backend
+    nobody can name. That is the exact question this report exists to
+    answer, so it answers it.
+
+    A session that has never been built has no `backend_id` either, and
+    for that one "unknown" is the truth.
+    """
+    if view.downgraded_from:
+        return view.downgraded_from
+    if view.backend_id is None:
+        return UNKNOWN
+    return "none"
+
+
 def _session_report(view: SessionView) -> dict:
     return {
         "session_id": view.session_id,
@@ -222,7 +242,7 @@ def _session_report(view: SessionView) -> dict:
         "rejected_by_reason": view.rejected_by_reason or UNKNOWN,
         "intrinsics_source": view.intrinsics_source,
         "backend_id": view.backend_id or UNKNOWN,
-        "backend_downgraded_from": view.downgraded_from or UNKNOWN,
+        "backend_downgraded_from": _downgrade_report(view),
         "redaction": view.redaction,
         "keyframes": view.keyframes,
         "edges": view.edges,
@@ -252,8 +272,13 @@ def render_text(report: dict) -> str:
         f"metres allowed  {report['scale']['allows_metres']}",
     ]
     if report["scale"]["state"] == SCALE_UNKNOWN:
+        # States the RULE rather than one of its two causes. `unknown` is
+        # set both by "no solved pose" and by "more than one segment,
+        # each with its own arbitrary unit" -- so a world with 29 solved
+        # poses across 6 segments used to be told it had no solved pose.
         lines.append(
-            "note            no solved pose, so this world has no unit at all"
+            "note            no unit at all -- that needs solved poses "
+            "inside a SINGLE segment"
         )
     elif not report["scale"]["allows_metres"]:
         lines.append(

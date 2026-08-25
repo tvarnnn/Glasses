@@ -9,6 +9,7 @@ Nothing here says anything about the real Ray-Ban camera. Every
 calibration in this file is fabricated.
 """
 
+import io
 import json
 import logging
 
@@ -324,49 +325,60 @@ class TestTheDriverDiscoversByObservedResolution:
 
         return world_build_session
 
-    def _write_capture(self, directory, records):
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / "frames.jsonl").write_text(
-            "".join(json.dumps(record) + "\n" for record in records),
-            encoding="utf-8",
+    def _frame(self, **kwargs):
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (360, 640)).save(buffer, format="JPEG")
+        return self._driver().ObservedFrame(
+            payload=buffer.getvalue(), source_seq=0, **kwargs
         )
 
-    def test_a_capture_journals_observed_size_is_read_from_its_first_record(
-        self, tmp_path
-    ):
-        self._write_capture(
-            tmp_path / "cap",
-            [
-                {"relpath": "frames/1.jpg", "width": 360, "height": 640},
-                {"relpath": "frames/2.jpg", "width": 360, "height": 640},
-            ],
+    def test_a_live_frame_is_measured_from_what_the_recorder_journalled(self):
+        """The recorder decodes every frame it stores and writes the size.
+
+        Preferred over decoding again because it is already in hand, and
+        because it is the same number the keyframe will carry -- so the
+        calibration and the resolution check cannot disagree.
+        """
+        assert self._driver().observed_size_of(
+            self._frame(width=360, height=640)
+        ) == (360, 640)
+
+    def test_a_live_frame_with_no_recorded_size_is_decoded(self):
+        """A source that carries no metadata still yields a resolution."""
+        assert self._driver().observed_size_of(self._frame()) == (360, 640)
+
+    def test_an_undecodable_frame_with_no_recorded_size_is_unobserved(self):
+        """Never a default. Unobserved means unknown intrinsics, honestly."""
+        frame = self._driver().ObservedFrame(payload=b"not a jpeg", source_seq=0)
+
+        assert self._driver().observed_size_of(frame) is None
+
+    def test_the_first_frame_is_measured_without_being_consumed(self):
+        """Measuring must not eat the frame it measured.
+
+        The live path takes one frame off the source to learn the
+        resolution and then observes the whole walk. If that frame did
+        not come back, every session would silently begin one frame in.
+        """
+        driver = self._driver()
+        source = (
+            driver.ObservedFrame(payload=b"a", source_seq=index)
+            for index in range(3)
         )
 
-        assert self._driver().observed_size_from_capture(tmp_path / "cap") == (
-            360,
-            640,
-        )
+        first, frames = driver.first_observed_frame(source)
 
-    def test_a_capture_with_no_frames_yet_reports_unobserved(self, tmp_path):
-        """A real state on the live path: the builder can attach first."""
-        self._write_capture(tmp_path / "cap", [])
+        assert first.source_seq == 0
+        assert [frame.source_seq for frame in frames] == [0, 1, 2]
 
-        assert self._driver().observed_size_from_capture(tmp_path / "cap") is None
+    def test_a_source_that_never_yields_a_frame_reports_none(self):
+        """A phone that connects and drops. Must not hang, must not guess."""
+        first, frames = self._driver().first_observed_frame(iter(()))
 
-    def test_a_capture_with_no_journal_reports_unobserved(self, tmp_path):
-        (tmp_path / "cap").mkdir()
-
-        assert self._driver().observed_size_from_capture(tmp_path / "cap") is None
-
-    def test_a_torn_journal_line_reports_unobserved_rather_than_raising(
-        self, tmp_path
-    ):
-        (tmp_path / "cap").mkdir()
-        (tmp_path / "cap" / "frames.jsonl").write_text(
-            '{"relpath": "frames/1.jpg", "wid', encoding="utf-8"
-        )
-
-        assert self._driver().observed_size_from_capture(tmp_path / "cap") is None
+        assert first is None
+        assert list(frames) == []
 
     def test_a_frames_directory_is_measured_from_the_first_jpeg(self, tmp_path):
         from PIL import Image
