@@ -46,7 +46,22 @@ CARTRIDGE_SCENE_UNDERSTANDING = "scene_understanding"
 RESULT_TYPE_STATUS = "status"
 
 # The one contract that exists.
-WORLD_BUILDER_STATUS_CONTRACT = "world_builder.status/2026-08-23"
+#
+# Bumped from .../2026-08-23 because `trajectory.pose_count` changed
+# MEANING, not merely because a field was added. It used to be
+# `keyframes - poses_refused`, which counts a segment anchor -- an
+# identity rotation at the origin, by construction -- as a camera
+# position. On the 2026-08-24 physical walk that reported "36 camera
+# poses" from a build whose manifest read `poses_solved: 0, points: 0`.
+#
+# A consumer pinned to the old identifier is refused rather than quietly
+# served a number that means something different. That is what "compare
+# for equality only; a mismatch means we are not talking about the same
+# agreement" is for, and a correction is exactly the case where serving
+# the old id would be a lie about compatibility. Adding `poses_anchor`
+# alone would not have justified this; changing what an existing figure
+# counts does.
+WORLD_BUILDER_STATUS_CONTRACT = "world_builder.status/2026-08-25"
 
 # The channel's own envelope contract, distinct from any cartridge's.
 # A change here affects every cartridge at once, which is exactly why it

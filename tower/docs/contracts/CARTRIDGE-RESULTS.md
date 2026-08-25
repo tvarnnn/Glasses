@@ -6,7 +6,7 @@ something does not exist, it says so and says why.
 
 **Envelope contract:** `cartridge_results.envelope/2026-08-23`
 **Producers offered:** World Builder `status`, contract
-`world_builder.status/2026-08-23`. Nothing else. See §9.
+`world_builder.status/2026-08-25`. Nothing else. See §9.
 
 **Audience.** Whoever implements the iOS consumer. You should be able to
 write it from this document without reading Tower's Python. If you find
@@ -71,7 +71,7 @@ asserts they cannot drift. **The phone does not need it.**
     {
       "cartridge": "world_builder",
       "result_type": "status",
-      "contract": "world_builder.status/2026-08-23",
+      "contract": "world_builder.status/2026-08-25",
       "available": true,
       "unavailable_reason": null,
       "snapshot_only": true
@@ -132,7 +132,7 @@ subscription open.
   "type": "result_subscribe",
   "cartridge": "world_builder",
   "result_type": "status",
-  "contract": "world_builder.status/2026-08-23",
+  "contract": "world_builder.status/2026-08-25",
   "world_id": null,
   "session_id": null,
   "since_revision": null
@@ -162,7 +162,7 @@ counter that moved would be a bug.
   "subscription_id": "sub-1",
   "cartridge": "world_builder",
   "result_type": "status",
-  "contract": "world_builder.status/2026-08-23",
+  "contract": "world_builder.status/2026-08-25",
   "snapshot_only": true,
   "world_id": null,
   "session_id": null,
@@ -203,7 +203,7 @@ cartridge-specific part.
   "subscription_id": "sub-1",
   "cartridge": "world_builder",
   "result_type": "status",
-  "contract": "world_builder.status/2026-08-23",
+  "contract": "world_builder.status/2026-08-25",
   "seq": 4,
   "revision": "e252f739c1cdedab",
   "revision_changed": true,
@@ -428,7 +428,7 @@ already generic and already tested.
 
 ## 10. World Builder `status` payload
 
-Contract: `world_builder.status/2026-08-23`.
+Contract: `world_builder.status/2026-08-25`.
 
 ### 10.0 If you implement nothing else, implement this
 
@@ -662,7 +662,8 @@ asserted without the figures to show for it.
 | Field | Notes |
 |---|---|
 | `current`, `built_from_keyframes`, `keyframes_now`, `stale_reason` | as for geometry |
-| `pose_count` | poses carrying a position = keyframes minus refused. **Not** `poses_solved`: an anchor has a position and is counted as neither solved nor refused |
+| `pose_count` | poses carrying a position that is **evidence**. Read from the manifest's `poses_positioned`, which the build counts per segment: every solved pose, plus the anchor of each segment that solved something. **Not** `poses_solved` (that drops the origin of every segment) and **not** `keyframes - poses_refused` (that promotes the bare anchor of a segment which resolved nothing). See the changelog for why this changed |
+| `poses_anchor` | how many poses were anchors. Reported beside the count, never folded into it, so an uncalibrated walk reads as "N segment origins, no trajectory" rather than as a trajectory |
 | `poses_solved`, `poses_refused`, `keyframes`, `segments` | the underlying figures |
 | `path_length` | see below |
 | `provenance` | `"inferred"` |
@@ -781,7 +782,8 @@ These are actual payloads, captured from the implementation.
   "trajectory": {"available": false, "current": false,
                  "built_from_keyframes": null, "keyframes_now": null,
                  "stale_reason": null, "pose_count": null, "poses_solved": null,
-                 "poses_refused": null, "keyframes": null, "segments": null,
+                 "poses_refused": null, "poses_anchor": null,
+                 "keyframes": null, "segments": null,
                  "path_length": null, "revision": null, "provenance": null,
                  "confidence": null,
                  "unavailable_reason": "no build has run for this session, so no poses exist"},
@@ -839,7 +841,8 @@ Note what a live session does **not** know: `frames_observed` is null, and
                "built_from_keyframes": 4, "keyframes_now": 4,
                "stale_reason": null,
                "pose_count": 4, "poses_solved": 3,
-               "poses_refused": 0, "keyframes": 4, "segments": 1,
+               "poses_refused": 0, "poses_anchor": 1,
+               "keyframes": 4, "segments": 1,
                "path_length": {"available": true, "value": 2.853251890377782,
                                "unit": "world units",
                                "scale_semantics": "relative",
@@ -851,7 +854,12 @@ Note what a live session does **not** know: `frames_observed` is null, and
 
 `pose_count: 4` with `poses_solved: 3` is not an inconsistency — the fourth
 is the anchor, which has a position and is counted as neither solved nor
-refused.
+refused. That segment resolved, so its origin is a real point on the path.
+
+The opposite case is the one that matters. A build with `poses_solved: 0`
+reports **`pose_count: 0`**, however many anchors it produced, because a
+segment that resolved nothing contributes an origin marker for an empty
+coordinate frame rather than a camera position.
 
 ### 10.3 What becomes available only after Stop, and after build
 
@@ -912,14 +920,65 @@ and `Start → Walk → Stop → the world appears` is the honest description.
    Builder emitting a per-frame event, which would turn a bounded journal
    into a per-frame one.
 5. **No imagery, and no artifact fetch contract.** §10.1.
-6. **Nothing has been validated on physical footage.** Every figure in this
-   document came from synthetic renders.
+6. **Most figures here came from synthetic renders.** One physical walk
+   has now been recorded and analysed (2026-08-24); where a number in
+   this document came from it, it says so.
 7. **`build_completed` is unreachable** in Tower's event vocabulary and is
    not exposed. Do not wait for it.
 
 ---
 
-## 12. Where the code is
+## 12. Changelog
+
+Identifiers are opaque and compared for equality only (§2). This section
+exists so a mismatch can be *understood*, not so it can be computed.
+
+### `world_builder.status/2026-08-25`
+
+Supersedes `world_builder.status/2026-08-23`. **One field changed
+meaning**, which is why the identifier moved rather than staying put for
+an additive change.
+
+**`trajectory.pose_count` counts something different.** It was
+`keyframes - poses_refused`. The build counts a segment ANCHOR as
+neither solved nor refused, so that subtraction promoted every anchor to
+a camera position — and an anchor is definitional, not measured: an
+identity rotation at the origin.
+
+The first physical walk (2026-08-24) made the consequence concrete. Its
+manifest reads `backend_id: "unposed", keyframes: 155, poses_solved: 0,
+poses_refused: 119, points: 0, segments: 36`. Nothing was reconstructed:
+no intrinsics exist for this camera, so the backend that solves poses
+could not run and withheld every one. The 36 remaining rows were segment
+anchors, all at the same point. The channel reported **"pose_count: 36"**
+and a phone displayed *"Camera poses: 36"*.
+
+`pose_count` is now read from the manifest's `poses_positioned`, which
+the build counts per segment: every solved pose, plus the anchor of each
+segment that solved something. For a build with `poses_solved: 0` it is
+**0**, whatever the anchor count.
+
+**`trajectory.poses_anchor` is new**, reported beside the count and never
+folded into it, so the same walk reads as "36 segment origins, no
+trajectory".
+
+**Worlds built before this change** carry no `poses_positioned`. The
+producer falls back to the old arithmetic for them rather than blanking
+the trajectory of every world already on disk; for the classical builds
+those worlds are, the two agree except across a segment that resolved
+nothing.
+
+**What a consumer must do.** Nothing, if it does not pin the contract
+identifier — the key set is unchanged apart from the added
+`poses_anchor`. A consumer that *does* pin it will be refused with
+`contract_mismatch` and must adopt the new identifier deliberately,
+having read the paragraph above. That refusal is the point: this build
+serves a figure that means something different from what the old
+identifier promised.
+
+---
+
+## 13. Where the code is
 
 | Concern | File |
 |---|---|

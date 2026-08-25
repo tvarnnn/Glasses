@@ -345,6 +345,19 @@ class WorldBuilderEngine:
         self._store.clear_edges(world_id, session_id)
 
         poses_solved = poses_refused = 0
+        # Counted, not derived by subtraction. `keyframes - poses_refused`
+        # silently promotes every anchor to a camera position, and an
+        # anchor is definitional rather than measured: identity rotation,
+        # zero translation, by construction. On the 2026-08-24 physical
+        # walk that arithmetic turned 36 origin markers into "36 camera
+        # poses" on the phone while poses_solved was zero.
+        #
+        # An anchor IS a real position when the chain it anchors resolved
+        # -- it is that segment's origin, and dropping it would
+        # under-report every segment by one. So the rule is per segment,
+        # and it needs the per-segment solve count to state.
+        poses_anchor = 0
+        poses_positioned = 0
         total_points = 0
         segments = sorted({keyframe.segment_index for keyframe in keyframes})
 
@@ -364,14 +377,27 @@ class WorldBuilderEngine:
             ]
             estimate = backend.estimate_window(window)
 
+            segment_solved = 0
+            segment_anchors = 0
             for keyframe, pose in zip(members, estimate.poses):
                 if pose.status == POSE_STATUS_SOLVED:
                     poses_solved += 1
-                elif pose.status != POSE_STATUS_ANCHOR:
+                    segment_solved += 1
+                elif pose.status == POSE_STATUS_ANCHOR:
+                    poses_anchor += 1
+                    segment_anchors += 1
+                else:
                     poses_refused += 1
                 pose_rows.append(
                     self._pose_row(keyframe, pose, segment)
                 )
+            # An anchor counts as a position only if something in its
+            # segment actually solved against it. A lone anchor in a
+            # segment that resolved nothing is an origin marker for an
+            # empty coordinate frame.
+            poses_positioned += segment_solved
+            if segment_solved:
+                poses_positioned += segment_anchors
 
             for previous, current, pose in zip(
                 members, members[1:], estimate.poses[1:]
@@ -454,6 +480,12 @@ class WorldBuilderEngine:
                 "keyframes": len(keyframes),
                 "poses_solved": poses_solved,
                 "poses_refused": poses_refused,
+                # Both reported. Suppressing the anchors would replace one
+                # misleading number with a missing one; a reader should be
+                # able to see "36 segment origins and no trajectory",
+                # which is a precise description of an uncalibrated walk.
+                "poses_anchor": poses_anchor,
+                "poses_positioned": poses_positioned,
                 "points": total_points,
                 "segments": len(segments),
                 "scale_state": scale_state,

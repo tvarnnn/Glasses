@@ -53,6 +53,14 @@ class WorkerSpec:
     argv: tuple[str, ...]
     cwd: str | None = None
     name: str = "capture-worker"
+    # Whether the child writes into this process's stdout and stderr.
+    #
+    # True by default, and that default is the point. A worker sent to
+    # DEVNULL is a worker whose failure is invisible: the operator sees a
+    # world that is not growing and has nothing to read. Interleaving is
+    # the lesser problem, and small in practice -- the world builder logs
+    # once at session start, once per rebuild, and once at the end.
+    inherit_output: bool = True
 
 
 @dataclass
@@ -265,8 +273,8 @@ class CaptureWorkerSupervisor:
             process = self._spawn(
                 argv,
                 cwd=self._spec.cwd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.STDOUT,
+                stdout=None if self._spec.inherit_output else subprocess.DEVNULL,
+                stderr=None if self._spec.inherit_output else subprocess.DEVNULL,
                 # A worker must not die because the operator pressed
                 # Ctrl-C in the Tower's console: on Windows a console
                 # Ctrl-C goes to the whole process group, and a follower

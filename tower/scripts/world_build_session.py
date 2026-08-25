@@ -38,6 +38,7 @@ that invents a focal length.
 
 import argparse
 import json
+import logging
 import sys
 import time
 from dataclasses import dataclass
@@ -55,6 +56,8 @@ from tower.world_builder.records import (  # noqa: E402
 from tower.world_builder.store import WorldStore  # noqa: E402
 
 DEFAULT_ROOT = Path("data/world_builder")
+
+logger = logging.getLogger("tower.world_build_session")
 
 
 @dataclass(frozen=True)
@@ -186,6 +189,17 @@ def main(argv=None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # Configured here rather than at import, so importing this module for
+    # a test does not reconfigure the test runner's logging. Only added
+    # if nothing else has set logging up: when the Tower spawns this as a
+    # capture worker its output is inherited, and a second handler would
+    # double every line in that console.
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+
     chosen = [
         name
         for name, value in (
@@ -212,15 +226,23 @@ def main(argv=None) -> int:
         intrinsics = CameraIntrinsics.unknown()
         frame_source = "live-capture"
         capture_id = args.follow_capture.name
+        # The sender chooses the stream size and DAT may change it
+        # mid-walk. This process measures each frame; it declares nothing.
+        declared_size = None
     elif args.synthetic:
         frames, intrinsics = synthetic_frames(
             args.synthetic_frames, args.width, args.height
         )
         frame_source = "synthetic"
+        # The only source whose size this process actually chose.
+        declared_size = (args.width, args.height)
     else:
         frames = load_frames(args.frames)
         intrinsics = CameraIntrinsics.unknown()
         frame_source = "recorded-capture"
+        # A directory of jpegs whose size was decided by whatever wrote
+        # them. Measured per keyframe, not declared here.
+        declared_size = None
 
     if args.intrinsics:
         intrinsics = camera_intrinsics_from_json_dict(
@@ -235,8 +257,35 @@ def main(argv=None) -> int:
         world_id,
         intrinsics=intrinsics,
         frame_source=frame_source,
-        declared_size=(args.width, args.height),
+        # Only for a source whose size this process actually CHOSE.
+        #
+        # --width/--height default to 480x360 and describe the synthetic
+        # renderer. Passing them for a followed capture records a size
+        # nobody measured: the 2026-08-24 session says `declared_width:
+        # 480, declared_height: 360` while every one of its 155 keyframes
+        # is 360x640. It was harmless only because unknown intrinsics
+        # skip the resolution check -- the moment a calibration exists,
+        # `_require_matching_resolution` turns it into a hard failure, or
+        # worse, invites calibrating at the wrong resolution.
+        #
+        # Per-keyframe width/height are measured off the decoded frame
+        # and were always right. None means unknown, which is the honest
+        # value for a stream whose size the sender decides.
+        declared_size=declared_size,
         capture_id=capture_id,
+    )
+
+    logger.info(
+        "[Tower][WorldBuilder] session %s in world %s: source=%s capture=%s "
+        "root=%s backend=%s intrinsics=%s rebuild_every=%s",
+        session_id,
+        world_id,
+        frame_source,
+        capture_id,
+        args.root,
+        args.backend,
+        intrinsics.source,
+        args.rebuild_every,
     )
 
     started = time.perf_counter()
@@ -259,15 +308,45 @@ def main(argv=None) -> int:
         # about. Rebuilding on one would burn a build to produce an anchor
         # pose and nothing else.
         if args.rebuild_every and since_rebuild >= args.rebuild_every and accepted >= 2:
-            engine.build(world_id, session_id)
+            rebuild_started = time.perf_counter()
+            interim = engine.build(world_id, session_id)
             rebuilds += 1
             since_rebuild = 0
+            # One line per rebuild, not per frame. Over a 15-minute walk
+            # this process used to print nothing at all until it was
+            # over, so "why isn't World Builder changing?" had no
+            # answer short of reading the world directory by hand.
+            logger.info(
+                "[Tower][WorldBuilder] rebuild %s: %s keyframes -> %s "
+                "positioned poses, %s points, %s segments in %.2fs",
+                rebuilds,
+                interim.keyframes,
+                interim.poses_solved,
+                interim.points,
+                interim.segments,
+                time.perf_counter() - rebuild_started,
+            )
     observe_seconds = time.perf_counter() - started
     summary = engine.stop_session()
 
     built = time.perf_counter()
     result = engine.build(world_id, session_id)
     build_seconds = time.perf_counter() - built
+    logger.info(
+        "[Tower][WorldBuilder] session %s finished: %s frames, %s keyframes, "
+        "%s segments, backend=%s (downgraded_from=%s), %s solved poses, "
+        "%s points, scale=%s, final build %.2fs",
+        session_id,
+        summary.frames_observed,
+        summary.keyframes_accepted,
+        summary.segments,
+        result.backend_id,
+        result.downgraded_from,
+        result.poses_solved,
+        result.points,
+        result.scale_state,
+        build_seconds,
+    )
 
     report = {
         "world_id": world_id,

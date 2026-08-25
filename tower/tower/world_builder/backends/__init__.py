@@ -52,7 +52,36 @@ def select_backend(
     if name == BACKEND_AUTO:
         if intrinsics.is_known:
             return BackendSelection(ClassicalTwoViewBackend())
-        return BackendSelection(UnposedBackend())
+        # Announced, and recorded, exactly like the explicit request
+        # below. This branch used to return silently with
+        # downgraded_from=None, on the reasoning that AUTO choosing the
+        # only backend it CAN choose is a selection rather than a
+        # downgrade.
+        #
+        # That reasoning is defensible and it cost a night. On the
+        # 2026-08-24 physical walk AUTO landed here, the session recorded
+        # `backend_id: "unposed", downgraded_from: null`, and the world
+        # came back with 155 keyframes, zero poses and zero points with
+        # nothing anywhere saying why. The operator's question is "why is
+        # there no geometry?", and the answer -- "because nothing has
+        # calibrated this camera" -- was computed here and thrown away.
+        #
+        # Whether AUTO "downgraded" is a question about this function's
+        # vocabulary. Whether the reconstruction lost its geometry to
+        # missing intrinsics is a question about the world, and it has
+        # the same answer either way.
+        reason = (
+            "no backend that solves poses can run without intrinsics, and "
+            f"this session's intrinsics are source={intrinsics.source!r}; "
+            "the unposed backend will record keyframes and tracking but "
+            "will produce no poses and no points"
+        )
+        logger.warning("world builder: backend selected unposed -- %s", reason)
+        return BackendSelection(
+            UnposedBackend(),
+            downgraded_from=BACKEND_CLASSICAL,
+            downgrade_reason=reason,
+        )
 
     # Explicitly requested classical.
     if intrinsics.is_known:
