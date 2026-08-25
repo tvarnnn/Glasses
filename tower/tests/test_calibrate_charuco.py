@@ -327,3 +327,205 @@ class TestIntrinsicsMustBePhysical:
         )
 
         assert intrinsics.is_known
+
+
+class TestTheResultLandsWhereTheBuilderLooks:
+    """The loop between calibrating and building, closed.
+
+    Before this, `--out` had no default and `--intrinsics` had no
+    discovery, so the one working path required an operator to remember a
+    flag at both ends. Forgetting either produced a silently pose-free
+    world -- which is what 2026-08-24 produced.
+    """
+
+    @pytest.fixture
+    def board_frames_dir(self, tmp_path, board_views):
+        directory = tmp_path / "board"
+        directory.mkdir()
+        for index, view in enumerate(board_views[:16]):
+            cv2.imwrite(str(directory / f"{index:04d}.jpg"), view)
+        return directory
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, "scripts/calibrate_charuco.py", *args],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_a_calibration_lands_in_the_store_with_no_out_flag(
+        self, board_frames_dir, tmp_path
+    ):
+        root = tmp_path / "world_root"
+
+        result = self._run(
+            "--frames", str(board_frames_dir), "--root", str(root)
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert (root / "intrinsics" / f"{WIDTH}x{HEIGHT}.json").exists()
+
+    def test_the_stored_file_is_what_the_store_reads_back(
+        self, board_frames_dir, tmp_path
+    ):
+        from tower.world_builder.intrinsics_store import IntrinsicsStore
+
+        root = tmp_path / "world_root"
+        self._run("--frames", str(board_frames_dir), "--root", str(root))
+
+        found = IntrinsicsStore(root).lookup(WIDTH, HEIGHT)
+
+        assert found.is_known
+        assert found.fx == pytest.approx(TRUE_FX, rel=0.03)
+
+    def test_the_stored_calibration_selects_the_classical_backend(
+        self, board_frames_dir, tmp_path
+    ):
+        from tower.world_builder.backends import (
+            BACKEND_AUTO,
+            ClassicalTwoViewBackend,
+            select_backend,
+        )
+        from tower.world_builder.intrinsics_store import IntrinsicsStore
+
+        root = tmp_path / "world_root"
+        self._run("--frames", str(board_frames_dir), "--root", str(root))
+
+        selection = select_backend(
+            BACKEND_AUTO, IntrinsicsStore(root).lookup(WIDTH, HEIGHT)
+        )
+
+        assert isinstance(selection.backend, ClassicalTwoViewBackend)
+
+    def test_success_output_names_the_resolution_it_is_valid_for(
+        self, board_frames_dir, tmp_path
+    ):
+        result = self._run(
+            "--frames",
+            str(board_frames_dir),
+            "--root",
+            str(tmp_path / "world_root"),
+        )
+
+        assert f"VALID ONLY FOR {WIDTH}x{HEIGHT}" in result.stdout
+        assert "NEXT:" in result.stdout
+        assert "world_build_session.py" in result.stdout
+
+    def test_success_output_warns_that_a_low_rms_is_not_proof(
+        self, board_frames_dir, tmp_path
+    ):
+        """RMS endorses the degenerate answer; the operator must be told."""
+        result = self._run(
+            "--frames",
+            str(board_frames_dir),
+            "--root",
+            str(tmp_path / "world_root"),
+        )
+
+        assert "LOW RMS IS NOT PROOF" in result.stdout
+        assert "docs/CALIBRATION.md" in result.stdout
+
+    def test_an_explicit_out_still_wins_and_says_it_is_undiscoverable(
+        self, board_frames_dir, tmp_path
+    ):
+        root = tmp_path / "world_root"
+        out = tmp_path / "elsewhere" / "intrinsics.json"
+
+        result = self._run(
+            "--frames",
+            str(board_frames_dir),
+            "--root",
+            str(root),
+            "--out",
+            str(out),
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert out.exists()
+        assert not (root / "intrinsics").exists()
+        assert "OUTSIDE the store" in result.stdout
+
+    def test_a_refused_calibration_writes_nothing_into_the_store(self, tmp_path):
+        """Refusal must not leave a half-answer where the builder looks."""
+        directory = tmp_path / "blank"
+        directory.mkdir()
+        for index in range(12):
+            cv2.imwrite(
+                str(directory / f"{index:04d}.jpg"),
+                np.full((HEIGHT, WIDTH), 255, np.uint8),
+            )
+        root = tmp_path / "world_root"
+
+        result = self._run("--frames", str(directory), "--root", str(root))
+
+        assert result.returncode != 0
+        assert "calibration refused" in result.stderr
+        assert not (root / "intrinsics").exists()
+
+
+class TestSplitHalfDiagnostic:
+    """The quality check reprojection RMS cannot be.
+
+    RMS says the solver fitted the views it was given. Agreement between
+    two disjoint halves says those views actually CONSTRAIN the camera --
+    the thing that view count and RMS both miss.
+    """
+
+    def test_well_varied_views_agree_between_halves(self, board_views):
+        from scripts.calibrate_charuco import split_half_report
+
+        first, second, spread = split_half_report(board_views[:24])
+
+        assert spread < 0.05
+        assert first.fx == pytest.approx(TRUE_FX, rel=0.05)
+        assert second.fx == pytest.approx(TRUE_FX, rel=0.05)
+
+    def test_the_diagnostic_writes_nothing(self, tmp_path, board_views):
+        directory = tmp_path / "board"
+        directory.mkdir()
+        for index, view in enumerate(board_views[:24]):
+            cv2.imwrite(str(directory / f"{index:04d}.jpg"), view)
+        root = tmp_path / "world_root"
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "scripts/calibrate_charuco.py",
+                "--frames",
+                str(directory),
+                "--root",
+                str(root),
+                "--split-half",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "fx disagreement between halves" in result.stdout
+        assert "Nothing was written" in result.stdout
+        assert not (root / "intrinsics").exists()
+
+    def test_a_half_that_cannot_be_calibrated_reports_that(self, tmp_path):
+        directory = tmp_path / "blank"
+        directory.mkdir()
+        for index in range(24):
+            cv2.imwrite(
+                str(directory / f"{index:04d}.jpg"),
+                np.full((HEIGHT, WIDTH), 255, np.uint8),
+            )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "scripts/calibrate_charuco.py",
+                "--frames",
+                str(directory),
+                "--split-half",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        assert "split-half refused" in result.stderr

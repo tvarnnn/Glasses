@@ -28,9 +28,12 @@ Frame sources:
                    throw them away and with them any ability to reason
                    about dropped frames.
 
-Intrinsics are unknown unless --intrinsics is given, and unknown
-intrinsics mean the engine honestly produces no poses. There is no flag
-that invents a focal length.
+Intrinsics come from the intrinsics store, keyed by the resolution the
+frames MEASURE at -- not by anything this process declares. `--intrinsics`
+overrides the store. When neither yields a calibration for the observed
+resolution the intrinsics stay unknown, the unposed backend runs, and the
+engine honestly produces no poses. There is no flag that invents a focal
+length, and nothing rescales a calibration from another resolution.
 
     .venv\\Scripts\\python.exe scripts/world_build_session.py --synthetic --name "Test Room"
     .venv\\Scripts\\python.exe scripts/world_build_session.py --frames data/capture/xyz
@@ -49,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tower.capture import CaptureFollower  # noqa: E402
 from tower.world_builder.backends import BACKEND_AUTO, BACKEND_NAMES  # noqa: E402
 from tower.world_builder.engine import WorldBuilderEngine  # noqa: E402
+from tower.world_builder.intrinsics_store import IntrinsicsStore  # noqa: E402
 from tower.world_builder.records import (  # noqa: E402
     CameraIntrinsics,
     camera_intrinsics_from_json_dict,
@@ -85,6 +89,95 @@ def load_frames(directory: Path) -> list[ObservedFrame]:
         ObservedFrame(payload=path.read_bytes(), source_seq=index, wire_seq=index)
         for index, path in enumerate(paths)
     ]
+
+
+def observed_size_from_capture(directory: Path) -> tuple[int, int] | None:
+    """The frame size a capture is actually recording, from its journal.
+
+    The journal is the honest source: the recorder writes the DECODED
+    width and height of each frame it stored. `capture.json` records what
+    the sender declared, and on 2026-08-24 the declaration and the pixels
+    disagreed.
+
+    Returns None when the capture has not written a frame yet -- which is
+    a real state on the live path, since the builder can attach before
+    the first frame lands. None means "not observed", never a default.
+    """
+    path = directory / "frames.jsonl"
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                width, height = record["width"], record["height"]
+                if isinstance(width, int) and isinstance(height, int):
+                    return (width, height)
+                return None
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+    return None
+
+
+def observed_size_from_frames(directory: Path) -> tuple[int, int] | None:
+    """The size of the first jpeg in a directory, read from its header."""
+    paths = sorted(directory.glob("*.jpg"))
+    if not paths:
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(paths[0]) as image:
+            return image.size
+    except Exception:  # noqa: BLE001 -- an undecodable frame is not fatal here
+        return None
+
+
+def resolve_intrinsics(store: IntrinsicsStore, observed_size, *, frame_source):
+    """Look up a calibration for the size the frames MEASURE at.
+
+    Never falls back to another resolution and never rescales: a
+    calibration wrong by a crop factor produces a plausible trajectory
+    that is wrong, which is the worst failure available. A miss returns
+    `unknown()` and the run proceeds exactly as an uncalibrated Tower has
+    always proceeded -- but it now says so, loudly, at the top of the log.
+    """
+    if observed_size is None:
+        known = store.list_resolutions()
+        logger.warning(
+            "[Tower][WorldBuilder] could not observe the frame resolution of "
+            "this %s source, so no calibration was looked up. Intrinsics stay "
+            "unknown: expect the unposed backend, 0 poses and 0 points. "
+            "Calibrations on file: %s",
+            frame_source,
+            ", ".join(f"{w}x{h}" for w, h in known) or "none",
+        )
+        return CameraIntrinsics.unknown()
+
+    width, height = observed_size
+    intrinsics = store.lookup(width, height)
+    if intrinsics.is_known:
+        return intrinsics
+
+    # The store already logged where it looked. This line adds what the
+    # operator can DO about it, and is the answer to the question the
+    # 2026-08-24 walk could not answer: "why is there no geometry?"
+    known = store.list_resolutions()
+    logger.warning(
+        "[Tower][WorldBuilder] NO CALIBRATION for the observed %sx%s frames "
+        "(looked for %s). Intrinsics stay unknown, so the unposed backend "
+        "runs and this session will produce 0 poses and 0 points. "
+        "Calibrations on file: %s. Fix: see docs/CALIBRATION.md and run "
+        "scripts/calibrate_charuco.py on board views captured at %sx%s.",
+        width,
+        height,
+        store.path_for(width, height),
+        ", ".join(f"{w}x{h}" for w, h in known) or "none",
+        width,
+        height,
+    )
+    return CameraIntrinsics.unknown()
 
 
 def follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls):
@@ -151,7 +244,12 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--intrinsics",
         type=Path,
-        help="JSON file holding a CameraIntrinsics record.",
+        help=(
+            "JSON file holding a CameraIntrinsics record. Overrides the "
+            "intrinsics store. Normally unnecessary: a calibration written "
+            "by calibrate_charuco.py is discovered automatically from "
+            "<root>/intrinsics/ by the observed frame resolution."
+        ),
     )
     parser.add_argument("--backend", choices=BACKEND_NAMES, default=BACKEND_AUTO)
     parser.add_argument("--format", choices=("text", "json"), default="text")
@@ -216,6 +314,9 @@ def main(argv=None) -> int:
     if args.rebuild_every < 0:
         parser.error("--rebuild-every must not be negative")
 
+    # Keyed by the resolution frames MEASURE at, never by --width/--height.
+    intrinsics_store = IntrinsicsStore(args.root)
+
     capture_id = None
     if args.follow_capture:
         frames = follow_capture(
@@ -223,12 +324,16 @@ def main(argv=None) -> int:
             poll_seconds=args.poll_seconds,
             max_idle_polls=args.max_idle_polls,
         )
-        intrinsics = CameraIntrinsics.unknown()
         frame_source = "live-capture"
         capture_id = args.follow_capture.name
         # The sender chooses the stream size and DAT may change it
         # mid-walk. This process measures each frame; it declares nothing.
         declared_size = None
+        intrinsics = resolve_intrinsics(
+            intrinsics_store,
+            observed_size_from_capture(args.follow_capture),
+            frame_source=frame_source,
+        )
     elif args.synthetic:
         frames, intrinsics = synthetic_frames(
             args.synthetic_frames, args.width, args.height
@@ -238,15 +343,33 @@ def main(argv=None) -> int:
         declared_size = (args.width, args.height)
     else:
         frames = load_frames(args.frames)
-        intrinsics = CameraIntrinsics.unknown()
         frame_source = "recorded-capture"
         # A directory of jpegs whose size was decided by whatever wrote
         # them. Measured per keyframe, not declared here.
         declared_size = None
+        intrinsics = resolve_intrinsics(
+            intrinsics_store,
+            observed_size_from_frames(args.frames),
+            frame_source=frame_source,
+        )
 
+    # An explicit file always wins over the store: it is the escape hatch
+    # for a calibration that lives elsewhere, and for reproducing an old
+    # build against the intrinsics it originally used. Unlike the store
+    # this does NOT check the observed resolution -- the engine's
+    # `_require_matching_resolution` does, per keyframe, and a hard
+    # failure is the right answer when an operator names a file by hand.
     if args.intrinsics:
         intrinsics = camera_intrinsics_from_json_dict(
             json.loads(args.intrinsics.read_text(encoding="utf-8"))
+        )
+        logger.info(
+            "[Tower][WorldBuilder] using --intrinsics %s (source=%s, %sx%s), "
+            "overriding the intrinsics store",
+            args.intrinsics,
+            intrinsics.source,
+            intrinsics.calibrated_width,
+            intrinsics.calibrated_height,
         )
 
     store = WorldStore(args.root)

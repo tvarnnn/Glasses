@@ -152,6 +152,13 @@ depth, no stereo. Structure comes from triangulation between keyframes.
 - A world with **more than one segment** stays `unknown`, because segments
   do not share a coordinate frame.
 
+**Calibrating the camera will not change any of this.** Intrinsics are
+what unlock *poses*; they say nothing about how large the world is. A
+calibrated monocular reconstruction is still internally consistent in an
+arbitrary unit, so `docs/CALIBRATION.md` states plainly that metric scale
+remains out of reach afterwards. Expecting metres to arrive with the
+first calibration is the obvious misreading, and it is wrong.
+
 **Never render any figure from this system in metres.** `format_distance`
 is the single choke point and refuses.
 
@@ -336,7 +343,43 @@ world instead of the live one. That is the Tower half of iOS's
    auto-exposure, real motion blur, real texture. The renderer is a
    perfect pinhole.
 2. **Whether calibration works at all** — `calibrate_charuco.py` has never
-   seen a printed board.
+   seen a printed board. **This is the single highest-value physical
+   action available**, and it is what stands between this system and
+   geometry: the 2026-08-24 walk produced 0 poses and 0 points purely
+   because `intrinsics.source == "unknown"`.
+
+   **The plumbing around it is now closed, and only the physical act
+   remains.** `tower/world_builder/intrinsics_store.py` is a
+   resolution-keyed store at `<world_root>/intrinsics/<w>x<h>.json`.
+   `calibrate_charuco.py` writes there by default, and
+   `world_build_session.py` looks there automatically using the
+   **observed** frame size — the capture journal's `width`/`height` for
+   `--follow-capture`, the first jpeg's header for `--frames`. Since the
+   Tower already passes `--root <TOWER_WORLD_ROOT>` to every follower it
+   spawns (`tower/main.py`), a calibration lands where the builder finds
+   it with **no operator flag on either end**. A miss returns
+   `CameraIntrinsics.unknown()` and logs the resolution, the path it
+   checked and the calibrations that do exist; behaviour on a miss is
+   otherwise byte-for-byte what it is today.
+
+   The store **never rescales**. A 480×360 calibration does not satisfy a
+   360×640 lookup, and a record whose filename and contents disagree is
+   refused — `scales_linearly_across_resolutions` is `null` and DAT's
+   resize-versus-crop behaviour is unestablished.
+
+   **The physical procedure is written down**: `docs/CALIBRATION.md` —
+   which board, how to verify the print, how many views at what tilts,
+   how to capture them through the glasses at the real 360×640 stream,
+   the exact command, and how to tell a good calibration from a bad one
+   that scored well. Two things there were measured rather than repeated:
+   a **uniform** print-scale error does not affect `fx` at all
+   (bit-identical result at 25% larger and 50% smaller), while a **10%
+   anisotropic** stretch costs 12% `fx` error at an unremarkable 0.67 px
+   RMS. `--split-half` was added to `calibrate_charuco.py` as the quality
+   check RMS cannot be: 0.31% and 1.94% spread on well-varied synthetic
+   sets against 4.55% on a marginal one whose RMS was indistinguishable.
+
+   Still synthetic, all of it. Nothing here has met a printed board.
 3. **Whether the delivered resolution supports reconstruction.** All
    figures here are 640×360 renders.
 4. ~~**Whether a real walk segments.**~~ **Settled, 2026-08-24.** It
