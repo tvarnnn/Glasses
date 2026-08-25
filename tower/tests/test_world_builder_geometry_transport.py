@@ -127,3 +127,75 @@ def test_a_frozen_segment_keeps_its_hash_when_a_later_segment_is_added(
 def test_a_missing_world_yields_none(derived_world):
     store, _, session_id = derived_world
     assert build_manifest(store, "nope", session_id) is None
+
+
+from tower.results.world_builder_geometry import build_segment
+
+
+def test_a_chunk_carries_poses_in_file_order(derived_world):
+    store, world_id, session_id = derived_world
+    chunk = build_segment(store, world_id, session_id, 0)
+
+    assert [p["status"] for p in chunk["poses"]] == ["anchor", "solved"]
+    assert chunk["segment_index"] == 0
+    assert chunk["registered"] is False
+
+
+def test_a_refused_pose_reaches_the_chunk_as_null(derived_world):
+    """The viewer must draw a break, not a line through a gap."""
+    store, world_id, session_id = derived_world
+    chunk = build_segment(store, world_id, session_id, 1)
+
+    refused = [p for p in chunk["poses"] if p["status"] == "unavailable"]
+    assert refused[0]["translation"] is None
+    assert refused[0]["degeneracy"] == "low_parallax"
+
+
+def test_points_are_bare_triples_not_tagged_rows(derived_world):
+    """The chunk already names its segment, so per-row tagging is redundant."""
+    store, world_id, session_id = derived_world
+    chunk = build_segment(store, world_id, session_id, 0)
+
+    assert chunk["points"] == [[1.0, 2.0, 3.0], [-1.0, 0.0, 5.0]]
+
+
+def test_an_unsampled_chunk_says_so(derived_world):
+    store, world_id, session_id = derived_world
+    chunk = build_segment(store, world_id, session_id, 0)
+
+    assert chunk["points_sent"] == 2
+    assert chunk["points_total"] == 2
+    assert chunk["point_sampling"] == "none"
+
+
+def test_sampling_never_lets_a_partial_cloud_look_whole(derived_world):
+    store, world_id, session_id = derived_world
+    chunk = build_segment(store, world_id, session_id, 0, max_points=1)
+
+    assert chunk["points_sent"] == 1
+    assert chunk["points_total"] == 2
+    assert chunk["point_sampling"] == "stride"
+    assert len(chunk["points"]) == 1
+
+
+def test_a_chunks_hash_matches_the_manifests_hash(derived_world):
+    """Otherwise the client's cache key never matches what it fetched."""
+    store, world_id, session_id = derived_world
+    manifest = build_manifest(store, world_id, session_id)
+    chunk = build_segment(store, world_id, session_id, 0)
+
+    assert chunk["content_hash"] == manifest["segments"][0]["content_hash"]
+
+
+def test_a_sampled_chunk_keeps_the_unsampled_hash(derived_world):
+    """The hash identifies the SEGMENT, not the transfer."""
+    store, world_id, session_id = derived_world
+    full = build_segment(store, world_id, session_id, 0)
+    sampled = build_segment(store, world_id, session_id, 0, max_points=1)
+
+    assert sampled["content_hash"] == full["content_hash"]
+
+
+def test_an_unknown_segment_yields_none(derived_world):
+    store, world_id, session_id = derived_world
+    assert build_segment(store, world_id, session_id, 99) is None

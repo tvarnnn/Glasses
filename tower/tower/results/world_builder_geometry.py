@@ -150,3 +150,63 @@ def build_manifest(store, world_id: str, session_id: str) -> dict | None:
         "segment_count": len(segments),
         "segments": segments,
     }
+
+
+def build_segment(
+    store, world_id: str, session_id: str, segment_index: int,
+    max_points: int | None = None,
+) -> dict | None:
+    """One segment's geometry, in its own frame.
+
+    `max_points` exists so a budget lever is available without a contract
+    change. It defaults to unlimited: the largest segment on the real walk
+    is 3,033 points, and because a closed segment is fetched exactly once
+    that is a one-time cost rather than a per-revision one.
+    """
+    read = _read(store, world_id, session_id)
+    if read is None:
+        return None
+    _, _, grouped = read
+    if segment_index not in grouped:
+        return None
+
+    poses = grouped[segment_index]["poses"]
+    points = grouped[segment_index]["points"]
+    # Hash the WHOLE segment before sampling: the hash identifies the
+    # segment, not this transfer, so a client that sampled once and
+    # refetches in full must not see a changed identity.
+    content_hash = segment_content_hash(poses, points)
+
+    total = len(points)
+    sampling = "none"
+    sent = points
+    if max_points is not None and total > max_points:
+        # Stride rather than head: a prefix of a point cloud is a corner of
+        # the room, and would read as a smaller world rather than a
+        # coarser one.
+        stride = max(1, total // max_points)
+        sent = points[::stride][:max_points]
+        sampling = "stride"
+
+    return {
+        "contract": GEOMETRY_CONTRACT,
+        "segment_index": segment_index,
+        "content_hash": content_hash,
+        "frame_id": f"segment:{segment_index}",
+        "registered": False,
+        "transform_to_world": None,
+        "poses": [
+            {
+                "keyframe_id": p["keyframe_id"],
+                "status": p["status"],
+                "degeneracy": p["degeneracy"],
+                "rotation": p["rotation"],
+                "translation": p["translation"],
+            }
+            for p in poses
+        ],
+        "points": [p["xyz"] for p in sent],
+        "points_sent": len(sent),
+        "points_total": total,
+        "point_sampling": sampling,
+    }
