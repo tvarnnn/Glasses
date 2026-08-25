@@ -483,7 +483,7 @@ result that claims `matched` while carrying no documents — it coerces to
 document.** A document is often the most sensitive thing a wearer looks
 at — `06-PRIVACY-DATA.md:80` names documents, screens, IDs, financial
 information and private communications as a standing risk of the input
-modality, and `guidelines/docs/modules/DOCUMENT-MEMORY.md:185-187` says
+modality, and `guidelines/docs/modules/DOCUMENT-MEMORY.md:185-188` says
 the same in the module's own words: these appear "as literal readable
 text, and a document's whole point is to be read."
 
@@ -515,7 +515,7 @@ all (`engine.py:140-143`, `records.py:162-163`). So:
    the imagery rule is not silently extended or silently ignored.
 4. `retains_raw_imagery` is a permanent property of the record. It is
    `false` today because page images are opt-in and off
-   (`engine.py:140-143`, `scripts/document_memory_session.py:85-91`), and
+   (`engine.py:140-143`, `scripts/document_memory_session.py:84-91`), and
    a build that flips the default flips a privacy property of every
    record it writes.
 
@@ -578,7 +578,7 @@ be told apart.
 
 **(b) A text source meaning "no recogniser ran".** The driver offers
 `--ocr none`, described as "honest about having read nothing rather than
-pretending" (`scripts/document_memory_session.py:70-77`) — but it is
+pretending" (`scripts/document_memory_session.py:69-78`) — but it is
 implemented as a `FixedTextRecogniser` with no pages, which returns
 `OcrResult(text="")` and `region_count == 0`, which is **byte-identical
 on the record to EasyOCR looking at a page and finding nothing**. Those
@@ -607,7 +607,7 @@ today with no iOS change at all**, because the frame dimensions are
 already on the wire and already in the journal.
 
 **A version note that is not obvious.** `store.read_all()` skips any
-record whose `schema_version != SCHEMA_VERSION` (`store.py:129-137`). So
+record whose `schema_version != SCHEMA_VERSION` (`store.py:132-140`). So
 a bump is not a migration — it is a data-loss event for everything
 already written. Additive optional fields read with `.get()` defaults do
 **not** need a bump and must not get one. Separately: because
@@ -664,7 +664,7 @@ valuable:
 - *Registering it as a production module* is blocked at the same
   V1.0/V1.1 boundary as World Builder, and 1.2 s of OCR could not sit on
   the event loop even if a slot were free
-  (`DOCUMENT-MEMORY.md:231-239`).
+  (`DOCUMENT-MEMORY.md:231-240`).
 - *Thumbnails* need an artifact fetch contract neither side has designed,
   and would arrive with `redaction: "none"`, which iOS withholds.
 
@@ -943,7 +943,7 @@ branches in order.
 ### 5.1 Status (EXISTS)
 
 **PLANNED. No code exists under `tower/`.**
-`guidelines/docs/modules/ENVIRONMENTAL-MEMORY.md:3-5`. Its neighbour is
+`guidelines/docs/modules/ENVIRONMENTAL-MEMORY.md:5`. Its neighbour is
 built and the boundary is drawn sharply in that same document:
 
 > Scene Understanding deliberately **persists nothing** — no store, no
@@ -957,7 +957,7 @@ And the document names itself the highest privacy exposure of the current
 module set, with a hard precondition: it "must not begin real data
 collection until the retention/deletion policy in `06-PRIVACY-DATA.md` is
 actually implemented for this module, not merely documented"
-(`ENVIRONMENTAL-MEMORY.md:20`).
+(`ENVIRONMENTAL-MEMORY.md:21`).
 
 ### 5.2 The question, decomposed
 
@@ -966,7 +966,7 @@ actually implemented for this module, not merely documented"
 | Claim | Available? |
 |---|---|
 | **"earlier"** — a time | **Yes**, exactly, as Tower-receipt time (§1.1) |
-| **"was in"** — presence of a thing | **Partially.** Document Memory produces text observations today. Scene Understanding detects and tracks but persists nothing, deliberately. Object Memory has a record type but no producer — Tasks 4–8 are blocked at a user ruling (`2026-08-25-object-memory-spatial-context.md:196-198`) |
+| **"was in"** — presence of a thing | **Partially.** Document Memory produces text observations today. Scene Understanding detects and tracks but persists nothing, deliberately. Object Memory has a record type but no producer — Tasks 4–8 are blocked at a user ruling (`2026-08-25-object-memory-spatial-context.md:201-204`) |
 | **"this room"** — a place identity | **No.** §1.2. Not weakly; not at all |
 
 The third one is the whole difficulty, and the temptation is to find a
@@ -981,11 +981,11 @@ Numbered because each is a refusal I would defend individually.
 1. **It must not claim to localise.** No room, no place, no location, no
    "here" — not in output, not in a field name, not in a docstring. The
    Object Memory plan already committed to this refusal
-   (`2026-08-25-object-memory-spatial-context.md:684-685`) and it applies
+   (`2026-08-25-object-memory-spatial-context.md:678-679`) and it applies
    with more force here, because this module's name invites it.
 
 2. **It must not answer `what_changed(location_or_context)`.**
-   `ENVIRONMENTAL-MEMORY.md:100` lists it among the candidate retrieval
+   `ENVIRONMENTAL-MEMORY.md:113` lists it among the candidate retrieval
    interfaces, and it is the single most dangerous API in that list. It
    is a **two-sided claim** — "X was here, and now it is not" — where
    only one side is observable. The module's own Failure Behavior section
@@ -1007,7 +1007,7 @@ Numbered because each is a refusal I would defend individually.
 
 4. **It must not be a raw archive.** `06-PRIVACY-DATA.md:37`: continuous
    raw video should not be retained by default.
-   `ENVIRONMENTAL-MEMORY.md:33`: "This is not intended to be a raw
+   `ENVIRONMENTAL-MEMORY.md:37`: "This is not intended to be a raw
    surveillance archive." Note that a `TEXT_SEEN` event for every sign
    the wearer walks past, at ~12 fps, is a surveillance archive with
    better compression. **The relevance/novelty filter is a V1 requirement,
@@ -1039,9 +1039,9 @@ Numbered because each is a refusal I would defend individually.
    (`object_memory/records.py:88`).
 
 9. **It must not persist people.** No biometric identity features
-   (`ENVIRONMENTAL-MEMORY.md:167`), and the `person` ruling is already
+   (`ENVIRONMENTAL-MEMORY.md:160`), and the `person` ruling is already
    open and unresolved on Object Memory
-   (`2026-08-25-object-memory-spatial-context.md:689-693`). An
+   (`2026-08-25-object-memory-spatial-context.md:682-688`). An
    environmental memory sharpens the stakes rather than softening them:
    "who was around, where, and when" is a materially different privacy
    object than a list of furniture.
@@ -1049,7 +1049,7 @@ Numbered because each is a refusal I would defend individually.
 10. **It must not offer a wire contract before it has a consumer.**
     Building a transport for a consumer that does not exist is the
     fabricated contract this project refuses
-    (`2026-08-25-object-memory-spatial-context.md:621-625`).
+    (`2026-08-25-object-memory-spatial-context.md:615-620`).
 
 ### 5.4 Making the gaps visible is a data-shape requirement
 
@@ -1074,7 +1074,7 @@ and an answer that says "I was not looking for 105 of those 435 seconds"
 is a fundamentally different object from one that does not.
 
 This is the same instinct as `pages_total: null` with a note
-(`retrieval.py:237-241`) and `frames_observed: null` while live
+(`retrieval.py:236-241`) and `frames_observed: null` while live
 (`CARTRIDGE-RESULTS.md` §10.1): report the shape of what you did not see,
 in the same breath as what you did.
 
@@ -1095,7 +1095,7 @@ window** — never a room, never a place, never a location. Call it a
   chain (`:75`). This is the same posture the Object Memory plan settled
   on for `(capture_id, source_seq)`: "two cartridges agreeing on a frame
   identity that a third, shared component defines is not cross-cartridge
-  coupling" (`2026-08-25-object-memory-spatial-context.md:236-240`).
+  coupling" (`2026-08-25-object-memory-spatial-context.md:235-240`).
 - It **makes no spatial claim**, which is its whole virtue. It cannot be
   misread as a room because it is a property of a socket.
 - It is **already recorded by the cartridge that would use it**:
@@ -1121,7 +1121,7 @@ window** — never a room, never a place, never a location. Call it a
   lineage structure of historical data changes retroactively when
   recomputed — the same instability that made the Object Memory plan
   refuse to *persist* `segment_index`
-  (`2026-08-25-object-memory-spatial-context.md:568-578`).
+  (`2026-08-25-object-memory-spatial-context.md:566-574`).
 - **The alternative — a bare time window with no place at all — is
   simpler and almost as good.** "What did I see between 14:02 and 14:20"
   needs no lineage, no manifest scan, and no new concept.
@@ -1161,12 +1161,12 @@ Roughly 40 lines and it belongs to transport, not to memory.
 **Part B — `scripts/what_was_observed.py`.** A composition layer, in
 `scripts/`, which is outside the import rules' scan root
 (`tests/test_architecture_boundaries.py:12`) and is the sanctioned place
-for a pairing (`2026-08-25-object-memory-spatial-context.md:583-591`). It
+for a pairing (`2026-08-25-object-memory-spatial-context.md:577-585`). It
 may import `tower.capture` and `tower.document_memory.retrieval`, and
 later `tower.object_memory`. It:
 
 1. takes a time window (`--since`, `--until`, or `--minutes-ago N
-   --window M`, matching `scripts/document_query.py:54-65`);
+   --window M`, matching `scripts/document_query.py:55-66`);
 2. asks Document Memory `around(when, window_seconds)`
    (`retrieval.py:142`) — no new retrieval code;
 3. computes coverage from Part A;
@@ -1174,7 +1174,7 @@ later `tower.object_memory`. It:
    refuses in the module's own voice when there are none: *"No record of
    observing anything in that window. That is a statement about what was
    captured, not about the world."* — the wording
-   `scripts/document_query.py:164-165` already uses.
+   `scripts/document_query.py:170-171` already uses.
 
 **Data shape.** No new store. No new record type. No new namespace. The
 answer is computed and discarded.
@@ -1243,7 +1243,7 @@ moves.
 
 **Why Document Memory does not gain a World Builder link.** It already
 declined one, with two reasons that both still hold
-(`DOCUMENT-MEMORY.md:207-215`): it must not import World Builder, and —
+(`DOCUMENT-MEMORY.md:206-215`): it must not import World Builder, and —
 the better reason — "World Builder's blur and motion gates would reject
 exactly the frames this cartridge wants. A held-still, high-detail view
 of a page has near-zero parallax and is `insufficient_motion` to a
@@ -1309,7 +1309,7 @@ Steps 0–5 and 8 need no hardware, no models and no rulings.
    Memory and World Builder would both want to. Following is read-only,
    so it ought to work, but nothing tests it and nothing documents it.
    Carried over unresolved from
-   `2026-08-25-object-memory-spatial-context.md:713-716`.
+   `2026-08-25-object-memory-spatial-context.md:709-713`.
 
 7. **Should `DocumentObservation` record the capture lineage root
    alongside `capture_id`?** §5.5 argues the lineage must be computed at
@@ -1318,9 +1318,9 @@ Steps 0–5 and 8 need no hardware, no models and no rulings.
    it, so the question is only about caching. I lean no.
 
 8. **What retention window is right for document text?** 30 days is the
-   driver's default (`scripts/document_memory_session.py:79-83`) and it
+   driver's default (`scripts/document_memory_session.py:78-83`) and it
    was chosen so that "forever" had to be selected rather than inherited
-   (`store.py:47-53`). It has never been reviewed against what a person
+   (`store.py:42-48`). It has never been reviewed against what a person
    would actually want for the most sensitive class of data on the
    platform, and it should be, before the first real document is stored.
 
