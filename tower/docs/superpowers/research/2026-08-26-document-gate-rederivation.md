@@ -311,3 +311,37 @@ or any iOS file.
 Full suite on the tree this is committed to: **1468 passed, 30 skipped,
 0 failed** (242 s), up from 1444/30/0 — the 24 new tests are the corpus
 guard.
+
+---
+
+## Controller verification: the rejected real screens are genuinely unreadable
+
+§2(a) is careful to say the 13 real-screen crops carry no transcript, so
+nothing there is a recall measurement — the case that they are unreadable
+rested on the pixel argument (glyphs ~2 px tall, gone before Otsu).
+
+That inference is now measured. EasyOCR 1.7.2 on CUDA, run over the full
+**unmodified** frames — no crop, no resize, no polarity flip, so the
+detector's own preprocessing cannot be blamed:
+
+| frame | shape | raw text regions | conf >= 0.5 |
+|---|---|---|---|
+| `b901bc…/3055` (the machine-proposed one) | 640x360 | **0** | 0 |
+| `341b0f…/251` | 640x360 | **0** | 0 |
+| `68a7c7…/1` | 640x360 | **0** | 0 |
+| `b1ab1d…/869` | 640x360 | **0** | 0 |
+
+**Zero raw detections** — not low-confidence output, not garbage strings.
+EasyOCR does not locate a single text region in frames where a human
+confirms a screen full of text.
+
+So the content this gate rejects at 0–2 transitions is content the
+recogniser cannot read either. The gate discards nothing that was
+recoverable, and the inverted ordering in §2(a) is not a threshold bug —
+**both statistics are reporting the same physical fact: at 360x640 the
+glyphs are not there.**
+
+This narrows what the cartridge is blocked on. It is not the gate, and it
+is not OCR quality. It is pixels on the glyph, which is why
+`2026-08-26-document-memory-reality-check.md` points at a higher-resolution
+still rather than at tuning.
