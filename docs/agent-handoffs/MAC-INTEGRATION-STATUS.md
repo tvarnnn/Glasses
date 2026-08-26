@@ -206,8 +206,50 @@ Found from the Mac side, verified in Tower source, **not fixed here** —
 
 ## 7. Physical validation
 
-**DONE:** app built, signed, installed and launched on the physical iPhone
-16 Pro; DAT registration; Ray-Bans discovered; live Tower connection.
+**DONE, and this session moved the line.** App built, signed, installed and
+launched on the physical iPhone 16 Pro against the live Tower. Clean run, no
+crash. Full console, in order:
+
+```
+[Glasses][Init] GlassesConnection created                    <- exactly one
+[Glasses][Tower] connection attempt: ws://100.110.156.55:8000/ws
+[Glasses][Registration] state changed: RegistrationState(rawValue: 3)
+[Glasses][Devices] devicesStream changed: count=0 ids=[]
+[Glasses][CameraPermission] check failed: No wearable devices ... discovered
+[Glasses][Devices] devicesStream changed: count=1 ids=["5161af8f...ec"]
+[Glasses][Tower] ping sent / pong validated                  <- pong still first
+[Glasses][Tower] receive loop started
+[Glasses][Tower] cartridges sent                             <- after the pong
+[Glasses][Tower] cartridges declared: world_builder/status available=true
+[Glasses][Tower] result_subscribe(world_builder) sent
+[Glasses][Tower] result_subscribed: sub-1 world_builder/status
+[Glasses][Tower] cartridge_result: ... seq=1 revision=a124493a48ee4b29 coalesced=0
+[Glasses][WorldBuilder] finalized keyframes=2 tracking=Good scale=Relative
+                        calibration=Calibrated geometry=95 poses=2 anchors=1
+                        segments=1 binding=none
+[Glasses][Camera] activeDeviceStream changed: Optional("5161af8f...ec")
+                        (hasActiveDevice=true)
+[Glasses][CameraPermission] checkPermissionStatus -> granted
+```
+
+**Two things here are new, and both matter.**
+
+- **The glasses are powered on and the camera is authorised.** Every earlier
+  handoff recorded them as "discovered, powered off"; the state machine ran all
+  the way through `count=0` → `count=1` → `hasActiveDevice=true` →
+  `PermissionStatus.granted`. The console also shows iOS attaching
+  `Ray-Ban Meta (Gen 2) - 37418056` as an ExternalAccessory before DAT reports
+  the device, so the two layers agree.
+- **The phone received a real world, not `idle`.** `finalized`, 2 keyframes,
+  tracking Good, **calibration Calibrated**, 95 geometry elements. The status
+  path end-to-end — declare, subscribe, decode, render — ran on hardware
+  against a Tower serving real data.
+
+The Tower is armed and not recording (`capture.armed: true,
+recording: false`), so nothing is mid-session and a walk can start clean.
+
+**This is the closest the program has been to P3.** Everything upstream of a
+wearer is now confirmed working on the actual device.
 
 **PENDING, and every one needs a wearer:**
 
@@ -219,8 +261,8 @@ Found from the Mac side, verified in Tower source, **not fixed here** —
 | Sender FPS against the physical baseline | a live stream, to measure encode/backlog headroom |
 | Frames from the real camera reaching the Tower | glasses powered on |
 
-**The single next physical action remains: power on the glasses.** Everything
-downstream of it is built, installed, running and connected.
+**The single next physical action is no longer "power on the glasses" — they
+are on.** It is: open the app, press Start, and walk. See §9.
 
 ---
 
