@@ -16,12 +16,17 @@ the score is reported alongside the count so a consumer can see how thin
 the evidence is. Nothing here establishes identity, and nothing persists.
 """
 
+import logging
+
 import cv2
 import numpy as np
 
 from tower.experiments import ExperimentResult, ExperimentSettings
 from tower.instrumentation import StageTimer
+from tower.loading import LoadInvalidation
 from tower.modules.base import FrameProcessingError
+
+logger = logging.getLogger(__name__)
 
 # Below this a COCO detection from a mobile-class detector is noise more
 # often than not. Reported as a metric so the choice stays visible, and
@@ -42,6 +47,16 @@ class ObjectDetectionExperiment:
         self._transform = None
         self._device = None
         self._categories = None
+        # Guards the handover from a load that may have been abandoned by
+        # the module's load timeout. See tower/loading.py.
+        self._invalidation = LoadInvalidation()
+
+    def _install(self, model, transform, categories, device) -> None:
+        """Hand the loaded model to `self`. Runs under the token's lock."""
+        self._model = model
+        self._transform = transform
+        self._categories = categories
+        self._device = device
 
     def load(self, settings: ExperimentSettings | None = None) -> None:
         # Local imports: torch/torchvision are an optional [ml] extra, and
@@ -58,18 +73,45 @@ class ObjectDetectionExperiment:
         weights = SSDLite320_MobileNet_V3_Large_Weights.COCO_V1
         model = ssdlite320_mobilenet_v3_large(weights=weights)
         model.eval()
-        self._device = torch.device(device)
-        model.to(self._device)
-        self._model = model
-        self._transform = weights.transforms()
-        self._categories = list(weights.meta["categories"])
+        # Locals until the very last line, then installed through the
+        # invalidation token. This runs on a worker thread so that the
+        # module's load timeout can actually bound the weight download --
+        # and a timeout ABANDONS this thread rather than stopping it, so
+        # `release()` may already have run by the time we get here.
+        # Assigning `self._model` directly would hand a live model, and on
+        # CUDA resident GPU memory, to a FAILED module that will never be
+        # released again.
+        torch_device = torch.device(device)
+        model.to(torch_device)
+        if not self._invalidation.publish(
+            lambda: self._install(
+                model,
+                weights.transforms(),
+                list(weights.meta["categories"]),
+                torch_device,
+            )
+        ):
+            del model
+            if torch_device.type == "cuda":
+                torch.cuda.empty_cache()
+            logger.warning(
+                "[Tower][Module] object detection weights finished loading "
+                "after the module was released; discarded"
+            )
 
-    def release(self) -> None:
-        was_cuda = self._device is not None and self._device.type == "cuda"
+    def _clear(self) -> None:
+        """Forget everything the load installed. Runs under the token's lock."""
         self._model = None
         self._transform = None
         self._categories = None
         self._device = None
+
+    def release(self) -> None:
+        was_cuda = self._device is not None and self._device.type == "cuda"
+        # Invalidate and clear as one critical section: clearing first
+        # would leave a window in which an abandoned loader installs into
+        # a slot that has just been emptied.
+        self._invalidation.invalidate(self._clear)
         if was_cuda:
             import torch
 

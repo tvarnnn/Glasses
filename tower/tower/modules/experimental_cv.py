@@ -1,3 +1,5 @@
+import asyncio
+
 from tower.experiments import EXPERIMENTS, ExperimentResult, ExperimentSettings
 from tower.modules.base import Module, ModuleDataBehavior, ModuleDescriptor
 
@@ -56,7 +58,25 @@ class ExperimentalCVModule(Module):
                     f"available: {sorted(EXPERIMENTS)}"
                 )
             self._experiment = factory()
-        self._experiment.load(self._settings)
+        # On a thread, not inline, and this is the only reason the
+        # container's load timeout means anything. `asyncio.wait_for` can
+        # cancel only at an await point; `experiment.load()` for a
+        # model-backed experiment is a torch import, a weight download and
+        # a `.to(device)`, none of which yield one. Called inline, a
+        # stalled download hangs the event loop -- the whole Tower, every
+        # websocket -- for as long as it takes, with a 120 s timer
+        # watching and unable to act.
+        #
+        # Deliberately in this module rather than in `Module.load()`:
+        # moving every module's `_do_load` off-thread changes the
+        # execution model of the shared lifecycle contract, and V1.1 owns
+        # lifecycle hardening. See the 2026-08-26 ruling in
+        # docs/superpowers/plans/2026-08-20-object-memory-first-slice.md.
+        #
+        # Read into a local first: a timeout marks the module FAILED and
+        # clears `self._experiment` while this call is still in flight.
+        experiment = self._experiment
+        await asyncio.to_thread(experiment.load, self._settings)
 
     async def _do_start(self) -> None:
         return None

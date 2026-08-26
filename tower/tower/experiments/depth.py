@@ -6,6 +6,7 @@ import numpy as np
 
 from tower.experiments import ExperimentResult, ExperimentSettings, decode_color
 from tower.instrumentation import StageTimer
+from tower.loading import LoadInvalidation
 from tower.modules.base import FrameProcessingError
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,15 @@ class DepthEstimation:
         # a growing list, so enabling it cannot grow without bound.
         self.capture_depth_array = capture_depth_array
         self.last_depth_array = None
+        # Guards the handover from a load that may have been abandoned.
+        # See tower/loading.py for the ordering bug this exists for.
+        self._invalidation = LoadInvalidation()
+
+    def _install(self, model, transform, device) -> None:
+        """Hand the loaded model to `self`. Runs under the token's lock."""
+        self._model = model
+        self._transform = transform
+        self._device = device
 
     def load(self, settings: ExperimentSettings | None = None) -> None:
         device = resolve_device(
@@ -64,25 +74,51 @@ class DepthEstimation:
         # nothing outside a depth-selected module may require it.
 
         start = time.perf_counter()
-        self._device = torch.device(device)
+        # Built into LOCALS, installed onto `self` only at the end and
+        # only through the invalidation token. This load runs on a worker
+        # thread now (see ExperimentalCVModule._do_load), and a timeout
+        # abandons that thread rather than stopping it: by the time these
+        # lines run, `release()` may already have happened. Assigning
+        # `self._model` directly -- as this method used to -- installs a
+        # live model, and on CUDA resident GPU memory, into a FAILED
+        # module that nothing will ever release again.
+        torch_device = torch.device(device)
         # Pinned: floating on the default branch is a reproducibility risk
         # for a measured baseline, not theoretical -- see the spec's
         # 2026-08-20 Amendment for how this was discovered.
         midas_ref = "intel-isl/MiDaS:454597711a62eabcbf7d1e89f3fb9f569051ac9b"
-        self._model = torch.hub.load(midas_ref, "MiDaS_small", trust_repo=True)
-        self._model.to(self._device)
-        self._model.eval()
-        self._transform = torch.hub.load(
+        model = torch.hub.load(midas_ref, "MiDaS_small", trust_repo=True)
+        model.to(torch_device)
+        model.eval()
+        transform = torch.hub.load(
             midas_ref, "transforms", trust_repo=True
         ).small_transform
         load_ms = (time.perf_counter() - start) * 1000
 
-        if self._device.type == "cuda":
+        if not self._invalidation.publish(
+            lambda: self._install(model, transform, torch_device)
+        ):
+            # Abandoned mid-load. This thread holds the only reference
+            # left, so this thread frees it -- nobody is coming back.
+            del model, transform
+            if torch_device.type == "cuda":
+                torch.cuda.empty_cache()
+            logger.warning(
+                "[Tower][Module] depth model finished loading after %.1fms "
+                "but the module had already been released; discarded",
+                load_ms,
+            )
+            return
+
+        # `torch_device`, not `self._device`: a release racing this log
+        # line would leave the attribute None, and a crash while logging a
+        # success is a silly way to fail a load that worked.
+        if torch_device.type == "cuda":
             allocated_mb = torch.cuda.memory_allocated() / (1024 * 1024)
             logger.info(
                 "[Tower][Module] depth model loaded on %s in %.1fms "
                 "(torch %s, cuda runtime %s, %.1fMB allocated)",
-                self._device,
+                torch_device,
                 load_ms,
                 torch.__version__,
                 torch.version.cuda,
@@ -91,10 +127,17 @@ class DepthEstimation:
         else:
             logger.info(
                 "[Tower][Module] depth model loaded on %s in %.1fms (torch %s)",
-                self._device,
+                torch_device,
                 load_ms,
                 torch.__version__,
             )
+
+    def _clear(self) -> None:
+        """Forget everything the load installed. Runs under the token's lock."""
+        self._model = None
+        self._transform = None
+        self._device = None
+        self.last_depth_array = None
 
     def release(self) -> None:
         is_cuda = self._device is not None and self._device.type == "cuda"
@@ -103,10 +146,11 @@ class DepthEstimation:
 
             peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
 
-        self._model = None
-        self._transform = None
-        self._device = None
-        self.last_depth_array = None
+        # Invalidate and clear together, under the token's lock. Clearing
+        # first and invalidating afterwards would leave the exact window
+        # this is here to close: a loader that passed the check installs
+        # into a slot that has just been emptied.
+        self._invalidation.invalidate(self._clear)
 
         if is_cuda:
             torch.cuda.empty_cache()

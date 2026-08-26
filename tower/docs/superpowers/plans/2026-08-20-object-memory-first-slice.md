@@ -891,9 +891,56 @@ defensible fallback if the user would rather ship the module now and
 treat weight pre-provisioning as a documented operational step. This is
 the user's call.
 
-- [ ] **Step 1: Obtain and record the user's ruling** in this file, with
+- [x] **Step 1: Obtain and record the user's ruling** in this file, with
       date and reasoning, before proceeding.
-- [ ] **Step 2: Implement the chosen option**, then continue to Task 5.
+- [x] **Step 2: Implement the chosen option**, then continue to Task 5.
+
+#### ⚡ RULING — 2026-08-26: **E + A**, made autonomously by the Tower lane
+
+**Who ruled, and on what authority.** Not the user. This gate was
+resolved by the Tower lane on 2026-08-26 under an **explicit autonomy
+grant** covering this decision. That is recorded here rather than left
+implicit, because the gate's own text says the call belongs to the user:
+anyone reading this later should know a delegated decision is what
+unblocked it, not a user preference expressed in a conversation.
+
+**The ruling.** Implement the recommendation as written — **E + A**:
+
+* **E.** Load gets its own bound, `LOAD_TIMEOUT_S = 120.0`
+  (`tower/modules/container.py`), distinct from the 10 s that still
+  governs start/stop/unload. Chosen from what a cold load actually has to
+  do: 119 MB of MiDaS weights (85.8 MB + a 33.2 MB backbone, measured on
+  this host's torch cache) plus two torch.hub repository clones, and
+  14.1 MB for SSDLite. Inside 10 s that is ~95 Mbit/s sustained from the
+  first byte; inside 120 s it is ~8 Mbit/s. A warm load of the same
+  models measures 1.8 s (depth, CUDA) and 0.16 s (SSDLite, CPU), so the
+  bound is ~65x the real cost — still a bound, not a surrender.
+* **A.** `ExperimentalCVModule._do_load` now awaits
+  `asyncio.to_thread(experiment.load, settings)`. That is the only reason
+  the bound means anything: `wait_for` cancels at await points, and a
+  weight download offers none.
+* **Consequence 2 mitigated as specified.** The load-invalidation token
+  is real, thread-safe, and lives in `tower/loading.py`
+  (`LoadInvalidation`); `DepthEstimation` and `ObjectDetectionExperiment`
+  build into locals and hand over through `publish()`, and their
+  `release()` invalidates and clears as one critical section. An
+  abandoned loader that finishes after release frees what it built
+  instead of installing it into a FAILED module.
+
+**Reversible.** Nothing here is a one-way door. E is one constant. A is
+one line in one module. The token is additive: an experiment that does
+not use it behaves exactly as before. Reverting all three restores the
+previous behaviour without touching the lifecycle contract.
+
+**B remains the V1.1 destination.** This ruling does NOT settle the
+contract question. `Module`/`ModuleContainer` were deliberately left
+alone: moving every module's `_do_load` off-thread changes the execution
+model every module depends on, and V1.1 owns lifecycle hardening. What
+B still has to do at V1.1 — including the shared
+`SSDLite320Detector` in `tower/detection.py`, which is untouched here
+because it runs out of process and never meets this timeout — is
+written up in
+`docs/superpowers/research/2026-08-26-lifecycle-load-timeout.md`.
 
 ---
 
