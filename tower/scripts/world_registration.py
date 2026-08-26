@@ -306,6 +306,27 @@ class MutualEvidence:
         """
         return float(self.forward.scale * self.reverse.scale)
 
+    @property
+    def rotation_disagreement_deg(self) -> float:
+        """How far the two directions disagree about orientation.
+
+        The forward fit rotates source into target; the reverse rotates
+        target into source. Composed, an honest pair returns to identity,
+        so the residual rotation angle IS the disagreement.
+
+        Reciprocity checked SCALE and nothing else, so a pair agreeing on
+        scale to 1% while disagreeing 40 degrees about which way a segment
+        faces was admitted -- folding one segment's geometry through
+        another's, which reads as a slightly odd floor plan rather than as
+        an error. Both rotations were already in hand; only the comparison
+        was missing.
+        """
+        composed = np.asarray(self.forward.rotation, dtype=np.float64) @ np.asarray(
+            self.reverse.rotation, dtype=np.float64
+        )
+        cosine = (float(np.trace(composed)) - 1.0) / 2.0
+        return float(math.degrees(math.acos(max(-1.0, min(1.0, cosine)))))
+
 
 @dataclass(frozen=True)
 class Thresholds:
@@ -328,6 +349,20 @@ class Thresholds:
     # success sat at 1.0-1.2x.
     max_scale_ambiguity: float = 3.0
     # Necessary, nowhere near sufficient -- see the module docstring.
+    # How far the two directions may disagree about ORIENTATION.
+    #
+    # Set from measurement, not taste. On the real world 3dd986b1 all six
+    # solvable pairs compose back to identity within 2.31 deg -- including
+    # (30,50), which is 3.2x wrong on SCALE. The research note records
+    # wrong rotations at 31.9 to 166.0 deg. 15 sits between, ~6x above the
+    # worst honest pair and ~2x below the mildest catastrophic one.
+    #
+    # HONEST STATUS: this clause changes no verdict on the corpus
+    # available today. It guards a documented failure class, it does not
+    # fix an observed one. Recorded so a successor does not mistake an
+    # inert guard for a load-bearing one -- or delete it as dead weight.
+    max_rotation_disagreement_deg: float = 15.0
+
     max_reprojection_px: float = 3.0
     # The pre-check. A segment whose own cameras carry no parallax cannot
     # have its scale measured from them at any quality of match, so this
@@ -727,9 +762,11 @@ def admit(evidence: MutualEvidence, thresholds: Thresholds) -> Verdict:
     span_over_depth = min(
         forward.target_span_over_depth, reverse.target_span_over_depth
     )
+    rotation_disagreement = evidence.rotation_disagreement_deg
     clauses = {
         "cameras": cameras,
         "reciprocity": reciprocity,
+        "rotation_disagreement_deg": rotation_disagreement,
         "scale_ambiguity": ambiguity,
         "reprojection_px": reprojection,
         "span_over_depth": span_over_depth,
@@ -769,6 +806,13 @@ def admit(evidence: MutualEvidence, thresholds: Thresholds) -> Verdict:
             f"the two directions disagree on scale by {_ratio(reciprocity):.2f}x; "
             "each was solved independently, so they should be reciprocal"
         )
+    if rotation_disagreement > thresholds.max_rotation_disagreement_deg:
+        return refuse(
+            f"the two directions disagree about orientation by "
+            f"{rotation_disagreement:.1f} degrees; composed they should "
+            "return to identity, so one of them folds this segment's "
+            "geometry through the other's"
+        )
     if ambiguity > thresholds.max_scale_ambiguity:
         return refuse(
             f"the scale is ambiguous over a {ambiguity:.1f}x range -- the fit "
@@ -782,7 +826,8 @@ def admit(evidence: MutualEvidence, thresholds: Thresholds) -> Verdict:
     return Verdict(
         evidence.pair,
         True,
-        f"both directions agree on scale to {abs(reciprocity - 1.0):.1%}",
+        f"both directions agree on scale to {abs(reciprocity - 1.0):.1%} "
+        f"and on orientation to {rotation_disagreement:.1f} deg",
         reciprocity,
         clauses,
     )

@@ -730,3 +730,87 @@ class TestTheRealWalk:
         encoded = report_to_json(report)
 
         assert json.loads(json.dumps(encoded)) == encoded
+
+
+# ---------------------------------------------------------------------------
+# Rotation reciprocity.
+#
+# The gate compared the two directions on ONE quantity: forward.scale *
+# reverse.scale. It never compared rotations, so a pair agreeing on scale
+# to 1% while disagreeing 40 degrees in rotation was admitted -- folding
+# one segment's geometry through another's, which the research note
+# records as a real failure class (31.9 to 166.0 degrees observed on
+# ill-conditioned pairs before refinement).
+#
+# HONEST STATUS: measured on the real world 3dd986b1, all six solvable
+# pairs agree on rotation to within 2.31 degrees, INCLUDING the dangerous
+# (30,50) pair that is 3.2x wrong on scale. This clause therefore changes
+# no verdict on the corpus available today. It is a guard against a
+# documented catastrophic failure, not a fix for an observed one, and the
+# distinction is recorded rather than blurred.
+# ---------------------------------------------------------------------------
+
+
+def _fit_rot(source, target, *, scale, rotation):
+    """_fit with an explicit rotation, which the base helper hardcodes to I."""
+    import dataclasses as _dc
+
+    return _dc.replace(_fit(source, target, scale=scale), rotation=rotation)
+
+
+def _rotation_about_z(degrees):
+    t = math.radians(degrees)
+    return np.array(
+        [[math.cos(t), -math.sin(t), 0.0],
+         [math.sin(t), math.cos(t), 0.0],
+         [0.0, 0.0, 1.0]]
+    )
+
+
+def test_a_pair_agreeing_on_scale_but_not_rotation_is_refused():
+    """The hole this clause closes. Scale reciprocity is perfect; the two
+    directions disagree by 40 degrees about which way the segment faces."""
+    rotation = _rotation_about_z(20.0)
+    forward = _fit_rot(0, 1, scale=2.0, rotation=rotation)
+    # A correct reverse would be rotation.T. This one is off by 40 deg.
+    reverse = _fit_rot(1, 0, scale=0.5, rotation=_rotation_about_z(20.0))
+    verdict = admit(MutualEvidence(forward=forward, reverse=reverse), Thresholds())
+    assert not verdict.registered
+    assert "orientation" in verdict.reason.lower()
+    assert verdict.clauses["rotation_disagreement_deg"] == pytest.approx(40.0)
+    # And the scale clause would have waved it straight through.
+    assert abs(verdict.clauses["reciprocity"] - 1.0) < 1e-9
+
+
+def test_a_pair_agreeing_on_both_is_admitted():
+    """Positive control: the clause must not refuse honest agreement."""
+    rotation = _rotation_about_z(20.0)
+    forward = _fit_rot(0, 1, scale=2.0, rotation=rotation)
+    reverse = _fit_rot(1, 0, scale=0.5, rotation=rotation.T)
+    verdict = admit(MutualEvidence(forward=forward, reverse=reverse), Thresholds())
+    assert verdict.registered, verdict.reason
+
+
+def test_the_rotation_bound_separates_measured_good_from_measured_bad():
+    """The bound is set from measurement, not taste.
+
+    Measured on world 3dd986b1: the worst rotation disagreement among six
+    solvable real pairs is 2.31 deg. The research note records wrong
+    rotations at 31.9 to 166.0 deg. The bound sits between, with margin on
+    both sides -- roughly 6x above the worst honest pair and 2x below the
+    mildest catastrophic one.
+    """
+    assert 2.31 < Thresholds().max_rotation_disagreement_deg < 31.9
+
+
+def test_rotation_disagreement_is_reported_even_when_it_passes():
+    """A consumer of a registered pair should be able to see HOW well the
+    two directions agreed, not just that they cleared the bar."""
+    rotation = _rotation_about_z(20.0)
+    evidence = MutualEvidence(
+        forward=_fit_rot(0, 1, scale=2.0, rotation=rotation),
+        reverse=_fit_rot(1, 0, scale=0.5, rotation=rotation.T),
+    )
+    assert evidence.rotation_disagreement_deg < 1e-6
+    verdict = admit(evidence, Thresholds())
+    assert "rotation_disagreement_deg" in verdict.clauses
