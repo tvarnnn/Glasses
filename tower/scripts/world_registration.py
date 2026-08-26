@@ -161,7 +161,6 @@ class SegmentGeometry:
     """
 
     index: int
-    keyframe_ids: list
     keypoints: list          # per frame, (n_features, 2) float64 pixels
     descriptors: list        # per frame, ORB descriptors or None
     points: np.ndarray       # (n_points, 3) in this segment's own frame
@@ -182,7 +181,18 @@ class SegmentGeometry:
 
 @dataclass(frozen=True)
 class DirectedFit:
-    """One direction's Sim3 estimate, mapping `source`'s frame into `target`'s.
+    """One direction's Sim3 estimate, mapping `target`'s frame into `source`'s.
+
+    Read that direction twice. The fit is produced by PnP-ing the SOURCE
+    segment's landmarks into the TARGET segment's images, so the transform
+    it recovers carries target-frame points into source-frame coordinates:
+    `fit.sim3.apply(target_points)` lands on the source's geometry. Naming
+    it the other way round is not a documentation slip -- it silently
+    inverts every map built on top of it, and an inverted map is smooth,
+    plausible and wrong, which is the one failure this module exists to
+    prevent. Measured on the real walk: applying `fit.sim3` to the target's
+    points matches the source at 0.0000 median residual, and the other way
+    round gives 21.96.
 
     Deliberately decision-free. Every field here is fit quality or
     provenance; none of it, alone or combined, is allowed to admit a pair.
@@ -200,14 +210,36 @@ class DirectedFit:
     cameras: int
     correspondences: int
     reprojection_px: float
+    # WHICH cameras were actually posed to produce this fit: a frozenset of
+    # (segment index, frame index). Not diagnostics -- this is what makes
+    # `MutualEvidence` mean anything.
+    #
+    # Checking that `source`/`target` are swapped only checks LABELS, and
+    # labels are trivially forged:
+    #
+    #     reverse = dataclasses.replace(forward, source=t, target=s,
+    #                                   scale=1.0 / forward.scale)
+    #
+    # is an algebraic inversion of the forward fit, agrees with it to
+    # 0.0% by construction, and was admitted before this field existed.
+    # A genuine reverse solve poses the OTHER segment's cameras, so its
+    # provenance cannot coincide with the forward one; a relabelled copy
+    # carries the forward provenance and is refused.
+    provenance: frozenset
     # Width, as a ratio, of the scale interval whose cost stays within 1.5x
     # of the minimum, with rotation and translation re-optimised at each
     # scale. 1.0x means one scale explains the data; 20x means the fit is
     # indifferent across a 20-fold range and its scale means nothing.
     scale_ambiguity: float
+    # The TARGET segment's own camera-centre span over its median scene
+    # depth. Scale enters this Sim3 only through the baseline between
+    # those cameras, so below MIN_SPAN_OVER_DEPTH the scale is not a
+    # measurement at all -- see `span_over_depth`.
+    target_span_over_depth: float
 
     @property
     def sim3(self) -> Sim3:
+        """Maps the TARGET segment's frame into the SOURCE segment's frame."""
         return Sim3(self.scale, self.rotation, self.translation)
 
 
@@ -242,6 +274,19 @@ class MutualEvidence:
                 f"{self.forward.source}<-{self.forward.target} and "
                 f"{self.reverse.source}<-{self.reverse.target}"
             )
+        # The check that has teeth. Swapped labels are free; posing the
+        # other segment's cameras is not. Two fits that were computed from
+        # the same cameras are one fit wearing two hats, and their
+        # reciprocity is arithmetic rather than evidence.
+        if self.forward.provenance == self.reverse.provenance:
+            raise ValueError(
+                "MutualEvidence needs two INDEPENDENT solves: both fits "
+                "name the same posed cameras "
+                f"({sorted(self.forward.provenance)}), so the reverse is a "
+                "relabelled copy of the forward rather than a second "
+                "estimate. Solve the other direction for real -- PnP the "
+                "other segment's landmarks into this one's images."
+            )
 
     @property
     def pair(self) -> tuple:
@@ -252,8 +297,12 @@ class MutualEvidence:
         """s(a<-b) * s(b<-a). Truth is exactly 1.0.
 
         The single most discriminating number available. On the real walk
-        it read 1.003 and 1.061 for the two pairs that survive every other
-        check, and 1.514 and 3.215 for pairs that fit at 1.6-2.5 px.
+        Measured by THIS script on world 3dd986b1c2364d4b85de97152f2e39f4:
+        1.0314 and 0.9823 for the two pairs that survive every other check,
+        against 0.6305 for (5,6) and 0.4693 for (30,50). (The feasibility
+        study's own harness read 1.003, 1.061, 1.514 and 3.215 on the same
+        pairs -- same verdicts, different third digits, because it is a
+        different implementation. Quote whichever code you are reading.)
         """
         return float(self.forward.scale * self.reverse.scale)
 
@@ -271,15 +320,22 @@ class Thresholds:
     # ambiguity on the real walk. Three is the minimum at which the
     # centre-based initialisation is over-determined at all.
     min_cameras: int = 3
-    # Separated (4,5) at 1.003 and (5,32) at 1.061 from (5,6) at 1.514 and
-    # (30,50) at 3.215. Deliberately not tighter: the measured spread of
-    # the two honest pairs already reaches 6%.
+    # Measured by this script: separates (4,5) at 1.0314 and (5,32) at
+    # 0.9823 from (5,6) at 0.6305 and (30,50) at 0.4693. Deliberately not
+    # tighter -- the honest pairs already spread to 3.1%.
     max_reciprocity_error: float = 0.10
     # Flagged both self-test failures at 4.1x and 17.2x, where every
     # success sat at 1.0-1.2x.
     max_scale_ambiguity: float = 3.0
     # Necessary, nowhere near sufficient -- see the module docstring.
     max_reprojection_px: float = 3.0
+    # The pre-check. A segment whose own cameras carry no parallax cannot
+    # have its scale measured from them at any quality of match, so this
+    # is refusable before trusting anything the solve reports. Every
+    # segment at or above 0.09 recovered its own scale to within 1.2% in
+    # a self-test; the two below 0.07 came back 33% and 57% wrong while
+    # fitting at under 1.8 px.
+    min_span_over_depth: float = MIN_SPAN_OVER_DEPTH
 
 
 @dataclass(frozen=True)
@@ -319,24 +375,6 @@ def span_over_depth(centres: np.ndarray, points: np.ndarray) -> float:
     if depth <= 1e-9:
         return 0.0
     return span / depth
-
-
-def umeyama(source: np.ndarray, target: np.ndarray) -> tuple:
-    """Closed-form similarity fitting source onto target. numpy only.
-
-    scipy is not installed and is not needed: this is one SVD of a 3x3.
-    """
-    n = len(source)
-    mu_s, mu_t = source.mean(axis=0), target.mean(axis=0)
-    x, y = source - mu_s, target - mu_t
-    u, d, vt = np.linalg.svd((y.T @ x) / n)
-    w = np.eye(3)
-    if np.linalg.det(u) * np.linalg.det(vt) < 0:
-        w[2, 2] = -1
-    rotation = u @ w @ vt
-    variance = float((x ** 2).sum() / n)
-    scale = float(np.trace(np.diag(d) @ w) / variance) if variance > 0 else 1.0
-    return scale, rotation, mu_t - scale * (rotation @ mu_s)
 
 
 def _chordal_rotation_mean(rotations: list) -> np.ndarray:
@@ -593,6 +631,14 @@ def fit_direction(source, target, matches) -> DirectedFit | None:
         correspondences=int(len(residuals)),
         reprojection_px=float(np.median(residuals)),
         scale_ambiguity=ambiguity,
+        # Tagged with the segment, not just the frame number. Two segments
+        # both numbering their frames from zero would otherwise collide,
+        # and a collision here reads as "not independent" and silently
+        # refuses a real pair.
+        provenance=frozenset(
+            (target.index, observation.frame) for observation in observations
+        ),
+        target_span_over_depth=target.span_over_depth,
     )
 
 
@@ -607,6 +653,10 @@ def admit(evidence: MutualEvidence, thresholds: Thresholds) -> Verdict:
     written in terms of reprojection -- which is exactly how (30,50), wrong
     by 3.2x at 1.62 px, would be admitted. Refusing the type refuses the
     whole class of mistake, at the one place a decision is made.
+
+    The type check is necessary and not sufficient: see
+    `MutualEvidence.__post_init__`, where the provenance clause refuses a
+    reverse fit that was manufactured from the forward one by relabelling.
     """
     if not isinstance(evidence, MutualEvidence):
         raise TypeError(
@@ -614,8 +664,11 @@ def admit(evidence: MutualEvidence, thresholds: Thresholds) -> Verdict:
             f"{type(evidence).__name__}. A single direction's fit quality "
             "cannot admit a pair: on the real walk, segments (30,50) fit at "
             "1.62 px with 88% of correspondences under 3 px and were wrong "
-            "by a factor of 3.2 in scale. Solve the other direction and "
-            "compare the scales."
+            "by a factor of 3.2 in scale (measured in "
+            "docs/superpowers/research/"
+            "2026-08-26-cross-segment-registration.md section 6). Solve the "
+            "other direction for real -- PnP the other segment's landmarks "
+            "into this one's images -- and compare the scales."
         )
 
     forward, reverse = evidence.forward, evidence.reverse
@@ -624,11 +677,19 @@ def admit(evidence: MutualEvidence, thresholds: Thresholds) -> Verdict:
     ambiguity = max(forward.scale_ambiguity, reverse.scale_ambiguity)
     reprojection = max(forward.reprojection_px, reverse.reprojection_px)
 
+    # Both directions' targets, so the clause covers BOTH segments: the
+    # forward fit poses the second segment's cameras and the reverse fit
+    # poses the first's.
+    span_over_depth = min(
+        forward.target_span_over_depth, reverse.target_span_over_depth
+    )
     clauses = {
         "cameras": cameras,
         "reciprocity": reciprocity,
         "scale_ambiguity": ambiguity,
         "reprojection_px": reprojection,
+        "span_over_depth": span_over_depth,
+        "correspondences": min(forward.correspondences, reverse.correspondences),
     }
 
     def refuse(reason):
@@ -653,6 +714,12 @@ def admit(evidence: MutualEvidence, thresholds: Thresholds) -> Verdict:
     # Checked before fit quality on purpose: this is the independent
     # evidence, and reading it first keeps the ordering of the code honest
     # about which clause is carrying the decision.
+    if span_over_depth < thresholds.min_span_over_depth:
+        return refuse(
+            f"the wearer stood still: one segment's cameras span only "
+            f"{span_over_depth:.3f} of the scene depth, so its scale is not "
+            "recoverable from them at any quality of match"
+        )
     if abs(reciprocity - 1.0) > thresholds.max_reciprocity_error:
         return refuse(
             f"the two directions disagree on scale by {_ratio(reciprocity):.2f}x; "
@@ -803,7 +870,6 @@ def read_segments(store: WorldStore, world_id: str, session_id: str) -> dict:
             descriptors.append(described)
         segments[index] = SegmentGeometry(
             index=index,
-            keyframe_ids=[k.keyframe_id for k in members],
             keypoints=keypoints,
             descriptors=descriptors,
             points=np.asarray(points_by_segment[index], dtype=np.float64),
@@ -901,11 +967,25 @@ def register(store: WorldStore, world_id: str, session_id: str,
                 [(b, a, [(y, x) for x, y in pairs]) for a, b, pairs in matches],
             )
             if forward is None or reverse is None:
+                # Distinguished, because "one direction worked" and
+                # "neither did" are different facts about the world and
+                # 61 of 74 pairs on the real walk are the second one.
+                # Reporting them all as the first overstates how close
+                # the pair came.
+                if forward is None and reverse is None:
+                    reason = (
+                        "neither direction could be solved: too few of "
+                        "either segment's cameras could be placed against "
+                        "the other's landmarks"
+                    )
+                else:
+                    solved = left if forward is not None else right
+                    reason = (
+                        f"only the {solved}-side direction could be solved, "
+                        "so there is no second estimate to check it against"
+                    )
                 verdicts.append(Verdict(
-                    (left, right), False,
-                    "only one direction could be solved, so there is nothing "
-                    "to check it against",
-                    float("nan"),
+                    (left, right), False, reason, float("nan"),
                     {"forward": forward is not None,
                      "reverse": reverse is not None},
                 ))

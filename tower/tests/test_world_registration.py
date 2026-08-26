@@ -9,7 +9,10 @@ and the tests below check that it structurally cannot -- not that some
 particular threshold happens to be set high enough today.
 """
 
+import copy
+import dataclasses
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -35,7 +38,14 @@ from tower.world_builder.store import WorldStore
 
 
 def _fit(source, target, *, scale, cameras=9, reprojection_px=1.5,
-         scale_ambiguity=1.2, correspondences=400):
+         scale_ambiguity=1.2, correspondences=400, span_over_depth=0.35,
+         provenance=None):
+    # Provenance defaults to the target's own cameras, which is what a real
+    # solve records -- so two fits built by this helper in opposite
+    # directions are independent, and two built in the SAME direction are
+    # not.
+    if provenance is None:
+        provenance = frozenset((target, frame) for frame in range(cameras))
     return DirectedFit(
         source=source,
         target=target,
@@ -46,6 +56,8 @@ def _fit(source, target, *, scale, cameras=9, reprojection_px=1.5,
         correspondences=correspondences,
         reprojection_px=reprojection_px,
         scale_ambiguity=scale_ambiguity,
+        provenance=provenance,
+        target_span_over_depth=span_over_depth,
     )
 
 
@@ -70,6 +82,43 @@ class TestFitQualityCannotAdmit:
             MutualEvidence(forward=fit, reverse=fit)
 
         assert "independent" in str(excinfo.value).lower()
+
+    def test_an_algebraically_inverted_copy_is_not_independent(self):
+        """The bypass an adversarial review found, and the reason for provenance.
+
+        Relabelling a fit and inverting its scale produces something that
+        agrees with itself to 0.0% by construction. It passed the
+        label-and-identity checks; it must not pass the provenance one.
+        """
+        forward = _fit(30, 50, scale=0.0923)
+
+        reverse = dataclasses.replace(
+            forward, source=50, target=30, scale=1.0 / forward.scale
+        )
+
+        with pytest.raises(ValueError) as excinfo:
+            MutualEvidence(forward=forward, reverse=reverse)
+
+        assert "independent" in str(excinfo.value).lower()
+
+    def test_a_deep_copy_is_not_independent_either(self):
+        forward = _fit(30, 50, scale=0.0923)
+        reverse = copy.deepcopy(forward)
+        object.__setattr__(reverse, "source", 50)
+        object.__setattr__(reverse, "target", 30)
+        object.__setattr__(reverse, "scale", 1.0 / forward.scale)
+
+        with pytest.raises(ValueError):
+            MutualEvidence(forward=forward, reverse=reverse)
+
+    def test_genuinely_separate_solves_are_accepted(self):
+        """The check must not refuse honest evidence: different cameras posed."""
+        evidence = MutualEvidence(
+            forward=_fit(4, 5, scale=0.3533),
+            reverse=_fit(5, 4, scale=2.8387),
+        )
+
+        assert evidence.forward.provenance != evidence.reverse.provenance
 
     def test_evidence_requires_opposite_directions(self):
         with pytest.raises(ValueError):
@@ -166,10 +215,92 @@ class TestGateClauses:
         evidence = MutualEvidence(forward=_fit(5, 1, scale=0.0),
                                   reverse=_fit(1, 5, scale=0.0))
 
+        assert not admit(evidence, Thresholds()).registered
+
+    def test_a_nan_scale_is_refused(self):
+        """The degenerate-scale clause is the ONLY NaN guard in the gate.
+
+        `abs(nan - 1.0) > 0.10` is False, so the reciprocity clause passes a
+        NaN straight through. Deleting the degenerate clause therefore
+        admits this pair -- which is what a mutation run found, because the
+        old test matched the word "scale" in a reason string that the
+        reciprocity clause also happens to contain. Assert the verdict.
+        """
+        evidence = MutualEvidence(
+            forward=_fit(5, 1, scale=float("nan")),
+            reverse=_fit(1, 5, scale=float("nan")),
+        )
+
+        assert not admit(evidence, Thresholds()).registered
+
+    def test_an_infinite_scale_is_refused(self):
+        evidence = MutualEvidence(
+            forward=_fit(5, 1, scale=float("inf")),
+            reverse=_fit(1, 5, scale=0.0),
+        )
+
+        assert not admit(evidence, Thresholds()).registered
+
+    def test_both_sides_need_enough_cameras_not_just_one(self):
+        """Kills `cameras = max(...)`: 30 on one side cannot cover 2 on the other."""
+        evidence = MutualEvidence(
+            forward=_fit(4, 5, scale=0.3533, cameras=30),
+            reverse=_fit(5, 4, scale=2.8387, cameras=2),
+        )
+
         verdict = admit(evidence, Thresholds())
 
         assert not verdict.registered
-        assert "scale" in verdict.reason
+        assert verdict.clauses["cameras"] == 2
+
+    def test_ambiguity_is_judged_on_the_worse_direction(self):
+        """Kills `ambiguity = min(...)`: one crisp direction cannot cover a vague one."""
+        evidence = MutualEvidence(
+            forward=_fit(4, 5, scale=0.3533, scale_ambiguity=1.0),
+            reverse=_fit(5, 4, scale=2.8387, scale_ambiguity=20.0),
+        )
+
+        verdict = admit(evidence, Thresholds())
+
+        assert not verdict.registered
+        assert verdict.clauses["scale_ambiguity"] == 20.0
+
+    def test_reprojection_is_judged_on_the_worse_direction(self):
+        evidence = MutualEvidence(
+            forward=_fit(4, 5, scale=0.3533, reprojection_px=0.1),
+            reverse=_fit(5, 4, scale=2.8387, reprojection_px=9.0),
+        )
+
+        verdict = admit(evidence, Thresholds())
+
+        assert not verdict.registered
+        assert verdict.clauses["reprojection_px"] == 9.0
+
+    def test_a_segment_without_parallax_is_refused_by_the_gate(self):
+        """Kills MIN_SPAN_OVER_DEPTH being decorative.
+
+        It used to appear only inside a reason string, so a pair whose
+        target segment had no baseline was admitted on reciprocity alone.
+        """
+        evidence = MutualEvidence(
+            forward=_fit(5, 6, scale=1.0, span_over_depth=0.043),
+            reverse=_fit(6, 5, scale=1.0, span_over_depth=0.345),
+        )
+
+        verdict = admit(evidence, Thresholds())
+
+        assert not verdict.registered
+        assert verdict.clauses["span_over_depth"] == pytest.approx(0.043)
+        assert "stood still" in verdict.reason
+
+    def test_parallax_on_both_sides_is_admitted(self):
+        """Segment 4 sits at 0.0951, barely over the line. It must still pass."""
+        evidence = MutualEvidence(
+            forward=_fit(4, 5, scale=0.3533, span_over_depth=0.345),
+            reverse=_fit(5, 4, scale=2.8387, span_over_depth=0.0951),
+        )
+
+        assert admit(evidence, Thresholds()).registered
 
 
 class TestSpanOverDepth:
@@ -225,17 +356,63 @@ def _synthetic_pair(scale=2.5, seed=0):
         keypoints_b.append(pix)
 
     a = SegmentGeometry(
-        index=0, keyframe_ids=["a0"], keypoints=[np.zeros((len(world), 2))],
+        index=0, keypoints=[np.zeros((len(world), 2))],
         descriptors=[None], points=points_a, poses={0: (np.eye(3), np.zeros(3))},
         observed={(0, k): k for k in range(len(world))}, intrinsics=K,
     )
     b = SegmentGeometry(
-        index=1, keyframe_ids=[f"b{j}" for j in range(5)],
-        keypoints=keypoints_b, descriptors=[None] * 5, points=points_b,
+        index=1, keypoints=keypoints_b, descriptors=[None] * 5, points=points_b,
         poses=poses_b, observed={}, intrinsics=K,
     )
     matches = [(0, j, [(k, k) for k in range(len(world))]) for j in range(5)]
     return a, b, matches, scale, R_true, t_true
+
+
+def _synthetic_world(scale=2.5, seed=1):
+    """Two segments that BOTH have geometry, related by a known Sim3.
+
+    The one-sided `_synthetic_pair` gives landmarks to one segment and
+    cameras to the other, so only one direction can be solved. Independent
+    agreement needs both, which needs both segments fully reconstructed --
+    which is also exactly the condition the real walk mostly fails to meet.
+    """
+    rng = np.random.default_rng(seed)
+    K = np.array([[440.0, 0, 180.0], [0, 440.0, 320.0], [0, 0, 1.0]])
+    world = rng.normal(0, 1.5, (140, 3)) + np.array([0.0, 0.0, 8.0])
+
+    axis = np.array([0.2, 1.0, -0.3])
+    axis = axis / np.linalg.norm(axis)
+    angle = 0.4
+    kx = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]],
+                   [-axis[1], axis[0], 0]])
+    R_true = np.eye(3) + np.sin(angle) * kx + (1 - np.cos(angle)) * (kx @ kx)
+    t_true = np.array([1.3, -0.7, 2.1])
+
+    points_a = world
+    points_b = (R_true.T @ (world - t_true).T).T / scale
+
+    def segment(index, points, step):
+        poses, keypoints = {}, []
+        for j in range(5):
+            centre = np.array([step * j, 0.05 * j, -0.08 * j])
+            R = np.eye(3)
+            t = -R @ centre
+            poses[j] = (R, t)
+            cam = (R @ points.T).T + t
+            keypoints.append((K[:2, :2] @ (cam[:, :2] / cam[:, 2:3]).T).T + K[:2, 2])
+        return SegmentGeometry(
+            index=index, keypoints=keypoints, descriptors=[None] * 5,
+            points=points, poses=poses,
+            observed={(j, k): k for j in range(5) for k in range(len(points))},
+            intrinsics=K,
+        )
+
+    a = segment(0, points_a, 0.9)
+    b = segment(1, points_b, 0.9 / scale)
+    pairs = [(k, k) for k in range(len(world))]
+    forward = [(i, j, pairs) for i in range(5) for j in range(5)]
+    reverse = [(j, i, pairs) for j in range(5) for i in range(5)]
+    return a, b, forward, reverse, scale
 
 
 class TestFitDirection:
@@ -252,24 +429,49 @@ class TestFitDirection:
         assert angle < 3.0
         assert np.linalg.norm(fit.translation - t_true) < 0.5 * scale
 
-    def test_a_recovered_pair_is_admitted_and_agrees_with_itself(self):
-        a, b, matches, scale, _, _ = _synthetic_pair(scale=2.5)
-        forward = fit_direction(a, b, matches)
-        assert forward is not None
-        # The synthetic reverse: the exact inverse scale, which is what an
-        # independent solve would find if both directions were honest.
-        reverse = DirectedFit(
-            source=b.index, target=a.index, scale=1.0 / forward.scale,
-            rotation=forward.rotation.T, translation=np.zeros(3),
-            cameras=forward.cameras, correspondences=forward.correspondences,
-            reprojection_px=forward.reprojection_px,
-            scale_ambiguity=forward.scale_ambiguity,
-        )
+    def test_two_separate_solves_of_one_pair_agree_and_are_admitted(self):
+        """Both directions solved for real, from different cameras.
+
+        This replaces a test that built its reverse as
+        `scale=1/forward.scale, rotation=forward.rotation.T` -- an
+        algebraic inversion that agrees with itself by construction. It
+        passed, which meant the file demonstrated the bypass rather than
+        the property.
+        """
+        a, b, forward_matches, reverse_matches, scale = _synthetic_world(2.5)
+
+        forward = fit_direction(a, b, forward_matches)
+        reverse = fit_direction(b, a, reverse_matches)
+
+        assert forward is not None and reverse is not None
+        assert forward.provenance != reverse.provenance
+        assert forward.scale == pytest.approx(scale, rel=0.05)
+        assert reverse.scale == pytest.approx(1.0 / scale, rel=0.05)
 
         verdict = admit(MutualEvidence(forward=forward, reverse=reverse),
                         Thresholds())
 
         assert verdict.registered
+        assert verdict.reciprocity == pytest.approx(1.0, abs=0.05)
+
+    def test_refinement_resolves_scale_finer_than_the_grid(self):
+        """Exercises the free-scale Gauss-Newton, not just the grid seeding.
+
+        The scale grid is 45 log-spaced points over 0.02..50, so adjacent
+        candidates differ by ~1.19x. A true scale sitting between two of
+        them cannot be recovered to 1% by seeding alone; only the final
+        unfixed refinement can close that gap.
+        """
+        grid = np.exp(np.linspace(np.log(0.02), np.log(50.0), 45))
+        below = grid[grid < 3.0].max()
+        truth = float(below * 1.19 ** 0.5)          # midway between two points
+        assert min(abs(np.log(grid / truth))) > 0.07
+
+        a, b, forward_matches, _, _ = _synthetic_world(truth)
+        fit = fit_direction(a, b, forward_matches)
+
+        assert fit is not None
+        assert fit.scale == pytest.approx(truth, rel=0.01)
 
     def test_too_few_cameras_returns_none(self):
         a, b, matches, *_ = _synthetic_pair()
@@ -411,52 +613,120 @@ def report():
 
 @pytest.mark.slow
 class TestTheRealWalk:
-    """The 51-segment walk, end to end. ~45 s; the numbers are the point.
+    """The real corpus, end to end. ~45 s; the invariants are the point.
 
-    Skipped when the corpus is absent, because this is a measurement
-    against one specific reconstruction rather than a property that holds
-    everywhere. It needs a world built AFTER support.json existed.
+    These deliberately assert RELATIONSHIPS, not frozen totals. The world
+    on disk was 51 segments and 12,023 points when this was written, and
+    `SupportMissingError` tells the reader to rebuild -- but keyframe
+    selection has since changed, so rebuilding from the capture yields a
+    different segmentation (33 segments, 8,333 points at the time of
+    writing). Pinning the old totals would mean that following the error
+    message's own instruction breaks the suite. The headline measurement
+    lives in the commit message and the research note, which can carry the
+    conditions that produced it; a test cannot.
+
+    Skipped when the corpus is absent, or when the world predates
+    support.json.
     """
 
-    def test_only_nineteen_of_fiftyone_segments_have_geometry(self, report):
-        assert report["segment_count"] == 51
-        assert report["segments_with_geometry"] == 19
+    def test_the_report_is_internally_consistent(self, report):
+        assert report["segments_with_geometry"] <= report["segment_count"]
+        assert report["segments_registered"] <= report["segments_with_geometry"]
+        assert report["points_registered"] <= report["points_total"]
+        assert len(report["segments"]) == report["segment_count"]
 
-    def test_segment_zero_is_refused_for_having_no_geometry(self, report):
-        """The prior investigation's flagship link, and it cannot be used.
+    def test_a_segment_with_no_points_is_never_registered(self, report):
+        """32 of 51 on the world as built: a lone anchor with no structure.
 
-        Segment 0 matched segments 45, 47, 48 and 50 as IMAGES. It has no
-        triangulated point, so there is no reconstruction to place.
+        Segment 0 is one of them -- the link a prior investigation
+        highlighted, real as an image match and unusable as a
+        registration, because there is no reconstruction to place.
         """
-        row = next(r for r in report["segments"] if r["segment_index"] == 0)
+        barren = [r for r in report["segments"] if r["points"] == 0]
 
-        assert not row["registered"]
-        assert row["points"] == 0
-        assert "no geometry" in row["reason"]
+        assert barren, "expected at least one segment with no geometry"
+        for row in barren:
+            assert not row["registered"]
+            assert row["transform_to_world"] is None
+            assert "no geometry" in row["reason"]
 
-    def test_three_segments_register(self, report):
-        registered = sorted(
-            r["segment_index"] for r in report["segments"] if r["registered"]
-        )
+    def test_every_registered_segment_carries_a_usable_transform(self, report):
+        registered = [r for r in report["segments"] if r["registered"]]
 
-        assert registered == [4, 5, 32]
-        assert report["admitted_pairs"] == [[4, 5], [5, 32]]
+        for row in registered:
+            transform = row["transform_to_world"]
+            assert transform is not None
+            assert math.isfinite(transform["scale"]) and transform["scale"] > 0
+            assert len(transform["rotation_wxyz"]) == 4
+            assert len(transform["translation"]) == 3
+            assert row["points"] > 0
+            assert row["span_over_depth"] >= 0.09
 
-    def test_they_carry_a_third_of_the_reconstructed_points(self, report):
-        assert report["points_total"] == 12023
-        assert report["points_registered"] == 3739
+    def test_every_unregistered_segment_says_why(self, report):
+        for row in report["segments"]:
+            if not row["registered"]:
+                assert row["reason"].strip()
+                assert row["transform_to_world"] is None
 
-    def test_the_known_bad_pairs_are_refused_on_disagreement(self, report):
-        pairs = {tuple(p["pair"]): p for p in report["pairs"]}
+    def test_the_reference_segment_is_placed_at_the_identity(self, report):
+        if report["reference_segment"] is None:
+            pytest.skip("nothing registered on this build of the world")
+        row = next(r for r in report["segments"]
+                   if r["segment_index"] == report["reference_segment"])
 
-        for pair in ((5, 6), (30, 50)):
-            assert not pairs[pair]["registered"]
-            assert abs(pairs[pair]["reciprocity"] - 1.0) > 0.10
+        assert row["registered"]
+        assert row["transform_to_world"]["scale"] == pytest.approx(1.0)
+        assert row["transform_to_world"]["translation"] == [0.0, 0.0, 0.0]
 
-    def test_standing_still_is_named_as_the_reason(self, report):
-        """Segment 6: 1115 points, 10 cameras, and unregisterable."""
-        row = next(r for r in report["segments"] if r["segment_index"] == 6)
+    def test_registration_is_exactly_the_admitted_component(self, report):
+        """No segment is placed except by a path of admitted pairs."""
+        registered = {r["segment_index"] for r in report["segments"]
+                      if r["registered"]}
+        admitted = {s for pair in report["admitted_pairs"] for s in pair}
 
-        assert not row["registered"]
-        assert row["span_over_depth"] < 0.09
-        assert "stood still" in row["reason"]
+        if not admitted:
+            assert not registered
+        else:
+            assert registered == admitted
+
+    def test_every_admitted_pair_passed_every_clause(self, report):
+        admitted = {tuple(p) for p in report["admitted_pairs"]}
+        for pair in report["pairs"]:
+            if tuple(pair["pair"]) not in admitted:
+                continue
+            assert pair["registered"]
+            assert abs(pair["reciprocity"] - 1.0) <= 0.10
+            assert pair["clauses"]["cameras"] >= 3
+            assert pair["clauses"]["scale_ambiguity"] <= 3.0
+            assert pair["clauses"]["reprojection_px"] <= 3.0
+            assert pair["clauses"]["span_over_depth"] >= 0.09
+
+    def test_pairs_whose_directions_disagree_are_never_admitted(self, report):
+        """The property, over whatever pairs this build of the world has.
+
+        Stated as a rule rather than as "(5,6) and (30,50) are refused",
+        so it keeps its meaning when the segmentation changes underneath.
+        """
+        disagreeing = [
+            p for p in report["pairs"]
+            if p["reciprocity"] is not None
+            and abs(p["reciprocity"] - 1.0) > 0.10
+        ]
+
+        assert disagreeing, "expected some pair whose two solves disagree"
+        for pair in disagreeing:
+            assert not pair["registered"]
+
+    def test_a_segment_that_stood_still_is_named_as_such(self, report):
+        still = [r for r in report["segments"]
+                 if r["points"] > 0 and r["span_over_depth"] is not None
+                 and r["span_over_depth"] < 0.09]
+
+        for row in still:
+            assert not row["registered"]
+            assert "stood still" in row["reason"]
+
+    def test_the_json_form_round_trips(self, report):
+        encoded = report_to_json(report)
+
+        assert json.loads(json.dumps(encoded)) == encoded
