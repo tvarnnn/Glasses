@@ -233,3 +233,41 @@ class TestBoundingBoxGeometry:
 
     def test_a_degenerate_box_does_not_divide_by_zero(self):
         assert BoundingBox(5, 5, 5, 5).iou(BoundingBox(0, 0, 10, 10)) == 0.0
+
+
+class TestTheSharedDetectorIsAdaptedNotAdopted:
+    """The platform reports a 4-tuple; this cartridge reports a BoundingBox.
+
+    The conversion is the whole of what `scene/detect.py`'s adapter does
+    now that the loader itself is shared, so it is worth an assertion of
+    its own. An x/y transposition here would be invisible everywhere
+    except in a relationship that came out mirrored.
+    """
+
+    def test_the_box_keeps_its_corner_order(self):
+        from tower.detection import Detection as PlatformDetection
+        from tower.scene.detect import to_scene_detection
+
+        converted = to_scene_detection(
+            PlatformDetection(label="cup", score=0.77, box=(1.0, 2.0, 30.0, 40.0))
+        )
+
+        assert converted.label == "cup"
+        assert converted.score == 0.77
+        assert isinstance(converted.box, BoundingBox)
+        assert (converted.box.x0, converted.box.y0) == (1.0, 2.0)
+        assert (converted.box.x1, converted.box.y1) == (30.0, 40.0)
+        assert converted.box.width == 29.0
+        assert converted.box.height == 38.0
+
+    def test_the_converted_detection_still_renders(self):
+        """`to_json_dict` is why this cartridge keeps its own type at all."""
+        from tower.detection import Detection as PlatformDetection
+        from tower.scene.detect import to_scene_detection
+
+        rendered = to_scene_detection(
+            PlatformDetection(label="chair", score=0.5, box=(0.0, 0.0, 2.0, 2.0))
+        ).to_json_dict()
+
+        assert rendered["label"] == "chair"
+        assert rendered["box"] == {"x0": 0.0, "y0": 0.0, "x1": 2.0, "y1": 2.0}

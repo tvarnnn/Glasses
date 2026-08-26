@@ -369,10 +369,16 @@ def test_object_memory_does_not_import_the_experimental_cv_lab():
     that may be thrown away, and nothing that can be thrown away should
     be upstream of a PERSISTENT store.
 
-    The two share weights, not code, and the duplication is the price of
-    that. If a third consumer appears, the fix is a shared detector
-    promoted to `tower/` (as `Confidence` was), never an import of the
-    sandbox.
+    A third consumer appeared, and the fix this docstring named is the
+    one that was taken: the detector seam is now `tower/detection.py`,
+    promoted to the platform exactly as `Confidence` was, and this
+    cartridge imports it from there. That changes nothing about the rule
+    below. Depending on a platform module and depending on a sandbox are
+    different acts -- shared code is maintained and its boundary is
+    tested (`test_the_shared_detector_imports_no_cartridge`), a sandbox
+    may be deleted tomorrow -- so an import of `tower.experiments` from
+    here is still forbidden, and still for the direction rather than the
+    duplication.
     """
     offenders = []
     for path in (TOWER / "object_memory").rglob("*.py"):
@@ -381,6 +387,67 @@ def test_object_memory_does_not_import_the_experimental_cv_lab():
         for name in _imports(path):
             if name.startswith("tower.experiments"):
                 offenders.append(f"{path} -> {name}")
+
+    assert offenders == []
+
+
+def test_the_shared_detector_imports_no_cartridge():
+    """`tower/detection.py` is platform code, so the arrows point one way.
+
+    The detector seam was duplicated in two cartridges and promoted here
+    once a third consumer of the same weights appeared. A promotion is
+    only safe while the promoted module stays ignorant of who calls it:
+    the moment this file imported Object Memory to reach a record shape,
+    or Scene Understanding to reach its `BoundingBox`, every other
+    cartridge would inherit that one's assumptions -- and the two
+    cartridges would be coupled THROUGH the platform, which is precisely
+    the coupling `test_a_cartridge_does_not_import_another_cartridge`
+    forbids directly. Promoting shared code must not open a side door
+    into a rule that is otherwise airtight.
+
+    The Lab is on the list for the additional reason the cartridge rules
+    already give: it is a sandbox that may be thrown away, and nothing
+    that may be thrown away belongs upstream of anything.
+    """
+    offenders = []
+    for name in _imports(TOWER / "detection.py"):
+        for cartridge in _CARTRIDGE_PACKAGES:
+            if f"tower.{cartridge}" in name or name.startswith(f"{cartridge}."):
+                offenders.append(f"detection.py -> {name}")
+        if name.startswith("tower.experiments"):
+            offenders.append(f"detection.py -> {name}")
+
+    assert offenders == []
+
+
+def test_the_shared_detector_holds_no_model_and_no_registry():
+    """Code was promoted; model residency deliberately was not.
+
+    Each cartridge still loads its own 13.4 MB of weights. That is the
+    property that stops a shared module becoming a single point of
+    failure: a cache would give one cartridge's crash, or one
+    cartridge's `release()`, a way to reach another's detector, and an
+    eviction policy would give it a way to reach one MID-FRAME.
+
+    A model manager may well be worth building later -- when a
+    measurement shows contention, which nothing in this repo does today.
+    This test is what makes that a decision rather than a drift: it fails
+    the moment module-level mutable state appears here.
+    """
+    tree = ast.parse((TOWER / "detection.py").read_text(encoding="utf-8"))
+    offenders = []
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if isinstance(value, (ast.Dict, ast.List, ast.Set, ast.DictComp, ast.ListComp)):
+            offenders.append(ast.dump(node)[:60])
+        if isinstance(value, ast.Call):
+            called = getattr(value.func, "id", None) or getattr(
+                value.func, "attr", None
+            )
+            if called in ("dict", "list", "set", "defaultdict", "lru_cache", "cache"):
+                offenders.append(f"module-level {called}()")
 
     assert offenders == []
 
