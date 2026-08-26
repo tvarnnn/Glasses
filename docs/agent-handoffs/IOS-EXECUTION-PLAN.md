@@ -10,10 +10,13 @@ The Tower lane does not modify it. When Tower work creates an iOS
 requirement, it is written here instead of implemented.
 
 **Tower lane:** `integration/world-builder-lifecycle-v1`.
-**Tower suite:** 1497 passed, 30 skipped, 0 failed.
+**Tower suite:** 1547 passed, 30 skipped, 0 failed.
 **Tower host:** Windows, no Apple toolchain — `swiftc`, `swift` and
-`xcodebuild` are all absent, so **no Swift in this repo has ever been
-compiled by anything.**
+`xcodebuild` are all absent, so **no Swift has ever been compiled in the
+Tower lane.** (As of 2026-08-26 the Mac lane has begun compiling on
+`ios/world-builder-integration` and has the app running on a phone. Where
+this document's §3.1 and §4 disagree with an actual `xcodebuild` result,
+**the compiler wins** — those sections were written without one.)
 
 ---
 
