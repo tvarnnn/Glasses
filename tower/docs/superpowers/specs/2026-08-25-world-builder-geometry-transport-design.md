@@ -433,6 +433,25 @@ on the Mac. No iOS claim in any report may say "passing" until that happens.
 
 ## 8. Status
 
-**DESIGN APPROVED — NOT IMPLEMENTED.** No code has been written. Physical
-validation of anything below remains pending and cannot be claimed from this
-machine.
+**IMPLEMENTATION COMPLETE — BUILD AND PHYSICAL VALIDATION PENDING.**
+
+Implemented across nine tasks on `integration/world-builder-lifecycle-v1`, plus
+one fix wave after a whole-branch review. See
+`docs/superpowers/plans/2026-08-25-world-builder-geometry-transport.md`.
+
+| Half | State |
+|---|---|
+| Tower | **1218 passed, 32 skipped, 0 failed**, run on this machine |
+| iOS | Written here and **never compiled** — no Swift toolchain exists on this machine (`xcodebuild`, `swift`, `swiftc` all absent). Every iOS commit says BUILD UNVERIFIED |
+
+**Nothing here has met the glasses.** The Tower half is proven by automated
+tests against synthetic and recorded fixtures; the iOS half is proven by
+nothing at all until a Mac compiles it. Neither is evidence that a wearer sees
+fragments appear during a walk — only a physical run is.
+
+One behaviour changed after review and is worth restating, because it is the
+one this design exists for: geometry that is **behind the journal** is now
+served with `current: false` rather than withheld. Withholding it 404'd for an
+entire capture, so the gallery populated only after Stop — which would have
+made §1.3's "a new segment appears as you walk" false in practice while every
+test stayed green.
