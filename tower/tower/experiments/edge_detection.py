@@ -1,8 +1,13 @@
 import cv2
 import numpy as np
 
-from tower.experiments import ExperimentResult, decode_color
+from tower.experiments import ExperimentResult, MetricKind, decode_color
 from tower.instrumentation import StageTimer
+
+# The headline `edge_density` says everything this experiment measures,
+# so there is no metrics bag. A metric added below without a line here
+# raises rather than being guessed at.
+METRIC_KINDS: dict[str, MetricKind] = {}
 
 
 def run(raw_bytes: bytes) -> ExperimentResult:

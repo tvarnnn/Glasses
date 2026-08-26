@@ -18,7 +18,9 @@ experiments added in V1 are also stateful, so the callable-only registry
 would have meant four more near-identical Module classes.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Callable, Protocol, runtime_checkable
 
 import cv2
@@ -115,6 +117,53 @@ class ExperimentResult:
     metrics: dict[str, float] = field(default_factory=dict)
 
 
+class MetricKind(Enum):
+    """How a per-frame metric may be combined across many frames.
+
+    Only the EXPERIMENT knows this. A corpus harness looking at the name
+    `tracked_fraction` can guess, and a harness that guesses wrong sums a
+    fraction to 768 over 9,199 frames and prints it as though it meant
+    something. So the producer declares it, next to the line that
+    produces it, and a consumer that meets an undeclared metric raises.
+
+    RATE      a per-frame quantity -- a fraction, a score, a mean, a
+              magnitude. The corpus summary is its MEAN. Summing is
+              nonsense.
+    COUNT     a per-frame tally, including a 0/1 flag whose sum is "how
+              many frames". The corpus summary is its SUM. Averaging
+              throws away the total.
+    CONSTANT  the same number every frame by construction -- an image
+              dimension, a configured threshold. BOTH summing and
+              averaging are meaningless; it is reported as the value (or
+              values) observed, with how many frames carried each.
+    UNAGGREGATED
+              a per-frame number with no meaningful corpus aggregate at
+              all. `dominant_direction_deg` is circular: the mean of 179
+              and -179 degrees is 0, which is the direction neither frame
+              was moving. The fourth kind exists because the alternative
+              is to call such a metric a RATE and publish that 0 -- which
+              is the exact defect the other three kinds were added to
+              kill. Reported as a frame count and nothing else.
+    """
+
+    RATE = "rate"
+    COUNT = "count"
+    CONSTANT = "constant"
+    UNAGGREGATED = "unaggregated"
+
+
+class UnclassifiedMetricError(LookupError):
+    """An experiment emitted a metric it never classified.
+
+    Deliberately an ERROR rather than a default. The predecessor of this
+    module classified by allowlist and SUMMED anything it did not
+    recognise, so eight dead names and fifteen mis-summed rates went
+    unnoticed for as long as nobody happened to read the totals. A
+    silent default is what made that invisible; the loud failure is the
+    fix.
+    """
+
+
 @runtime_checkable
 class Experiment(Protocol):
     """One CV experiment, stateful or not.
@@ -169,22 +218,94 @@ from tower.experiments import (  # noqa: E402
     redaction_impact,
 )
 
-# name -> zero-argument factory. A FACTORY, not an instance: constructing
-# a detector at import time would load model weights in any process that
-# so much as imports this module, including every unrelated test.
-EXPERIMENTS: dict[str, Callable[[], Experiment]] = {
-    "baseline": lambda: StatelessExperiment("baseline", baseline.run),
-    "edge_detection": lambda: StatelessExperiment(
-        "edge_detection", edge_detection.run
-    ),
-    "frame_quality": lambda: StatelessExperiment("frame_quality", frame_quality.run),
-    "feature_detection": lambda: StatelessExperiment(
-        "feature_detection", feature_detection.run
-    ),
-    "redaction_impact": lambda: StatelessExperiment(
-        "redaction_impact", redaction_impact.run
-    ),
-    "optical_flow": optical_flow.OpticalFlowExperiment,
-    "object_detection": object_detection.ObjectDetectionExperiment,
-    "depth": depth.DepthEstimation,
+# `depth.py` is under review in another lane and cannot be edited in this
+# change, so its declaration sits here rather than beside the metrics it
+# describes, where the other seven live. It belongs in `depth.py` and
+# moves there the moment that file is writable again. Nothing depends on
+# the location: `_REGISTRY` below cannot hold a factory without a
+# declaration either way.
+_DEPTH_METRIC_KINDS: dict[str, MetricKind] = {
+    "mean_relative_depth": MetricKind.RATE,
+    "min_relative_depth": MetricKind.RATE,
+    "max_relative_depth": MetricKind.RATE,
+    "std_relative_depth": MetricKind.RATE,
 }
+
+
+@dataclass(frozen=True)
+class ExperimentRegistration:
+    """A factory and, inseparably, what its numbers mean.
+
+    One record rather than two parallel dicts, so that registering an
+    experiment without classifying its metrics is not a thing that can be
+    done and then forgotten -- it is a missing positional argument.
+    """
+
+    factory: Callable[[], Experiment]
+    metric_kinds: Mapping[str, MetricKind]
+
+
+# name -> registration. A FACTORY, not an instance: constructing a
+# detector at import time would load model weights in any process that so
+# much as imports this module, including every unrelated test.
+_REGISTRY: dict[str, ExperimentRegistration] = {
+    "baseline": ExperimentRegistration(
+        lambda: StatelessExperiment("baseline", baseline.run),
+        baseline.METRIC_KINDS,
+    ),
+    "edge_detection": ExperimentRegistration(
+        lambda: StatelessExperiment("edge_detection", edge_detection.run),
+        edge_detection.METRIC_KINDS,
+    ),
+    "frame_quality": ExperimentRegistration(
+        lambda: StatelessExperiment("frame_quality", frame_quality.run),
+        frame_quality.METRIC_KINDS,
+    ),
+    "feature_detection": ExperimentRegistration(
+        lambda: StatelessExperiment("feature_detection", feature_detection.run),
+        feature_detection.METRIC_KINDS,
+    ),
+    "redaction_impact": ExperimentRegistration(
+        lambda: StatelessExperiment("redaction_impact", redaction_impact.run),
+        redaction_impact.METRIC_KINDS,
+    ),
+    "optical_flow": ExperimentRegistration(
+        optical_flow.OpticalFlowExperiment, optical_flow.METRIC_KINDS
+    ),
+    "object_detection": ExperimentRegistration(
+        object_detection.ObjectDetectionExperiment, object_detection.METRIC_KINDS
+    ),
+    "depth": ExperimentRegistration(depth.DepthEstimation, _DEPTH_METRIC_KINDS),
+}
+
+# The long-standing public shape, derived rather than duplicated: every
+# caller that only wants "name -> factory" keeps working, and the two
+# cannot drift apart because there is only one list.
+EXPERIMENTS: dict[str, Callable[[], Experiment]] = {
+    name: registration.factory for name, registration in _REGISTRY.items()
+}
+
+
+def metric_kinds(experiment_name: str) -> Mapping[str, MetricKind]:
+    """What every metric this experiment emits means. KeyError names a
+    registry miss, which is a different bug from an unclassified metric
+    and is therefore a different exception."""
+    return _REGISTRY[experiment_name].metric_kinds
+
+
+def classify_metric(experiment_name: str, metric_name: str) -> MetricKind:
+    """How to combine one metric across frames, or raise.
+
+    There is no default. See `UnclassifiedMetricError`.
+    """
+    kinds = metric_kinds(experiment_name)
+    try:
+        return kinds[metric_name]
+    except KeyError:
+        raise UnclassifiedMetricError(
+            f"{experiment_name} emitted {metric_name!r}, which it never "
+            f"classified. Add it to METRIC_KINDS in the experiment as one "
+            f"of {', '.join(k.name for k in MetricKind)} -- the experiment "
+            f"is the only thing that knows which. Classified: "
+            f"{sorted(kinds)}"
+        ) from None

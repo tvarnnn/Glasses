@@ -22,6 +22,7 @@ from scripts.capture_corpus_benchmark import (
     benchmark_corpus,
     iter_capture_frames,
 )
+from tower.experiments import UnclassifiedMetricError, frame_quality
 
 
 def _jpeg(width: int = 32, height: int = 24, value: int = 128) -> bytes:
@@ -134,3 +135,130 @@ class TestBenchmark:
         payload = json.loads(json.dumps(report.to_json_dict()))
         assert payload["frames"] == 5
         assert payload["experiment"] == "baseline"
+
+
+def _textured_jpeg(width: int = 96, height: int = 72, shift: int = 0) -> bytes:
+    """Blocky noise a corner tracker can actually follow.
+
+    Flat frames yield no corners, so an optical-flow run over them never
+    reaches the branch that reports `tracked_fraction` -- which is the
+    metric this harness was summing to ~768 over the real corpus.
+    """
+    rng = np.random.default_rng(11)
+    small = rng.integers(0, 255, (height // 8, width // 8, 3), dtype=np.uint8)
+    array = np.asarray(
+        Image.fromarray(small).resize((width, height), Image.NEAREST)
+    )
+    if shift:
+        array = np.roll(array, shift, axis=1)
+    buf = io.BytesIO()
+    Image.fromarray(array).save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+
+
+@pytest.fixture
+def textured_corpus(tmp_path):
+    """One capture whose frames move, so flow has something to measure."""
+    frames = tmp_path / "captures" / "moving" / "frames"
+    frames.mkdir(parents=True)
+    for seq in range(1, 6):
+        (frames / f"{seq:08d}.jpg").write_bytes(_textured_jpeg(shift=2 * seq))
+    return tmp_path / "captures"
+
+
+class TestMetricsAggregateTheWayTheExperimentSaysTheyDo:
+    """The harness used to guess from the metric's NAME, via an allowlist
+    that had been checked against the producers exactly once."""
+
+    def test_a_rate_is_averaged_and_never_summed(self, corpus):
+        report = benchmark_corpus(corpus, "frame_quality")
+
+        assert "sharpness_laplacian_var" in report.averaged_metrics
+        assert "sharpness_laplacian_var" not in report.summed_metrics
+        # A fraction that has been summed over five frames is not a
+        # fraction any more. This is the whole defect, in one bound.
+        assert 0.0 <= report.averaged_metrics["overexposed_fraction"] <= 1.0
+        assert 0.0 <= report.averaged_metrics["underexposed_fraction"] <= 1.0
+
+    def test_a_count_is_summed_and_a_configured_value_is_neither(self, corpus):
+        report = benchmark_corpus(corpus, "feature_detection")
+
+        assert "keypoint_count" in report.summed_metrics
+        assert "mean_response" in report.averaged_metrics
+        assert "requested_features" in report.constant_metrics
+        assert "requested_features" not in report.summed_metrics
+        assert "requested_features" not in report.averaged_metrics
+
+    def test_a_constant_is_reported_once_with_the_frames_that_carried_it(
+        self, corpus
+    ):
+        """Summing a 32-pixel width over five frames gives 160, which is
+        not a width. Averaging gives 32, which pretends the corpus was
+        uniform. Neither is a report; the value and its frame count is."""
+        report = benchmark_corpus(corpus, "frame_quality")
+
+        assert report.constant_metrics["width"] == {32.0: 5}
+        assert report.constant_metrics["height"] == {24.0: 5}
+        assert "width" not in report.summed_metrics
+        assert "width" not in report.averaged_metrics
+
+    def test_a_constant_that_differs_between_captures_reports_both_values(
+        self, tmp_path
+    ):
+        """The corpus really does hold more than one resolution, so a
+        single number here would be a lie rather than a simplification."""
+        root = tmp_path / "captures"
+        for capture_id, (width, height), count in (
+            ("small", (32, 24), 2), ("large", (64, 48), 3)
+        ):
+            frames = root / capture_id / "frames"
+            frames.mkdir(parents=True)
+            for seq in range(1, count + 1):
+                (frames / f"{seq:08d}.jpg").write_bytes(_jpeg(width, height))
+
+        report = benchmark_corpus(root, "frame_quality")
+
+        assert report.constant_metrics["width"] == {32.0: 2, 64.0: 3}
+
+    def test_a_metric_with_no_meaningful_aggregate_is_counted_not_combined(
+        self, textured_corpus
+    ):
+        """A mean of 179 and -179 degrees is 0 -- a direction neither
+        frame was moving."""
+        report = benchmark_corpus(textured_corpus, "optical_flow")
+
+        assert report.unaggregated_metrics["dominant_direction_deg"] > 0
+        assert "dominant_direction_deg" not in report.summed_metrics
+        assert "dominant_direction_deg" not in report.averaged_metrics
+
+    def test_tracked_fraction_stays_a_fraction(self, textured_corpus):
+        """The reported symptom: ~768 over 9,199 real frames, for a
+        quantity that cannot exceed 1."""
+        report = benchmark_corpus(textured_corpus, "optical_flow")
+
+        assert "tracked_fraction" in report.averaged_metrics
+        assert 0.0 <= report.averaged_metrics["tracked_fraction"] <= 1.0
+        assert report.summed_metrics["seeded_count"] >= 1.0
+
+    def test_an_unclassified_metric_stops_the_run_instead_of_being_summed(
+        self, corpus, monkeypatch
+    ):
+        """Remove one classification and the harness must refuse, not
+        guess. This is the assertion the previous design could not make:
+        a miss there was indistinguishable from a count."""
+        monkeypatch.delitem(frame_quality.METRIC_KINDS, "overexposed_fraction")
+
+        with pytest.raises(UnclassifiedMetricError) as excinfo:
+            benchmark_corpus(corpus, "frame_quality")
+
+        assert "overexposed_fraction" in str(excinfo.value)
+
+    def test_the_three_shapes_survive_the_json_round_trip(self, corpus):
+        report = benchmark_corpus(corpus, "frame_quality")
+        payload = json.loads(json.dumps(report.to_json_dict()))
+
+        assert payload["averaged_metrics"]["overexposed_fraction"] <= 1.0
+        assert payload["constant_metrics"]["width"] == [
+            {"value": 32.0, "frames": 5}
+        ]
+        assert "width" not in payload["summed_metrics"]

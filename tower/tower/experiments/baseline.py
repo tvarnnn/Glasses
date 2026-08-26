@@ -1,5 +1,11 @@
-from tower.experiments import ExperimentResult
+from tower.experiments import ExperimentResult, MetricKind
 from tower.frame_processing import process_frame
+
+# Baseline's headline IS its whole result: `mean_intensity` travels in
+# the dedicated field, which the harness already averages. Empty, and
+# empty on purpose -- a metric added below without a line here raises
+# rather than being guessed at.
+METRIC_KINDS: dict[str, MetricKind] = {}
 
 
 def run(raw_bytes: bytes) -> ExperimentResult:

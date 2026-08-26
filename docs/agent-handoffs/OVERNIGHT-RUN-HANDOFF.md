@@ -6,10 +6,23 @@ If context is lost, a successor session can resume from this file plus
 
 **Branch:** `integration/world-builder-lifecycle-v1`
 **Run started from:** `3998e5a`
-**Last updated:** 2026-08-26, after the Object Memory iOS surface
-**Suite at last update:** 1497 passed, 30 skipped, 0 failed
+**Last updated:** 2026-08-26, after the lifecycle ruling and the corpus
+harness fix
+**Suite at last update:** 1533 passed, 30 skipped, 0 failed
 
-`main` is untouched at `35214a1`. Nothing has been merged or pushed.
+`main` is **untouched at `35214a1`**, locally and on origin. Nothing has been
+merged to it.
+
+**The integration branch HAS been pushed** — `origin/integration/world-builder-lifecycle-v1`.
+Two fast-forward pushes, no force, no rebase, both lanes' commits intact.
+This changed on 2026-08-26 when iOS ownership moved to a Mac lane that needs
+to pull Tower work. **Fetch before every push and check whether the remote
+advanced**; if it has, integrate rather than force.
+
+**iOS is owned by the Mac lane.** This lane does not modify `ios/`. Tower
+work that creates an iOS requirement is written to
+`docs/agent-handoffs/IOS-EXECUTION-PLAN.md`, which is the single current
+iOS document.
 
 ---
 
@@ -148,6 +161,44 @@ laptop from another."* Empty: distinguishes "no record within the window
 it can see" from a class never looked for, whose *"absence carries no
 information at all."*
 
+### Module lifecycle — RULED AND IMPLEMENTED, then adversarially reviewed
+
+The decision gate that had been open all run (§4's "needs a human ruling")
+was **ruled E+A by this lane** on 2026-08-26 under an explicit autonomy
+grant: research had already resolved it with five costed options and a
+recommendation. Reversible; **B remains the V1.1 destination.**
+
+- `asyncio.wait_for` **cannot interrupt synchronous work**, so the 10 s
+  lifecycle timeout was fiction for any module that loads a model.
+- **`LOAD_TIMEOUT_S = 120.0`**, derived not chosen: a cold depth load fetches
+  **119.0 MB**, needing ~95 Mbit/s to fit in 10 s — so 10 s meant deterministic
+  first-run failure. Warm loads measure 1.80 s (depth, CUDA) and 0.16 s
+  (SSDLite), so 120 s is ~65x real cost and still a real bound.
+- `tower/loading.py` adds `LoadInvalidation`, fixing an **ordering** bug: on
+  timeout the orphaned loader would otherwise install a model into an
+  already-released module — on CUDA, holding VRAM nothing would ever free.
+
+**An adversarial reviewer then confirmed six findings.** The core
+check-and-assign guarantee holds and the orphan path genuinely frees
+(weakref probes inside `empty_cache`). What failed is everything around it —
+most seriously that `main.py:212` runs the load under `asyncio.run`, whose
+executor shutdown **joins the orphan**, so the bound does not bound startup
+at the only place it runs. Full list and evidence:
+`research/2026-08-26-lifecycle-adversarial-findings.md`.
+
+### The corpus harness was summing almost every rate
+
+`_RATE_METRICS` was an allowlist that **silently summed anything unnamed**.
+8 of 11 entries were dead names; 15 rate-like metrics were summed. Fixed by
+moving classification to the experiments (a factory cannot be registered
+without a declaration) and making an unclassified metric **an error, not a
+default**. Four kinds: RATE, COUNT, CONSTANT, UNAGGREGATED.
+
+Proof on real data: `tracked_fraction` **7,468.205 -> 0.8118** for a quantity
+that cannot exceed 1. **No published figure was contaminated** — checked;
+the only corpus-scale published run was `object_detection`, whose three rate
+metrics were the three live entries.
+
 ### Document Memory — PREMISE FALSIFIED
 
 Implemented, 145 tests, and **never ran on a real frame** until this run.
@@ -257,12 +308,15 @@ matter most:
   thing that should be softened to get a green run.
   Not a timeout: `drain()` blocks by design and `pump()` is synchronous
   over the portal, precisely so timing cannot decide the outcome. The
-  leading hypothesis is Windows file locking — the test unlinks
-  `world.json` while a subscription is live, and `unlink()` raises
-  WinError 32 if a handle is open at that instant. `read_json_closed()`
-  already narrows that window, which fits a rare race rather than a
-  broken test. **This is a hypothesis; the traceback was never captured.**
-  Next occurrence, capture it with `--tb=long` before doing anything else.
+  hypothesis was Windows file locking, and it is now **CONFIRMED**: a
+  later full-suite run surfaced it as **WinError 32**, the sharing
+  violation raised when `unlink()` meets an open handle. The test unlinks
+  `world.json` while a subscription is live, which is deliberate — that
+  is the case it exists to cover. `read_json_closed()` already narrows
+  the window, which is why it is rare rather than constant.
+  **It is a real Windows race in the test, not a defect in the result
+  channel**, and the fix is to make the unlink tolerate a transient
+  sharing violation — never to soften the assertion that follows it.
 
 - **`data/captures/` is never pruned.** 9,199 real frames with no retention
   policy governing them.

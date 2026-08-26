@@ -16,12 +16,17 @@ the score is reported alongside the count so a consumer can see how thin
 the evidence is. Nothing here establishes identity, and nothing persists.
 """
 
+import logging
+
 import cv2
 import numpy as np
 
-from tower.experiments import ExperimentResult, ExperimentSettings
+from tower.experiments import ExperimentResult, ExperimentSettings, MetricKind
 from tower.instrumentation import StageTimer
+from tower.loading import LoadInvalidation
 from tower.modules.base import FrameProcessingError
+
+logger = logging.getLogger(__name__)
 
 # Below this a COCO detection from a mobile-class detector is noise more
 # often than not. Reported as a metric so the choice stays visible, and
@@ -33,6 +38,23 @@ SCORE_THRESHOLD = 0.4
 # them by name. Everything else is folded into `detections`.
 TRACKED_CLASSES = ("person", "chair", "couch", "dining table", "tv", "laptop")
 
+# `score_threshold` is SCORE_THRESHOLD echoed back on every frame: a
+# constant, and the old harness AVERAGED it, which happened to give the
+# right number for the wrong reason. The per-class entries are derived
+# from TRACKED_CLASSES rather than typed out, so a class added above
+# cannot arrive unclassified.
+METRIC_KINDS: dict[str, MetricKind] = {
+    "detections": MetricKind.COUNT,
+    "raw_detections": MetricKind.COUNT,
+    "score_threshold": MetricKind.CONSTANT,
+    "mean_score": MetricKind.RATE,
+    "max_score": MetricKind.RATE,
+    **{
+        f"count_{name.replace(' ', '_')}": MetricKind.COUNT
+        for name in TRACKED_CLASSES
+    },
+}
+
 
 class ObjectDetectionExperiment:
     name = "object_detection"
@@ -42,6 +64,16 @@ class ObjectDetectionExperiment:
         self._transform = None
         self._device = None
         self._categories = None
+        # Guards the handover from a load that may have been abandoned by
+        # the module's load timeout. See tower/loading.py.
+        self._invalidation = LoadInvalidation()
+
+    def _install(self, model, transform, categories, device) -> None:
+        """Hand the loaded model to `self`. Runs under the token's lock."""
+        self._model = model
+        self._transform = transform
+        self._categories = categories
+        self._device = device
 
     def load(self, settings: ExperimentSettings | None = None) -> None:
         # Local imports: torch/torchvision are an optional [ml] extra, and
@@ -58,18 +90,71 @@ class ObjectDetectionExperiment:
         weights = SSDLite320_MobileNet_V3_Large_Weights.COCO_V1
         model = ssdlite320_mobilenet_v3_large(weights=weights)
         model.eval()
-        self._device = torch.device(device)
-        model.to(self._device)
-        self._model = model
-        self._transform = weights.transforms()
-        self._categories = list(weights.meta["categories"])
+        # Locals until the very last line, then installed through the
+        # invalidation token. This runs on a worker thread so that the
+        # module's load timeout can actually bound the weight download --
+        # and a timeout ABANDONS this thread rather than stopping it, so
+        # `release()` may already have run by the time we get here.
+        # Assigning `self._model` directly would hand a live model, and on
+        # CUDA resident GPU memory, to a FAILED module that will never be
+        # released again.
+        torch_device = torch.device(device)
+        try:
+            model.to(torch_device)
+            # Built out here rather than inside the publish lambda: they
+            # can raise, and raising inside `install` would do so while
+            # the token's lock is held, with the model already resident
+            # and nothing covering it. The token guards the publish, not
+            # the build, so the build guards itself.
+            transform = weights.transforms()
+            categories = list(weights.meta["categories"])
+        except BaseException:
+            # This frame owns the model and nothing installed it, so this
+            # frame frees it -- before the traceback that would otherwise
+            # pin it escapes to the container's `except` block, which
+            # calls `release()` while the traceback is still live.
+            del model
+            if torch_device.type == "cuda":
+                torch.cuda.empty_cache()
+            raise
+        if not self._invalidation.publish(
+            lambda: self._install(model, transform, categories, torch_device)
+        ):
+            del model
+            if torch_device.type == "cuda":
+                torch.cuda.empty_cache()
+            logger.warning(
+                "[Tower][Module] object detection weights finished loading "
+                "after the module was released; discarded"
+            )
 
-    def release(self) -> None:
-        was_cuda = self._device is not None and self._device.type == "cuda"
+    def _clear(self) -> None:
+        """Forget everything the load installed. Runs under the token's lock."""
         self._model = None
         self._transform = None
         self._categories = None
         self._device = None
+
+    def release(self) -> None:
+        # The device is read INSIDE the teardown so that one lock covers
+        # both the question and the answer. Reading it before invalidating
+        # -- as this used to -- is a TOCTOU: an abandoned loader that
+        # publishes in between makes `publish()` return True, so the
+        # loader skips its own `empty_cache()`, `_clear` drops the CUDA
+        # model, and the stale False here means `empty_cache()` runs
+        # nowhere at all. Same shape as depth.py's `release()`.
+        was_cuda: list[bool] = []
+
+        def _teardown() -> None:
+            # Runs under the token's lock, and must not touch the token.
+            if self._device is not None and self._device.type == "cuda":
+                was_cuda.append(True)
+            self._clear()
+
+        # Invalidate and clear as one critical section: clearing first
+        # would leave a window in which an abandoned loader installs into
+        # a slot that has just been emptied.
+        self._invalidation.invalidate(_teardown)
         if was_cuda:
             import torch
 

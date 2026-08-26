@@ -16,8 +16,24 @@ the others offer.
 import cv2
 import numpy as np
 
-from tower.experiments import ExperimentResult, decode_color
+from tower.experiments import ExperimentResult, MetricKind, decode_color
 from tower.instrumentation import StageTimer
+
+# What each number means when many frames are combined. Seven of these
+# are per-frame measurements whose corpus answer is a mean; `width` and
+# `height` are neither summable nor averageable -- a corpus of 9,199
+# frames does not have a mean width, it has the sizes it was shot at.
+METRIC_KINDS: dict[str, MetricKind] = {
+    "sharpness_laplacian_var": MetricKind.RATE,
+    "gradient_energy": MetricKind.RATE,
+    "entropy_bits": MetricKind.RATE,
+    "contrast_std": MetricKind.RATE,
+    "edge_density": MetricKind.RATE,
+    "overexposed_fraction": MetricKind.RATE,
+    "underexposed_fraction": MetricKind.RATE,
+    "width": MetricKind.CONSTANT,
+    "height": MetricKind.CONSTANT,
+}
 
 # 8-bit imagery, so these are absolute levels rather than fractions.
 # Chosen at the ends of the range: a pixel at 250+ has almost certainly

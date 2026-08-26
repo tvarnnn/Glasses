@@ -35,26 +35,36 @@ from pathlib import Path
 # directly still needs the project root importable.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tower.experiments import EXPERIMENTS, ExperimentSettings  # noqa: E402
+from tower.experiments import (  # noqa: E402
+    EXPERIMENTS,
+    ExperimentSettings,
+    MetricKind,
+    classify_metric,
+)
 
-# Metric names whose values are RATES or SCORES, which must be averaged.
-# Everything else -- detection counts, per-class counts -- is a COUNT and
-# must be summed. Getting this backwards produces a number that looks
-# plausible and means nothing: a summed "mean score" of 47.3 across 91
-# frames, or a detection count averaged down to 0.4.
-_RATE_METRICS = frozenset({
-    "score_threshold",
-    "mean_score",
-    "max_score",
-    "mean_depth",
-    "depth_p50",
-    "depth_p95",
-    "sharpness",
-    "blur_ratio",
-    "inlier_ratio",
-    "survival_ratio",
-    "overlap_ratio",
-})
+# How to combine a metric across frames is NOT decided here. It used to
+# be: an allowlist of names, everything else summed. Eight of its eleven
+# names were dead, fifteen rate-like metrics were being summed, and
+# `tracked_fraction` -- a quantity that cannot exceed 1 -- was reported
+# as 768 over the real corpus. A name is not evidence of what a number
+# means; the experiment that produced it is, and it now says so in its
+# own METRIC_KINDS. A metric that says nothing raises here rather than
+# defaulting to a plausible, meaningless total.
+
+# A CONSTANT with more distinct values than this is not a constant, and
+# whatever it is, accumulating one entry per frame for 9,199 frames is
+# not a report. The corpus holds a handful of resolutions, so the ceiling
+# is loose enough never to fire on a correct declaration.
+_MAX_CONSTANT_VALUES = 16
+
+
+class MisclassifiedConstantError(ValueError):
+    """A metric declared CONSTANT that keeps changing.
+
+    Raised rather than smoothed over: a constant that varies is either a
+    misdeclaration by the experiment or a genuinely surprising corpus,
+    and both are things a benchmark should stop and say out loud.
+    """
 
 
 @dataclass
@@ -96,8 +106,16 @@ class CorpusReport:
     captures: int = 0
     timings_ms: list[float] = field(default_factory=list)
     per_capture: dict[str, CaptureReport] = field(default_factory=dict)
+    # One field per MetricKind, so a reader never has to ask which
+    # aggregation produced a number.
     summed_metrics: dict[str, float] = field(default_factory=dict)
     averaged_metrics: dict[str, float] = field(default_factory=dict)
+    # metric -> {value: frames that reported it}. Usually one entry.
+    constant_metrics: dict[str, dict[float, int]] = field(default_factory=dict)
+    # metric -> frames that reported it, and nothing else. A circular
+    # quantity has no mean and no total; saying how often it was measured
+    # is the most a corpus summary can honestly say about it.
+    unaggregated_metrics: dict[str, int] = field(default_factory=dict)
     mean_intensity: float = 0.0
 
     @property
@@ -126,6 +144,16 @@ class CorpusReport:
             "averaged_metrics": {
                 k: round(v, 4) for k, v in sorted(self.averaged_metrics.items())
             },
+            "constant_metrics": {
+                name: [
+                    {"value": value, "frames": frames}
+                    for value, frames in sorted(
+                        values.items(), key=lambda kv: (-kv[1], kv[0])
+                    )
+                ]
+                for name, values in sorted(self.constant_metrics.items())
+            },
+            "unaggregated_metrics": dict(sorted(self.unaggregated_metrics.items())),
             "per_capture": [
                 r.to_json_dict() for r in sorted(
                     self.per_capture.values(), key=lambda r: r.capture_id
@@ -185,6 +213,8 @@ def benchmark_corpus(
 
     summed: dict[str, float] = {}
     averaged: dict[str, list[float]] = {}
+    constants: dict[str, dict[float, int]] = {}
+    unaggregated: dict[str, int] = {}
     intensities: list[float] = []
 
     try:
@@ -213,16 +243,32 @@ def benchmark_corpus(
                 intensities.append(result.mean_intensity)
 
             for name, value in result.metrics.items():
-                if name in _RATE_METRICS:
+                # Raises UnclassifiedMetricError if the experiment never
+                # said what this number is. That is the point.
+                kind = classify_metric(experiment_name, name)
+                if kind is MetricKind.RATE:
                     averaged.setdefault(name, []).append(value)
-                else:
+                elif kind is MetricKind.COUNT:
                     summed[name] = summed.get(name, 0.0) + value
+                elif kind is MetricKind.CONSTANT:
+                    seen = constants.setdefault(name, {})
+                    seen[value] = seen.get(value, 0) + 1
+                    if len(seen) > _MAX_CONSTANT_VALUES:
+                        raise MisclassifiedConstantError(
+                            f"{experiment_name}.{name} is declared CONSTANT "
+                            f"but has taken more than {_MAX_CONSTANT_VALUES} "
+                            f"distinct values across {report.frames} frames"
+                        )
+                else:
+                    unaggregated[name] = unaggregated.get(name, 0) + 1
     finally:
         experiment.release()
 
     report.captures = len(report.per_capture)
     report.summed_metrics = summed
     report.averaged_metrics = {k: statistics.fmean(v) for k, v in averaged.items()}
+    report.constant_metrics = constants
+    report.unaggregated_metrics = unaggregated
     report.mean_intensity = statistics.fmean(intensities) if intensities else 0.0
     return report
 
@@ -250,6 +296,20 @@ def _render_text(report: CorpusReport) -> str:
             lines.append("averaged:")
             for name, value in sorted(report.averaged_metrics.items()):
                 lines.append(f"  {name:<28} {value:.4f}")
+        if report.constant_metrics:
+            lines.append("constant (value x frames):")
+            for name, values in sorted(report.constant_metrics.items()):
+                rendered = ", ".join(
+                    f"{value:g} x{frames}"
+                    for value, frames in sorted(
+                        values.items(), key=lambda kv: (-kv[1], kv[0])
+                    )
+                )
+                lines.append(f"  {name:<28} {rendered}")
+        if report.unaggregated_metrics:
+            lines.append("not aggregated (no meaningful corpus summary):")
+            for name, frames in sorted(report.unaggregated_metrics.items()):
+                lines.append(f"  {name:<28} measured on {frames} frames")
     else:
         lines.append("no frames found -- is TOWER_CAPTURE_ROOT right?")
     return "\n".join(lines)
