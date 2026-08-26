@@ -353,7 +353,9 @@ final class WorldBuilderViewModel: ObservableObject {
         // slow part, and a newer manifest may have landed during them.
         guard revision == lastGeometryRevision else { return }
         geometryChunks = chunks
-        fragmentsModel = WorldFragmentsModel(segments: manifest.segments)
+        fragmentsModel = WorldFragmentsModel(
+            segments: manifest.segments, isCurrent: manifest.current
+        )
 
         // Published first, and *then* the marker is cleared: whatever did
         // arrive is on screen, and only the retry is rearmed. A partially

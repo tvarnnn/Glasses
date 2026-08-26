@@ -22,6 +22,12 @@ import SwiftUI
 struct WorldFragmentsModel: Equatable {
     let segments: [WorldSegmentSummary]
 
+    /// Whether the Tower's geometry reflects every keyframe it has accepted.
+    ///
+    /// A `var` with a default so the memberwise initialiser keeps working for
+    /// the empty and cleared cases, which have no manifest to ask.
+    var isCurrent: Bool = true
+
     /// Only resolved segments with real bounds can be drawn. A resolved
     /// segment with no bounds is incoherent and is refused rather than framed
     /// by guess.
@@ -38,6 +44,15 @@ struct WorldFragmentsModel: Equatable {
     /// True once the Tower registers segments into one frame. False today.
     var hasSharedFrame: Bool {
         !segments.isEmpty && segments.allSatisfy(\.registered)
+    }
+
+    /// Said out loud when the fragments on screen are real but behind. Not a
+    /// warning and not an error state: the world is still being built, and
+    /// this is what "still building" looks like from here.
+    var buildingNote: String? {
+        if isCurrent { return nil }
+        return "The Tower is still building this world, so these fragments "
+            + "may be behind the newest frames."
     }
 
     var headline: String {
@@ -131,6 +146,12 @@ struct WorldFragmentsView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text(model.headline)
                 .font(.headline)
+
+            if let note = model.buildingNote {
+                Text(note)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
 
             if model.fragments.isEmpty {
                 // UNKNOWN: nothing has been mapped. Not an empty canvas,

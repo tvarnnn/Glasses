@@ -146,6 +146,15 @@ extension WorldSegmentSummary {
 struct WorldGeometryManifest: Equatable, Sendable {
     let worldID: String
     let sessionID: String
+    /// Whether this geometry reflects every keyframe the Tower has accepted.
+    ///
+    /// `false` is the NORMAL state during a walk, not an error: the Tower
+    /// rebuilds as it goes, and the next keyframe puts the finished build
+    /// behind. The Tower used to hide behind-but-real geometry behind a 404,
+    /// which meant the gallery stayed empty for the whole capture. It now
+    /// serves it with this flag, and the flag is the only thing standing
+    /// between "a partial world" and "the finished world".
+    let current: Bool
     let geometryRevision: String
     let poseConvention: WorldPoseConvention
     let segments: [WorldSegmentSummary]
@@ -224,7 +233,13 @@ enum WorldGeometryDecoder {
         }
 
         return WorldGeometryManifest(
-            worldID: worldID, sessionID: sessionID, geometryRevision: revision,
+            worldID: worldID, sessionID: sessionID,
+            // Absent means TRUE, and that is not an optimistic default. A
+            // Tower old enough not to send this field is one that answered
+            // 404 for anything behind the journal -- so on that Tower,
+            // geometry that arrived at all was current by construction.
+            current: json["current"] as? Bool ?? true,
+            geometryRevision: revision,
             poseConvention: convention, segments: segments
         )
     }

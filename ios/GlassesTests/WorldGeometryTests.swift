@@ -45,6 +45,34 @@ final class WorldGeometryDecoderTests: XCTestCase {
         XCTAssertEqual(manifest?.segments[0].pointCount, 2)
     }
 
+    func testAManifestThatIsBehindTheJournalDecodesAsNotCurrent() {
+        // The Tower used to answer 404 for geometry that was real but behind,
+        // which during a walk meant the whole capture. It now serves it with
+        // current: false, and this flag is the only thing separating a
+        // partial world from the finished one.
+        var json = manifestJSON()
+        json["current"] = false
+
+        let manifest = WorldGeometryDecoder.manifest(from: json)
+        XCTAssertNotNil(manifest, "behind is served, not refused")
+        XCTAssertEqual(manifest?.current, false)
+        XCTAssertEqual(manifest?.segments.count, 2, "the geometry is unchanged")
+    }
+
+    func testACurrentManifestSaysSo() {
+        var json = manifestJSON()
+        json["current"] = true
+        XCTAssertEqual(WorldGeometryDecoder.manifest(from: json)?.current, true)
+    }
+
+    func testAManifestWithoutTheFieldIsTakenAsCurrent() {
+        // An older Tower never sends it -- and that Tower hid anything behind
+        // the journal behind a 404, so what it did serve was current by
+        // construction.
+        XCTAssertNil(manifestJSON()["current"])
+        XCTAssertEqual(WorldGeometryDecoder.manifest(from: manifestJSON())?.current, true)
+    }
+
     func testAnUnresolvedSegmentKeepsNilBoundsRatherThanAZeroBox() {
         let manifest = WorldGeometryDecoder.manifest(from: manifestJSON())
         let unresolved = manifest?.segments[1]
@@ -224,6 +252,25 @@ final class WorldFragmentsModelTests: XCTestCase {
         let model = WorldFragmentsModel(segments: [])
         XCTAssertTrue(model.fragments.isEmpty)
         XCTAssertEqual(model.headline, "Nothing mapped yet")
+    }
+
+    func testAWorldStillBeingBuiltSaysSoRatherThanPassingAsFinished() {
+        let model = WorldFragmentsModel(
+            segments: [summary(index: 0, points: 100, state: .resolved, bounds: box)],
+            isCurrent: false
+        )
+
+        XCTAssertEqual(model.fragments.count, 1, "behind geometry is still drawn")
+        XCTAssertNotNil(model.buildingNote)
+        XCTAssertTrue(model.buildingNote!.contains("still building"))
+    }
+
+    func testACurrentWorldAddsNoCaveat() {
+        let model = WorldFragmentsModel(
+            segments: [summary(index: 0, points: 100, state: .resolved, bounds: box)],
+            isCurrent: true
+        )
+        XCTAssertNil(model.buildingNote)
     }
 
     func testAResolvedSegmentWithoutBoundsIsNotDrawn() {
