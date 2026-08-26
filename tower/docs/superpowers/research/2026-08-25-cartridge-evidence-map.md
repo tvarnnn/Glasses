@@ -1,0 +1,211 @@
+# Cartridge evidence map and high-level roadmap
+
+**Date:** 2026-08-25
+**Method:** three parallel archaeology agents over `tower/`, `ios/` and the
+docs tree, plus direct measurement of on-disk artifacts. Every status below is
+read off code, tests or data — not off a design document.
+
+This exists because the same archaeology keeps being redone. It records what is
+*built*, what is *designed*, and what has *met hardware* — three different
+things that the docs routinely conflate.
+
+---
+
+## 1. The rule this map applies
+
+| Class | Means |
+|---|---|
+| IMPLEMENTED | code exists and is tested |
+| PARTIAL | some layers exist, a named layer does not |
+| PLANNED-WITH-DESIGN | a real design doc exists; no code |
+| PLANNED-DOC-ONLY | a module doc exists; no design, no code |
+| Physically validated | ran against real Ray-Ban glasses, with a report |
+
+Test coverage is not physical validation. Several cartridges are heavily tested
+and have never seen a real frame.
+
+---
+
+## 2. Status
+
+| Cartridge | Status | Tests | Physically validated |
+|---|---|---|---|
+| **World Builder** | PARTIAL → transport now complete | ~310 + 20 iOS | **Partly.** Capture/reconnect on 2026-08-24; first posed reconstruction 2026-08-25. Geometry has never reached a phone |
+| **Experimental CV Lab** | IMPLEMENTED | 86 | **Partly.** The `baseline` experiment only, 2026-08-21 |
+| **Document Memory** | IMPLEMENTED engine + CLI; no wire contract | 145 | **No.** Synthetic pages only. `data/document_memory/` has never existed |
+| **Scene Understanding** | IMPLEMENTED, persists nothing by design | 98 | **No.** There is no imagery of people on this host |
+| **Object Memory** | PARTIAL — data layer only, 328 lines, no producer | 33 | **Never run at all** |
+| **Environmental Memory** | PLANNED-WITH-DESIGN; the design says *do not begin* | 0 | N/A |
+| **Translator** | PLANNED-WITH-DESIGN; two plans, both stamped DO NOT IMPLEMENT | 0 | N/A |
+| **Visual Q&A** | PLANNED-DOC-ONLY | 0 | N/A |
+| **Accessibility** | PLANNED-DOC-ONLY, additionally hard-blocked | 0 | N/A |
+
+There is no `tower/tower/cartridges/` directory. Cartridges are sibling packages
+under `tower/tower/`. "Cartridge" is a docs word; the code says "module" only
+for the lifecycle contract.
+
+---
+
+## 3. The four blockers that actually gate the program
+
+Ordered by how much they unblock per unit of work.
+
+### 3.1 The ML stack is not installed — everything model-backed is inert
+
+`torch`, `torchvision`, `timm` and `easyocr` are **absent from the venv**.
+Verified independently twice. Only `cv2` 5.0.0 and `numpy` 2.5.2 are present.
+
+So object detection (SSDLite320/COCO), depth (MiDaS), scene detection,
+orientation (KeypointRCNN) and OCR (EasyOCR) **cannot run at all right now**,
+and every "measured on this host" figure across the docs is currently
+unreproducible. No document says so.
+
+The only vendored model is
+`tower/models/face_detection_yunet_2023mar.onnx` (232 KB), which works because
+`cv2.FaceDetectorYN` is compiled into opencv-headless.
+
+**This is the cheapest high-value item on the board.** Restoring CUDA torch in
+the correct install order (`README.md:70-95` documents the hazard) reanimates
+three cartridges' worth of measurement.
+
+### 3.2 An unrecorded ruling gates the module lifecycle
+
+`docs/superpowers/plans/2026-08-20-object-memory-first-slice.md:826-896` is a
+decision gate that has never been answered. In short: `_do_load()` must load a
+detector synchronously, `asyncio.wait_for` cannot interrupt sync CPU work on the
+loop thread, so the 10 s `LIFECYCLE_TIMEOUT_S` is fiction; enforcing it makes a
+cold-cache first run fail deterministically, and `to_thread` + `mark_failed()`
+leaks a loaded model through an ordering bug no `release()` can fix.
+
+Five options are costed. It gates Object Memory tasks 4-8, a **second module
+slot** (the V1.0 trigger), and transitively Accessibility and Visual Q&A.
+
+**This one needs a human ruling.** It is an execution-model decision, not a bug.
+
+### 3.3 The `person` ruling
+
+COCO includes `person`. Object Memory's Task 6 as written would persist a record
+per bystander. Escalated, unresolved, and it must be decided **before** any code
+writes such a record.
+
+### 3.4 No audio path exists anywhere
+
+`tower/frames.py` accepts JPEG only; `Module.process()` takes `bytes` meaning one
+still image. *"The only sensor observation this platform has a word for is a
+still image."* Every audio library is absent and there is no capture endpoint
+attached.
+
+Blocks Translator, and the voice half of Visual Q&A and Accessibility.
+
+Three hardware facts reshape it: Ray-Ban HFP is documented 8 kHz mono (every
+ASR candidate expects 16 kHz), A2DP and HFP are mutually exclusive (the wearer
+cannot hear high-quality audio while the mic captures), and the mic is reachable
+through ordinary `AVAudioSession`, **not** a DAT call.
+
+---
+
+## 4. Shared infrastructure — what exists
+
+| Concern | Where | Note |
+|---|---|---|
+| Module contract | `tower/modules/base.py` | 6 states; `mark_failed()` is terminal |
+| Container | `tower/modules/container.py` | **"Registry of one."** Holds exactly one Module |
+| Capability registry | `tower/results/registry.py` | Static, compiled in. Not dynamic discovery |
+| Result channel | `tower/results/`, `tower/routes/results_ws.py` | Read-only over state other processes persisted. One slot per subscription, newest wins |
+| Geometry transport | `tower/results/world_builder_geometry.py`, `tower/routes/geometry.py` | **New.** HTTP, off the frame socket |
+| Capture recorder | `tower/capture.py` | Shared, off by default, bounded, purgeable |
+| Capture workers | `tower/capture_workers.py` | One child process per capture lineage, from an argv — cartridge-blind |
+| Boundary enforcement | `tests/test_architecture_boundaries.py` | AST-based; includes an AST-level ban on gaze/identity vocabulary |
+
+**What does not exist:** multi-consumer frame distribution, frame metadata into
+modules, any asynchronous execution path (no worker, queue or executor anywhere
+in `tower/`), cartridge-declared sensor requirements.
+
+### The frame fan-out, precisely
+
+One decode-and-dispatch feeding **one** module. Every other cartridge runs
+**out of process**, tailing the capture journal via `CaptureFollower`. Only
+World Builder is auto-attached, because `main.py` hardcodes one `WorkerSpec`.
+
+There is **no shared inference**: three separate sites load the same SSDLite320
+COCO weights independently, and sharing is explicitly refused for now on the
+grounds that the consumers want different things from the same weights.
+
+---
+
+## 5. Dependency graph
+
+```
+  ML stack restored (§3.1)  ── unblocks measurement for ──┐
+                                                          │
+  Lifecycle ruling (§3.2) ──┬─ Object Memory 4-8          │
+                            ├─ second module slot          │
+                            └─ Accessibility, Visual Q&A   │
+                                                          │
+  `person` ruling (§3.3) ──── Object Memory persistence    │
+                                                          │
+  Audio path (§3.4) ────────┬─ Translator                  │
+                            └─ voice half of VQA / A11y    │
+                                                          │
+  World Builder geometry ───┬─ Object Memory spatial ◄─────┘
+   (transport done;          ├─ Scene Understanding spatial
+    registration NOT)        └─ Environmental Memory "where"
+```
+
+**World Builder's registration gap propagates.** Three cartridges want "where",
+and no cartridge can answer it while segments share no coordinate frame. The
+Environmental Memory study put it bluntly: of *"what was in this room earlier?"*,
+the word **"room" is not weakly supported — it is not supported at all.**
+
+---
+
+## 6. The cheapest evidence available, unclaimed
+
+`data/captures/` holds **18 captures, 9,199 real Ray-Ban frames** at 360×640
+portrait. **No detector or OCR has ever been run on any of them.**
+
+Document Memory's OCR benchmark used **landscape** frame sizes while every real
+frame is **portrait** — so the delivered case may be worse than the worst row in
+its table, and nobody has checked. Word recall was already 0.43–0.81 at 640×360
+against 0.96–1.00 at 1280×720.
+
+Running the existing detectors over that corpus is roughly ten seconds of CPU
+and can falsify several cartridge premises. It is blocked only by §3.1.
+
+---
+
+## 7. Recommended order
+
+1. **Physically validate the geometry transport.** Handoff written. Cheap, and
+   it closes World Builder's product path.
+2. **Restore the ML stack** (§3.1). Cheapest unblock on the board.
+3. **Run the 9,199 frames through what exists** (§6). Highest evidence per
+   minute; may falsify premises before they cost implementation.
+4. **Get the two rulings** (§3.2, §3.3). Human decisions; nothing routes around
+   them.
+5. **Then World Builder registration** — covisibility before bundle adjustment,
+   because BA measured 0.00% drift improvement on a chain graph with median
+   covisibility span 1. Three cartridges are waiting on this.
+6. **Then capture resolution.** DAT offers 720×1280; the app streams 360×640;
+   frames are ~20.8 KB JPEG at ~2 Mbps, so there is headroom. This is a
+   correctness lever on tracking, not a cosmetic one — and it may move Document
+   Memory's OCR recall from 0.43 to near 1.0 at the same time.
+
+Note that 1080p is **not** available. `07-PLATFORM-CONSTRAINTS.md:79` lists
+`high` 720×1280, `medium` 504×896, `low` 360×640, all 9:16. There is no
+landscape mode, so the ~45° horizontal field is fixed by the SDK at every
+resolution.
+
+---
+
+## 8. Stale documentation found
+
+| Claim | Reality |
+|---|---|
+| `EXPERIMENTAL-CV.md:275-279`: face detection BLOCKED, "no ONNX file exists anywhere on disk" | False. YuNet is vendored and in production use |
+| `SCENE-UNDERSTANDING.md:357`: "torch is CPU-only on this host" | torch is not installed at all |
+| `03-ROADMAP.md:112` cites `tower/modules/depth_cv.py` | Deleted at V0.9.5 — the same doc says so 40 lines later |
+| `04-MODULE-SYSTEM.md:198`: recorder writes under `data/world_builder/captures/` | Actual path is `data/captures/`, and putting the shared recorder under a cartridge prefix is what `capture.py` argues against |
+| `IOS-to-Tower.md:62`: capability declaration "MISSING — TOWER NEEDED" | Implemented since 2026-08-23 |
+| Every doc treating calibration as the standing blocker | A `self_calibrated` record for 360×640 has existed since 2026-08-25 |
+| `2026-08-25-FINAL-HANDOFF.md:91-97`: the iOS client "is in no branch of this repository" | It was on `origin/ios/world-builder-integration` the whole time; that handoff searched only the `ios-origin` remote |
