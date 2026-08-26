@@ -366,3 +366,43 @@ the sentinel for "no degeneracy" **is** the empty string, so Swift's
 `?? ""` lands on the same value. No `null`-versus-empty conflation, and
 no conflict with the project's absent-is-never-zero rule. `dominant_degeneracy`
 is separately and correctly optional on both sides.
+
+---
+
+## Build settings, read directly — 2026-08-26
+
+Two flagged risks are retired by the project file rather than by opinion.
+Read off `XCBuildConfiguration` blocks in `ios/Glasses.xcodeproj/project.pbxproj`:
+
+| target | `SWIFT_VERSION` | `SWIFT_DEFAULT_ACTOR_ISOLATION` |
+|---|---|---|
+| `com.tristanvarner.Glasses` (app) | **5.0** | **MainActor** |
+| `com.tristanvarner.GlassesTests` | **5.0** | **none** |
+
+**1. The `@MainActor` finding does not fire, and the refusal above was
+right.** The test target does not set `SWIFT_DEFAULT_ACTOR_ISOLATION` at
+all, so it does not inherit the app target's MainActor default. This is
+now settled from build settings, not merely from the precedent of
+non-annotated classes on `main`.
+
+**2. The `URLProtocol` stubs' mutable `static var` state is not a compile
+error.** It would be one under Swift 6 language mode — *"not
+concurrency-safe because it is nonisolated global shared mutable state"*
+— but both targets are **Swift 5.0**, and `SWIFT_STRICT_CONCURRENCY` is
+not set anywhere in the project, so checking is `minimal` and this is at
+most a warning. This applies to both `StubbedGeometryProtocol`
+(`WorldGeometryTests.swift`) and `ObjectMemoryStubProtocol`
+(`ObjectMemoryTests.swift`), and it retires the risk named as the most
+likely first failure by three separate sources: this review, deferred
+finding #20 in `plans/2026-08-25-geometry-transport-followups.md`, and
+the agent that wrote the Object Memory surface.
+
+The related note there — `protocolClasses` relying on array-literal
+coercion to `[AnyClass]` — is left alone deliberately.
+`configuration.protocolClasses = [Stub.self]` is the idiomatic form and
+takes its element type from context; annotating it would be cargo cult,
+unlike the `[String: Any]` case fixed above, where the `Any` slot gave
+the compiler nothing to infer from.
+
+**What this does NOT say.** These two rules will not reject this code. No
+compiler has run. Everything in `WORLD-BUILDER-STATUS.md` P1/P2 stands.
