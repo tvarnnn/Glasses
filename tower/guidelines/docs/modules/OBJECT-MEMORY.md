@@ -2,17 +2,48 @@
 
 ## Status
 
-**PARTIALLY IMPLEMENTED, then BLOCKED.** Still a strong candidate for an
-early project — it is bounded enough to build incrementally while
+> ## CORRECTED 2026-08-26 — the producer and the wire surface now exist
+>
+> This section said "Nothing currently produces an observation" and
+> marked both the producer and any HTTP surface **BLOCKED**. Two of those
+> three claims are now false; one is still true, and the distinction is
+> the whole point.
+>
+> **The blocker gates a live in-process `Module`, not the cartridge.**
+> Every other cartridge produces *out of process* by tailing a capture
+> journal. Object Memory now does the same via
+> `scripts/object_memory_session.py`, so the lifecycle ruling below is
+> **untouched and still pending** — it was never what gated producing
+> observations.
+>
+> - **55 real observations** from 9,199 real frames (29 `laptop`,
+>   26 `cell phone`), written and read back.
+> - **An HTTP read surface exists**: `tower/routes/observations.py`,
+>   registered as a fifth router. Read-only by construction — `purge`
+>   and `prune_expired` are unreachable from the wire, AST-enforced — and
+>   retention cannot be widened over HTTP.
+> - **Zero `person` records.** The `person` ruling is *sidestepped*, not
+>   resolved: a closed whitelist is enforced at the **store**, not merely
+>   at the filter, because a review found `append()` accepting a `person`
+>   record directly.
+> - **Still genuinely blocked:** the live in-process `Module` subclass and
+>   any WebSocket surface, on the lifecycle ruling described below.
+> - **Still missing:** an iOS surface.
+>
+> Detail: `docs/agent-handoffs/CARTRIDGE-ROADMAP.md` and
+> `docs/contracts/OBJECT-MEMORY.md`.
+
+**PARTIALLY IMPLEMENTED.** Bounded enough to build incrementally while
 exercising detection, tracking, temporal reasoning, relevance filtering
-and persistence — but it is no longer entirely unbuilt, and it is stopped
-at a named gate rather than merely unstarted.
+and persistence. It produces and serves observations today; what remains
+blocked is running *live in process*.
 
 | Part | Status |
 |---|---|
 | Observation record schema, relevance filtering, observation store (append, read, `last_seen`, retention pruning, real `purge`) | **CURRENTLY IMPLEMENTED** — `tower/object_memory/{records,relevance,store}.py`, tested |
-| A detector producing observations | **BLOCKED** |
-| A `Module` subclass, wiring, any HTTP/WS surface | **BLOCKED** |
+| A detector producing observations | **IMPLEMENTED**, out of process — `scripts/object_memory_session.py`, 55 real observations |
+| An HTTP read surface | **IMPLEMENTED** — `tower/routes/observations.py`, read-only, retention non-wideable |
+| A `Module` subclass, wiring, any **WS** surface | **BLOCKED** on the lifecycle ruling |
 | Spatial anchors against a World Builder world | **PLANNED** — the contract is written down but no anchor exists yet |
 
 **The blocker, precisely.** Task 4 requires the module's `_do_load()` to
@@ -24,9 +55,11 @@ Four costed options are written up in
 Master Guide classifies choosing between them as needing user judgement,
 so an agent must not resolve it autonomously.
 
-Nothing currently produces an observation: `Module.process()` receives
-raw JPEG bytes and no timestamp, sequence number or session id, so even a
-working detector could not populate the fields the schema already has.
+That gap is real for the *live* path: `Module.process()` receives raw
+JPEG bytes and no timestamp, sequence number or session id, so even a
+working in-process detector could not populate the fields the schema
+already has. The journal-follower sidesteps it by reading those fields
+from the capture journal, where they exist.
 
 **Before the first anchor is ever written**, add `anchor_keyframe_id` and
 `position_in_anchor_frame` to the anchor schema. Without them the first
