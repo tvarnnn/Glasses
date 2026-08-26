@@ -257,12 +257,15 @@ matter most:
   thing that should be softened to get a green run.
   Not a timeout: `drain()` blocks by design and `pump()` is synchronous
   over the portal, precisely so timing cannot decide the outcome. The
-  leading hypothesis is Windows file locking — the test unlinks
-  `world.json` while a subscription is live, and `unlink()` raises
-  WinError 32 if a handle is open at that instant. `read_json_closed()`
-  already narrows that window, which fits a rare race rather than a
-  broken test. **This is a hypothesis; the traceback was never captured.**
-  Next occurrence, capture it with `--tb=long` before doing anything else.
+  hypothesis was Windows file locking, and it is now **CONFIRMED**: a
+  later full-suite run surfaced it as **WinError 32**, the sharing
+  violation raised when `unlink()` meets an open handle. The test unlinks
+  `world.json` while a subscription is live, which is deliberate — that
+  is the case it exists to cover. `read_json_closed()` already narrows
+  the window, which is why it is rare rather than constant.
+  **It is a real Windows race in the test, not a defect in the result
+  channel**, and the fix is to make the unlink tolerate a transient
+  sharing violation — never to soften the assertion that follows it.
 
 - **`data/captures/` is never pruned.** 9,199 real frames with no retention
   policy governing them.
