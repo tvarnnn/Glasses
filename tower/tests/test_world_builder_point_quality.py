@@ -63,12 +63,15 @@ def test_near_parallel_point_is_now_discarded():
     old behaviour fails here with an explanation attached.
     """
     pa, pb, rotation, translation = _near_parallel_pair()
-    points = triangulate_points(pa, pb, rotation, translation, CAMERA)
-    assert len(points) == 0, (
-        "A pair subtending 0.00006 deg is not distant geometry, it is two "
-        "parallel rays. If this returns a point again, the seed-pair gate "
-        "has been removed or bypassed."
+    points, quality, counts = triangulate_points(
+        pa, pb, rotation, translation, CAMERA, return_quality=True,
     )
+    # Retained for solving, refused for publication. A pair subtending
+    # 0.00006 deg is not distant geometry, it is two parallel rays -- but
+    # its bearing is still usable, so it stays in the map.
+    assert len(points) == 1
+    assert list(quality) == [False]
+    assert counts["low_parallax"] == 1
 
 
 def test_triangulate_points_mask_and_counts_agree():
@@ -77,14 +80,14 @@ def test_triangulate_points_mask_and_counts_agree():
     world = np.array([[0.0, 0.0, 10.0], [0.0, 0.0, 100000.0]])
     pa = _project(world, IDENTITY_POSE).astype(np.float32)
     pb = _project(world, (rotation, translation)).astype(np.float32)
-    points, keep, counts = triangulate_points(
+    points, keep, quality, counts = triangulate_points(
         pa, pb, rotation, translation, CAMERA,
-        return_mask=True, return_counts=True,
+        return_mask=True, return_quality=True,
     )
-    assert len(points) == int(keep.sum())
+    assert len(points) == int(keep.sum()) == len(quality)
+    publishable = int(np.count_nonzero(quality))
     assert (
-        int(keep.sum()) + counts["low_parallax"] + counts["high_reprojection"]
-        == 2
+        publishable + counts["low_parallax"] + counts["high_reprojection"] == 2
     )
 
 
@@ -97,10 +100,10 @@ def test_cheirality_rejects_are_not_also_counted_as_gate_rejects():
     behind = np.array([[0.0, 0.0, -10.0]])
     pa = np.array([[100.0, 300.0]], dtype=np.float32)
     pb = np.array([[100.0, 300.0]], dtype=np.float32)
-    points, counts = triangulate_points(
-        pa, pb, rotation, translation, CAMERA, return_counts=True,
+    points, quality, counts = triangulate_points(
+        pa, pb, rotation, translation, CAMERA, return_quality=True,
     )
-    assert len(points) == 0
+    assert len(points) == 0 and len(quality) == 0
     assert counts["low_parallax"] == 0
     assert counts["high_reprojection"] == 0
 
@@ -521,11 +524,14 @@ def test_chain_extension_discards_near_parallel_landmarks():
     kp_p = [_KP(tuple(_project(world, pose_p)[0]))]
     kp_c = [_KP(tuple(_project(world, pose_c)[0]))]
 
-    points, observed, counts = backend._triangulate_new(
+    points, observed, counts, quality = backend._triangulate_new(
         kp_p, kp_c, [(0, 0)], pose_p, pose_c, 0, 1,
     )
-    assert points == []
-    assert observed == {}
+    # The landmark STAYS in the map -- an unconstrained depth is still a
+    # usable bearing for PnP -- but it is marked unpublishable. Dropping
+    # it here instead cost 26 solved poses across the pinned corpus.
+    assert len(points) == 1
+    assert quality == [False]
     assert counts["low_parallax"] == 1
 
 
@@ -538,10 +544,11 @@ def test_chain_extension_keeps_well_conditioned_landmarks():
     kp_p = [_KP(tuple(pt)) for pt in _project(world, pose_p)]
     kp_c = [_KP(tuple(pt)) for pt in _project(world, pose_c)]
 
-    points, observed, counts = backend._triangulate_new(
+    points, observed, counts, quality = backend._triangulate_new(
         kp_p, kp_c, [(0, 0), (1, 1), (2, 2)], pose_p, pose_c, 0, 1,
     )
     assert len(points) == 3
+    assert quality == [True, True, True]
     assert counts == {"low_parallax": 0, "high_reprojection": 0}
 
 
@@ -558,10 +565,10 @@ def test_chain_extension_is_correct_under_non_identity_poses():
     kp_p = [_KP(tuple(pt)) for pt in _project(world, pose_p)]
     kp_c = [_KP(tuple(pt)) for pt in _project(world, pose_c)]
 
-    points, observed, counts = backend._triangulate_new(
+    points, observed, counts, quality = backend._triangulate_new(
         kp_p, kp_c, [(0, 0), (1, 1), (2, 2)], pose_p, pose_c, 0, 1,
     )
-    assert len(points) == 3, (
+    assert quality == [True, True, True], (
         "real structure under non-identity poses must survive; losing it "
         "here means the camera centres are being computed wrongly"
     )
@@ -578,21 +585,22 @@ def test_chain_extension_accounting_closes():
     kp_p = [_KP(tuple(pt)) for pt in _project(world, pose_p)]
     kp_c = [_KP(tuple(pt)) for pt in _project(world, pose_c)]
 
-    points, _, counts = backend._triangulate_new(
+    points, _, counts, quality = backend._triangulate_new(
         kp_p, kp_c, [(0, 0), (1, 1), (2, 2)], pose_p, pose_c, 0, 1,
     )
-    assert len(points) + counts["low_parallax"] + counts["high_reprojection"] == 3
+    publishable = sum(1 for q in quality if q)
+    assert publishable + counts["low_parallax"] + counts["high_reprojection"] == 3
 
 
-def test_chain_extension_with_no_matches_returns_three_values():
+def test_chain_extension_with_no_matches_returns_full_arity():
     """The empty path must return the same arity as the populated one, or
-    the caller unpacks two values from a three-tuple only on busy frames."""
+    the caller unpacks the wrong count only on frames that had matches."""
     backend = _backend_with_camera()
-    points, observed, counts = backend._triangulate_new(
+    points, observed, counts, quality = backend._triangulate_new(
         [], [], [], (np.eye(3), np.zeros(3)),
         (np.eye(3), np.array([-1.0, 0.0, 0.0])), 0, 1,
     )
-    assert points == [] and observed == {}
+    assert points == [] and observed == {} and quality == []
     assert counts == {"low_parallax": 0, "high_reprojection": 0}
 
 

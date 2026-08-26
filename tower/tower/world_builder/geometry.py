@@ -354,13 +354,19 @@ def triangulate_points(
     translation: np.ndarray,
     camera_matrix: np.ndarray,
     return_mask: bool = False,
-    return_counts: bool = False,
+    return_quality: bool = False,
 ):
     """Triangulate into the FIRST camera's frame, dropping bad points.
 
     Points behind either camera, or non-finite, are removed rather than
     returned with a flag: a point the geometry says is behind the camera
     is not a low-confidence point, it is not a point.
+
+    `return_quality` additionally yields a per-surviving-point boolean --
+    True where `landmark_gate` says the landmark's position is defensible
+    -- and the refusal counts. Quality is REPORTED, not applied: see the
+    comment in the body for why a landmark that fails the gate still
+    belongs in the solver's map.
     """
     projection_a = camera_matrix @ np.hstack([np.eye(3), np.zeros((3, 1))])
     projection_b = camera_matrix @ np.hstack([rotation, translation.reshape(3, 1)])
@@ -373,36 +379,38 @@ def triangulate_points(
     in_front_a = xyz[:, 2] > 0
     xyz_b = (rotation @ xyz.T).T + translation.reshape(3)
     in_front_b = xyz_b[:, 2] > 0
-    cheirality_keep = np.isfinite(xyz).all(axis=1) & in_front_a & in_front_b
+    keep = np.isfinite(xyz).all(axis=1) & in_front_a & in_front_b
 
-    # Cheirality and finiteness say the point is in front of both
-    # cameras. They do not say the two rays actually MEET there. Without
-    # the gate below, landmarks survive at up to 33,363 baselines out,
-    # and the bounding box the phone frames each fragment card against
-    # ends up 329x larger than the geometry inside it.
+    # The gate JUDGES; it does not filter here.
     #
-    # The gate runs only on rows cheirality already accepted, so a point
-    # dropped for being behind a camera is never also counted under a
-    # gate reason and the accounting identity stays exact.
-    keep = np.zeros(len(xyz), dtype=bool)
+    # An earlier revision dropped failing landmarks at this point. Measured
+    # over the pinned eight, that cost 26 solved poses (346 -> 320) across
+    # four captures: chain extension needs >= MIN_PNP_CORRESPONDENCES 3-D
+    # to 2-D correspondences against EXISTING landmarks, so removing them
+    # from the map starves PnP and breaks chains early.
+    #
+    # A landmark whose depth is unconstrained is still a perfectly good
+    # correspondence anchor -- its bearing is fine, only its distance is
+    # not. So it stays in the map for solving, and the caller declines to
+    # PUBLISH a coordinate it cannot defend. Refusing to publish a number
+    # is honest; refusing to solve with a usable bearing is just lossy.
+    quality = np.zeros(int(keep.sum()), dtype=bool)
     counts = {"low_parallax": 0, "high_reprojection": 0}
-    if cheirality_keep.any():
+    if keep.any():
         pa = np.asarray(points_a, dtype=np.float64).reshape(-1, 2)
         pb = np.asarray(points_b, dtype=np.float64).reshape(-1, 2)
-        subset_keep, counts = landmark_gate(
-            xyz[cheirality_keep],
-            pa[cheirality_keep],
-            pb[cheirality_keep],
+        quality, counts = landmark_gate(
+            xyz[keep],
+            pa[keep],
+            pb[keep],
             (np.eye(3), np.zeros(3)),
             (rotation, translation),
             camera_matrix,
         )
-        keep[cheirality_keep] = subset_keep
 
-    if return_mask and return_counts:
-        return xyz[keep], keep, counts
-    if return_counts:
-        return xyz[keep], counts
+    result = (xyz[keep],)
     if return_mask:
-        return xyz[keep], keep
-    return xyz[keep]
+        result += (keep,)
+    if return_quality:
+        result += (quality, counts)
+    return result[0] if len(result) == 1 else result

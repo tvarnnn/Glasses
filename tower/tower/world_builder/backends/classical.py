@@ -174,6 +174,8 @@ class ClassicalTwoViewBackend(GeometryBackend):
             1: (pair.estimate.rotation, pair.estimate.translation),
         }
         landmarks = list(pair.points)
+        # Publishability, index-aligned with `landmarks`.
+        landmark_ok = list(pair.quality)
         # (frame index, feature index) -> landmark index, so a later frame
         # can find 3-D correspondences for the features it matched.
         observed: dict[tuple[int, int], int] = {}
@@ -208,6 +210,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 new_observed,
                 reobserved,
                 extend_discards,
+                extend_quality,
             ) = self._extend(
                 features[previous],
                 features[current],
@@ -242,6 +245,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
             )
             base = len(landmarks)
             landmarks.extend(new_points)
+            landmark_ok.extend(extend_quality)
             for key, offset in new_observed.items():
                 observed[key] = base + offset
             support.append(
@@ -251,14 +255,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 )
             )
 
-        block = (
-            PointBlock(
-                xyz=np.asarray(landmarks, dtype=np.float32),
-                support_views=_support_table(support),
-            )
-            if landmarks
-            else None
-        )
+        block = _publishable_block(landmarks, landmark_ok, support)
         return GeometryEstimate(
             poses=tuple(poses),
             points=block,
@@ -320,6 +317,8 @@ class ClassicalTwoViewBackend(GeometryBackend):
 
         features = detect_and_describe(frame.image_gray)
         new_points: list = []
+        # Publishability for THIS delta, index-aligned with new_points.
+        new_points_ok: list = []
         # Rows for THIS keyframe's delta block, landmark indices local to
         # it. The chain's own copy carries the same rows shifted into the
         # accumulated map.
@@ -342,7 +341,9 @@ class ClassicalTwoViewBackend(GeometryBackend):
             else:
                 chain.absolute[1] = (pose.rotation, pose.translation)
                 chain.landmarks.extend(pair.points)
+                chain.landmark_ok.extend(pair.quality)
                 new_points = pair.points
+                new_points_ok = list(pair.quality)
                 for offset, (index_a, index_b) in enumerate(
                     pair.inlier_index_pairs
                 ):
@@ -360,6 +361,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 new_observed,
                 reobserved,
                 extend_discards,
+                extend_quality,
             ) = self._extend(
                 chain.previous_features,
                 features,
@@ -386,6 +388,8 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 )
                 base = len(chain.landmarks)
                 chain.landmarks.extend(triangulated)
+                chain.landmark_ok.extend(extend_quality)
+                new_points_ok = list(extend_quality)
                 new_points = triangulated
                 for key, offset in new_observed.items():
                     chain.observed[key] = base + offset
@@ -406,15 +410,13 @@ class ClassicalTwoViewBackend(GeometryBackend):
         chain.previous_features = features
         if chain.broken is None:
             chain.forget_before(index)
+        # The delta is filtered exactly as the snapshot is, so a viewer
+        # that appends every delta ends up holding what snapshot() says --
+        # an invariant the incremental suite asserts directly.
         return Extension(
             pose=pose,
-            new_points=(
-                PointBlock(
-                    xyz=np.asarray(new_points, dtype=np.float32),
-                    support_views=_support_block(delta_support),
-                )
-                if new_points
-                else None
+            new_points=_publishable_block(
+                new_points, new_points_ok, [_support_block(delta_support)]
             ),
         )
 
@@ -422,13 +424,8 @@ class ClassicalTwoViewBackend(GeometryBackend):
         chain = self._chain
         if chain is None or chain.count == 0:
             return GeometryEstimate(poses=())
-        block = (
-            PointBlock(
-                xyz=np.asarray(chain.landmarks, dtype=np.float32),
-                support_views=_support_table(chain.support),
-            )
-            if chain.landmarks
-            else None
+        block = _publishable_block(
+            chain.landmarks, chain.landmark_ok, chain.support
         )
         return GeometryEstimate(
             poses=tuple(chain.poses),
@@ -452,16 +449,30 @@ class ClassicalTwoViewBackend(GeometryBackend):
         """
         tally["low_parallax"] += counts.get("low_parallax", 0)
         tally["high_reprojection"] += counts.get("high_reprojection", 0)
-        tally["produced"] += (
-            kept + counts.get("low_parallax", 0) + counts.get("high_reprojection", 0)
-        )
+        # `kept` is what entered the MAP. Refusals are a subset of it --
+        # a refused landmark is still in the map, just not publishable --
+        # so it must not be added again here.
+        tally["produced"] += kept
         return tally
 
 
     class _PairResult:
-        __slots__ = ("estimate", "points", "inlier_index_pairs", "discarded")
+        __slots__ = (
+            "estimate",
+            "points",
+            "inlier_index_pairs",
+            "discarded",
+            "quality",
+        )
 
-        def __init__(self, estimate, points, inlier_index_pairs, discarded=None):
+        def __init__(
+            self,
+            estimate,
+            points,
+            inlier_index_pairs,
+            discarded=None,
+            quality=None,
+        ):
             self.estimate = estimate
             self.points = points
             self.inlier_index_pairs = inlier_index_pairs
@@ -469,6 +480,12 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 "low_parallax": 0,
                 "high_reprojection": 0,
             }
+            # Per-landmark publishability, index-aligned with `points`.
+            # The landmarks stay in the map either way; this only says
+            # which of them a world may state a coordinate for.
+            self.quality = (
+                list(quality) if quality is not None else [True] * len(points)
+            )
 
     def _estimate_pair(self, features_a, features_b, keyframe_id):
         keypoints_a, descriptors_a = features_a
@@ -603,9 +620,9 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 [],
             )
 
-        points, keep_mask, discarded = triangulate_points(
+        points, keep_mask, quality, discarded = triangulate_points(
             inlier_a, inlier_b, rotation, translation, camera_matrix,
-            return_mask=True, return_counts=True,
+            return_mask=True, return_quality=True,
         )
         surviving_pairs = [
             pair for pair, keep in zip(
@@ -624,6 +641,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
             list(points),
             surviving_pairs,
             discarded,
+            [bool(q) for q in quality],
         )
 
     def _extend(
@@ -688,6 +706,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 {},
                 {},
                 {"low_parallax": 0, "high_reprojection": 0},
+                [],
             )
 
         ok, rotation_vector, translation, inlier_indices = cv2.solvePnPRansac(
@@ -712,6 +731,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 {},
                 {},
                 {"low_parallax": 0, "high_reprojection": 0},
+                [],
             )
 
         rotation, _ = cv2.Rodrigues(rotation_vector)
@@ -719,7 +739,12 @@ class ClassicalTwoViewBackend(GeometryBackend):
 
         # Triangulate the features that had no landmark yet, using the two
         # absolute poses, so new structure lands directly in world frame.
-        new_points, new_observed, discard_counts = self._triangulate_new(
+        (
+            new_points,
+            new_observed,
+            discard_counts,
+            new_quality,
+        ) = self._triangulate_new(
             keypoints_previous,
             keypoints_current,
             matched_pairs,
@@ -747,6 +772,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
             new_observed,
             reobserved,
             discard_counts,
+            new_quality,
         )
 
     def _triangulate_new(
@@ -760,7 +786,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
         current_index,
     ):
         if not matched_pairs:
-            return [], {}, {"low_parallax": 0, "high_reprojection": 0}
+            return [], {}, {"low_parallax": 0, "high_reprojection": 0}, []
 
         rotation_p, translation_p = pose_previous
         rotation_c, translation_c = pose_current
@@ -782,38 +808,90 @@ class ClassicalTwoViewBackend(GeometryBackend):
         # Two absolute poses, so these landmarks are already in world
         # frame -- and unlike the seed pair, neither pose is identity.
         #
+        # The gate is evaluated ONLY over landmarks that will actually
+        # enter the map (finite, and in front of both cameras). Gating a
+        # wider set would count refusals for points that were never
+        # admitted anyway, and the manifest's accounting identity
+        # -- published + refused == triangulated -- would stop closing.
+        rotation_p, translation_p = pose_previous
+        rotation_c, translation_c = pose_current
+        depth_p = (rotation_p @ xyz.T).T[:, 2] + translation_p[2]
+        depth_c = (rotation_c @ xyz.T).T[:, 2] + translation_c[2]
+        admissible = (
+            np.isfinite(xyz).all(axis=1) & (depth_p > 0) & (depth_c > 0)
+        )
+
         # points_p/points_c are built TRANSPOSED above, (2, N). The gate
         # validates shape rather than reshaping, so passing them without
         # the .T would raise instead of silently rejecting every landmark.
-        finite = np.isfinite(xyz).all(axis=1)
         gate_keep = np.zeros(len(xyz), dtype=bool)
         counts = {"low_parallax": 0, "high_reprojection": 0}
-        if finite.any():
+        if admissible.any():
             subset_keep, counts = landmark_gate(
-                xyz[finite],
-                points_p.T[finite],
-                points_c.T[finite],
+                xyz[admissible],
+                points_p.T[admissible],
+                points_c.T[admissible],
                 pose_previous,
                 pose_current,
                 self._camera_matrix,
             )
-            gate_keep[finite] = subset_keep
+            gate_keep[admissible] = subset_keep
 
-        new_points, new_observed = [], {}
+        new_points, new_observed, new_quality = [], {}, []
         for offset, ((index_p, index_c), point) in enumerate(
             zip(matched_pairs, xyz)
         ):
-            if not gate_keep[offset]:
-                continue
-            depth_p = (rotation_p @ point + translation_p)[2]
-            depth_c = (rotation_c @ point + translation_c)[2]
-            if depth_p <= 0 or depth_c <= 0:
+            if not admissible[offset]:
                 continue
             landmark = len(new_points)
             new_points.append(point)
+            # Kept in the map regardless of the gate -- see the comment in
+            # geometry.triangulate_points. The gate decides publication,
+            # not whether PnP may use the bearing.
+            new_quality.append(bool(gate_keep[offset]))
             new_observed[(previous_index, index_p)] = landmark
             new_observed[(current_index, index_c)] = landmark
-        return new_points, new_observed, counts
+        return new_points, new_observed, counts, new_quality
+
+
+def _publishable_block(landmarks, landmark_ok, support_blocks):
+    """The PointBlock a world may actually state, plus remapped support.
+
+    Landmarks the gate refused stay in the solver's map -- they are usable
+    bearings -- but a world must not publish a coordinate it cannot
+    defend. Filtering happens HERE, at the boundary, so that removing a
+    point from the output can never change which poses were solved.
+
+    Support rows name landmarks by index, so dropping landmarks requires
+    remapping the survivors and discarding rows that point at the dropped
+    ones. Getting this wrong would silently mis-attribute observations to
+    the wrong 3-D point, which is worse than publishing nothing.
+    """
+    if not landmarks:
+        return None
+    ok = list(landmark_ok) + [True] * (len(landmarks) - len(landmark_ok))
+    remap = {}
+    kept = []
+    for index, landmark in enumerate(landmarks):
+        if ok[index]:
+            remap[index] = len(kept)
+            kept.append(landmark)
+    if not kept:
+        return None
+
+    table = _support_table(support_blocks)
+    if len(table):
+        survives = np.array(
+            [row[2] in remap for row in table], dtype=bool
+        )
+        table = table[survives]
+        if len(table):
+            table = table.copy()
+            table[:, 2] = [remap[row[2]] for row in table]
+    return PointBlock(
+        xyz=np.asarray(kept, dtype=np.float32),
+        support_views=table,
+    )
 
 
 def _discard_diagnostics(tally):
@@ -848,6 +926,7 @@ class _Chain:
         "broken",
         "count",
         "discarded",
+        "landmark_ok",
         "landmarks",
         "observed",
         "poses",
@@ -858,6 +937,7 @@ class _Chain:
     def __init__(self) -> None:
         self.count = 0
         self.previous_features = None
+        self.landmark_ok = []
         # Discards accumulate for the LIFE of the chain, so the snapshot
         # reports the whole segment rather than the last window.
         self.discarded = {
