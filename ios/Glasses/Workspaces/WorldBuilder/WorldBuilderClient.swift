@@ -196,18 +196,24 @@ final class WorldBuilderViewModel: ObservableObject {
     private var cancellables: Set<AnyCancellable> = []
 
     /// Geometry transport. A `struct` and an `actor`, neither of which holds a
-    /// connection: `URLSession.shared` is the app's, and the store is a
-    /// dictionary. So the claim in this type's doc comment — that it holds no
-    /// runtime references and tears nothing down — still stands.
-    private let geometry = WorldGeometryClient()
+    /// connection: the client carries a `URL` and a `URLSession` — the app's
+    /// shared one unless a test substitutes a stubbed one — and the store is a
+    /// dictionary. So the claim in this type's doc comment, that it holds no
+    /// runtime references and tears nothing down, still stands.
+    private let geometry: WorldGeometryClient
     private let geometryStore = WorldGeometryStore()
 
     /// The `geometry.revision` whose manifest is currently on screen, or `nil`
-    /// when there is none — including after a fetch that failed, so the next
-    /// report retries rather than being locked out.
+    /// when there is none.
+    ///
+    /// Cleared again after *any* fetch that failed — the manifest, or any one
+    /// segment — so that the next report retries rather than being locked out.
+    /// This marker is the only thing that unlocks a refetch, and a finalized
+    /// world's revision never moves again, so leaving it set after a failure
+    /// would make one refused request permanent.
     private var lastGeometryRevision: String?
 
-    /// No default argument, deliberately.
+    /// No default argument on `client`, deliberately.
     ///
     /// A default would make "swap the unavailable client for a Tower-backed one
     /// right here in the workspace view" the path of least resistance — and
@@ -215,9 +221,22 @@ final class WorldBuilderViewModel: ObservableObject {
     /// state inside an object destroyed on every cartridge switch. The Product
     /// Shell V2 handoff §11 names that exact failure. Requiring injection means
     /// the correct wiring is the only wiring available.
-    init(client: any WorldBuilderClient) {
+    ///
+    /// `geometry` **does** default, and the asymmetry is the point. The danger
+    /// the paragraph above describes is a client that accumulates state and
+    /// holds a subscription; `WorldGeometryClient` is a struct holding a `URL`
+    /// and `URLSession.shared`, accumulates nothing, and owns no connection to
+    /// lose. Its two properties were given defaults when it was written for
+    /// exactly this reason — so a test can point it at a stubbed
+    /// `URLSessionConfiguration` and watch what this type does when a fetch
+    /// fails, which is behaviour no amount of reading proves.
+    init(
+        client: any WorldBuilderClient,
+        geometry: WorldGeometryClient = WorldGeometryClient()
+    ) {
         self.client = client
         self.state = client.state
+        self.geometry = geometry
 
         client.stateUpdates
             .receive(on: DispatchQueue.main)
@@ -305,6 +324,10 @@ final class WorldBuilderViewModel: ObservableObject {
         await geometryStore.retainOnly(Set(manifest.segments.map(\.contentHash)))
 
         var chunks: [String: WorldSegmentChunk] = [:]
+        // A segment that could not be fetched is drawn as a blank tile — which
+        // is honest — but the world must not be *left* that way. See the clear
+        // at the end of this function.
+        var anySegmentFailed = false
         for summary in manifest.segments {
             if let cached = await geometryStore.chunk(forHash: summary.contentHash) {
                 chunks[summary.contentHash] = cached
@@ -312,7 +335,10 @@ final class WorldBuilderViewModel: ObservableObject {
             }
             guard let chunk = try? await geometry.segment(
                 worldID: worldID, sessionID: sessionID, index: summary.segmentIndex
-            ) else { continue }
+            ) else {
+                anySegmentFailed = true
+                continue
+            }
             await geometryStore.insert(chunk)
             // Filed under the chunk's OWN hash, not the summary's. A rebuild
             // between the two requests returns different geometry under the
@@ -328,6 +354,21 @@ final class WorldBuilderViewModel: ObservableObject {
         guard revision == lastGeometryRevision else { return }
         geometryChunks = chunks
         fragmentsModel = WorldFragmentsModel(segments: manifest.segments)
+
+        // Published first, and *then* the marker is cleared: whatever did
+        // arrive is on screen, and only the retry is rearmed. A partially
+        // fetched world showing the segments it has beats showing none.
+        //
+        // Without this, one refused segment request would blank that fragment
+        // for good. The revision is the only thing that unlocks a refetch, and
+        // by the reasoning three guards above, a *finalized* world's revision
+        // never moves again — so "until the world changes" would mean "never".
+        // The manifest path clears the marker for the same reason and under the
+        // same staleness guard, so a newer update already in flight is not
+        // stomped.
+        if anySegmentFailed, revision == lastGeometryRevision {
+            lastGeometryRevision = nil
+        }
     }
 
     /// Why the cartridge is or is not usable, given the current connection.

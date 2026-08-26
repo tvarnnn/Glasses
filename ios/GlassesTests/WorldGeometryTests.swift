@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 import CoreGraphics
 import Combine
@@ -429,5 +430,213 @@ final class WorldBuilderViewModelGeometryTests: XCTestCase {
         try? await Task.sleep(nanoseconds: 50_000_000)
         cancellable.cancel()
         XCTAssertTrue(received.isEmpty)
+    }
+}
+
+// MARK: - A failed fetch must not wedge the world
+
+/// A stubbed HTTP layer for the geometry routes.
+///
+/// `URLProtocol` rather than a local server because the thing under test is not
+/// the network — it is what `WorldBuilderViewModel` does to its own retry
+/// marker when a request fails. A protocol stub can refuse one specific path,
+/// count how many times it was asked, and then start succeeding, which is
+/// exactly the sequence the sticky-segment bug lives in.
+///
+/// `WorldGeometryClient` was written with `baseURL` and `session` as defaulted
+/// properties; this is what that was for.
+final class StubbedGeometryProtocol: URLProtocol {
+
+    /// Request path → (status code, body). A path with no entry fails as a
+    /// transport error, which is a third failure shape worth having.
+    private static var routes: [String: (Int, String)] = [:]
+    private static var paths: [String] = []
+    private static let lock = NSLock()
+
+    static func reset(routes: [String: (Int, String)]) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.routes = routes
+        paths = []
+    }
+
+    static func set(route: String, to response: (Int, String)) {
+        lock.lock()
+        defer { lock.unlock() }
+        routes[route] = response
+    }
+
+    /// How many times a path was requested. The assertion that matters is a
+    /// *count*, not a boolean: "it was fetched" is true after the first failing
+    /// attempt too, and would pass whether or not the retry ever happened.
+    static func requestCount(for path: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return paths.filter { $0 == path }.count
+    }
+
+    /// A session wired to this stub. `.ephemeral` so nothing is cached between
+    /// tests — a cached 404 would make the retry look like it never happened.
+    static func makeSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubbedGeometryProtocol.self]
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        return URLSession(configuration: configuration)
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let path = request.url?.path ?? ""
+        StubbedGeometryProtocol.lock.lock()
+        StubbedGeometryProtocol.paths.append(path)
+        let route = StubbedGeometryProtocol.routes[path]
+        StubbedGeometryProtocol.lock.unlock()
+
+        guard let route, let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.cannotConnectToHost))
+            return
+        }
+        let response = HTTPURLResponse(
+            url: url, statusCode: route.0, httpVersion: "HTTP/1.1", headerFields: nil
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(route.1.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+@MainActor
+final class WorldGeometryRetryTests: XCTestCase {
+
+    private static let host = URL(string: "http://stub.invalid")!
+    private static let manifestPath = "/worlds/w1/geometry/manifest"
+    private static let segmentPath = "/worlds/w1/geometry/segment/0"
+
+    /// One segment, resolved, with bounds — the shape that gets a drawn tile,
+    /// so a missing chunk is a visibly blank fragment and not a non-event.
+    private static let manifestBody = """
+        {"contract": "world_builder.geometry/2026-08-25",
+         "world_id": "w1", "session_id": "s1", "geometry_revision": "g1",
+         "pose_convention": {
+           "pose_type": "T_world_camera", "quaternion_order": "wxyz",
+           "handedness": "right",
+           "camera_axes": "opencv_x_right_y_down_z_forward",
+           "translation_units": "world",
+           "world_axes_origin": "first_keyframe_camera",
+           "up_axis": "unknown", "pose_dtype": "float64",
+           "point_dtype": "float32"},
+         "segment_count": 1,
+         "segments": [
+           {"segment_index": 0, "content_hash": "h0", "frame_id": "segment:0",
+            "registered": false, "transform_to_world": null,
+            "resolution_state": "resolved", "dominant_degeneracy": null,
+            "keyframe_count": 2, "solved_count": 1, "point_count": 1,
+            "bounds": {"min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 1.0]}}]}
+        """
+
+    private static let segmentBody = """
+        {"contract": "world_builder.geometry/2026-08-25",
+         "segment_index": 0, "content_hash": "h0", "frame_id": "segment:0",
+         "registered": false, "transform_to_world": null,
+         "poses": [{"keyframe_id": "s1:0", "status": "anchor", "degeneracy": "",
+                    "rotation": [1.0, 0.0, 0.0, 0.0],
+                    "translation": [0.0, 0.0, 0.0]}],
+         "points": [[0.5, 0.5, 0.5]],
+         "points_sent": 1, "points_total": 1, "point_sampling": "none"}
+        """
+
+    private func makeViewModel() -> WorldBuilderViewModel {
+        WorldBuilderViewModel(
+            client: UnavailableWorldBuilderClient(),
+            geometry: WorldGeometryClient(
+                baseURL: Self.host, session: StubbedGeometryProtocol.makeSession()
+            )
+        )
+    }
+
+    /// A refused segment request must not blank a fragment permanently.
+    ///
+    /// The revision is the only thing that unlocks a refetch, and a
+    /// **finalized** world's revision never moves again — so a segment left
+    /// unfetched "until the world changes" is a segment left unfetched forever.
+    /// One transient blip on a walk that has already ended would cost that
+    /// fragment for good.
+    func testARefusedSegmentIsRetriedUnderTheSameRevision() async {
+        StubbedGeometryProtocol.reset(routes: [
+            Self.manifestPath: (200, Self.manifestBody),
+            Self.segmentPath: (404, ""),
+        ])
+        let viewModel = makeViewModel()
+
+        await viewModel.geometryDidChange(worldID: "w1", sessionID: "s1", revision: "g1")
+
+        // What did arrive is on screen: the manifest's segment is drawn, with
+        // no chunk behind it. A blank tile is honest; refusing the whole world
+        // because one request failed would show less than the Tower said.
+        XCTAssertEqual(viewModel.fragmentsModel.segments.count, 1)
+        XCTAssertTrue(viewModel.geometryChunks.isEmpty)
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.segmentPath), 1)
+
+        // The next report carries the SAME revision — which is all a finalized
+        // world will ever carry — and the fetch must be attempted again.
+        StubbedGeometryProtocol.set(route: Self.segmentPath, to: (200, Self.segmentBody))
+        await viewModel.geometryDidChange(worldID: "w1", sessionID: "s1", revision: "g1")
+
+        XCTAssertEqual(
+            StubbedGeometryProtocol.requestCount(for: Self.segmentPath),
+            2,
+            "a refused segment was never retried; on a finalized world that tile stays blank forever"
+        )
+        XCTAssertEqual(viewModel.geometryChunks["h0"]?.points.count, 1)
+    }
+
+    /// The negative control, and the reason the test above is not vacuous.
+    ///
+    /// If `geometryDidChange` simply refetched on every call, the retry
+    /// assertion would pass without the marker doing anything at all. This pins
+    /// the other half: a fetch that fully succeeded is **not** repeated under an
+    /// unchanged revision, which is what stops the ~2 s heartbeat from pulling a
+    /// megabyte twice a second.
+    func testASucceededFetchIsNotRepeatedUnderTheSameRevision() async {
+        StubbedGeometryProtocol.reset(routes: [
+            Self.manifestPath: (200, Self.manifestBody),
+            Self.segmentPath: (200, Self.segmentBody),
+        ])
+        let viewModel = makeViewModel()
+
+        await viewModel.geometryDidChange(worldID: "w1", sessionID: "s1", revision: "g1")
+        await viewModel.geometryDidChange(worldID: "w1", sessionID: "s1", revision: "g1")
+        await viewModel.geometryDidChange(worldID: "w1", sessionID: "s1", revision: "g1")
+
+        XCTAssertEqual(
+            StubbedGeometryProtocol.requestCount(for: Self.manifestPath),
+            1,
+            "an unchanged revision refetched; the heartbeat would pull a megabyte every 2 s"
+        )
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.segmentPath), 1)
+        XCTAssertEqual(viewModel.geometryChunks.count, 1)
+    }
+
+    /// The manifest path's own escape hatch, which had no test before.
+    func testARefusedManifestIsRetriedUnderTheSameRevision() async {
+        StubbedGeometryProtocol.reset(routes: [Self.manifestPath: (404, "")])
+        let viewModel = makeViewModel()
+
+        await viewModel.geometryDidChange(worldID: "w1", sessionID: "s1", revision: "g1")
+        XCTAssertTrue(viewModel.fragmentsModel.segments.isEmpty)
+
+        StubbedGeometryProtocol.set(route: Self.manifestPath, to: (200, Self.manifestBody))
+        StubbedGeometryProtocol.set(route: Self.segmentPath, to: (200, Self.segmentBody))
+        await viewModel.geometryDidChange(worldID: "w1", sessionID: "s1", revision: "g1")
+
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.manifestPath), 2)
+        XCTAssertEqual(viewModel.fragmentsModel.segments.count, 1)
+        XCTAssertEqual(viewModel.geometryChunks.count, 1)
     }
 }
