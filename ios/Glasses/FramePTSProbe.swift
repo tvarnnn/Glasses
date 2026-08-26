@@ -67,6 +67,20 @@ nonisolated final class FramePTSProbe {
     private var lastHost: Double?
     private var discontinuities = 0
 
+    /// The last frame of the previous stream session, kept across the gap.
+    ///
+    /// This is the whole reconnect experiment. World Builder chains captures
+    /// across a reconnect, so whether the capture clock's epoch survives one
+    /// decides whether a PTS from before the drop is comparable with one after
+    /// it. Two outcomes, and they are not close together:
+    ///
+    /// - **device-persistent** — the new session's first PTS is roughly the old
+    ///   session's last PTS plus the wall-clock gap, so `d_pts ≈ d_host`.
+    /// - **per-session** — the count restarts, so `d_pts` is negative or far
+    ///   smaller than `d_host`.
+    private var previousSessionEnd: (pts: Double, host: Double, seq: Int)?
+    private var sessionIndex = 1
+
     /// How often the rolling summary prints. Long enough that the console is
     /// readable during a walk, short enough to see a drift develop.
     private static let summaryInterval: Double = 5.0
@@ -114,7 +128,7 @@ nonisolated final class FramePTSProbe {
             let uptime = ProcessInfo.processInfo.systemUptime
             let hostClock = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
             print("""
-                [PTSProbe] FIRST FRAME \
+                [PTSProbe] FIRST FRAME session=\(sessionIndex) \
                 pts_seconds=\(pts) \
                 pts_value=\(time.value) pts_timescale=\(time.timescale) \
                 pts_epoch=\(time.epoch) pts_flags=\(time.flags.rawValue) \
@@ -122,6 +136,35 @@ nonisolated final class FramePTSProbe {
                 process_uptime=\(uptime) \
                 offset_host_minus_pts=\(hostNow - pts)
                 """)
+
+            // The answer, printed as the comparison rather than as two numbers
+            // a reader has to subtract.
+            if let previous = previousSessionEnd {
+                let dPTS = pts - previous.pts
+                let dHost = hostNow - previous.host
+                // Three outcomes, not two. The third was found by measurement
+                // and is the one that matters: the clock neither resets nor
+                // tracks wall time, so it stays monotonic across a stop while
+                // silently understating how long the stop was.
+                let ratio = dHost > 0 ? dPTS / dHost * 100 : 0
+                let verdict: String
+                if dPTS < 0 {
+                    verdict = "PER-SESSION (clock went backwards across the gap)"
+                } else if dHost > 0, abs(dPTS - dHost) < 0.5 {
+                    verdict = "FREE-RUNNING (capture clock ran through the gap)"
+                } else if dHost > 0, dPTS < dHost {
+                    verdict = "SUSPENDED-BUT-MONOTONIC (advanced \(String(format: "%.1f", ratio))% of the gap: did not reset, did not measure it either)"
+                } else {
+                    verdict = "UNEXPLAINED (clock advanced further than wall time)"
+                }
+                print("""
+                    [PTSProbe] SESSION BOUNDARY \(previous.seq) -> \(seq) \
+                    prev_last_pts=\(previous.pts) new_first_pts=\(pts) \
+                    d_pts=\(dPTS) d_host=\(dHost) \
+                    difference=\(dPTS - dHost) \
+                    VERDICT=\(verdict)
+                    """)
+            }
         }
 
         if let lastPTS, let lastHost {
@@ -222,8 +265,22 @@ nonisolated final class FramePTSProbe {
         lock.lock()
         defer { lock.unlock() }
         guard !samples.isEmpty else { return }
-        print("[PTSProbe] FINAL (\(reason))")
+        print("[PTSProbe] FINAL session=\(sessionIndex) (\(reason))")
         summarise()
+
+        // Kept: the anchor the next session is measured against.
+        if let lastPTS, let lastHost {
+            previousSessionEnd = (pts: lastPTS, host: lastHost, seq: seq)
+        }
+        // Cleared: everything whose meaning does not survive the gap. The
+        // inter-session interval is not a frame interval, and leaving it in
+        // `samples` would put a multi-second outlier into the next session's
+        // jitter statistics and swamp the millisecond effects being measured.
+        samples.removeAll()
+        lastPTS = nil
+        lastHost = nil
+        firstReported = false
+        sessionIndex += 1
     }
 }
 #endif

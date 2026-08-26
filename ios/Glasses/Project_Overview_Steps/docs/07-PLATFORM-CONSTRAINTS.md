@@ -308,6 +308,40 @@ The epoch says the same thing independently: `pts_timescale = 1000000` (microsec
 
 Measured with `ios/Glasses/FramePTSProbe.swift` (DEBUG-only, pure observation). Delete that file to remove the experiment.
 
+### 9.1 The capture clock stops when the camera does — measured 2026-08-26
+
+**Do not use the PTS to measure elapsed time across a stream stop.** It is
+monotonic across one, which is exactly what makes this dangerous: nothing
+looks broken.
+
+| Event | wall gap | clock advanced | ratio |
+|---|---|---|---|
+| pause → resume | 17.86 s | 17.80 s | 99.7 % |
+| pause → resume | 39.165 s | 39.165 s | 100.0 % |
+| **stop → start** | **25.95 s** | **7.19 s** | **28 %** |
+| **stop → start** | **192.70 s** | **~10.95 s** | **5.7 %** |
+
+A *pause* keeps the camera subsystem alive and the clock runs through it,
+matching wall time to ~5 ppm. A *stop* tears the subsystem down and the clock
+freezes. Note the two stop rows: the gaps differ by 7.4x and the advance
+barely moves (7.19 s vs ~10.95 s). What survives is a fixed teardown-and-
+startup tail at each end — **not elapsed time, and not proportional to it.**
+
+The epoch itself is durable: it does not reset on a stop, and it does not
+reset when the *app process* restarts (observed continuing across a rebuild
+and relaunch). It belongs to the glasses or to the DAT daemon, not to the app
+or to the stream session.
+
+**Consequence for World Builder.** The Tower chains captures across a
+reconnect into one lineage. If any consumer ever derives a duration, a rate,
+or a gap from PTS across that boundary, it will silently understate the
+dropout by an unbounded amount — a five-minute WiFi outage would read as about
+ten seconds. Elapsed time across a reconnect must come from the Tower's own
+receipt clock, which is what `time_basis: "tower-receipt"` already records.
+
+**Safe uses:** ordering and inter-frame intervals *within* one continuous
+streaming session. **Unsafe:** anything spanning a stop.
+
 **Affected modules:** World Builder, Object Memory (temporal memory), Environmental Memory, any tracking/multi-frame reasoning.
 
 **Mitigation (future transport protocol, not designed here):**
@@ -508,8 +542,9 @@ No specific SLAM, SfM, Gaussian Splatting, or depth-model implementation is sele
 ## Unresolved Questions Requiring Future Investigation
 
 - **~~`VideoFrame`/`CMSampleBuffer` timestamp semantics~~ — ANSWERED 2026-08-26.** It is a capture-side clock; the measurement and its limits are in Limitation 9. **Two narrower questions remain open:**
-  - **Is the PTS epoch device-persistent or per-stream-session?** The first frame of one session read 424.72 s, so the epoch predates the session — but whether a second session continues that count or restarts is untested. It is a two-minute test (stop the stream, start it again without power-cycling the glasses, compare the new first PTS against the old last one plus wall time) and it decides whether PTS is usable across a World Builder capture-lineage reconnect.
-  - **What is the actual clock drift?** Not resolvable in 45 s. Needs a multi-minute stream to separate a real rate difference from arrival jitter.
+  - **~~Is the PTS epoch device-persistent or per-stream-session?~~ — ANSWERED 2026-08-26. Neither.** See Limitation 9.1: the clock free-runs through a *pause* but freezes for most of a *stop*, so it stays monotonic across a reconnect while understating the gap. **This is the one to know about before using PTS for anything spanning a dropout.**
+  - **~~What is the actual clock drift?~~ — BOUNDED 2026-08-26 at ~5 ppm.** Not from the 45 s stream, where arrival jitter swamped it, but from a clean bracket across a 39.165 s pause: the two clocks disagreed by 0.19 ms. The earlier three-figure ppm values were jitter, not drift.
+  - **Still open: does the clock survive the glasses powering off?** Every measurement so far kept them awake. A cold boot would distinguish "camera-subsystem uptime" from "device uptime" and would say whether the epoch is stable for a whole wearing session.
 - **Doff-specific session behavior** (Limitation 4): DAT's documented session-interruption causes cover fold/hinge-close explicitly; whether doff (without folding) has a distinct, separately-documented effect on `DeviceSessionState` versus what Mock Device Kit's `doff()` simulates is not confirmed.
 - **Real BLE-Classic bandwidth figures** (Limitation 2): the adaptive ladder's behavior is documented qualitatively; actual achieved FPS/resolution/latency under real conditions is explicitly a V0.7 measurement milestone, not yet performed.
 
