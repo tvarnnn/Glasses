@@ -299,10 +299,33 @@ wall in view, turn your body rather than your head.
 
 1. **Fragments appear DURING the walk.** This is the entire claim. Previously the
    phone showed counters only.
-2. Headline reads **"N fragments, not yet connected"** — not "1 world". Expect a
-   number near 19, and expect it to look *ugly*. That is honest.
+2. Headline reads **"N fragments, not yet connected"** — not "1 world", and
+   expect it to look *ugly*. That is honest.
 3. A note that the world is still building, which should clear shortly after Stop.
-4. "N areas were seen but could not be reconstructed" — expect roughly 30.
+4. "N areas were seen but could not be reconstructed".
+
+**The expected numbers changed on 2026-08-26 and no longer match the recorded
+2026-08-25 session.** Tracking was fixed after that walk — `LK_MAX_LEVEL` 3→4
+and forward-backward 1.0→3.0, because the tracker was losing *reach*, not
+losing the image. Replaying the very same capture through the current code:
+
+| | recorded 2026-08-25 | current code, same frames |
+|---|---|---|
+| segments | 51 | **33** |
+| solved poses | 94 | 61 |
+| points | 12,023 | 8,333 |
+
+So expect roughly **a dozen or so fragments** rather than 19, and fewer points.
+Verified identical on the live incremental path and the cold batch path, as
+`test_a_live_build_equals_a_cold_build_of_the_same_keyframes` requires.
+
+**Do not read the lower pose and point counts as a regression.** Across five
+real captures the change is strongly positive — 151→114 segments, solved poses
+211→**265**, points 27,406→**42,100**. This particular capture is the one where
+it costs geometry; another (`e1c52b9f`) goes 27→111 poses and 5,117→22,909
+points. Per-capture variance is large and bidirectional, so a single walk cannot
+confirm or refute the change. What it *can* confirm is that fragments appear at
+all, which is what this test is for.
 
 **Failure signatures:**
 
