@@ -354,6 +354,50 @@ improvement because the observation graph is a chain with median covisibility
 span 1, so **covisibility comes before bundle adjustment**
 (`WORLD-BUILDER.md:452-461`).
 
+### 4.3 Evidence has since moved two of those items — recorded 2026-08-26
+
+**Tracking continuity is no longer future work; it is done and measured.**
+`docs/superpowers/research/2026-08-26-segment-fragmentation.md` found the
+assumed cause was wrong. Breaks were not imagery the tracker could not
+follow: of 50 declared losses, 47 still had survival above the floor against
+the previous frame. The mechanism was reference staleness — the reference
+advances only on an accept, so a run of blurred frames freezes it while the
+camera keeps moving (max 89 frames stale). Two constants plus a grace window
+took the real walk from **51 to 29 segments** and the eight-capture corpus
+from **171 to 110**, with keyframes falling rather than rising.
+
+That also retires a line in this document's own §1.1. It quoted
+`engine.py:767` — "they are independent windows today, and they must stay
+so" — as though independence were a property of the data. It is a property
+of the *pipeline*. Sampling 130 keyframes and ORB-matching every
+cross-segment pair produced **285 verified links, 258 of them non-adjacent,
+with all 51 segments in a single connected component.** The fragments were
+never geometrically disconnected. Nothing had tried to link them.
+
+**So registration moves from "expected eventually" to the next wave**, and it
+is now the last thing standing between this contract and the product the
+module doc describes. Two things make that cheap rather than disruptive:
+
+1. **The contract already carries it.** §3.4's forward-compatibility hooks —
+   `registered` and `transform_to_world` on every segment, in both the
+   manifest and each chunk — were designed for exactly this and need no
+   change. A registration pass flips a flag and fills a Sim3.
+2. **No cached geometry is invalidated.** Segment-local points and poses do
+   not move; only the *placement* above them does. Every `content_hash`
+   stays valid across a registration pass, so the transport and the client
+   cache are unaffected.
+
+The renderer is likewise ready: `WorldFragmentsModel.hasSharedFrame` already
+merges fragments into one canvas when every segment reports `registered`,
+and `testRegisteredSegmentsWouldShareAFrame` already pins it.
+
+**What remains genuinely unknown** is scale. Each segment normalises its
+first baseline to 1.0, so the ~87x span across segments is arbitrary, and a
+Sim3 needs the scale factor recovered from shared structure. Feasibility of
+that recovery is under investigation; a wrong Sim3 fabricates a
+plausible-looking world, which is the failure this project cares most about,
+so nothing gets `registered: true` without a confidence signal that earns it.
+
 ---
 
 ## 5. iOS implementation
