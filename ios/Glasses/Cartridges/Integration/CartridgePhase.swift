@@ -54,6 +54,19 @@ enum CartridgePhase: String, Equatable, Sendable, CaseIterable {
     /// strings distinguished them before this case existed; the headline and
     /// the glyph did not, which is most of what a person actually reads.
     case disconnected
+    /// The Tower does this, under an agreement this build cannot read.
+    ///
+    /// Separate from `unsupported` for exactly the reason `disconnected` is
+    /// separate from it, one level up: the two call for **opposite** responses.
+    /// `unsupported` is "this Tower may never do this", and there is nothing a
+    /// person can do about it. This one is "this Tower already does this and
+    /// the app is behind", which a person can act on immediately — and
+    /// rendering it as "Nothing yet" tells someone a feature does not exist
+    /// when in fact they are one update away from it.
+    ///
+    /// The explanation string always distinguished them. The headline and the
+    /// glyph — which is most of what anyone actually reads — did not.
+    case needsUpdate
     /// The capability exists but nothing has been asked of it yet.
     case idle
     /// Something is genuinely in flight and the Tower has not answered.
@@ -78,7 +91,7 @@ enum CartridgePhase: String, Equatable, Sendable, CaseIterable {
     var mayCarryData: Bool {
         switch self {
         case .live, .settled: return true
-        case .unsupported, .disconnected, .idle, .waiting, .failed: return false
+        case .unsupported, .disconnected, .needsUpdate, .idle, .waiting, .failed: return false
         }
     }
 

@@ -318,6 +318,7 @@ final class TowerClient: NSObject, ObservableObject {
             stallTimeout: Self.sendStallTimeout
         )
         self.autoReconnect = false
+        self.handshakeLegTimeout = Self.defaultHandshakeLegTimeout
         super.init()
     }
 
@@ -339,9 +340,11 @@ final class TowerClient: NSObject, ObservableObject {
         metrics: SenderMetrics,
         maxFramesInFlight: Int? = nil,
         stallTimeout: TimeInterval? = nil,
-        autoReconnect: Bool = false
+        autoReconnect: Bool = false,
+        handshakeLegTimeout: Int? = nil
     ) {
         self.metrics = metrics
+        self.handshakeLegTimeout = handshakeLegTimeout ?? Self.defaultHandshakeLegTimeout
         self.sendWindow = SendWindow(
             capacity: maxFramesInFlight ?? Self.defaultMaxFramesInFlight,
             stallTimeout: stallTimeout ?? Self.sendStallTimeout
@@ -431,6 +434,44 @@ final class TowerClient: NSObject, ObservableObject {
         validationTask = Task { [weak self] in
             await self?.validateConnection(task: task)
         }
+        armHandshakeWatchdog(for: task)
+    }
+
+    /// Guarantee that a connection attempt ends.
+    ///
+    /// `validateConnection` awaits a `send` and a `receive` on the socket, and
+    /// neither reliably returns when a peer accepts the TCP connection and then
+    /// never completes the WebSocket upgrade. Structured-concurrency timeouts
+    /// cannot rescue that — a task group has to await its own child before it
+    /// can throw, and that child is the stuck call — so the bound is enforced
+    /// from outside, on the thing that really is cancellable: the socket.
+    ///
+    /// `fail(_:task:)` tears the connection down, which makes the pending calls
+    /// error out, sets `.failed`, and lets `scheduleReconnect` advance. Without
+    /// it a hung connect parked the client in `.connecting` permanently: the
+    /// attempt budget was never spent, nothing tried again, and nothing said so.
+    ///
+    /// Found while decomposing a real 9-second reconnect on a physical walk,
+    /// ~8.5 s of which was spent in `.connecting`. This does not make that walk
+    /// faster — it makes the failure terminate.
+    private func armHandshakeWatchdog(for task: URLSessionWebSocketTask) {
+        handshakeWatchdog?.cancel()
+        // Both legs plus room for the ordinary case to finish on its own, so
+        // this fires only when the per-leg bounds have failed to.
+        let budget = handshakeLegTimeout * 2
+        handshakeWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(budget))
+            guard !Task.isCancelled else { return }
+            self?.handshakeDidTimeOut(task: task, after: budget)
+        }
+    }
+
+    private func handshakeDidTimeOut(task: URLSessionWebSocketTask, after seconds: Int) {
+        // Only if this attempt is still the current one and still unresolved. A
+        // connection that came online, failed on its own, or was superseded has
+        // already had its outcome.
+        guard isCurrent(task), status == .connecting else { return }
+        fail("Handshake did not complete within \(seconds)s", task: task)
     }
 
     func disconnect() {
@@ -558,7 +599,19 @@ final class TowerClient: NSObject, ObservableObject {
         let mainActorWasResponsive = (sinceLastFrame ?? .infinity) <= Self.mainActorGapAllowance
         if mainActorWasResponsive, sendWindow.isStalled(at: now) {
             let age = sendWindow.oldestAge(at: now) ?? 0
-            log("send window stalled — \(sendWindow.inFlight) sends outstanding, oldest \(String(format: "%.1f", age))s; replacing the connection")
+            // The healthy distribution alongside the verdict. A stall is only
+            // interpretable against what this link normally does: an oldest-slot
+            // age of 2 s means one thing when the running max is 90 ms and quite
+            // another when it is 1.8 s. These rows exist on the developer
+            // surface and had never been recorded next to an actual stall.
+            let snapshot = metrics.snapshot
+            let slotMax: String = snapshot.slotLifetimeMsMax.map { String(format: "%.0f", $0) } ?? "-"
+            let sendMax: String = snapshot.sendLatencyMsMax.map { String(format: "%.0f", $0) } ?? "-"
+            let ageText: String = String(format: "%.1f", age)
+            let outstanding: Int = sendWindow.inFlight
+            let priorRecoveries: Int = snapshot.stallRecoveries
+            let diagnosis: String = "slot ms max \(slotMax), send ms max \(sendMax), prior stall recoveries \(priorRecoveries)"
+            log("send window stalled — \(outstanding) sends outstanding, oldest \(ageText)s (\(diagnosis)); replacing the connection")
             // This frame still has to reach a terminal outcome, or every stall
             // would leave one selected frame permanently unaccounted for and
             // `framesUnaccounted` would drift upwards — the one number that
@@ -842,6 +895,15 @@ final class TowerClient: NSObject, ObservableObject {
         }
     }
 
+    /// The bound on each half of the opening handshake — the connect-and-ping
+    /// leg, and the pong. See `validateConnection`.
+    private static let defaultHandshakeLegTimeout = 6
+    /// Injectable so a test can prove the bound exists without spending six
+    /// seconds per leg doing it.
+    private let handshakeLegTimeout: Int
+    /// Bounds one whole connection attempt. See `armHandshakeWatchdog`.
+    private var handshakeWatchdog: Task<Void, Never>?
+
     /// Sends one ping and validates the pong within a bounded timeout. On
     /// success, hands off to the continuous receive loop.
     private func validateConnection(task: URLSessionWebSocketTask) async {
@@ -852,10 +914,39 @@ final class TowerClient: NSObject, ObservableObject {
                 return
             }
 
-            try await task.send(.string(pingText))
-            log("ping sent: \(pingText)")
+            // Leg timings, because a reconnect's cost was guessed once and the
+            // guess was wrong. A 9-second outage on the walk was attributed to
+            // "the reconnect"; decomposing the console showed ~8.5 s of it was
+            // spent in `.connecting` — i.e. a brand-new socket could not
+            // complete its upgrade either — which means the teardown decision
+            // cost well under a second and something about the path or the peer
+            // cost the rest. Three hypotheses fit that (a new flow paying SYN
+            // retransmission, a Tower event loop blocked in reconstruction, a
+            // genuinely dead link) and they imply different fixes, so the next
+            // walk must not have to guess again.
+            let handshakeBegan = MonotonicClock.now
 
-            let message = try await withTimeout(seconds: 6) {
+            // NOT wrapped in `withTimeout`, deliberately — `armHandshakeWatchdog`
+            // is what bounds this.
+            //
+            // This `send` cannot return until TCP connect and the HTTP Upgrade
+            // have completed, so it *is* the connect leg, and it had no
+            // deadline at all. Wrapping it in `withTimeout` was tried first and
+            // **does not work**: a throwing task group must await its remaining
+            // child before it can propagate the sleeper's error, and that child
+            // is the call that is stuck. Measured rather than reasoned —
+            // against a listener that accepts TCP and never upgrades, a
+            // one-second `withTimeout` here left the client `.connecting` for
+            // the full twelve seconds the test was willing to wait.
+            //
+            // The same caveat applies to the pong's `withTimeout` below. It is
+            // kept because it does bound the ordinary case; it is simply not
+            // the guarantee. Cancelling the socket is.
+            try await task.send(.string(pingText))
+            let connectMs = (MonotonicClock.now - handshakeBegan) * 1000
+            log("ping sent (connect+upgrade \(Int(connectMs)) ms): \(pingText)")
+
+            let message = try await withTimeout(seconds: handshakeLegTimeout) {
                 try await task.receive()
             }
             log("message received: \(message)")
@@ -870,12 +961,20 @@ final class TowerClient: NSObject, ObservableObject {
                 return
             }
 
-            log("pong validated")
+            let handshakeMs = (MonotonicClock.now - handshakeBegan) * 1000
+            log(
+                "pong validated (connect+upgrade \(Int(connectMs)) ms,"
+                    + " pong \(Int(handshakeMs - connectMs)) ms,"
+                    + " handshake total \(Int(handshakeMs)) ms)"
+            )
             guard !Task.isCancelled, isCurrent(task) else { return }
             // Deliberately does *not* refill the reconnect budget yet — see
             // `becameOnlineAt`. Reaching `.online` is not evidence of a working
             // connection; staying there is.
             becameOnlineAt = MonotonicClock.now
+            // The handshake is done; its bound has nothing left to bound.
+            handshakeWatchdog?.cancel()
+            handshakeWatchdog = nil
             status = .online
             startReceiveLoop(task: task)
             // After the pong, never before. The Tower never speaks first, so
@@ -1093,6 +1192,8 @@ final class TowerClient: NSObject, ObservableObject {
     }
 
     private func teardownConnection(cancelWith closeCode: URLSessionWebSocketTask.CloseCode) {
+        handshakeWatchdog?.cancel()
+        handshakeWatchdog = nil
         validationTask?.cancel()
         validationTask = nil
         receiveTask?.cancel()

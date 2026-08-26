@@ -637,6 +637,104 @@ final class TowerWorldBuilderClientTests: XCTestCase {
         tower.disconnect()
     }
 
+    /// The wait for `result_subscribed` is bounded, and ends in a state a
+    /// person can read.
+    ///
+    /// `subscribeIfPossible` shows a spinner *before* sending, and
+    /// `sendResultMessage` deliberately swallows a send failure so the result
+    /// channel can never take down the frame path. Both are right alone;
+    /// together they left a subscribe that never landed, on a socket that
+    /// stayed up, waiting forever with nothing to end it.
+    ///
+    /// This server answers the ping and the cartridge declaration — so the
+    /// socket is genuinely healthy and `.online` — and then simply never
+    /// acknowledges the subscription.
+    func testAnUnacknowledgedSubscriptionTimesOutRatherThanSpinningForever() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        defer { server.stop() }
+
+        server.onText = { text in
+            guard
+                let data = text.data(using: .utf8),
+                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let type = json["type"] as? String
+            else { return }
+            switch type {
+            case "ping":
+                server.send(text: #"{"type":"pong"}"#)
+            case "cartridges":
+                server.send(text: """
+                    {"type":"cartridges",
+                     "envelope_contract":"cartridge_results.envelope/2026-08-23",
+                     "cartridges":[{"cartridge":"world_builder","result_type":"status",
+                        "contract":"\(Self.contract)","available":true,
+                        "unavailable_reason":null,"snapshot_only":true}],
+                     "not_offered":[]}
+                    """)
+            // `result_subscribe` is deliberately unanswered.
+            default:
+                break
+            }
+        }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        let client = TowerWorldBuilderClient(tower: tower, subscribeAckTimeout: .milliseconds(300))
+        tower.connect(to: url(port: port))
+
+        await expect { client.state == .awaitingFirstUpdate }
+        XCTAssertEqual(client.state.phase, .waiting, "a spinner is honest while the wait is live")
+
+        await expect("the subscription wait never ended") {
+            if case .failed = client.state { return true }
+            return false
+        }
+
+        guard case .failed(let failure) = client.state else {
+            return XCTFail("expected a bounded failure, got \(client.state)")
+        }
+        XCTAssertEqual(
+            failure.kind, .timedOut,
+            "a Tower that is reachable but silent is a timeout, not a transport failure"
+        )
+        XCTAssertEqual(tower.status, .online, "the socket was healthy throughout")
+        XCTAssertFalse(client.state.hasWorld)
+
+        tower.disconnect()
+    }
+
+    /// The bound must not fire into a subscription that succeeded.
+    ///
+    /// The timeout sleeps off the main actor, so the ack can land while it is
+    /// still sleeping. Without the disarm — and the attempt counter behind it —
+    /// a healthy subscription would be torn down a few hundred milliseconds
+    /// after it started working.
+    func testAnAcknowledgedSubscriptionIsNotTornDownByItsOwnTimeout() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        serve(server)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        let client = TowerWorldBuilderClient(tower: tower, subscribeAckTimeout: .milliseconds(200))
+        tower.connect(to: url(port: port))
+
+        await expect { client.state == .awaitingFirstUpdate }
+        server.send(text: snapshotMessage(seq: 1, modelState: "receiving", keyframes: 4, revision: "r1"))
+        await expect { client.state.snapshot?.keyframeCount == 4 }
+
+        // Well past the bound, which must have been disarmed by the ack.
+        try? await Task.sleep(nanoseconds: 600_000_000)
+
+        XCTAssertEqual(
+            client.state.snapshot?.keyframeCount, 4,
+            "a live subscription was torn down by a timeout that should have been disarmed"
+        )
+        if case .failed = client.state { XCTFail("the bound fired into a working subscription") }
+
+        tower.disconnect()
+    }
+
     /// A result marked as a partial update is refused, and — this is the point
     /// — refused *loudly*.
     ///
@@ -822,9 +920,12 @@ final class TowerWorldBuilderClientTests: XCTestCase {
             recorder.all.compactMap(decode).contains { $0["type"] as? String == "result_subscribe" },
             "the client subscribed against a contract it does not implement"
         )
+        // `.needsUpdate`: the Tower declared World Builder, so it can do this
+        // and the app is what is behind. Rendering that as "Nothing yet" would
+        // tell the wearer the cartridge does not exist.
         XCTAssertEqual(
             client.availability(isTowerReachable: true).forcedPhase,
-            .unsupported
+            .needsUpdate
         )
 
         tower.disconnect()
@@ -1728,7 +1829,7 @@ final class TowerWorldBuilderSessionBindingTests: XCTestCase {
         )
         XCTAssertEqual(
             client.availability(isTowerReachable: true).forcedPhase,
-            .unsupported,
+            .needsUpdate,
             "the superseded contract was treated as one this build implements"
         )
 

@@ -52,6 +52,51 @@ climbing — but they are separated by **nine seconds of unobserved wearer
 motion**. Any correspondence search across that boundary is being asked to
 match two views with a large, unmodelled baseline between them.
 
+### 1.1 Correction — the reconnect is not what cost the nine seconds
+
+**An earlier revision of this document said the phone's reconnect decision cost
+the walk nine seconds. That was wrong, and the console says so.** Decomposing
+it properly:
+
+- the **first** dropped frame reads `status=failed("Send stalled for 2.0s")`;
+- **every one after it reads `status=connecting`.**
+
+There was one reconnect attempt, and it spent roughly **8.5 of the 9 seconds
+unable to complete a WebSocket handshake**. The backoff is 0.5 s. So the cost
+attributable to the phone deciding to replace the connection is on the order of
+**0.6–0.9 s — under 10% of the hole.** The other ~8.5 s is something that
+stopped a *brand-new* socket from being established.
+
+**Three hypotheses fit, and they are not equivalent for you:**
+
+1. **A new TCP flow paying SYN retransmission** (1 s / 2 s / 4 s) where an
+   established flow would have retransmitted from a measured RTT. Phone-side,
+   and ours to measure.
+2. **The Tower's event loop was blocked**, serving neither the old socket's
+   reads nor the new socket's upgrade. **This walk was the first with World
+   Builder reconstruction running on the Tower**, `tower/handoff.md:709`
+   already names "blocking the socket read path >2 s" as a known anti-pattern,
+   and the original send-window baseline measured a **52-second** Tower-side
+   read stall. If a rebuild ran synchronously on the event loop for ~8 s, that
+   predicts exactly what was observed — on both sockets at once.
+3. **A genuine link outage** for ~8.5 s, in which case nothing either lane does
+   would have helped.
+
+**Only hypothesis 2 is yours**, and it is the one we cannot test from the phone.
+If a rebuild can occupy the event loop for multiple seconds, the phone's
+2.0 s stall detector will keep replacing connections during exactly the moments
+reconstruction is working hardest — and each replacement costs a frame gap that
+makes reconstruction harder. That is a feedback loop, not a coincidence, and it
+would be worth checking whether any World Builder work runs on the request path
+rather than in an executor.
+
+**What we have done so we both stop guessing:** the phone now logs each
+handshake leg separately — connect+upgrade ms, pong ms, total — and prints the
+slot-lifetime max, send-latency max and prior stall-recovery count alongside
+every stall verdict. The next walk will say which of the three it was. **If it
+turns out to be the Tower's read path, the fix is not in `ios/` and we will not
+attempt it.**
+
 ---
 
 ## 2. The correlation, stated as a hypothesis rather than a conclusion
@@ -131,13 +176,24 @@ what we render until you say which number is right.
 
 Ours, not yours, listed so you know it is handled:
 
-- **The stall that caused the drop is phone-side.** `SendWindow` capacity is 4
-  (12 fps × 1/3) and all four slots were outstanding for 2.0 s, so the client
-  deliberately replaced the connection — its own stall detection working as
-  designed. Whether 2.0 s is the right patience for a Tailscale link mid-walk
-  is a Mac-lane question and is now on our list. **We are not changing the
-  frame rate to chase it**, and we will coordinate with you before touching
-  `FrameRateGate.towerTargetFPS`.
+- **The stall detector is phone-side, and we investigated raising it and
+  refused.** `SendWindow` capacity is 4 (12 fps × 1/3), measured against a
+  physical baseline and since confirmed at 11.97 fps over 9,199 frames — it is
+  not a guess and it is not moving. The 2.0 s stall threshold *is* a judgment
+  rather than a measurement, but raising it would not have saved this walk: the
+  replacement connection needed ~8.5 s, so any threshold under that fires
+  anyway and merely makes the hole longer. It is also a published cross-lane
+  invariant (`tower/handoff.md:622`), and the repo pre-registered the condition
+  for changing it — "stall recoveries climbing continuously" — which n=1 does
+  not meet. **We are not changing `sendStallTimeout`, `outboundLatencyBudget`
+  or `FrameRateGate.towerTargetFPS` on this evidence**, and we will coordinate
+  with you before touching the frame rate.
+- **We did fix a real defect the walk exposed by accident.** The connect leg of
+  the handshake had no deadline at all: a peer that accepts TCP and never
+  upgrades parked the client in `.connecting` permanently, with the reconnect
+  budget never spent and nothing trying again. It is now bounded by a watchdog
+  that cancels the socket. Unrelated to your lane; recorded because it means a
+  future walk cannot silently stop reconnecting.
 - **The geometry pull had no logging at all.** This walk produced 482 console
   lines across seven subsystems and not one said whether the phone ever fetched
   the geometry manifest. So "do fragments appear during the walk" — the

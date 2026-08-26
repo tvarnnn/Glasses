@@ -10,6 +10,8 @@
 //
 
 import Combine
+import Network
+import os
 import UIKit
 import XCTest
 
@@ -1161,6 +1163,78 @@ final class TowerClientTests: XCTestCase {
         client.sendStreamStop()
         client.sendStreamStart()
         XCTAssertNil(client.latestFrameResult, "a new bracket must not inherit the previous one's reply")
+
+        client.disconnect()
+    }
+
+    /// A connect that never completes must terminate, not hang forever.
+    ///
+    /// `validateConnection` bounded the pong at 6 s and left the `send` beside
+    /// it — which cannot return until TCP connect and the HTTP Upgrade have
+    /// finished, so it *is* the connect leg — with no deadline at all. A peer
+    /// that accepts the TCP connection and never upgrades parked the client in
+    /// `.connecting` permanently: `fail(_:task:)` was never reached, so the
+    /// reconnect schedule never advanced and the attempt budget was never
+    /// spent. Nothing tried again, and nothing said so.
+    ///
+    /// Found while decomposing a real 9-second reconnect on a physical walk,
+    /// ~8.5 s of which was spent in `.connecting`.
+    ///
+    /// The listener here is deliberately **plain TCP** — no
+    /// `NWProtocolWebSocket` in its stack — so it completes the handshake's
+    /// first half and then simply never speaks.
+    func testAConnectThatNeverUpgradesFailsInsteadOfHangingForever() async throws {
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        let listener = try NWListener(using: parameters)
+        let queue = DispatchQueue(label: "SilentTCPListener")
+
+        // Accepted and then ignored: started so the TCP handshake completes,
+        // and never written to, so the upgrade cannot.
+        let accepted = OSAllocatedUnfairLock(initialState: [NWConnection]())
+        listener.newConnectionHandler = { connection in
+            connection.start(queue: queue)
+            accepted.withLock { $0.append(connection) }
+        }
+
+        let port: UInt16 = try await withCheckedThrowingContinuation { continuation in
+            // Locked rather than a captured `var`: `stateUpdateHandler` runs on
+            // the listener's queue, and a continuation resumed twice traps.
+            let resumed = OSAllocatedUnfairLock(initialState: false)
+            listener.stateUpdateHandler = { state in
+                let claim = resumed.withLock { already -> Bool in
+                    if already { return false }
+                    already = true
+                    return true
+                }
+                switch state {
+                case .ready:
+                    guard let port = listener.port else { return }
+                    if claim { continuation.resume(returning: port.rawValue) }
+                case .failed(let error):
+                    if claim { continuation.resume(throwing: error) }
+                default:
+                    break
+                }
+            }
+            listener.start(queue: queue)
+        }
+        defer { listener.cancel() }
+
+        let client = TowerClient(metrics: SenderMetrics(), handshakeLegTimeout: 1)
+        client.connect(to: url(port: port))
+
+        let reachedConnecting = await waitUntil { client.status == .connecting }
+        XCTAssertTrue(reachedConnecting, "the client never began connecting")
+
+        let terminated = await waitUntil(timeout: 8) {
+            if case .failed = client.status { return true }
+            return false
+        }
+        XCTAssertTrue(
+            terminated,
+            "the client is still connecting to a peer that will never answer — the connect leg is unbounded"
+        )
 
         client.disconnect()
     }

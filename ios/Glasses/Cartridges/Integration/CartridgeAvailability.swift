@@ -118,7 +118,11 @@ enum CartridgeAvailability: Equatable, Sendable {
     /// as `idle`, which would invite a user to press a button that cannot work.
     var forcedPhase: CartridgePhase? {
         switch self {
-        case .noContract, .unsupportedContract: return .unsupported
+        case .noContract: return .unsupported
+        // Not `.unsupported`. The Tower is already serving this cartridge; the
+        // app is the half that is behind, and that is the one case on this
+        // screen a person can actually fix.
+        case .unsupportedContract: return .needsUpdate
         // Not `.unsupported`. A Tower that is merely unreachable may well be
         // able to do this, and drawing it with the same headline and glyph as
         // "will never do this" is the half of the distinction a person actually

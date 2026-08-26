@@ -645,7 +645,13 @@ final class CartridgeIntegrationTests: XCTestCase {
         )
         XCTAssertEqual(availability, .unsupportedContract(declared: declared))
         XCTAssertFalse(availability.isAvailable)
-        XCTAssertEqual(availability.forcedPhase, .unsupported)
+        // `.needsUpdate`, not `.unsupported`. The Tower *declared* this
+        // cartridge — it can do it — and this build is the half that cannot
+        // read the agreement. That is the one empty state on this screen a
+        // person can end themselves, and "Nothing yet" told them a feature
+        // did not exist when they were one update away from it.
+        XCTAssertEqual(availability.forcedPhase, .needsUpdate)
+        XCTAssertNotEqual(availability.forcedPhase, .unsupported)
     }
 
     /// The precedence rule. A contract mismatch is not fixed by reconnecting,
@@ -685,9 +691,12 @@ final class CartridgeIntegrationTests: XCTestCase {
         // unreachable may well be able to do this, and the shared panel now
         // says so in its headline and glyph rather than only in its prose.
         XCTAssertEqual(CartridgeAvailability.towerUnreachable.forcedPhase, .disconnected)
+        // `.needsUpdate`, not `.unsupported`, for the same reason `.disconnected`
+        // is not `.unsupported`: opposite responses. Nothing fixes `.noContract`
+        // but a Tower change; this one is fixed by updating the app.
         XCTAssertEqual(
             CartridgeAvailability.unsupportedContract(declared: declared).forcedPhase,
-            .unsupported
+            .needsUpdate
         )
     }
 
@@ -825,7 +834,10 @@ final class CartridgeIntegrationTests: XCTestCase {
         XCTAssertFalse(CartridgePhase.live.showsProgress)
         XCTAssertFalse(CartridgePhase.settled.showsProgress)
         XCTAssertFalse(CartridgePhase.failed.showsProgress)
-        XCTAssertEqual(CartridgePhase.allCases.count, 7, "a phase was added without a decision here")
+        // Decided: nothing is in flight while the app is the thing that is
+        // behind, so a spinner would be as untrue here as in `.unsupported`.
+        XCTAssertFalse(CartridgePhase.needsUpdate.showsProgress)
+        XCTAssertEqual(CartridgePhase.allCases.count, 8, "a phase was added without a decision here")
     }
 
     /// An unreachable Tower and an absent capability are different situations
@@ -833,6 +845,20 @@ final class CartridgeIntegrationTests: XCTestCase {
     func testAnUnreachableTowerIsNotAMissingCapability() {
         XCTAssertNotEqual(CartridgePhase.disconnected, CartridgePhase.unsupported)
         XCTAssertFalse(CartridgePhase.disconnected.mayCarryData)
+    }
+
+    /// The third member of the same family. All four empty phases mean "there
+    /// is nothing to show", and each one implies a different next move: wait
+    /// for the Tower to gain the capability, wait for the network, update the
+    /// app, or press the button. Collapsing any two of them hands a person the
+    /// wrong instruction.
+    func testTheFourEmptyPhasesAreDistinctBecauseTheirRemediesAre() {
+        let empty: [CartridgePhase] = [.unsupported, .disconnected, .needsUpdate, .idle]
+        XCTAssertEqual(Set(empty).count, empty.count, "two empty phases collapsed into one")
+        for phase in empty {
+            XCTAssertFalse(phase.mayCarryData, "\(phase) must not carry data")
+            XCTAssertFalse(phase.showsProgress, "\(phase) must not claim work is underway")
+        }
     }
 
     // MARK: Failures

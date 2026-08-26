@@ -24,7 +24,7 @@ Every row below was produced from a clean `derivedDataPath` in this session.
 | Debug (Simulator) | **0 errors, 0 warnings** |
 | Release (Simulator) | **0 errors, 0 warnings** |
 | Signed device build | **0 errors, 0 warnings** — `Apple Development: tv.lloyd@icloud.com` |
-| XCTest | **392 passed, 0 failed** (was 388; four added this wave) |
+| XCTest | **396 passed, 0 failed** (was 388 at the start of this lane's session) |
 | Install on physical iPhone 16 Pro | **done** — `com.tristanvarner.Glasses` |
 
 **The `warning:` lines from `appintentsmetadataprocessor` are not compiler
@@ -155,6 +155,56 @@ chooses what it runs at startup and this app cannot ask it for anything else.
 
 ---
 
+## 4.5 Second wave — the walk's findings
+
+### 4.5.1 The subscribe wait was unbounded
+
+`subscribeIfPossible` shows a spinner *before* sending, and
+`sendResultMessage` deliberately swallows a send failure so the result channel
+can never take down the frame path. Both are right alone. Together they left a
+`result_subscribe` that never reached the wire, on a socket that then stayed
+up, waiting with nothing to end it. `CartridgeFailure.Kind.timedOut` existed
+for exactly this — Rule 15 — and was never constructed anywhere in the app.
+Now bounded at 10 s, disarmed on the ack, on an inbound error, and on the
+connection going away, with an attempt counter so a stale bound cannot fire
+into a later attempt.
+
+### 4.5.2 `noContract` and `unsupportedContract` rendered identically
+
+Same headline ("Nothing yet"), same glyph, **opposite remedies**: one is "this
+Tower may never do this" and there is nothing to be done; the other is "the
+Tower already does this and the app is behind", which a person fixes in a
+minute. A new `CartridgePhase.needsUpdate` now carries it — "Update needed",
+`arrow.down.circle`. This is the same argument the codebase already made once
+when it split `.disconnected` out of `.unsupported`, applied one level up. The
+suite's own tripwire — *"a phase was added without a decision here"* — caught
+the addition and was answered rather than silenced.
+
+### 4.5.3 A connect that never completes never ended — and `withTimeout` could not fix it
+
+The handshake's `receive` was bounded at 6 s; the `send` beside it, which
+cannot return until TCP connect and the HTTP Upgrade are done, had **no
+deadline at all**. A peer that accepts TCP and never upgrades parked the client
+in `.connecting` permanently: `fail(_:task:)` was never reached, the reconnect
+schedule never advanced, the attempt budget was never spent, and nothing said
+so.
+
+**The first fix did not work, and finding that out is the valuable part.**
+Wrapping the `send` in the existing `withTimeout` helper is useless here: a
+throwing task group must await its remaining child before it can propagate the
+sleeper's error, and that child is the stuck call. Measured, not reasoned —
+against a listener that accepts TCP and never upgrades, a one-second
+`withTimeout` left the client `.connecting` for the full twelve seconds the
+test would wait.
+
+The bound therefore had to act on the socket, which *is* cancellable, rather
+than on the await. A watchdog now tears the connection down if a whole attempt
+has not resolved. **The same caveat applies to the pong's existing 6 s
+`withTimeout`** — it bounds the ordinary case, it is not a guarantee — and that
+is now written where the next reader will find it.
+
+---
+
 ## 5. Reviewed and deliberately NOT changed
 
 Recorded so the next lane does not re-litigate them. Each was proposed, argued
@@ -180,6 +230,21 @@ against by an independent adversarial reviewer, and refused on evidence.
   presence there must never be read as an offer, and a test pins it.
 - **Raising `FrameRateGate.towerTargetFPS`** from 12. Untouched. Requires a
   device measurement and coordination with the World Builder lane.
+- **Raising `sendStallTimeout` from 2.0 s** after it cost ~9 s of a walk.
+  Investigated and **refused**, which was not the expected outcome. It would
+  not have saved that walk: the replacement connection needed ~8.5 s to
+  handshake, so any threshold below that fires anyway and merely lengthens the
+  hole. The mechanism it protects is severe — there is no API to time out an
+  individual `send`, `didCloseWith` fires only on a real close frame, and send
+  completions have been observed succeeding for ~40 s after a disconnect, so
+  the stall detector is the *only* observer of a dead socket. `SendWindow`
+  capacity 4 is measured (and since confirmed at 11.97 fps over 9,199 frames),
+  not a guess. The repo pre-registered the condition for raising the threshold
+  — "stall recoveries climbing continuously" — and n=1 does not meet it. It is
+  also a published cross-lane invariant. **Instrumented instead**: each
+  handshake leg is timed separately and every stall verdict now prints the
+  slot-lifetime max, send-latency max and prior recovery count, so the next
+  walk distinguishes the three competing hypotheses instead of guessing.
 
 ---
 
@@ -315,14 +380,8 @@ are on.** It is: open the app, press Start, and walk. See §9.
 
 ## 8. Known gaps, ranked, not yet addressed
 
-1. **Subscribe ack has no timeout.** `subscribeIfPossible` sets
-   `.awaitingFirstUpdate` before sending, and `sendResultMessage` deliberately
-   does not escalate a failed send. A subscribe that never lands on a socket
-   that stays up leaves a spinner forever. `CartridgeFailure.Kind.timedOut`
-   exists for exactly this and is never constructed.
-2. **`noContract` and `unsupportedContract` render identically** — same
-   headline, same glyph — while calling for opposite user actions ("wait for
-   the Tower" vs "update the app").
+1. ~~Subscribe ack has no timeout.~~ **FIXED — §4.5.1.**
+2. ~~`noContract` and `unsupportedContract` render identically.~~ **FIXED — §4.5.2.**
 3. **Three retain cycles defeat `GlassesConnection.isolated deinit`**
    (`:190, :210, :220`): `Task { [weak self] in guard let self else … }` over an
    unbounded DAT stream promotes the capture to strong. The correct pattern is
@@ -345,9 +404,13 @@ are on.** It is: open the app, press Start, and walk. See §9.
 
 1. Run `ios/scripts/contract-drift-check.py` first. It answers in seconds
    whether the Tower has moved under this build.
-2. Fix §8.1 (subscribe-ack timeout) — it has a user-visible symptom, an unused
-   failure kind built for it, and a bounded fix.
-3. Fix §8.2 (availability states rendering identically).
+2. **The next walk is instrumented — read its `[Glasses][Geometry]` and
+   handshake-leg lines before changing anything.** They answer P3 and they
+   settle which of the three reconnect hypotheses is real. Do not tune a
+   transport constant before those numbers exist.
+3. Fix §8.3 (the three retain cycles) — it is the largest remaining correctness
+   item that does not need a wearer.
 4. When a wearer is available, run P11 before P3: it tests a prediction rather
    than gathering data.
-5. Do not re-open §5. Those were argued and refused on evidence.
+5. Do not re-open §5. Those were argued and refused on evidence, and one of
+   them — the send-stall threshold — is a published cross-lane invariant.

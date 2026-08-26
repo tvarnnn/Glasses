@@ -463,6 +463,21 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     /// declaration republished while the ack is in flight would open a second
     /// subscription for the same cartridge.
     private var isSubscribing = false
+    /// Bounds the wait for a `result_subscribed`. See `armSubscribeTimeout`.
+    private var subscribeTimeout: Task<Void, Never>?
+    /// Which subscribe attempt a timeout belongs to. Without it, a timeout
+    /// armed for one attempt can fire into a later one that is legitimately
+    /// still waiting.
+    private var subscribeAttempt = 0
+    /// Long enough that a congested Tailscale link mid-walk is not called
+    /// dead — the whole handshake ahead of this one completed in well under a
+    /// second on the physical run — and short enough that a person is not left
+    /// in front of a spinner with no end. Matches the bound
+    /// `ObjectMemoryHTTPClient` puts on its own requests.
+    private static let defaultSubscribeAckTimeout: Duration = .seconds(10)
+    /// Injectable so a test can bound the wait in milliseconds rather than
+    /// spending ten seconds proving a ten-second bound exists.
+    private let subscribeAckTimeout: Duration
 
     /// Resubscribes spent on the current connection.
     ///
@@ -476,8 +491,9 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     private var resubscribesUsed = 0
     private static let resubscribeBudget = 3
 
-    init(tower: TowerClient) {
+    init(tower: TowerClient, subscribeAckTimeout: Duration? = nil) {
         self.tower = tower
+        self.subscribeAckTimeout = subscribeAckTimeout ?? Self.defaultSubscribeAckTimeout
 
         // `.receive(on:)` on both, and it is load-bearing rather than
         // stylistic. A `@Published` publisher fires from `willSet`, so a sink
@@ -546,6 +562,10 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             // because availability already reports the connection truthfully.
             subscriptionID = nil
             isSubscribing = false
+            // The socket that the subscribe was sent on is gone, so the bound
+            // has nothing left to bound. Leaving it armed would report a
+            // timeout against a connection the reconnect path already owns.
+            disarmSubscribeTimeout()
             return
         }
         resubscribesUsed = 0
@@ -595,6 +615,71 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             resultType: offer.resultType,
             contract: offer.contract
         )
+        armSubscribeTimeout()
+    }
+
+    /// Bound the wait for the Tower's `result_subscribed`.
+    ///
+    /// ## Why the wait was unbounded, and what that looked like
+    ///
+    /// `subscribeIfPossible` sets `.awaitingFirstUpdate` — a spinner — *before*
+    /// sending, and `TowerClient.sendResultMessage` deliberately does not
+    /// escalate a failed send: it returns silently if the socket is not online
+    /// and swallows an async send error, because a result-channel message
+    /// failing must not take down the frame path. Both of those are right on
+    /// their own. Together they mean a `result_subscribe` that never reaches
+    /// the wire, on a socket that then stays up, leaves the workspace waiting
+    /// for an answer that is not coming. Nothing cleared `isSubscribing` except
+    /// leaving `.online` or an inbound error, so the spinner had no end.
+    ///
+    /// `CartridgeFailure.Kind.timedOut` exists for exactly this — Rule 15,
+    /// bounded operations — and was never constructed anywhere in the app.
+    ///
+    /// Deliberately a *failure*, not a silent retry: the socket is up and the
+    /// Tower is not answering a message it acknowledges within milliseconds
+    /// when healthy. That is worth telling someone about rather than papering
+    /// over, and the reconnect path already owns the case where the socket
+    /// itself is the problem.
+    private func armSubscribeTimeout() {
+        subscribeAttempt += 1
+        let attempt = subscribeAttempt
+        let timeout = subscribeAckTimeout
+        subscribeTimeout?.cancel()
+        subscribeTimeout = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled else { return }
+            self?.subscribeDidTimeOut(attempt: attempt)
+        }
+    }
+
+    /// Cancel a pending bound. Called wherever the wait legitimately ends.
+    private func disarmSubscribeTimeout() {
+        subscribeTimeout?.cancel()
+        subscribeTimeout = nil
+    }
+
+    private func subscribeDidTimeOut(attempt: Int) {
+        // Three guards, and each one closes a real race: a newer attempt has
+        // superseded this timeout; the ack arrived while it was sleeping; or
+        // the connection went away and the reconnect path already owns the
+        // state.
+        guard attempt == subscribeAttempt, isSubscribing, subscriptionID == nil else { return }
+        guard tower.status == .online else { return }
+
+        isSubscribing = false
+        lastReport = nil
+        sessionBinding = bindingWithNoReport
+        state = .failed(
+            CartridgeFailure(
+                kind: .timedOut,
+                message: """
+                    The Tower did not acknowledge the World Builder subscription \
+                    within \(subscribeAckTimeout.components.seconds) seconds. \
+                    The connection is still open, so this is the Tower not \
+                    answering rather than the network being gone.
+                    """
+            )
+        )
     }
 
     // MARK: Result channel
@@ -610,6 +695,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             guard ack.cartridge == WorldBuilderResultContract.towerCartridge else { return }
             subscriptionID = ack.subscriptionID
             isSubscribing = false
+            disarmSubscribeTimeout()
 
         case .unsubscribed(let id):
             guard id == subscriptionID else { return }
@@ -825,6 +911,9 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         if error.closesSubscription {
             subscriptionID = nil
             isSubscribing = false
+            // The Tower answered, so the wait is over however it ended. The
+            // resubscribe below arms a fresh bound of its own.
+            disarmSubscribeTimeout()
             guard resubscribesUsed < Self.resubscribeBudget else {
                 state = .failed(
                     CartridgeFailure(
@@ -855,5 +944,8 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             state = .failed(CartridgeFailure(kind: .transport, message: error.message))
         }
         isSubscribing = false
+        // Any inbound error ends the wait: the Tower answered, even if what it
+        // said was that this cannot work.
+        disarmSubscribeTimeout()
     }
 }
