@@ -25,25 +25,32 @@ from tower.scene.detect import SCORE_THRESHOLD, Detector
 from tower.scene.orientation import age_estimate, facing_from_keypoints
 from tower.scene.records import FacingEstimate
 from tower.scene.state import SceneState, describe_position, relate
-from tower.scene.tracking import Tracker, TrackerPolicy
+from tower.scene.tracking import (
+    DELIVERED_FRAME_INTERVAL_S,
+    Tracker,
+    TrackerPolicy,
+)
 
 logger = logging.getLogger(__name__)
 
-# The interval at which frames actually arrive, in seconds. Measured from
-# the corpus's own `frames.jsonl` receipt timestamps across the 14
-# captures with more than 50 frames: a median gap of 83.5 ms, i.e. 12.0
-# fps, with per-capture medians of 68.5-87.6 ms. This cartridge used to
-# say "~300 ms", which the corpus contradicts by 3.6x, and which had
-# every ratio in the module's documentation stacked on top of it.
-DELIVERED_FRAME_INTERVAL_S = 0.0835
+# `DELIVERED_FRAME_INTERVAL_S` is 83.5 ms -- 12.0 fps, measured from the
+# corpus's own `frames.jsonl` receipt timestamps, where this cartridge
+# used to say "~300 ms" and had every ratio in its documentation stacked
+# on top of that. It is imported rather than defined here because
+# `TrackerPolicy.max_misses` is derived from it too, and it has to live
+# below both consumers. It stays importable from here, which is where a
+# driver looks for a frame-rate fact.
 
-# How many delivered frames one orientation estimate may skip. Three,
-# because that is `TrackerPolicy.min_hits` -- the consecutive-frame
-# streak a track must survive before it is confirmed and can be reported
-# at all. Estimating facing more often than a track can be confirmed
-# buys nothing; less often, and a track can appear, be reported and be
-# dropped without its facing ever being measured once.
-ORIENTATION_FRAME_STRIDE = 3
+# How many delivered frames one orientation estimate may skip: the
+# tracker's confirmation streak, currently three. Estimating facing more
+# often than a track can be confirmed buys nothing; less often, and a
+# track can appear, be reported and be dropped without its facing ever
+# being measured once.
+#
+# Written as the coupling rather than as 3, because the coupling is the
+# reason. A test used to be the only thing holding these two equal; a
+# retune of `min_hits` would have passed review and broken it.
+ORIENTATION_FRAME_STRIDE = TrackerPolicy.min_hits
 
 # How often the orientation stage may run, in seconds. The arithmetic,
 # so the next person can re-derive it instead of trusting it:

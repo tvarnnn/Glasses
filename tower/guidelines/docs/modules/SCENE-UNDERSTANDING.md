@@ -64,18 +64,42 @@ throughout:
 | 0% | 2 | [2] | 1.000 |
 | 10% | 2 | [2] | 1.000 |
 | 20% | 2 | [2] | 1.000 |
-| 40% | 2 | [1, 2] | 0.939 |
+| 40% | 2 | [1, 2] | **0.965** |
+| 60% | 2 | [0, 1, 2] | **0.783** |
 
 A count taken from raw detections would follow the dropout column
 exactly.
 
-The 40% row was **0.974 before the confirmation fix in §8.1** and is
-0.939 after. That is the correct direction for the trade: requiring a
-consecutive streak means a track dropped at extreme dropout takes longer
-to re-confirm, and it is what stops a detection present one frame in six
-from becoming a permanent phantom person. A count that is occasionally
-conservative under a detector losing 40% of frames is a better failure
-than one that is permanently wrong under a reflection.
+The 40% row was **0.974 before the confirmation fix in §8.1**, 0.939
+after it, and 0.965 since the miss budget was retuned; the 60% row is
+new and is where that retune shows, at 0.783 against **0.252** on the
+old constant. Requiring a consecutive streak means a track dropped at
+extreme dropout takes longer to re-confirm, and it is what stops a
+detection present one frame in six from becoming a permanent phantom
+person. A count that is occasionally conservative under a detector
+losing 40% of frames is a better failure than one that is permanently
+wrong under a reflection.
+
+**The miss budget is a duration, and it was written as a frame count.**
+`max_misses = 5` was justified as "roughly 1.5 seconds of absence"
+against an assumed ~3.3 fps. At the measured 12.0 fps it bought 0.42 s,
+so a person occluded for half a second was dropped, returned with a new
+`track_id`, and was **counted as somebody new** — the exact failure
+counting-from-tracks exists to prevent. It is now derived:
+`MAX_ABSENCE_S = 1.0` divided by the measured frame interval, which is
+12 frames. The sweep behind that number, on 9,145 real corpus frames,
+is in `docs/superpowers/research/2026-08-26-tracker-retune.md`. The other
+two thresholds were swept in the same pass and both survived, with
+`min_iou = 0.25` now derived from the measured 1st percentile of
+same-object consecutive-frame IoU and `min_hits = 3` from a two-sided
+sweep that rejects 4 and 2.
+
+The cost is named rather than hidden: a track whose object has genuinely
+gone stays confirmed for up to one second, so the count can be one too
+high for that long. That is a real claim about the room, and 1.0 s is
+where it was put because count stability at 18 and 24 frames is
+identical to 12 — a longer window buys nothing measurable and asserts
+more.
 
 
 **Association is by IoU only, never appearance.** Matching by how
