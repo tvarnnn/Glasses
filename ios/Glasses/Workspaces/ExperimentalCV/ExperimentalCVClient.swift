@@ -58,10 +58,11 @@ final class UnavailableExperimentalCVClient: ExperimentalCVClient {
     /// *replies*, which this app observes on every frame, and says nothing
     /// about what the Tower stores, which this app has no way to know.
     static let reason = """
-        The Tower cannot run experiments yet. Experimental CV Lab is Module #1 \
-        on the roadmap, but the module container it would run inside does not \
-        exist, so the Tower declares no experiments and can accept no request \
-        to run one.
+        The Tower runs one experiment, chosen when it started, and this app \
+        cannot ask it to run another. Its per-frame reply carries that \
+        experiment's own result, which the home screen shows; what does not \
+        exist yet is a way to list the experiments, request one, or read a \
+        result with provenance attached, so nothing can be launched from here.
         """
 
     let cartridgeID = "experimental-cv"

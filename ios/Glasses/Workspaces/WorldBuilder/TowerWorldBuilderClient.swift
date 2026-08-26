@@ -641,6 +641,40 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     }
 
     private func apply(_ envelope: CartridgeResultEnvelope) {
+        // The envelope says whether it is a complete state or a delta, and
+        // this build knows how to merge exactly nothing.
+        //
+        // `snapshot` is `true` on every envelope today — `ResultEnvelope`
+        // defaults it and no Tower code overrides it — and it exists for this
+        // moment: "a consumer that reads this field and finds `false` one day
+        // will know to look for delta-merge rules; one that never sees the
+        // field at all would quietly assume whichever it was written against."
+        //
+        // Read this before deleting it as speculative. Without the guard, a
+        // delta does not fail loudly, it fails *silently and wrongly*: a
+        // partial payload saying `model_state: "receiving"` with no
+        // `world_snapshot` decodes cleanly and returns `.awaitingFirstUpdate`,
+        // which collapses a fully populated world panel to "waiting for the
+        // first update" with no error, no log, and nothing on screen to
+        // suggest anything was missed. Refusing costs one comparison; not
+        // refusing costs a wrong answer that looks like a right one.
+        guard envelope.isSnapshot else {
+            lastReport = nil
+            sessionBinding = bindingWithNoReport
+            state = .failed(
+                CartridgeFailure(
+                    kind: .notSupported,
+                    message: """
+                        The Tower sent a World Builder result marked as a partial update \
+                        rather than a complete one. This build can only read complete \
+                        results, so it is showing nothing rather than a world assembled \
+                        from a piece it does not know how to merge.
+                        """
+                )
+            )
+            return
+        }
+
         guard let next = WorldBuilderResultDecoder.modelState(from: envelope.payload) else {
             // A payload that could not be read is not a world of unknown
             // ownership — there is nothing to judge — so the gate is bypassed

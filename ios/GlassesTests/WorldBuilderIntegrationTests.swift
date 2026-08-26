@@ -637,6 +637,70 @@ final class TowerWorldBuilderClientTests: XCTestCase {
         tower.disconnect()
     }
 
+    /// A result marked as a partial update is refused, and — this is the point
+    /// — refused *loudly*.
+    ///
+    /// `snapshot` is `true` on every envelope the Tower sends today;
+    /// `ResultEnvelope` defaults it and nothing overrides it. The field exists
+    /// so that a future delta mode cannot be mistaken for this one.
+    ///
+    /// Without the guard the failure is silent rather than absent. A delta
+    /// saying `model_state: "receiving"` with no `world_snapshot` decodes
+    /// *cleanly*: `modelState(from:)` returns `.awaitingFirstUpdate`, which
+    /// collapses a populated world back to a spinner. This test drives exactly
+    /// that shape, after a real world is on screen, so a regression shows up as
+    /// the wrong state rather than as a missing error.
+    func testAPartialResultIsRefusedRatherThanQuietlyBlankingTheWorld() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        serve(server)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        let client = TowerWorldBuilderClient(tower: tower)
+        tower.connect(to: url(port: port))
+        await expect { client.state == .awaitingFirstUpdate }
+
+        // A real world first, so the refusal has something to protect.
+        server.send(text: snapshotMessage(seq: 1, modelState: "receiving", keyframes: 17, revision: "r1"))
+        await expect { client.state.snapshot?.keyframeCount == 17 }
+
+        // The dangerous shape: `snapshot: false`, and a payload that would
+        // otherwise decode without complaint.
+        server.send(text: """
+            {"type":"cartridge_result",
+             "envelope_contract":"cartridge_results.envelope/2026-08-23",
+             "subscription_id":"sub-1","cartridge":"world_builder","result_type":"status",
+             "contract":"\(Self.contract)","seq":2,"revision":"r2",
+             "revision_changed":true,"coalesced":0,"cursor_status":null,
+             "snapshot":false,"tower_sent_at":1787463092.9,"time_basis":"tower-receipt",
+             "payload":{"model_state":"receiving","model_state_reason":null}}
+            """)
+
+        await expect("a partial result was not refused") {
+            if case .failed = client.state { return true }
+            return false
+        }
+
+        guard case .failed(let failure) = client.state else {
+            return XCTFail("expected a refusal, got \(client.state)")
+        }
+        XCTAssertEqual(
+            failure.kind, .notSupported,
+            "a delta this build cannot merge is an unsupported result, not an unreadable one"
+        )
+        XCTAssertNotEqual(
+            client.state, .awaitingFirstUpdate,
+            "the partial update silently collapsed the world into a spinner"
+        )
+        XCTAssertFalse(
+            client.state.hasWorld,
+            "a world must not survive as a fact assembled from a piece that was refused"
+        )
+
+        tower.disconnect()
+    }
+
     /// The ~2 s heartbeat re-sends an unchanged snapshot to refresh the fields
     /// excluded from the revision hash. A republish for one of those would put
     /// a list diff on the main actor for nothing.

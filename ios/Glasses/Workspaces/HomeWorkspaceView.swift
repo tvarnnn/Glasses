@@ -116,7 +116,7 @@ struct HomeWorkspaceView: View {
             While a session runs, frames stream to the Tower at a \
             \(Int(FrameRateGate.towerTargetFPS)) fps target — the rate actually \
             reached is in the session numbers. The Tower returns a measurement \
-            for each frame; no module runs there yet.
+            for each frame, which is the running module's own result.
             """
     }
 

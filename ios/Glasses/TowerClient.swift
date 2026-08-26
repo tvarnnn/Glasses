@@ -14,20 +14,58 @@ import UIKit
 
 /// One `frame_result` message, as the Tower actually sends it today.
 ///
-/// Not a guess at a future protocol: these are exactly the three keys the
-/// current Tower puts on the wire, and every one is optional because the
-/// decoder must not fabricate a value the message omitted. The Tower's whole
-/// per-frame vocabulary is `seq`, `mean_intensity` and `processing_ms` — it
-/// runs one fixed handler and has no module runtime — so this is the complete
-/// truth about what comes back, and the app must not imply otherwise.
+/// Not a guess at a future protocol — every field here is one the Tower
+/// builds in `tower/tower/routes/ws.py:148-165`, and every one is optional (or
+/// empty-by-default) because the decoder must not fabricate a value the
+/// message omitted.
+///
+/// ## The earlier version of this comment was wrong, and it cost a cartridge
+///
+/// It read: *"The Tower's whole per-frame vocabulary is `seq`,
+/// `mean_intensity` and `processing_ms` — it runs one fixed handler and has no
+/// module runtime."* Both halves were false. `ws.py` sends **five keys
+/// unconditionally** — `seq`, `processing_ms`, `result_value`, `result_label`
+/// and `stage_ms` — and adds `mean_intensity` and `metrics` when the
+/// experiment produced them. The Tower does have a module runtime:
+/// `tower/tower/main.py` builds a `ModuleContainer` around a live
+/// `ExperimentalCVModule`, and a running Tower reports `module_state: active`
+/// on `/health`.
+///
+/// So `result_value` and `result_label` — the experiment's own answer, the
+/// only thing the Tower says about what it *concluded* rather than how long it
+/// took — were arriving on every single frame and being dropped on the floor,
+/// while the Experimental CV Lab workspace told the wearer the Tower "cannot
+/// run experiments yet".
+///
+/// The Tower's registry says the same thing from its side: `experimental_cv`
+/// is `not_offered` on the result channel because *"results already reach the
+/// client on `frame_result`"*. They do. This type is now the shape of what
+/// actually arrives.
 struct TowerFrameResult: Equatable, Sendable {
     /// The frame this result answers, matching the `seq` the app sent.
     let sequence: Int?
-    /// Mean pixel intensity, 0...1. The only thing the Tower currently reports
-    /// about a frame's *content*.
+    /// Mean pixel intensity, 0...1. Present only when the experiment reported
+    /// one — `nil` means the experiment said nothing, never that the frame was
+    /// dark.
     let meanIntensity: Double?
     /// How long the Tower spent on the frame.
     let processingMs: Double?
+    /// The experiment's headline number. Its meaning is the experiment's, not
+    /// this app's: it is paired with `resultLabel` and must never be rendered
+    /// without it, because a bare number implies a unit nobody promised.
+    let resultValue: Double?
+    /// The experiment's own name for what it measured. The one piece of
+    /// provenance on this channel.
+    let resultLabel: String?
+    /// Per-stage timings inside the Tower's own processing, name -> ms.
+    /// Empty when the Tower sent an empty object; there is no distinction on
+    /// the wire between empty and absent, and none is invented here.
+    let stageMs: [String: Double]
+    /// Additive measurements, name -> number, omitted entirely when empty.
+    /// Deliberately numbers only: `ws.py` calls this "a MEASUREMENT channel,
+    /// not the structured result channel", and the structured one is blocked
+    /// on module-contract work this app must not pre-empt.
+    let metrics: [String: Double]
 }
 
 /// Connection status to the Tower (the project's base-station/hub service).
@@ -912,6 +950,16 @@ final class TowerClient: NSObject, ObservableObject {
             let seq = json["seq"] as? Int
             let meanIntensity = json["mean_intensity"] as? Double
             let processingMs = json["processing_ms"] as? Double
+            let resultValue = json["result_value"] as? Double
+            let resultLabel = json["result_label"] as? String
+            // `?? [:]` rather than an optional: the Tower sends `stage_ms`
+            // unconditionally but may send it empty, and `metrics` is omitted
+            // when empty. Both mean "no stages/measurements to report", so
+            // collapsing absent and empty here loses nothing.
+            let stageMs = json["stage_ms"] as? [String: Double] ?? [:]
+            // Not `metrics`: that name is this client's `SenderMetrics`, and
+            // shadowing it here silently rebinds every use below.
+            let extraMetrics = json["metrics"] as? [String: Double] ?? [:]
 
             resultLogCounter += 1
             if resultLogCounter % Self.frameLogStride == 1 {
@@ -932,7 +980,11 @@ final class TowerClient: NSObject, ObservableObject {
             latestFrameResult = TowerFrameResult(
                 sequence: seq,
                 meanIntensity: meanIntensity,
-                processingMs: processingMs
+                processingMs: processingMs,
+                resultValue: resultValue,
+                resultLabel: resultLabel,
+                stageMs: stageMs,
+                metrics: extraMetrics
             )
             #endif
             metrics.recordFrameResult()
@@ -1085,6 +1137,15 @@ final class TowerClient: NSObject, ObservableObject {
         // connection they arrive on. Set directly rather than via
         // `sendStreamStop()`: there is no socket left to send on.
         isStreamingToTower = false
+        // Scoped to the socket that carried it, for the same reason as the
+        // line above. `HomeWorkspaceView` renders this under the caption
+        // "latest Tower reply", and a reading from a connection that is gone
+        // is not the latest anything. It was cleared only by the stream
+        // bracket, so a socket that dropped mid-capture left the dead
+        // connection's number on screen for the whole outage — and forever
+        // once the reconnect budget is spent, because no `stream_stop` is
+        // ever sent for a socket that is not there.
+        latestFrameResult = nil
         #endif
     }
 

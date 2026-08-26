@@ -1165,6 +1165,124 @@ final class TowerClientTests: XCTestCase {
         client.disconnect()
     }
 
+    /// The Tower's per-frame vocabulary is six keys, not three.
+    ///
+    /// `tower/tower/routes/ws.py:148-155` builds every `frame_result` with
+    /// `seq`, `processing_ms`, **`result_value`, `result_label` and
+    /// `stage_ms`** — all five unconditional — then adds `mean_intensity` and
+    /// `metrics` only when the experiment produced them. `ExperimentResult`
+    /// (`tower/tower/experiments/__init__.py:106-117`) is where those fields
+    /// come from.
+    ///
+    /// This app decoded three of them and dropped the rest, and the doc
+    /// comment on `TowerFrameResult` asserted that three *was* the whole
+    /// vocabulary. `result_label` is the experiment's own headline answer, so
+    /// what was being discarded was the only thing the Tower says about what
+    /// it *concluded*, as opposed to how long it took.
+    func testTheWholeFrameResultVocabularyIsDecodedNotJustTheTimings() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        // Shaped exactly as `ws.py` builds it, including the optional pair.
+        server.send(text: #"{"type":"frame_result","seq":11,"processing_ms":8.5,"result_value":0.73,"result_label":"baseline","stage_ms":{"decode":2.0,"infer":6.5},"mean_intensity":0.42,"metrics":{"edges":1024.0}}"#)
+
+        let arrived = await waitUntil { client.latestFrameResult?.sequence == 11 }
+        XCTAssertTrue(arrived)
+
+        let result = try XCTUnwrap(client.latestFrameResult)
+        XCTAssertEqual(result.processingMs ?? -1, 8.5, accuracy: 0.0001)
+        XCTAssertEqual(result.meanIntensity ?? -1, 0.42, accuracy: 0.0001)
+
+        XCTAssertEqual(result.resultValue ?? -1, 0.73, accuracy: 0.0001,
+                       "the experiment's headline number was dropped")
+        XCTAssertEqual(result.resultLabel, "baseline",
+                       "the experiment's own name for its answer was dropped")
+        XCTAssertEqual(result.stageMs, ["decode": 2.0, "infer": 6.5],
+                       "the per-stage timings were dropped")
+        XCTAssertEqual(result.metrics, ["edges": 1024.0],
+                       "the additive measurement channel was dropped")
+
+        client.disconnect()
+    }
+
+    /// The two optional keys are genuinely optional, and their absence must
+    /// not be read as zero.
+    ///
+    /// `ws.py:156-165` omits `mean_intensity` when the experiment reported
+    /// none and omits `metrics` entirely when empty — "an experiment whose
+    /// headline says everything does not pay for an empty object on every
+    /// frame". Absent is not `0.0`.
+    func testTheOptionalHalfOfAFrameResultIsAbsentRatherThanZero() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        server.send(text: #"{"type":"frame_result","seq":3,"processing_ms":1.0,"result_value":2.0,"result_label":"edges","stage_ms":{}}"#)
+        let arrived = await waitUntil { client.latestFrameResult?.sequence == 3 }
+        XCTAssertTrue(arrived)
+
+        let result = try XCTUnwrap(client.latestFrameResult)
+        XCTAssertNil(result.meanIntensity, "an omitted intensity is unknown, not dark")
+        XCTAssertTrue(result.metrics.isEmpty)
+        XCTAssertTrue(result.stageMs.isEmpty)
+        XCTAssertEqual(result.resultLabel, "edges")
+
+        client.disconnect()
+    }
+
+    /// A reply belongs to the socket that carried it.
+    ///
+    /// `teardownConnection` already clears everything else scoped to one
+    /// connection — the send window, `lastSendFrameAt`, `isStreamingToTower` —
+    /// and says of the last of those that leaving it set across a teardown
+    /// "would be a lie". `latestFrameResult` was cleared only by
+    /// `sendStreamStart`/`sendStreamStop`, so a socket that dropped mid-capture
+    /// left the dead connection's reading on screen under the caption "latest
+    /// Tower reply" (`HomeWorkspaceView.swift`) — for the whole outage, and
+    /// permanently once the reconnect budget is spent.
+    func testAFrameResultDoesNotOutliveTheSocketThatCarriedIt() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        // Mid-capture: a bracket is open, so nothing else would clear this.
+        client.sendStreamStart()
+        server.send(text: #"{"type":"frame_result","seq":5,"processing_ms":1.0,"result_value":1.0,"result_label":"baseline","stage_ms":{},"mean_intensity":0.5}"#)
+        let arrived = await waitUntil { client.latestFrameResult != nil }
+        XCTAssertTrue(arrived)
+
+        // The socket drops under it. `autoReconnect` is off by default, so this
+        // settles rather than racing a retry.
+        server.stop()
+        let dropped = await waitUntil { client.status != .online }
+        XCTAssertTrue(dropped, "the client did not notice the socket close")
+
+        XCTAssertNil(
+            client.latestFrameResult,
+            "a reading from a dead socket was still being offered as the latest Tower reply"
+        )
+
+        client.disconnect()
+    }
+
     // MARK: - Cartridge integration: runtime ownership
 
     /// Building and discarding every cartridge view model must not disturb the

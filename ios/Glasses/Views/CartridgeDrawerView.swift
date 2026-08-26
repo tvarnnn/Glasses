@@ -63,7 +63,7 @@ struct CartridgeDrawerView: View {
                 } header: {
                     Text("Modules")
                 } footer: {
-                    Text("Opening a cartridge changes this app's workspace. It does not start anything on the Tower — the Tower has no module runtime yet, so every badge below still reflects the roadmap rather than something you can run.")
+                    Text("Opening a cartridge changes this app's workspace. It does not start anything on the Tower — the Tower chooses what it runs at startup and this app cannot ask it for anything else, so every badge below still reflects the roadmap rather than something you can run.")
                         .padding(.top, 4)
                 }
             }
