@@ -141,19 +141,23 @@ side has run ahead of every gate that would let it reach a person.
 
 **Unblocked, no permission needed:**
 
-1. **Depth on real frames.** Scene Understanding refused `in_front_of` /
-   `behind` on a **synthetic** 6–8% MiDaS flicker measurement. Needs
-   `timm`. Cheap, and it either restores two spatial relations or retires
-   them on evidence.
-
-   **Measure it on both devices.** Orientation is the cautionary case: the
-   feared 798 ms was CPU-with-synthetic-input and is withdrawn, but the
-   replacement is **43.4 ms on CUDA and 956.4 ms on CPU — and CPU is the
-   default device.** So the synthetic figure was wrong in both directions
-   at once: far too pessimistic for the GPU path, and too *optimistic* for
-   the one that actually runs by default, where it is 29.1× the detector
-   against an 83.5 ms frame interval. A depth measurement taken only on
-   CUDA would repeat that mistake.
+1. ~~**Depth on real frames.**~~ **DONE, 2026-08-26 — the relations are
+   retired on evidence.** See
+   `tower/docs/superpowers/research/2026-08-26-depth-ordering-on-real-frames.md`.
+   Measured on both devices as instructed, and cost turned out not to be
+   the question: MiDaS-small is **5.73 ms on CUDA and 18.29 ms on CPU**
+   against an 83.4 ms interval, affordable on the default device. What
+   killed it was motion. Ordering 2,700 object pairs by MiDaS depth
+   reverses on 3.8% of consecutive-frame transitions and separation
+   predicts reliability strongly — but at matched separation the flip rate
+   climbs from **0.0% (n=124) to 11.5% (n=52)** between the most static
+   frames and the top motion decile, and this corpus's 99th-percentile
+   inter-frame box motion is 56 px, so it contains no walking. `in_front_of`
+   / `behind` stay refused, now on a measurement of the right quantity.
+   The old 6–8% flicker figure was about right in magnitude (4.8% here);
+   the ordering conclusion drawn from it did not follow. **What would
+   unblock it: corpus footage with sustained wearer locomotion** — moved to
+   "waiting on a wearer".
 2. **Experimental CV Lab beyond `baseline`.** The only cartridge with no
    external gate at all.
 

@@ -206,7 +206,7 @@ to anchor to. No world ids are invented.
 
 | Refused | Why, and what would settle it |
 |---|---|
-| `in_front_of` / `behind` | Needs depth. The only depth available is MiDaS relative inverse depth, measured by this project at 6–8% temporal flicker; ordering two boxes by a flickering field gives a relation that inverts frame to frame. To settle it: run the depth experiment over two objects at a known separation and measure how often the ordering flips |
+| `in_front_of` / `behind` | **Measured and still refused** (2026-08-26, 9,199 real frames — `docs/superpowers/research/2026-08-26-depth-ordering-on-real-frames.md`). Ordering two boxes by MiDaS relative inverse depth reverses on **3.8%** of consecutive-frame transitions over 2,700 object pairs, and separation predicts it strongly (15.7% below 0.02 separation, 0.0% above 0.40) — but only while the scene is still. At matched separation the flip rate goes from **0.0% (n=124) to 11.5% (n=52)** between the most static frames and the top motion decile, and the corpus's 99th-percentile inter-frame box motion is 56 px, so it contains no walking. Cost is not the obstacle: **5.73 ms CUDA / 18.29 ms CPU** against an 83.4 ms interval. The earlier 6–8% flicker figure was about right in magnitude (4.8% here) but the ordering conclusion drawn from it did not follow. To settle it: corpus footage with sustained wearer locomotion |
 | `on` | Needs support-surface reasoning and depth. Box containment is not it — a laptop *in front of* a desk overlaps its box identically to one *on* it |
 | `inside` | Same: 2-D containment cannot distinguish it |
 | `near` | Image proximity is not world proximity. Two things at opposite ends of a room can be adjacent in a frame |
