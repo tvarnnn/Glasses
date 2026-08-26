@@ -1,5 +1,10 @@
 # iOS execution plan — the single current handoff
 
+> **The Mac lane has now answered §3.1 and §3.2.** Results, the one
+> defect found, and where physical validation actually stopped:
+> **[`MAC-BUILD-VERIFICATION.md`](MAC-BUILD-VERIFICATION.md)**.
+> The Swift compiles; 388 tests pass; the phone needs one tap.
+
 **START HERE.** This is the one document Mac Claude needs. Everything else
 iOS-facing is either a contract it points to, or reference material
 classified in §7. Where another document disagrees with this one, **this
