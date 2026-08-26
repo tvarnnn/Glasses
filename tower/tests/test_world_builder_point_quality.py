@@ -594,3 +594,143 @@ def test_chain_extension_with_no_matches_returns_three_values():
     )
     assert points == [] and observed == {}
     assert counts == {"low_parallax": 0, "high_reprojection": 0}
+
+
+# ---------------------------------------------------------------------------
+# Task 5: the discards are reported, not silently dropped.
+# ---------------------------------------------------------------------------
+
+
+def _prepared_backend(camera, width, height):
+    """A backend prepared through the real prepare() path, not by poking
+    _camera_matrix -- prepare() is where a refusal on unknown intrinsics
+    lives, and a test that bypasses it tests a code path production never
+    takes."""
+    from tower.world_builder.backends.classical import ClassicalTwoViewBackend
+    from tower.world_builder.records import CameraIntrinsics
+
+    backend = ClassicalTwoViewBackend()
+    backend.prepare(
+        CameraIntrinsics(
+            source="self_calibrated",
+            fx=float(camera[0][0]),
+            fy=float(camera[1][1]),
+            cx=float(camera[0][2]),
+            cy=float(camera[1][2]),
+            calibrated_width=width,
+            calibrated_height=height,
+        )
+    )
+    return backend
+
+
+def _rendered_window(count, step=0.12, width=480, height=360):
+    import cv2
+
+    from tests import synthetic_scene as ss
+    from tower.world_builder.backend import KeyframeInput
+
+    camera = ss.camera_matrix(width, height)
+    images = ss.render_sequence(
+        ss.furnished_room(), ss.strafe(count, step=step), camera, width, height
+    )
+    window = [
+        KeyframeInput(
+            keyframe_id=f"kf{i}",
+            image_gray=cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),
+            image_bgr=img,
+        )
+        for i, img in enumerate(images)
+    ]
+    return camera, window, width, height
+
+
+def test_estimate_window_reports_discard_counts_in_diagnostics():
+    """The batch path must surface what it threw away."""
+    camera, window, width, height = _rendered_window(6)
+    estimate = _prepared_backend(camera, width, height).estimate_window(window)
+
+    assert "points_discarded" in estimate.diagnostics
+    discarded = estimate.diagnostics["points_discarded"]
+    assert set(discarded) == {"low_parallax", "high_reprojection"}
+    assert all(isinstance(v, int) for v in discarded.values())
+
+    produced = estimate.diagnostics["points_triangulated"]
+    kept = 0 if estimate.points is None else len(estimate.points.xyz)
+    assert kept + sum(discarded.values()) == produced
+
+
+def test_diagnostics_present_even_when_nothing_is_discarded():
+    """Absent-vs-zero. A build that discarded nothing must say so with a
+    zero, not by omitting the key -- otherwise a consumer cannot tell
+    'discarded nothing' from 'this build predates the counter'."""
+    camera, window, width, height = _rendered_window(2)
+    estimate = _prepared_backend(camera, width, height).estimate_window(window)
+    assert "points_discarded" in estimate.diagnostics
+    assert "points_triangulated" in estimate.diagnostics
+
+
+def test_manifest_reports_discards_and_the_accounting_closes(tmp_path):
+    """End to end through the real engine: the manifest states what was
+    thrown away, per segment and in total, and the arithmetic closes.
+
+    Points are never reported alone here -- poses_solved rides alongside,
+    because a build that improved `points` by refusing fewer bad rays and
+    one that improved it by solving more poses are different events.
+    """
+    import cv2
+
+    from tests import synthetic_scene as ss
+    from tower.world_builder.engine import WorldBuilderEngine
+    from tower.world_builder.records import CameraIntrinsics
+    from tower.world_builder.store import WorldStore
+
+    width, height = 480, 360
+    camera = ss.camera_matrix(width, height)
+    images = ss.render_sequence(
+        ss.furnished_room(), ss.strafe(8, step=0.12), camera, width, height
+    )
+    intrinsics = CameraIntrinsics(
+        source="self_calibrated",
+        fx=float(camera[0][0]),
+        fy=float(camera[1][1]),
+        cx=float(camera[0][2]),
+        cy=float(camera[1][2]),
+        calibrated_width=width,
+        calibrated_height=height,
+    )
+
+    store = WorldStore(tmp_path)
+    engine = WorldBuilderEngine(store)
+    world_id = engine.create_world()
+    session_id = engine.start_session(
+        world_id,
+        intrinsics=intrinsics,
+        frame_source="synthetic",
+        declared_size=(width, height),
+    )
+    for index, image in enumerate(images):
+        engine.observe(ss.encode_jpeg(image), source_seq=index)
+    engine.stop_session()
+    result = engine.build(world_id, session_id)
+
+    manifest = store.read_derived_manifest(world_id)
+
+    assert "points_discarded" in manifest
+    discarded = manifest["points_discarded"]
+    assert set(discarded) == {"low_parallax", "high_reprojection"}
+    assert "points_triangulated" in manifest
+    assert manifest["points"] + sum(discarded.values()) == (
+        manifest["points_triangulated"]
+    ), "every triangulated point is either shipped or accounted for"
+
+    # Per-segment detail survives into BuildResult for anyone debugging a
+    # specific fragment rather than a whole walk.
+    per_segment = result.diagnostics["points_discarded_by_segment"]
+    assert isinstance(per_segment, dict)
+    for reasons in per_segment.values():
+        assert set(reasons) == {"low_parallax", "high_reprojection"}
+    for reason in ("low_parallax", "high_reprojection"):
+        assert sum(r[reason] for r in per_segment.values()) == discarded[reason]
+
+    assert result.poses_solved >= 0 and result.points == manifest["points"]

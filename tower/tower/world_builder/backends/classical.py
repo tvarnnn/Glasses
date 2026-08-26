@@ -132,12 +132,22 @@ class ClassicalTwoViewBackend(GeometryBackend):
         if not window:
             return GeometryEstimate(poses=())
 
+        # Created before any early return below. The batch and live paths
+        # are asserted bit-identical (test_world_builder_incremental
+        # TestBitIdenticalEquivalence), and the live path always reports a
+        # tally -- so a degenerate window that returns early must report
+        # zeros here, not omit the key. Absent would mean "this build
+        # predates the counter", which is a different fact from "nothing
+        # was discarded".
+        tally = self._new_discard_tally()
         features = [detect_and_describe(frame.image_gray) for frame in window]
         poses: list[PoseEstimate] = [
             PoseEstimate(keyframe_id=window[0].keyframe_id, status=POSE_STATUS_ANCHOR)
         ]
         if len(window) == 1:
-            return GeometryEstimate(poses=tuple(poses))
+            return GeometryEstimate(
+                poses=tuple(poses), diagnostics=_discard_diagnostics(tally)
+            )
 
         # -- initialise from the first pair -----------------------------
         pair = self._estimate_pair(features[0], features[1], window[1].keyframe_id)
@@ -153,7 +163,10 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 )
                 for frame in window[2:]
             )
-            return GeometryEstimate(poses=tuple(poses))
+            self._add_discards(tally, pair.discarded, len(pair.points))
+            return GeometryEstimate(
+                poses=tuple(poses), diagnostics=_discard_diagnostics(tally)
+            )
 
         # World frame == first keyframe's camera frame.
         absolute = {
@@ -184,11 +197,18 @@ class ClassicalTwoViewBackend(GeometryBackend):
             seed.append((0, index_a, offset))
             seed.append((1, index_b, offset))
         support.append(_support_block(seed))
+        self._add_discards(tally, pair.discarded, len(pair.points))
 
         # -- extend by PnP ----------------------------------------------
         for current in range(2, len(window)):
             previous = current - 1
-            estimate, new_points, new_observed, reobserved = self._extend(
+            (
+                estimate,
+                new_points,
+                new_observed,
+                reobserved,
+                extend_discards,
+            ) = self._extend(
                 features[previous],
                 features[current],
                 previous,
@@ -198,6 +218,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 observed,
                 window[current].keyframe_id,
             )
+            self._add_discards(tally, extend_discards, len(new_points))
             poses.append(estimate)
             if estimate.status != POSE_STATUS_SOLVED:
                 # Stop chaining. Remaining frames are honestly unavailable;
@@ -238,7 +259,11 @@ class ClassicalTwoViewBackend(GeometryBackend):
             if landmarks
             else None
         )
-        return GeometryEstimate(poses=tuple(poses), points=block)
+        return GeometryEstimate(
+            poses=tuple(poses),
+            points=block,
+            diagnostics=_discard_diagnostics(tally),
+        )
 
     # -- the incremental seam -------------------------------------------
     #
@@ -311,6 +336,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 chain.previous_features, features, frame.keyframe_id
             )
             pose = pair.estimate
+            self._add_discards(chain.discarded, pair.discarded, len(pair.points))
             if pose.status != POSE_STATUS_SOLVED:
                 chain.broken = pose.degeneracy
             else:
@@ -328,7 +354,13 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 # and map-relative indices coincide here and only here.
                 chain.support.append(_support_block(delta_support))
         else:
-            pose, triangulated, new_observed, reobserved = self._extend(
+            (
+                pose,
+                triangulated,
+                new_observed,
+                reobserved,
+                extend_discards,
+            ) = self._extend(
                 chain.previous_features,
                 features,
                 index - 1,
@@ -337,6 +369,9 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 chain.landmarks,
                 chain.observed,
                 frame.keyframe_id,
+            )
+            self._add_discards(
+                chain.discarded, extend_discards, len(triangulated)
             )
             if pose.status != POSE_STATUS_SOLVED:
                 chain.broken = pose.degeneracy
@@ -395,17 +430,45 @@ class ClassicalTwoViewBackend(GeometryBackend):
             if chain.landmarks
             else None
         )
-        return GeometryEstimate(poses=tuple(chain.poses), points=block)
+        return GeometryEstimate(
+            poses=tuple(chain.poses),
+            points=block,
+            diagnostics=_discard_diagnostics(chain.discarded),
+        )
 
     # -- helpers --------------------------------------------------------
 
-    class _PairResult:
-        __slots__ = ("estimate", "points", "inlier_index_pairs")
+    @staticmethod
+    def _new_discard_tally():
+        return {"low_parallax": 0, "high_reprojection": 0, "produced": 0}
 
-        def __init__(self, estimate, points, inlier_index_pairs):
+    @staticmethod
+    def _add_discards(tally, counts, kept):
+        """Fold one triangulation call into a running tally.
+
+        `produced` is kept + refused, so the manifest can state the
+        accounting identity rather than leaving a consumer to infer that
+        the points it can see are all that were ever made.
+        """
+        tally["low_parallax"] += counts.get("low_parallax", 0)
+        tally["high_reprojection"] += counts.get("high_reprojection", 0)
+        tally["produced"] += (
+            kept + counts.get("low_parallax", 0) + counts.get("high_reprojection", 0)
+        )
+        return tally
+
+
+    class _PairResult:
+        __slots__ = ("estimate", "points", "inlier_index_pairs", "discarded")
+
+        def __init__(self, estimate, points, inlier_index_pairs, discarded=None):
             self.estimate = estimate
             self.points = points
             self.inlier_index_pairs = inlier_index_pairs
+            self.discarded = discarded or {
+                "low_parallax": 0,
+                "high_reprojection": 0,
+            }
 
     def _estimate_pair(self, features_a, features_b, keyframe_id):
         keypoints_a, descriptors_a = features_a
@@ -540,9 +603,9 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 [],
             )
 
-        points, keep_mask = triangulate_points(
+        points, keep_mask, discarded = triangulate_points(
             inlier_a, inlier_b, rotation, translation, camera_matrix,
-            return_mask=True,
+            return_mask=True, return_counts=True,
         )
         surviving_pairs = [
             pair for pair, keep in zip(
@@ -560,6 +623,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
             ),
             list(points),
             surviving_pairs,
+            discarded,
         )
 
     def _extend(
@@ -623,6 +687,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 [],
                 {},
                 {},
+                {"low_parallax": 0, "high_reprojection": 0},
             )
 
         ok, rotation_vector, translation, inlier_indices = cv2.solvePnPRansac(
@@ -646,6 +711,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 [],
                 {},
                 {},
+                {"low_parallax": 0, "high_reprojection": 0},
             )
 
         rotation, _ = cv2.Rodrigues(rotation_vector)
@@ -680,6 +746,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
             new_points,
             new_observed,
             reobserved,
+            discard_counts,
         )
 
     def _triangulate_new(
@@ -749,6 +816,23 @@ class ClassicalTwoViewBackend(GeometryBackend):
         return new_points, new_observed, counts
 
 
+def _discard_diagnostics(tally):
+    """Shape the running tally into the diagnostics the manifest carries.
+
+    `points_triangulated` is stated rather than left to be inferred: a
+    consumer seeing only the surviving points cannot otherwise tell a
+    sparse world from a heavily filtered one, and those need different
+    responses from whoever is holding the glasses.
+    """
+    return {
+        "points_discarded": {
+            "low_parallax": tally["low_parallax"],
+            "high_reprojection": tally["high_reprojection"],
+        },
+        "points_triangulated": tally["produced"],
+    }
+
+
 class _Chain:
     """The carried state of one forward-only solve, and nothing else.
 
@@ -763,6 +847,7 @@ class _Chain:
         "absolute",
         "broken",
         "count",
+        "discarded",
         "landmarks",
         "observed",
         "poses",
@@ -773,6 +858,13 @@ class _Chain:
     def __init__(self) -> None:
         self.count = 0
         self.previous_features = None
+        # Discards accumulate for the LIFE of the chain, so the snapshot
+        # reports the whole segment rather than the last window.
+        self.discarded = {
+            "low_parallax": 0,
+            "high_reprojection": 0,
+            "produced": 0,
+        }
         self.absolute: dict[int, tuple] = {}
         self.landmarks: list = []
         # (frame index, feature index) -> landmark index. PRUNED.

@@ -400,6 +400,10 @@ class WorldBuilderEngine:
         poses_anchor = 0
         poses_positioned = 0
         total_points = 0
+        # Per segment, so a specific unreadable fragment can be chased
+        # without re-running the walk. Summed for the manifest.
+        discards_by_segment: dict[int, dict[str, int]] = {}
+        total_triangulated = 0
         segments = sorted({keyframe.segment_index for keyframe in keyframes})
 
         pose_rows: list[dict] = []
@@ -481,6 +485,17 @@ class WorldBuilderEngine:
                         quality=Confidence.from_score(pose.inlier_ratio),
                     ),
                 )
+
+            segment_discards = estimate.diagnostics.get("points_discarded") or {}
+            discards_by_segment[segment] = {
+                "low_parallax": int(segment_discards.get("low_parallax", 0)),
+                "high_reprojection": int(
+                    segment_discards.get("high_reprojection", 0)
+                ),
+            }
+            total_triangulated += int(
+                estimate.diagnostics.get("points_triangulated", 0)
+            )
 
             if estimate.points is not None:
                 # Tagged with the segment that produced them. Segments do
@@ -565,6 +580,23 @@ class WorldBuilderEngine:
                 "poses_anchor": poses_anchor,
                 "poses_positioned": poses_positioned,
                 "points": total_points,
+                # What was triangulated but refused, and why. Stated
+                # rather than left to be inferred: a consumer seeing only
+                # the surviving points cannot otherwise tell a sparse
+                # world from a heavily filtered one, and those call for
+                # different responses from whoever is wearing the glasses.
+                # Zero is written explicitly -- absent would mean "this
+                # build predates the counter", which is a different fact.
+                "points_discarded": {
+                    "low_parallax": sum(
+                        d["low_parallax"] for d in discards_by_segment.values()
+                    ),
+                    "high_reprojection": sum(
+                        d["high_reprojection"]
+                        for d in discards_by_segment.values()
+                    ),
+                },
+                "points_triangulated": total_triangulated,
                 "segments": len(segments),
                 "scale_state": scale_state,
             },
@@ -581,6 +613,7 @@ class WorldBuilderEngine:
             segments=len(segments),
             scale_state=scale_state,
             downgraded_from=selection.downgraded_from,
+            diagnostics={"points_discarded_by_segment": discards_by_segment},
         )
 
     # -- internals -----------------------------------------------------
