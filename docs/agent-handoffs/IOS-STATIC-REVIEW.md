@@ -333,3 +333,36 @@ The residual risk is concentrated in one place: whether
 onto the five new un-annotated test classes (S1). That is the finding most likely
 to produce a wall of errors — and also the one with the strongest
 counter-evidence on `main`, and the cheapest fix if it fires.
+
+---
+
+## Controller verification, 2026-08-26
+
+Checked by the controller rather than accepted from the report.
+
+**CERTAIN #1 — confirmed and FIXED** (`153792c`). The distinction the
+report drew is the real one: every empty literal on `main` sits in a
+*typed* slot (`accessibilityAddTraits` takes an OptionSet, `supported:`
+a typed array), so Swift infers the element type. The two new ones sit
+in `[String: Any]` value slots, where nothing constrains it.
+
+**SUSPECTED #3 — applied** (`153792c`), as a type annotation only. It is
+semantically identical at runtime.
+
+**SUSPECTED #2 (`@MainActor`) — deliberately NOT applied.** The report
+supplied its own counter-evidence: non-`@MainActor` test classes on
+`main` do the same thing and compile, so the test target does not
+inherit the app target's `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`.
+Adding the annotation would change actor isolation semantics on a guess,
+with no compiler to check it. **If `xcodebuild` does raise isolation
+errors here, the one-line-per-class fix in the report above is correct** —
+apply it then, not now.
+
+**Runtime note on `WorldPose.degeneracy` — closed, benign.** The report
+flagged `null -> ""`. Traced to the producer: `records.py:557` types the
+field `degeneracy: str = DEGENERACY_NONE`, and `schema.py:67` defines
+`DEGENERACY_NONE = ""`. Tower therefore never emits `null` for it, and
+the sentinel for "no degeneracy" **is** the empty string, so Swift's
+`?? ""` lands on the same value. No `null`-versus-empty conflation, and
+no conflict with the project's absent-is-never-zero rule. `dominant_degeneracy`
+is separately and correctly optional on both sides.
