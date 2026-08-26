@@ -120,3 +120,46 @@ final class WorldGeometryDecoderTests: XCTestCase {
         XCTAssertEqual(chunk?.pointsTotal, 3000)
     }
 }
+
+final class WorldGeometryStoreTests: XCTestCase {
+
+    private func chunk(index: Int, hash: String) -> WorldSegmentChunk {
+        WorldSegmentChunk(
+            segmentIndex: index, contentHash: hash, registered: false,
+            poses: [], points: [[0, 0, 0]], pointsSent: 1, pointsTotal: 1,
+            pointSampling: "none"
+        )
+    }
+
+    func testACachedSegmentIsNotRefetched() async {
+        // The property the whole design rests on: a closed segment is frozen,
+        // so it crosses the wire exactly once.
+        let store = WorldGeometryStore()
+        await store.insert(chunk(index: 0, hash: "h0"))
+
+        let needed = await store.hashesMissing(from: ["h0", "h1"])
+        XCTAssertEqual(needed, ["h1"])
+    }
+
+    func testAChangedHashIsRefetched() async {
+        let store = WorldGeometryStore()
+        await store.insert(chunk(index: 0, hash: "h0"))
+
+        let needed = await store.hashesMissing(from: ["h0-moved"])
+        XCTAssertEqual(needed, ["h0-moved"])
+    }
+
+    func testTheCacheIsKeyedByHashNotBySegmentIndex() async {
+        // A re-solved segment keeps its index and changes its content. Keying
+        // on the index would serve stale geometry under a fresh revision.
+        let store = WorldGeometryStore()
+        await store.insert(chunk(index: 0, hash: "old"))
+        await store.insert(chunk(index: 0, hash: "new"))
+
+        let old = await store.chunk(forHash: "old")
+        let new = await store.chunk(forHash: "new")
+        XCTAssertNotNil(old)
+        XCTAssertNotNil(new)
+        XCTAssertEqual(new?.contentHash, "new")
+    }
+}
