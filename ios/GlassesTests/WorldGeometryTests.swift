@@ -74,6 +74,17 @@ final class WorldGeometryDecoderTests: XCTestCase {
         XCTAssertNil(WorldGeometryDecoder.manifest(from: json))
     }
 
+    func testAMalformedSegmentRowDropsTheWholeManifest() {
+        // Skipping the bad row would silently shrink the world and the viewer
+        // would render a smaller map as if it were complete.
+        var json = manifestJSON()
+        var segments = json["segments"] as! [[String: Any]]
+        segments[1].removeValue(forKey: "content_hash")
+        json["segments"] = segments
+
+        XCTAssertNil(WorldGeometryDecoder.manifest(from: json))
+    }
+
     func testARefusedPoseDecodesAsNilTranslationNotZero() {
         let json: [String: Any] = [
             "contract": "world_builder.geometry/2026-08-25",

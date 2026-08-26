@@ -16,8 +16,12 @@ enum WorldGeometryContract {
 ///
 /// Every one of them renders plausibly and wrongly if guessed — inverting
 /// `T_world_camera` still produces a map that looks like a map, and that was a
-/// real shipped bug. So the convention travels on the wire and this build
-/// compares all nine before drawing anything.
+/// real shipped bug. So the convention travels on the wire, and this build
+/// compares the five keys that change how a pose is interpreted
+/// (`poseType`, `quaternionOrder`, `handedness`, `cameraAxes`,
+/// `translationUnits`) before drawing anything. `upAxis` is deliberately
+/// excluded — see `matchesThisBuild` below — because the 2D top-down view
+/// does not depend on which way is up.
 struct WorldPoseConvention: Equatable, Sendable {
     let poseType: String
     let quaternionOrder: String
