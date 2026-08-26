@@ -278,7 +278,43 @@ if it ever earns the attention.
 | P9/P10 — loop closure | not reached |
 | Sender FPS against the physical baseline | not reached |
 | Redaction against a real face | not reached, and §8 of the plan says this corpus cannot answer it anyway |
-| Calibration | no board printed |
+| Calibration | **exists** — see §8.3. Not the blocker the older handoffs describe |
+
+### 8.3 Calibration is no longer the blocker, and the docs still say it is
+
+`WORLD-BUILDER-INTEGRATION.md` §4 and `WORLD-BUILDER-IOS.md` §7 both say
+that without intrinsics there is no reconstruction, and that getting them
+needs a printed, physically measured ChArUco board. **An intrinsics file
+now exists** and the Tower finds it with no flag on either end:
+
+```
+data/world_builder/intrinsics/360x640.json
+  source: "self_calibrated"       model: "pinhole_radtan"
+  fx 438.225   fy 437.778   cx 174.877   cy 323.380
+  reprojection_rms_px: 0.289      view_count: 511
+```
+
+That is why world `3dd986b1…` reads `backend_id: "classical-sfm"` with 94
+solved poses and 12,023 points instead of downgrading to `unposed`. **So
+a walk today should produce geometry, and P3 is reachable without
+printing anything.**
+
+Two caveats that keep the older documents' *reasoning* intact even though
+their conclusion has moved:
+
+- `source` is **`self_calibrated`**, not a measured board. The plan's §5
+  is still right that no board has been printed, and the distortion model
+  on a ~100° lens remains unexercised against ground truth.
+- **Metric scale is still unreachable.** Calibration was never going to
+  deliver it (`IOS-EXECUTION-PLAN.md` §5.2), and
+  `scales_linearly_across_resolutions` is `null`.
+
+The store is keyed by observed frame size, and `_require_matching_resolution`
+**refuses** a calibration from another size rather than scaling the world
+by the ratio. The app sends DAT's frames unresized, and the last real
+capture delivered 360×640 — the key that exists. If the glasses deliver
+anything else, the Tower will say so and fall back to `unposed`, which is
+the safe failure.
 
 **The single next physical action is: power on the glasses.** Everything
 downstream of that is code that is now built, installed, running and
