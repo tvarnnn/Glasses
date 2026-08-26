@@ -60,9 +60,26 @@ LK_MAX_LEVEL = 4
 # Measured with the pyramid change: 51 -> 33 segments on that walk, and
 # 171 -> 130 across eight captures.
 #
-# It does NOT work by suppressing losses. Running the real geometry module
-# over intra-segment keyframe pairs, reconstruction quality ROSE: solvable
-# pairs 46% -> 53%, median triangulation angle 0.43 -> 0.63 degrees.
+# THIS HALF IS NOT FREE, and an earlier version of this comment claimed it
+# was on confounded evidence. Against a known warp, raising 1.0 -> 3.0 at a
+# FIXED pyramid level roughly doubles the gross-outlier rate: 0.97% -> 1.74%
+# of surviving tracks land beyond 20 px of truth. The pyramid change cuts
+# that rate about 6x (6.27% -> 0.97%), so the pair together is a net ~3.6x
+# purity improvement -- but the forward-backward half is the weaker and
+# costlier half of it, buying only 40 -> 33 segments.
+#
+# What bounds the damage is that LK tracks never reach the solve.
+# `backends/classical.py` re-detects ORB and matches independently, so this
+# tolerance decides which frames are PROMOTED, not which correspondences
+# are triangulated. And it does not splice: on unrelated frames the
+# combined change discriminates BETTER than the baseline, not worse.
+#
+# (The retired claim, recorded so nobody re-derives it: intra-segment
+# solvable pairs rose 46% -> 53% and triangulation angle 0.43 -> 0.63 deg.
+# That is confounded. Fewer segments means longer segments means a
+# wider-baseline pair population -- median keyframe gap 6 -> 9 -- and
+# triangulation angle rises with baseline by construction. It is exactly
+# what zero change in track quality would produce.)
 FORWARD_BACKWARD_MAX_PX = 3.0
 
 # Below this many surviving tracks nothing downstream is meaningful.
