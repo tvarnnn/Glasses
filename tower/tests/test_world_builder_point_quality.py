@@ -205,15 +205,65 @@ def test_gate_on_empty_input_returns_empty_mask_and_zero_counts():
     assert counts == {"low_parallax": 0, "high_reprojection": 0}
 
 
-def test_gate_threshold_is_the_declared_invariant_not_a_new_constant():
-    """The whole argument for this change is that it introduces no new
-    tuning constant. Pin that: gate 1's default IS the module's declared
-    triangulation-angle bar."""
+def test_gate_threshold_is_derived_not_invented():
+    """The gate bar is DERIVED from existing constants and the actual
+    calibration, not chosen.
+
+    For a two-view triangulation, sigma_d/d = sigma_px / (f * theta).
+    Setting that to 1.0 -- an error bar as wide as the measurement --
+    gives theta_min = sigma_px / f, with sigma_px the pipeline's own
+    RANSAC_THRESHOLD_PX. Nothing here is tunable by taste.
+    """
+    import math
+
     from tower.world_builder import geometry
 
+    derived = geometry.min_parallax_deg(CAMERA)
+    focal = 0.5 * (CAMERA[0][0] + CAMERA[1][1])
+    assert derived == math.degrees(geometry.RANSAC_THRESHOLD_PX / focal)
+    assert abs(derived - 0.1308) < 1e-3
+    # And the depth error at that angle really is ~100%.
     assert (
-        geometry.landmark_gate.__defaults__[0]
-        == geometry.MIN_TRIANGULATION_ANGLE_DEG
+        abs(
+            geometry.RANSAC_THRESHOLD_PX / (focal * math.radians(derived))
+            - 1.0
+        )
+        < 1e-9
     )
-    assert geometry.MIN_TRIANGULATION_ANGLE_DEG == 0.5
-    assert geometry.MAX_LANDMARK_REPROJECTION_PX == 3.0
+
+
+def test_gate_bar_scales_with_focal_length():
+    """A pixel-denominated bar that did not scale would silently change
+    meaning if the delivered resolution ever moved. This one scales."""
+    from tower.world_builder import geometry
+
+    doubled = np.array(
+        [[2 * 438.23, 0.0, 349.76], [0.0, 2 * 437.78, 646.76], [0.0, 0.0, 1.0]]
+    )
+    assert geometry.min_parallax_deg(doubled) < geometry.min_parallax_deg(CAMERA)
+    assert abs(
+        geometry.min_parallax_deg(doubled) * 2 - geometry.min_parallax_deg(CAMERA)
+    ) < 1e-9
+
+
+def test_gate_bar_is_not_the_pair_level_constant():
+    """Guards the distinction the corpus measurement forced.
+
+    MIN_TRIANGULATION_ANGLE_DEG answers "is this PAIR good enough to trust
+    a pose from" (0.5 deg, a 26% depth error). Gating LANDMARKS there
+    discards 37-44% of a real world. These are different questions and
+    must not be re-conflated by a well-meaning cleanup.
+    """
+    from tower.world_builder import geometry
+
+    assert geometry.min_parallax_deg(CAMERA) < geometry.MIN_TRIANGULATION_ANGLE_DEG
+
+
+def test_gate_falls_back_rather_than_admitting_everything_without_calibration():
+    """A zero/garbage camera matrix must not yield a zero bar that admits
+    every unconstrained ray."""
+    from tower.world_builder import geometry
+
+    assert geometry.min_parallax_deg(np.zeros((3, 3))) == (
+        geometry.MIN_TRIANGULATION_ANGLE_DEG
+    )

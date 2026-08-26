@@ -12,6 +12,8 @@ numbers and not others.
 """
 
 import cv2
+import math
+
 import numpy as np
 
 # Minimum median triangulation angle for translation to be trustworthy.
@@ -41,15 +43,9 @@ MIN_INLIERS = 15
 # The per-landmark reprojection bar. This is the same 3.0 px budget
 # solvePnPRansac already uses to call a POSE an inlier
 # (classical.PNP_REPROJECTION_ERROR_PX) -- applied to the landmark that
-# comes out, which nothing did before. A point reprojecting worse than
-# the pose that produced it is inconsistent with that pose by the
-# pipeline's own standard.
-#
-# Deliberately NOT a new tuning constant. The argument for gating at all
-# is that the pipeline already declares what counts as geometry and then
-# fails to enforce it per point; inventing a fresh threshold here would
-# undercut that argument.
+# comes out, which nothing did before.
 MAX_LANDMARK_REPROJECTION_PX = 3.0
+
 
 ORB_FEATURES = 1500
 LOWE_RATIO = 0.75
@@ -203,6 +199,46 @@ def motion_direction(rotation: np.ndarray, translation: np.ndarray) -> np.ndarra
     return direction / norm if norm > 1e-12 else direction
 
 
+def min_parallax_deg(camera_matrix, pixel_noise_px: float = RANSAC_THRESHOLD_PX):
+    """The angle below which a two-view landmark carries no depth at all.
+
+    For a two-view triangulation the relative depth uncertainty is
+
+        sigma_d / d  =  sigma_px / (f * theta)
+
+    with theta the angle the two camera centres subtend AT the landmark.
+    Setting that to 1.0 -- an error bar as wide as the measurement, i.e.
+    an error bar that reaches infinity -- gives
+
+        theta_min = sigma_px / f
+
+    At this platform's calibration (f ~ 438, sigma_px = RANSAC_THRESHOLD_PX
+    = 1.0) that is 0.131 deg. Above it a landmark is imprecise; below it a
+    landmark is not a measurement, and its distance is set by pixel noise.
+
+    Deliberately NOT MIN_TRIANGULATION_ANGLE_DEG (0.5 deg). That constant
+    answers a different question -- "is this PAIR good enough to trust a
+    pose from" -- and 0.5 deg corresponds to a 26% depth error, which is
+    imprecise but real geometry. Measured on the real corpus, gating
+    landmarks at 0.5 deg discards 37-44% of all points while a gate at
+    this bound discards 8-9%, and both recover essentially the same
+    fragment legibility. This project has already ruled on that trade
+    once: loss-grace-3 was rejected for destroying a third of the
+    reconstruction (keyframes.py:117-136). Same trade, same verdict.
+
+    Scales with focal length, so it stays correct if the delivered
+    resolution ever changes -- unlike a hardcoded pixel or degree bar.
+    """
+    focal = 0.5 * (
+        float(camera_matrix[0][0]) + float(camera_matrix[1][1])
+    )
+    if not math.isfinite(focal) or focal <= 0:
+        # No usable calibration: fall back to the pair-level constant
+        # rather than admitting everything.
+        return MIN_TRIANGULATION_ANGLE_DEG
+    return math.degrees(pixel_noise_px / focal)
+
+
 def _camera_centre(pose):
     """World-frame position of a camera, given a world->camera pose."""
     rotation, translation = pose
@@ -218,7 +254,7 @@ def landmark_gate(
     pose_a,
     pose_b,
     camera_matrix,
-    min_angle_deg: float = MIN_TRIANGULATION_ANGLE_DEG,
+    min_angle_deg: float | None = None,
     max_reprojection_px: float = MAX_LANDMARK_REPROJECTION_PX,
 ):
     """Which triangulated landmarks are geometry, and why the rest are not.
@@ -226,11 +262,10 @@ def landmark_gate(
     Two gates, both enforcing invariants this module already declares:
 
     1. The angle subtended AT the landmark by the two camera centres must
-       reach `min_angle_deg`. Below that the rays are near-parallel and
-       where they "meet" is set by numerical noise, not by the scene.
-       MIN_TRIANGULATION_ANGLE_DEG has always been this module's answer to
-       "is this pair real geometry"; it was applied once, to the median
-       angle of a pair, and never to an individual landmark.
+       reach `min_angle_deg`, defaulting to `min_parallax_deg(camera_matrix)`
+       -- the angle at which depth uncertainty reaches 100%. Below it the
+       rays are parallel to within pixel noise and where they "meet" is
+       set by that noise, not by the scene.
     2. The landmark must reproject into BOTH source views within
        `max_reprojection_px`.
 
@@ -250,6 +285,8 @@ def landmark_gate(
     `kept + low_parallax + high_reprojection == len(xyz)` exact.
     """
     xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+    if min_angle_deg is None:
+        min_angle_deg = min_parallax_deg(camera_matrix)
     counts = {"low_parallax": 0, "high_reprojection": 0}
     if len(xyz) == 0:
         return np.zeros(0, dtype=bool), counts
