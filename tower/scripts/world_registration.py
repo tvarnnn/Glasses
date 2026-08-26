@@ -399,6 +399,56 @@ class _Observation:
     t_pnp: np.ndarray
 
 
+def _solve_pnp_ransac_or_refuse(object_points, image_points, camera_matrix):
+    """solvePnPRansac, converting a solver assertion into a refusal.
+
+    SQPNP raises rather than returning False when the minimal sample
+    RANSAC draws has degenerate coordinate variance:
+
+        sqpnp.cpp:236 (-215) point_coordinate_variance >= POINT_VARIANCE_THRESHOLD
+
+    Which sample gets drawn is data-dependent, so this fires on some real
+    walks and not others. Reproduced on the 33-segment world built from
+    capture 22e9d428.
+
+    A degenerate configuration is exactly what a refusal is FOR. Letting
+    the assertion escape turns "this keyframe could not be posed" into
+    "the reconstruction process died", which on the live path means a walk
+    ends mid-room.
+
+    Inputs are validated BEFORE the call, so a cv2.error reaching the
+    handler is a statement about the GEOMETRY rather than about our
+    argument marshalling. That distinction needs enforcing rather than
+    asserting: OpenCV raises cv2.error for malformed arguments too, so
+    catching it without validating first would hide a real bug in this
+    repo as an innocent refusal -- which is how a pipeline quietly stops
+    reconstructing.
+    """
+    object_points = np.asarray(object_points, dtype=np.float64)
+    image_points = np.asarray(image_points, dtype=np.float64)
+    if object_points.ndim != 2 or object_points.shape[1] != 3:
+        raise ValueError(
+            f"object_points must be (N, 3), got {object_points.shape}"
+        )
+    if image_points.shape != (len(object_points), 2):
+        raise ValueError(
+            f"image_points must be ({len(object_points)}, 2), got "
+            f"{image_points.shape}"
+        )
+    try:
+        return cv2.solvePnPRansac(
+            object_points,
+            image_points,
+            camera_matrix,
+            None,
+            reprojectionError=PNP_REPROJECTION_ERROR_PX,
+            confidence=RANSAC_CONFIDENCE,
+            flags=cv2.SOLVEPNP_SQPNP,
+        )
+    except cv2.error:
+        return False, None, None, None
+
+
 def _pnp_observations(source, target, matches, intrinsics) -> list:
     """PnP the source segment's landmarks into each of the target's keyframes.
 
@@ -433,14 +483,8 @@ def _pnp_observations(source, target, matches, intrinsics) -> list:
         image_points = np.asarray(
             [images[f] for f in features], dtype=np.float64
         )
-        ok, rvec, tvec, inliers = cv2.solvePnPRansac(
-            object_points,
-            image_points,
-            intrinsics,
-            None,
-            reprojectionError=PNP_REPROJECTION_ERROR_PX,
-            confidence=RANSAC_CONFIDENCE,
-            flags=cv2.SOLVEPNP_SQPNP,
+        ok, rvec, tvec, inliers = _solve_pnp_ransac_or_refuse(
+            object_points, image_points, intrinsics
         )
         if not ok or inliers is None or len(inliers) < MIN_PNP_CORRESPONDENCES:
             continue
