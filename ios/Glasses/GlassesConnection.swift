@@ -676,6 +676,16 @@ final class GlassesConnection: ObservableObject {
         }.store(in: streamTokenBag)
 
         stream.videoFramePublisher.listen { [weak self] frame in
+            // Sampled HERE, on DAT's callback thread, before the main-actor
+            // hop below. The `now` inside the Task carries main-actor queueing
+            // latency as well as transport latency, so it cannot be used to ask
+            // what clock the buffer's timestamp is on. Pure observation: the
+            // probe reads a timestamp and prints, and nothing downstream sees
+            // it. See FramePTSProbe.
+            FramePTSProbe.shared.record(
+                sampleBuffer: frame.sampleBuffer, hostNow: MonotonicClock.now
+            )
+
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 // One clock read serves both the gate and the log budgets.
@@ -747,6 +757,7 @@ final class GlassesConnection: ObservableObject {
 
     private func cleanupCameraSession() {
         print("[Glasses][Camera] session cleanup")
+        FramePTSProbe.shared.reportFinal(reason: "session cleanup")
         let hadCamera = camera != nil
         sessionTokenBag.clear()
         streamTokenBag.clear()
