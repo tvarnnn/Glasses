@@ -5,7 +5,7 @@ writing more iOS-facing work: it says which of the plan's assumptions
 survived contact with a compiler and which did not.
 
 **Lane:** Mac/iOS. **Branch:** `ios/world-builder-integration`.
-**Tower lane integrated:** `integration/world-builder-lifecycle-v1` @ `d0291c1`.
+**Tower lane integrated:** `integration/world-builder-lifecycle-v1` @ `25eb794`.
 **Date:** 2026-08-26.
 
 **Toolchain that produced every result below:** Xcode 26.6 (17F113),
@@ -319,6 +319,110 @@ the safe failure.
 **The single next physical action is: power on the glasses.** Everything
 downstream of that is code that is now built, installed, running and
 connected.
+
+## 8.4 The capture clock, measured — and the reconnect question answered
+
+`tower/docs/superpowers/research/2026-08-26-two-clocks-capture-vs-receipt.md`
+names one thing as a **blocking prerequisite** for the capture-timestamp wire
+addition: whether the capture epoch survives a reconnect. **It has now been
+measured.** Commits `f77b623` and `002231f`.
+
+**DAT's `CMSampleBuffer` PTS is a capture clock.** 1,084 frames off the real
+Ray-Bans over 45 s, sampled on DAT's callback thread before the main-actor
+hop. The argument is the jitter, not the offset: `residual_sd / d_host_sd =
+1.003` (the residual is entirely arrival jitter; the PTS carries none of it)
+and `d_pts_sd / d_host_sd = 0.141` (a tight 1/24 s grid against arrivals
+scattering from 2.5 ms bursts to 120 ms stalls). Microsecond timescale, first
+frame at 424.72 s against a host uptime of 519,597 s.
+
+**The epoch across a reconnect: neither persistent nor reset.**
+
+| Event | wall gap | clock advanced | ratio |
+|---|---|---|---|
+| pause → resume | 17.86 s | 17.80 s | 99.7 % |
+| pause → resume | 39.165 s | 39.165 s | 100.0 % |
+| **stop → start** | **25.95 s** | **7.19 s** | **28 %** |
+| **stop → start** | **192.70 s** | **~10.95 s** | **5.7 %** |
+
+A *pause* keeps the camera subsystem alive and the clock runs through it. A
+*stop* tears it down and the clock freezes. The two stop rows are the finding:
+the gaps differ by **7.4x** while the advance barely moves, so what survives a
+stop is a fixed teardown-and-startup tail at each end — **not elapsed time,
+and not proportional to it.** It stays monotonic throughout, which is exactly
+what makes it dangerous: nothing looks broken.
+
+**Your conservative rule was right, and is now evidence-backed.** The research
+doc says a transported capture clock "must be treated as valid only within a
+single uninterrupted connection." That is precisely correct. A consumer
+deriving a duration across a lineage reconnect would report a five-minute
+outage as about ten seconds.
+
+**So §6.5 is unblocked, with one binding rule to add:** the wire must carry an
+**epoch/session identity** alongside the capture timestamp, or the Tower must
+treat capture timestamps as incomparable across a `stream_stop`/`stream_start`
+boundary. Without one of those, splicing two segments of a lineage on this
+clock produces a plausible, monotonic, wrong timeline.
+
+**Also bounded:** drift is **~5 ppm**, from a clean bracket across the 39.165 s
+pause where the clocks disagreed by 0.19 ms. Earlier three-figure ppm values
+from the 45 s stream were arrival jitter and are withdrawn.
+
+**Still open, and deliberately not guessed:** whether the clock survives the
+glasses *powering off*. Every measurement kept them awake.
+
+---
+
+## 8.5 Correction: `source_seq` stepping by 2 is not frame loss
+
+The research doc and `IOS-EXECUTION-PLAN.md` §6.5 both conclude "roughly every
+other captured frame never arrives." **The conclusion that the camera captures
+~24 fps is right and is now confirmed twice over. The mechanism is not loss.**
+
+Measured at the phone: DAT delivers frames to the listener at **24.04 fps**
+(`d_host` mean 0.041598 s, sampled pre-hop). Nothing is lost in transit to the
+phone. What happens next is deliberate:
+
+- `FrameRateGate.towerTargetFPS = 12` drops every other frame
+  (`ios/Glasses/FrameRateGate.swift:78`).
+- `frameCount` increments for **every** DAT frame, gated or not, and that
+  ordinal is what `sendFrame` carries
+  (`ios/Glasses/GlassesConnection.swift:694-699`).
+
+The code comment there already states the intent: *"Sequence numbers are DAT
+callback ordinals: every delivered frame gets one, whether or not it is
+transmitted. That is what lets the Tower compute the source rate from `seq`
+gaps, and it is deliberately unchanged."*
+
+**So the step-by-2 is the designed signal, working.** The Tower is reading it
+correctly and inferring the source rate correctly; only the word "never
+arrives" is wrong, and it points at a transport problem that does not exist.
+
+**What this changes:** raising delivery is a **one-constant change**, not a
+transport investigation. `FrameRateGate.towerTargetFPS` is documented as
+deliberately conservative, with the roadmap target at 15 fps, and its own
+comment says not to raise it on estimates — the gate is main-thread headroom
+(JPEG encode, base64, JSON, viewfinder render per selected frame) and
+sustained bandwidth over Tailscale. **That measurement now exists on the
+developer surface and has not been read on a real walk.** It is the cheapest
+open lever on delivered frame rate.
+
+---
+
+## 8.6 First geometry on the phone
+
+During the PTS runs the phone reported, on hardware:
+
+```
+finalized keyframes=2 tracking=Good scale=Relative calibration=Calibrated
+          geometry=95 poses=2 anchors=1 segments=1
+```
+
+**`geometry=95`, `poses=2`, and scale `Unknown` → `Relative`.** Small, and from
+a two-keyframe capture rather than a walk, but it is the first non-zero
+geometry to reach the iOS client and it exercised the `Relative` scale path
+end to end. P3 (fragments appearing *during* a walk) is still not done.
+
+---
 
 ## 9. For the Tower lane
 
