@@ -30,12 +30,40 @@ MAX_TRACK_POINTS = 600
 TRACK_QUALITY_LEVEL = 0.01
 TRACK_MIN_DISTANCE = 7
 LK_WINDOW = (21, 21)
-LK_MAX_LEVEL = 3
+# Level 4, not 3. Lucas-Kanade's capture range is roughly
+# winSize/2 * 2**maxLevel: ~80 px at level 3, ~160 px at level 4.
+# Displacement p99 on the 2026-08-25 walk is 85 px -- just past level 3,
+# which is the worst possible place for it to sit.
+#
+# This matters because the reference frame does NOT advance every frame.
+# It advances on an accept (`engine.py:283`), so a run of blurred frames
+# freezes it while the camera keeps moving: median 7, mean 12.4, max 89
+# frames stale at the moment loss was declared. The tracker is then asked
+# to cross that entire gap in one call.
+#
+# Measured on the real walk: 51 -> 40 segments, 4.85 ms either way (the
+# extra pyramid level is free at this resolution), one added keyframe.
+LK_MAX_LEVEL = 4
 
 # Forward-backward consistency threshold in pixels. A track that does not
 # land back where it started under the reverse flow is not a track, it is
 # a coincidence.
-FORWARD_BACKWARD_MAX_PX = 1.0
+#
+# 3.0, not 1.0. Round-trip error grows with the distance travelled, and a
+# stale reference (see LK_MAX_LEVEL above) makes long hops routine rather
+# than exceptional -- so a 1.0 px budget calibrated for adjacent frames
+# rejects tracks that are real, turning recoverable drift into declared
+# loss. 47 of the 50 losses on the real walk still had frame-to-frame
+# survival above the 0.05 floor; only 3 were genuine.
+#
+# 3.0 is still an eighth of the 21 px search window, so it discriminates.
+# Measured with the pyramid change: 51 -> 33 segments on that walk, and
+# 171 -> 130 across eight captures.
+#
+# It does NOT work by suppressing losses. Running the real geometry module
+# over intra-segment keyframe pairs, reconstruction quality ROSE: solvable
+# pairs 46% -> 53%, median triangulation angle 0.43 -> 0.63 degrees.
+FORWARD_BACKWARD_MAX_PX = 3.0
 
 # Below this many surviving tracks nothing downstream is meaningful.
 MIN_TRACKS_FOR_MOTION = 12
