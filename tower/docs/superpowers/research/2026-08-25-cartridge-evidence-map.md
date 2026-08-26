@@ -128,7 +128,17 @@ for the lifecycle contract.
 
 Ordered by how much they unblock per unit of work.
 
-### 3.1 The ML stack is not installed — everything model-backed is inert
+### 3.1 ~~The ML stack is not installed — everything model-backed is inert~~
+
+> **FIXED 2026-08-26 — this section is history, not status.** `torch
+> 2.13.0+cu132` and `torchvision 0.28.0+cu132` are installed with CUDA
+> **executing** on Blackwell `sm_120`, alongside `easyocr 1.7.2`,
+> `scipy 1.18.1` and `cv2 5.0.0`. Only `timm` is still missing, which
+> gates depth alone. Everything below describes the state that has since
+> been resolved; it is kept because the *trap* it documents is still
+> live — a bare `pip install .[ml]` resolves **CPU-only** torch from
+> PyPI on Windows, and it imports and runs, silently turning every GPU
+> figure into a CPU figure.
 
 `torch`, `torchvision`, `timm` and `easyocr` are **absent from the venv**.
 Verified independently twice. Only `cv2` 5.0.0 and `numpy` 2.5.2 are present.
