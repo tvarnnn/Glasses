@@ -12,9 +12,38 @@ uniformly aspirational, so read the split carefully.
 | ChArUco camera calibration | **CURRENTLY IMPLEMENTED** (`scripts/calibrate_charuco.py`) |
 | Incremental update stream and Tower-side live following | **CURRENTLY IMPLEMENTED** (`events.jsonl` + cursor, `world_inspect.py --follow`) |
 | Registration as a production module on the live frame path | **BLOCKED** — the module contract is a registry of one with a scalar result type. A test pins non-registration deliberately (`tests/test_architecture_boundaries.py`) |
-| PC/phone viewer | **PLANNED** — see Live Visualization below |
+| Geometry transport to a phone | **IMPLEMENTED** on the Tower side — manifest + per-segment content-hashed chunks over HTTP, `world_builder.geometry/2026-08-25`, contract in `docs/contracts/` |
+| PC/phone viewer | **WRITTEN, NEVER COMPILED** — the iOS decoder, client, cache and fragments renderer exist; no Swift toolchain on the Tower host has ever built them |
 | Metric scale, loop closure, relocalisation, multi-session refinement | **PLANNED** |
-| Validation against real Ray-Ban footage | **BLOCKED** on hardware. Every measurement to date is synthetic |
+| Validation against real Ray-Ban footage | **PARTLY DONE — this line was wrong, corrected 2026-08-26.** See below |
+
+> **Correction, 2026-08-26.** "Every measurement to date is synthetic" is
+> no longer true, and World Builder is now the *most* real-data-validated
+> cartridge in the program. It has been run over **9,199 real frames**
+> across real captures:
+>
+> - Tracking was diagnosed and fixed on real footage — the tracker was
+>   losing *reach*, not the image (47 of 50 declared losses still had
+>   survival above the floor against the previous frame). Across five real
+>   captures: **151 -> 114 segments, poses 211 -> 265, points
+>   27,406 -> 42,100**.
+> - Calibration is solved, not blocked: `intrinsics/360x640.json`,
+>   self-calibrated over **511 views at 0.289 px RMS**.
+> - Cross-segment registration produces its first merged geometry on the
+>   real world: 51 segments, 19 with geometry, **3 registered carrying
+>   31.1% of all points** — and it refuses more than it admits.
+>
+> **What is still genuinely blocked on hardware** is narrower and is
+> enumerated as P1–P11 in `docs/agent-handoffs/WORLD-BUILDER-STATUS.md`.
+> The three that matter: whether fragments appear *during* a walk (P3),
+> whether a deliberate sideways walk raises the registrable fraction
+> (P11 — 16 of 19 segments are refused because the wearer stood still, so
+> scale is unobservable), and whether a registered pair is actually
+> correct (P9 — nothing automated can catch a wrong Sim3; pair (30,50)
+> fits at 1.62 px while being **3.2x wrong on scale**).
+>
+> Separately: **no Swift in this repo has ever been compiled.** That gates
+> the viewer regardless of hardware.
 
 Reports: `reports/2026-08-22-world-builder-v1-report.md` (what was built
 and why) and `reports/2026-08-22-world-builder-closeout.md` (requirement
