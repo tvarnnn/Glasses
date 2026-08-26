@@ -5,6 +5,48 @@
 docs tree, plus direct measurement of on-disk artifacts. Every status below is
 read off code, tests or data — not off a design document.
 
+---
+
+> ## Superseded in four places — updated 2026-08-26
+>
+> This remains the orientation document, but four of its findings have since
+> been acted on or falsified. Read this block before trusting the tables.
+>
+> **1. §3.1's headline is fixed. The ML stack is installed.**
+> `torch 2.13.0+cu132` and `torchvision 0.28.0+cu132` are in the venv with
+> **CUDA working on Blackwell** — `sm_120` in the arch list, capability
+> `(12, 0)`, a real kernel executed. `easyocr 1.7.2` is installed and pinned.
+> The Blackwell question turned out to be settled by this repo's own history,
+> not by research. Detail:
+> `2026-08-26-ml-dependency-feasibility.md`.
+>
+> **2. §6's cheapest evidence has been collected.** The 9,199 real frames have
+> now been through a detector. Three cartridge premises moved as a result —
+> most importantly, the `person` detections are the **wearer's own torso**
+> (median box bottom edge 0.981, 59% touching the frame edge), so this corpus
+> is not a validation set for bystander perception and never was. Detail:
+> `2026-08-26-real-corpus-first-measurement.md`.
+>
+> **3. Document Memory's premise did not survive.** It is still IMPLEMENTED,
+> but detection fires **6 times in 9,199 frames and all six are false
+> positives**. Detection, not recognition, is the binding constraint — the
+> inverse of what its own module doc claimed. Its resolution table was also
+> measured in **landscape geometries DAT cannot produce**. Detail:
+> `2026-08-26-document-memory-reality-check.md`.
+>
+> **4. Object Memory is no longer blocked, and §3.2's ruling is not what
+> gated it.** The Task 4 decision gates registering as a live in-process
+> `Module`; every other cartridge produces out of process by tailing a
+> capture journal. Object Memory now does the same and has written its first
+> **55 real observations**. The `person` ruling is still unresolved and is
+> now *sidestepped* rather than pre-empted: a closed whitelist persists only
+> `laptop` and `cell phone`, so no bystander record can be written until a
+> human decides.
+>
+> **What did not change:** there is still no audio path of any kind, so
+> Translator, and the voice halves of Visual Q&A and Accessibility, remain
+> blocked exactly as described below.
+
 This exists because the same archaeology keeps being redone. It records what is
 *built*, what is *designed*, and what has *met hardware* — three different
 things that the docs routinely conflate.
