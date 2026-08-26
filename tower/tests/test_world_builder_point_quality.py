@@ -491,3 +491,106 @@ def test_gate_refuses_transposed_input_instead_of_deleting_everything():
         landmark_gate(world, pa.T.copy(), pb, IDENTITY_POSE, pose_b, CAMERA)
     with pytest.raises(ValueError, match="points_b must be"):
         landmark_gate(world, pa, pb.T.copy(), IDENTITY_POSE, pose_b, CAMERA)
+
+
+# ---------------------------------------------------------------------------
+# Task 4: chain extension. Unlike the seed pair, this site solves with two
+# ABSOLUTE poses that are never identity, and it builds its observation
+# arrays transposed -- both of which the gate must survive.
+# ---------------------------------------------------------------------------
+
+
+class _KP:
+    def __init__(self, pt):
+        self.pt = pt
+
+
+def _backend_with_camera():
+    from tower.world_builder.backends.classical import ClassicalTwoViewBackend
+
+    backend = ClassicalTwoViewBackend()
+    backend._camera_matrix = CAMERA
+    return backend
+
+
+def test_chain_extension_discards_near_parallel_landmarks():
+    backend = _backend_with_camera()
+    pose_p = (np.eye(3), np.zeros(3))
+    pose_c = (np.eye(3), np.array([-0.001, 0.0, 0.0]))
+    world = np.array([[0.0, 0.0, 1000.0]])
+    kp_p = [_KP(tuple(_project(world, pose_p)[0]))]
+    kp_c = [_KP(tuple(_project(world, pose_c)[0]))]
+
+    points, observed, counts = backend._triangulate_new(
+        kp_p, kp_c, [(0, 0)], pose_p, pose_c, 0, 1,
+    )
+    assert points == []
+    assert observed == {}
+    assert counts["low_parallax"] == 1
+
+
+def test_chain_extension_keeps_well_conditioned_landmarks():
+    """The control. Chain extension must not become a shredder."""
+    backend = _backend_with_camera()
+    pose_p = (np.eye(3), np.zeros(3))
+    pose_c = (np.eye(3), np.array([-0.30, 0.0, 0.0]))
+    world = np.array([[0.0, 0.0, 3.0], [0.4, 0.2, 3.5], [-0.3, -0.1, 2.6]])
+    kp_p = [_KP(tuple(pt)) for pt in _project(world, pose_p)]
+    kp_c = [_KP(tuple(pt)) for pt in _project(world, pose_c)]
+
+    points, observed, counts = backend._triangulate_new(
+        kp_p, kp_c, [(0, 0), (1, 1), (2, 2)], pose_p, pose_c, 0, 1,
+    )
+    assert len(points) == 3
+    assert counts == {"low_parallax": 0, "high_reprojection": 0}
+
+
+def test_chain_extension_is_correct_under_non_identity_poses():
+    """This site NEVER sees identity poses in production -- it solves with
+    two absolute poses in world frame. A camera-centre convention error
+    that the seed-pair tests cannot see would surface here as wholesale
+    loss of real structure.
+    """
+    backend = _backend_with_camera()
+    pose_p = (_rot_z(15.0), np.array([0.4, -0.2, 0.1]))
+    pose_c = (_rot_z(22.0), np.array([0.1, -0.25, 0.15]))
+    world = np.array([[0.2, 0.1, 3.0], [-0.4, 0.3, 3.6], [0.5, -0.2, 2.8]])
+    kp_p = [_KP(tuple(pt)) for pt in _project(world, pose_p)]
+    kp_c = [_KP(tuple(pt)) for pt in _project(world, pose_c)]
+
+    points, observed, counts = backend._triangulate_new(
+        kp_p, kp_c, [(0, 0), (1, 1), (2, 2)], pose_p, pose_c, 0, 1,
+    )
+    assert len(points) == 3, (
+        "real structure under non-identity poses must survive; losing it "
+        "here means the camera centres are being computed wrongly"
+    )
+    assert counts == {"low_parallax": 0, "high_reprojection": 0}
+    assert len(observed) == 6  # two observations per landmark
+
+
+def test_chain_extension_accounting_closes():
+    """produced == kept + low_parallax + high_reprojection."""
+    backend = _backend_with_camera()
+    pose_p = (np.eye(3), np.zeros(3))
+    pose_c = (np.eye(3), np.array([-0.30, 0.0, 0.0]))
+    world = np.array([[0.0, 0.0, 3.0], [0.0, 0.0, 100000.0], [0.4, 0.2, 3.5]])
+    kp_p = [_KP(tuple(pt)) for pt in _project(world, pose_p)]
+    kp_c = [_KP(tuple(pt)) for pt in _project(world, pose_c)]
+
+    points, _, counts = backend._triangulate_new(
+        kp_p, kp_c, [(0, 0), (1, 1), (2, 2)], pose_p, pose_c, 0, 1,
+    )
+    assert len(points) + counts["low_parallax"] + counts["high_reprojection"] == 3
+
+
+def test_chain_extension_with_no_matches_returns_three_values():
+    """The empty path must return the same arity as the populated one, or
+    the caller unpacks two values from a three-tuple only on busy frames."""
+    backend = _backend_with_camera()
+    points, observed, counts = backend._triangulate_new(
+        [], [], [], (np.eye(3), np.zeros(3)),
+        (np.eye(3), np.array([-1.0, 0.0, 0.0])), 0, 1,
+    )
+    assert points == [] and observed == {}
+    assert counts == {"low_parallax": 0, "high_reprojection": 0}

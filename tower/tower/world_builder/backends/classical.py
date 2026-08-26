@@ -44,6 +44,7 @@ from tower.world_builder.geometry import (
     homography_ratio,
     match_indices,
     median_triangulation_angle_deg,
+    landmark_gate,
     triangulate_points,
 )
 from tower.world_builder.records import CameraIntrinsics
@@ -652,7 +653,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
 
         # Triangulate the features that had no landmark yet, using the two
         # absolute poses, so new structure lands directly in world frame.
-        new_points, new_observed = self._triangulate_new(
+        new_points, new_observed, discard_counts = self._triangulate_new(
             keypoints_previous,
             keypoints_current,
             matched_pairs,
@@ -692,7 +693,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
         current_index,
     ):
         if not matched_pairs:
-            return [], {}
+            return [], {}, {"low_parallax": 0, "high_reprojection": 0}
 
         rotation_p, translation_p = pose_previous
         rotation_c, translation_c = pose_current
@@ -711,11 +712,31 @@ class ClassicalTwoViewBackend(GeometryBackend):
         with np.errstate(divide="ignore", invalid="ignore"):
             xyz = (homogeneous[:3] / homogeneous[3]).T
 
+        # Two absolute poses, so these landmarks are already in world
+        # frame -- and unlike the seed pair, neither pose is identity.
+        #
+        # points_p/points_c are built TRANSPOSED above, (2, N). The gate
+        # validates shape rather than reshaping, so passing them without
+        # the .T would raise instead of silently rejecting every landmark.
+        finite = np.isfinite(xyz).all(axis=1)
+        gate_keep = np.zeros(len(xyz), dtype=bool)
+        counts = {"low_parallax": 0, "high_reprojection": 0}
+        if finite.any():
+            subset_keep, counts = landmark_gate(
+                xyz[finite],
+                points_p.T[finite],
+                points_c.T[finite],
+                pose_previous,
+                pose_current,
+                self._camera_matrix,
+            )
+            gate_keep[finite] = subset_keep
+
         new_points, new_observed = [], {}
         for offset, ((index_p, index_c), point) in enumerate(
             zip(matched_pairs, xyz)
         ):
-            if not np.isfinite(point).all():
+            if not gate_keep[offset]:
                 continue
             depth_p = (rotation_p @ point + translation_p)[2]
             depth_c = (rotation_c @ point + translation_c)[2]
@@ -725,7 +746,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
             new_points.append(point)
             new_observed[(previous_index, index_p)] = landmark
             new_observed[(current_index, index_c)] = landmark
-        return new_points, new_observed
+        return new_points, new_observed, counts
 
 
 class _Chain:
