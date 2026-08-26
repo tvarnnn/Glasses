@@ -201,6 +201,21 @@ matter most:
 - **`session_id` + `frame_seq` resolves to retained raw JPEGs** outside Object
   Memory's retention. Records now tag `frame-referenced`, but capture-side
   retention is the real fix and does not exist.
+- **One flaky test, observed once and not reproduced.**
+  `test_result_channel_hostile.py::test_the_channel_survives_the_world_vanishing_mid_subscription`
+  failed in one full-suite run on 2026-08-26 and passed in the next, plus
+  5/5 alone and 18/18 in its own file. **Do not "fix" it by weakening the
+  assertion** — it guards against fabricated results, which is the last
+  thing that should be softened to get a green run.
+  Not a timeout: `drain()` blocks by design and `pump()` is synchronous
+  over the portal, precisely so timing cannot decide the outcome. The
+  leading hypothesis is Windows file locking — the test unlinks
+  `world.json` while a subscription is live, and `unlink()` raises
+  WinError 32 if a handle is open at that instant. `read_json_closed()`
+  already narrows that window, which fits a rare race rather than a
+  broken test. **This is a hypothesis; the traceback was never captured.**
+  Next occurrence, capture it with `--tb=long` before doing anything else.
+
 - **`data/captures/` is never pruned.** 9,199 real frames with no retention
   policy governing them.
 - 21 deferred World Builder findings, triaged in
