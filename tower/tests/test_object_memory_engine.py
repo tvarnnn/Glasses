@@ -6,6 +6,8 @@ model would fail on a train, and these cases are about the record the
 producer writes, not about whether torchvision can find a laptop.
 """
 
+import json
+
 import cv2
 import numpy as np
 import pytest
@@ -14,7 +16,7 @@ from tower.object_memory.detector import Detection, FixedDetector
 from tower.object_memory.engine import ObjectMemoryEngine
 from tower.object_memory.records import Confidence
 from tower.object_memory.relevance import RelevancePolicy
-from tower.object_memory.store import ObservationStore
+from tower.object_memory.store import OBSERVATIONS_FILENAME, ObservationStore
 
 WIDTH, HEIGHT = 360, 640
 
@@ -52,7 +54,7 @@ def test_a_whitelisted_detection_becomes_a_persisted_observation(tmp_path):
     assert observation.confidence is Confidence.HIGH
     assert observation.session_id == "cap-1"
     assert observation.frame_seq == 7
-    assert observation.privacy_tags == ("derived-only",)
+    assert observation.privacy_tags == ("derived-only", "frame-referenced")
     assert observation.spatial_ref is None
 
 
@@ -175,3 +177,178 @@ def test_counts_by_class_report_what_was_actually_remembered(tmp_path):
     assert engine.recorded_by_class == {"laptop": 1, "cell phone": 1}
     assert engine.detections_seen == 2
     assert len(store.all_observations()) == 2
+
+
+# --- REVIEW FINDING 3: spatial_ref must be null in the BYTES that reach disk ---
+
+
+def test_spatial_ref_is_null_in_the_line_the_store_actually_writes(tmp_path):
+    # Asserting on a read-back observation cannot catch this: the read
+    # path nulls spatial_ref unconditionally, and prune's raw-dict rewrite
+    # preserves unknown keys by design -- so a box written here would
+    # reach disk, survive retention and be invisible to every read. This
+    # slice knows no position in a room, and the file has to say so.
+    store, engine = _engine(tmp_path, [[_detection()]], session_id="cap-1")
+
+    engine.observe(_frame(), received_at=900.0, source_seq=7)
+
+    raw = json.loads(
+        (tmp_path / OBSERVATIONS_FILENAME).read_text(encoding="utf-8").strip()
+    )
+    assert raw["spatial_ref"] is None
+    assert raw["external_refs"] == []
+
+
+# --- REVIEW FINDING 4: confidence is DERIVED from the score, never asserted ---
+
+
+@pytest.mark.parametrize(
+    "score,expected",
+    [
+        (0.45, Confidence.LOW),
+        (0.60, Confidence.MEDIUM),
+        (0.95, Confidence.HIGH),
+    ],
+)
+def test_the_recorded_confidence_follows_the_detector_score(
+    tmp_path, score, expected
+):
+    # min_score is lowered so all three scores are actually persisted;
+    # the point is the mapping, not the threshold.
+    store, engine = _engine(
+        tmp_path, [[_detection(score=score)]], policy=RelevancePolicy(min_score=0.1)
+    )
+
+    engine.observe(_frame(), received_at=900.0, source_seq=0)
+
+    (observation,) = store.all_observations()
+    assert observation.confidence is expected
+
+
+# --- REVIEW FINDING 5: the tags must describe the record's REACH, not just
+# its content ---
+
+
+def test_the_tags_admit_the_record_points_back_at_a_stored_frame(tmp_path):
+    # `derived-only` is true of the CONTENT -- no pixels, no crop. It was
+    # false about reach: session_id + frame_seq is an exact pointer into
+    # data/captures/<id>/frames/, which Object Memory's retention does not
+    # govern. Purging every record here leaves that JPEG where it is.
+    store, engine = _engine(tmp_path, [[_detection()]], session_id="cap-1")
+
+    engine.observe(_frame(), received_at=900.0, source_seq=7)
+
+    (observation,) = store.all_observations()
+    assert observation.privacy_tags == ("derived-only", "frame-referenced")
+
+
+def test_a_record_that_points_at_no_frame_does_not_claim_it_does(tmp_path):
+    store, engine = _engine(tmp_path, [[_detection()]], session_id=None)
+
+    engine.observe(_frame(), received_at=900.0, source_seq=None)
+
+    (observation,) = store.all_observations()
+    assert observation.privacy_tags == ("derived-only",)
+
+
+# --- REVIEW FINDING 6: write on first sighting, then upgrade in-window ---
+#
+# The filter records the FIRST detection after each gap, so the persisted
+# laptop median was 0.601 against a population median of 0.910 -- the
+# memory was pessimistic about sightings it had seen clearly seconds
+# later. The write still happens immediately (a killed session loses
+# nothing) and observed_at still means "when it came into view"; the
+# stronger look is carried alongside as best_score.
+
+
+def test_the_first_sighting_is_written_at_once_and_is_its_own_best(tmp_path):
+    store, engine = _engine(tmp_path, [[_detection(score=0.60)]])
+
+    engine.observe(_frame(), received_at=900.0, source_seq=0)
+
+    (observation,) = store.all_observations()
+    assert observation.detector_score == pytest.approx(0.60)
+    assert observation.best_score == pytest.approx(0.60)
+
+
+def test_a_stronger_look_inside_the_window_upgrades_best_score_in_place(tmp_path):
+    store, engine = _engine(
+        tmp_path,
+        [[_detection(score=0.60)], [_detection(score=0.97)]],
+        policy=RelevancePolicy(resample_seconds=30.0),
+    )
+
+    engine.observe(_frame(), received_at=900.0, source_seq=0)
+    engine.observe(_frame(), received_at=905.0, source_seq=1)
+
+    (observation,) = store.all_observations()
+    assert observation.best_score == pytest.approx(0.97)
+    assert engine.best_score_upgrades == 1
+    # Still one record, still counted as suppressed, and the first
+    # sighting's own numbers are untouched.
+    assert engine.observations_recorded == 1
+    assert engine.dropped["resampled"] == 1
+    assert observation.detector_score == pytest.approx(0.60)
+    assert observation.observed_at == 900.0
+    assert observation.frame_seq == 0
+    assert observation.confidence is Confidence.MEDIUM
+
+
+def test_a_weaker_look_inside_the_window_does_not_lower_the_best(tmp_path):
+    store, engine = _engine(
+        tmp_path,
+        [[_detection(score=0.97)], [_detection(score=0.60)]],
+        policy=RelevancePolicy(resample_seconds=30.0),
+    )
+
+    engine.observe(_frame(), received_at=900.0, source_seq=0)
+    engine.observe(_frame(), received_at=905.0, source_seq=1)
+
+    (observation,) = store.all_observations()
+    assert observation.best_score == pytest.approx(0.97)
+    assert engine.best_score_upgrades == 0
+
+
+def test_a_sighting_after_the_window_starts_a_record_with_its_own_best(tmp_path):
+    store, engine = _engine(
+        tmp_path,
+        [[_detection(score=0.60)], [_detection(score=0.97)]],
+        policy=RelevancePolicy(resample_seconds=30.0),
+    )
+
+    engine.observe(_frame(), received_at=900.0, source_seq=0)
+    engine.observe(_frame(), received_at=1000.0, source_seq=1)
+
+    bests = [o.best_score for o in store.all_observations()]
+    assert bests == [pytest.approx(0.60), pytest.approx(0.97)]
+    assert engine.best_score_upgrades == 0
+
+
+def test_an_upgrade_that_fails_to_reach_disk_is_counted_not_swallowed(tmp_path):
+    class FailingUpgradeStore:
+        def __init__(self):
+            self.appended = []
+
+        def append(self, observation):
+            self.appended.append(observation)
+
+        def update_best_score(self, object_class, observed_at, score):
+            raise OSError("disk full")
+
+    store = FailingUpgradeStore()
+    engine = ObjectMemoryEngine(
+        store,
+        FixedDetector([[_detection(score=0.60)], [_detection(score=0.97)]]),
+        policy=RelevancePolicy(resample_seconds=30.0),
+        clock=lambda: 1000.0,
+    )
+    engine.load()
+
+    engine.observe(_frame(), received_at=900.0, source_seq=0)
+    engine.observe(_frame(), received_at=905.0, source_seq=1)
+
+    assert engine.best_score_upgrades == 0
+    assert engine.upgrade_failures == 1
+    # The record itself is still there: an upgrade is an improvement on
+    # an honest record, never a precondition for having one.
+    assert len(store.appended) == 1

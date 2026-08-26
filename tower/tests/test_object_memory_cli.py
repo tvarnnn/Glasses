@@ -53,7 +53,9 @@ def capture(tmp_path):
     return directory
 
 
-def _observation(object_class="laptop", observed_at=1000.0, recorded_at=None):
+def _observation(
+    object_class="laptop", observed_at=1000.0, recorded_at=None, best_score=None
+):
     return ObjectObservation(
         object_class=object_class,
         detector_score=0.81,
@@ -70,6 +72,7 @@ def _observation(object_class="laptop", observed_at=1000.0, recorded_at=None):
         privacy_tags=("derived-only",),
         spatial_ref=None,
         external_refs=(),
+        best_score=best_score,
     )
 
 
@@ -305,3 +308,161 @@ class TestQueryDriver:
         assert json.loads(result.stdout)["observations_removed"] == 1
         assert store.all_observations() == []
         assert not any(tmp_path.iterdir())
+
+
+class TestReaderCannotWidenRetention:
+    """--retention-days is a request, not an authority.
+
+    The store persists the window it was written under, and every read
+    clamps to min(persisted, requested). Before that, a reader could hand
+    itself 3650 days -- or 0, meaning forever -- and be served a record
+    the wearer had been promised was gone.
+    """
+
+    WRITTEN_AT = 1_000_000.0
+    WINDOW = 30 * 86400.0
+
+    def _store_written_under_the_default(self, tmp_path, age_days):
+        recorded_at = self.WRITTEN_AT
+        store = ObservationStore(
+            tmp_path, retention_seconds=self.WINDOW, clock=lambda: recorded_at
+        )
+        store.append(_observation(observed_at=recorded_at, recorded_at=recorded_at))
+        return recorded_at + age_days * 86400.0
+
+    @pytest.mark.parametrize("requested", ["3650", "0"])
+    def test_a_wider_request_does_not_resurrect_an_expired_record(
+        self, tmp_path, requested
+    ):
+        now = self._store_written_under_the_default(tmp_path, age_days=40)
+
+        result = _run(
+            "object_query.py",
+            "--root",
+            str(tmp_path),
+            "--last-seen",
+            "laptop",
+            "--retention-days",
+            requested,
+            "--now",
+            str(now),
+        )
+
+        assert result.returncode == 1
+        assert "No record" in result.stdout
+
+    def test_a_wider_request_does_not_leak_the_record_as_json_either(self, tmp_path):
+        now = self._store_written_under_the_default(tmp_path, age_days=40)
+
+        result = _run(
+            "object_query.py",
+            "--root",
+            str(tmp_path),
+            "--last-seen",
+            "laptop",
+            "--retention-days",
+            "0",
+            "--now",
+            str(now),
+            "--format",
+            "json",
+        )
+
+        payload = json.loads(result.stdout)
+        assert payload["observed"] is False
+        assert payload["observation"] is None
+
+    def test_a_record_inside_the_promised_window_is_still_answered(self, tmp_path):
+        now = self._store_written_under_the_default(tmp_path, age_days=3)
+
+        result = _run(
+            "object_query.py",
+            "--root",
+            str(tmp_path),
+            "--last-seen",
+            "laptop",
+            "--now",
+            str(now),
+        )
+
+        assert result.returncode == 0, result.stderr
+
+    def test_a_narrower_request_is_still_obeyed(self, tmp_path):
+        now = self._store_written_under_the_default(tmp_path, age_days=3)
+
+        result = _run(
+            "object_query.py",
+            "--root",
+            str(tmp_path),
+            "--last-seen",
+            "laptop",
+            "--retention-days",
+            "1",
+            "--now",
+            str(now),
+        )
+
+        assert result.returncode == 1
+        assert "No record" in result.stdout
+
+
+class TestTheAnswerSaysWhatItKnows:
+    def test_it_reports_the_first_score_and_the_best_one_while_in_view(self, tmp_path):
+        store = ObservationStore(tmp_path, retention_seconds=None)
+        store.append(_observation(best_score=0.97))
+
+        stdout = _run(
+            "object_query.py",
+            "--root",
+            str(tmp_path),
+            "--last-seen",
+            "laptop",
+            "--now",
+            "1060.0",
+        ).stdout
+
+        assert "0.81" in stdout
+        assert "0.97" in stdout
+        assert "best score" in stdout
+
+    def test_the_json_answer_carries_the_best_score(self, tmp_path):
+        store = ObservationStore(tmp_path, retention_seconds=None)
+        store.append(_observation(best_score=0.97))
+
+        payload = json.loads(
+            _run(
+                "object_query.py",
+                "--root",
+                str(tmp_path),
+                "--last-seen",
+                "laptop",
+                "--now",
+                "1060.0",
+                "--format",
+                "json",
+            ).stdout
+        )
+
+        assert payload["observation"]["best_score"] == pytest.approx(0.97)
+
+    def test_it_says_that_deleting_the_record_does_not_delete_the_frame(
+        self, tmp_path
+    ):
+        # The honest half of `derived-only`: the record holds no imagery,
+        # but session_id + frame_seq resolves to a JPEG this cartridge's
+        # retention does not govern.
+        store = ObservationStore(tmp_path, retention_seconds=None)
+        store.append(_observation())
+
+        stdout = _run(
+            "object_query.py",
+            "--root",
+            str(tmp_path),
+            "--last-seen",
+            "laptop",
+            "--now",
+            "1060.0",
+        ).stdout
+
+        assert "capture retention" in stdout
+        assert "data/captures" in stdout

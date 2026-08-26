@@ -24,6 +24,21 @@ Nor is it a claim the object is still there. It is a record that a
 CATEGORY was visible once -- not that this is YOUR laptop, and not that
 absence of a record means absence of the laptop.
 
+ON RETENTION
+
+`--retention-days` is a request, not an authority. The store records the
+window it was WRITTEN under, and every read is clamped to
+min(persisted, requested): this CLI can narrow the window it sees and
+cannot widen it. Asking for 3650 days, or 0 meaning forever, against a
+store written under the 30-day default still gets you 30 days.
+
+ON WHAT DELETION REACHES
+
+`--purge-all` deletes every observation this cartridge holds. It does not
+touch `data/captures/`, and a record's session_id + frame_seq points
+straight into it. The imagery is governed by capture-side retention,
+which is not Object Memory's to give away or to promise.
+
     .venv\Scripts\python.exe scripts/object_query.py --last-seen laptop
 """
 
@@ -36,7 +51,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tower.object_memory.relevance import PERSISTED_CLASSES  # noqa: E402
-from tower.object_memory.store import ObservationStore  # noqa: E402
+from tower.object_memory.store import (  # noqa: E402
+    DEFAULT_RETENTION_DAYS,
+    ObservationStore,
+)
 
 DEFAULT_ROOT = Path("data/object_memory")
 
@@ -51,10 +69,12 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--retention-days",
         type=float,
-        default=30.0,
+        default=DEFAULT_RETENTION_DAYS,
         help=(
-            "The retention this store was written under. Reads apply it, "
-            "so an expired observation is not served. 0 means keep forever."
+            "Narrow the window this read may see. The store persists the "
+            "window it was written under and reads clamp to "
+            "min(persisted, requested), so this can only ever serve LESS. "
+            "0 means 'no limit of my own', not 'keep forever'."
         ),
     )
     parser.add_argument(
@@ -102,6 +122,11 @@ def main(argv=None) -> int:
                             "session_id": observation.session_id,
                             "frame_seq": observation.frame_seq,
                             "source": observation.source,
+                            # The pointer resolves into data/captures/,
+                            # whose lifetime this cartridge neither sets
+                            # nor enforces. Purging every observation
+                            # here leaves the imagery where it is.
+                            "imagery_retention": "capture-side",
                         }
                         if observation
                         else None
@@ -123,10 +148,16 @@ def main(argv=None) -> int:
         return 1
 
     age_minutes = (now - observation.observed_at) / 60.0
+    best = "not tracked" if observation.best_score is None else observation.best_score
     print(f"=== last observed {observation.object_class} ===")
     print(f"  when          {age_minutes:.1f} min ago (tower-receipt time)")
-    print(f"  confidence    {observation.confidence.value}")
-    print(f"  score         {observation.detector_score}")
+    print(f"  confidence    {observation.confidence.value} (of the first look)")
+    print(f"  score         {observation.detector_score} (when it came into view)")
+    # Two numbers because they measure two things: the first look is what
+    # observed_at, frame_seq and the box all describe, while best_score is
+    # the strongest look during the same sighting. Records written before
+    # best_score existed say so rather than borrowing the other number.
+    print(f"  best score    {best} (strongest look while in view)")
     print(f"  capture       {observation.session_id}")
     print(f"  frame_seq     {observation.frame_seq}")
     print(f"  camera        {observation.source}")
@@ -139,6 +170,12 @@ def main(argv=None) -> int:
         "OBSERVED, NOT PRESENT: a category was visible in that frame. Not "
         "a claim it is still there, and not a claim it is YOUR "
         f"{observation.object_class}."
+    )
+    print(
+        "PROVENANCE: the capture and frame_seq above resolve to a stored "
+        "frame under data/captures/. This record holds no imagery, but "
+        "deleting it does not delete that frame -- capture retention "
+        "governs the image, and Object Memory does not set it."
     )
     return 0
 

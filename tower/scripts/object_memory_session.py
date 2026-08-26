@@ -34,6 +34,16 @@ A record says a CATEGORY was visible at a time, with a confidence. It is
 not a claim that the object is there now, not a claim about WHICH laptop,
 and not a position in a room -- `spatial_ref` is null and stays null.
 
+A record is written the moment a class comes into view, so a killed
+session loses nothing and `observed_at` means what it says. A stronger
+look at the same sighting inside the resample window is folded back into
+that record as `best_score`; `detector_score` keeps meaning "the frame
+this record describes". Neither is a calibrated probability.
+
+`--retention-days` is recorded in the store's manifest at first append,
+and every later read clamps to min(persisted, requested). A reader can
+narrow that window; nothing a reader passes can widen it.
+
     .venv\Scripts\python.exe scripts/object_memory_session.py --frames data/captures/<id>
     .venv\Scripts\python.exe scripts/object_memory_session.py --follow-capture data/captures/<id>
 """
@@ -57,7 +67,10 @@ from tower.object_memory.relevance import (  # noqa: E402
     PERSISTED_CLASSES,
     RelevancePolicy,
 )
-from tower.object_memory.store import ObservationStore  # noqa: E402
+from tower.object_memory.store import (  # noqa: E402
+    DEFAULT_RETENTION_DAYS,
+    ObservationStore,
+)
 from tower.storage import read_raw_jsonl  # noqa: E402
 
 DEFAULT_ROOT = Path("data/object_memory")
@@ -126,8 +139,12 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--retention-days",
         type=float,
-        default=30.0,
-        help="Forget observations older than this. 0 means keep forever.",
+        default=DEFAULT_RETENTION_DAYS,
+        help=(
+            "Forget observations older than this. 0 means keep forever. "
+            "Recorded in the store manifest at first append, and every "
+            "later read is clamped to it."
+        ),
     )
     parser.add_argument("--poll-seconds", type=float, default=0.25)
     parser.add_argument("--max-idle-polls", type=int, default=None)
@@ -217,10 +234,14 @@ def main(argv=None) -> int:
         "detections_seen": engine.detections_seen,
         "observations_recorded": engine.observations_recorded,
         "recorded_by_class": engine.recorded_by_class,
+        # An upgrade is a record whose best_score was raised by a
+        # stronger look at the SAME sighting -- not a second record.
+        "best_score_upgrades": engine.best_score_upgrades,
         # Not noise: "wrote 11 records" is meaningless without "and
         # declined 4,000, nearly all of them for being off the whitelist".
         "declined": engine.dropped,
         "write_failures": engine.write_failures,
+        "upgrade_failures": engine.upgrade_failures,
         "stored_observations": len(store.all_observations()),
         "pruned_expired": pruned,
         "retention_days": args.retention_days,
@@ -242,6 +263,11 @@ def main(argv=None) -> int:
             "is excluded on purpose; see relevance.PERSISTED_CLASSES."
         )
         print("Times are tower-receipt, never on-glasses capture time.")
+        print(
+            "Records point back at data/captures/ by session and frame. "
+            "That imagery is governed by capture retention, not by this "
+            "store's."
+        )
     return 0
 
 

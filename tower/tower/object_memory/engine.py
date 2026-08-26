@@ -18,9 +18,14 @@ import time
 import cv2
 import numpy as np
 
-from tower.object_memory.records import Confidence, ObjectObservation
+from tower.object_memory.records import (
+    Confidence,
+    ObjectObservation,
+    privacy_tags_for,
+)
 from tower.object_memory.relevance import (
     RECORD,
+    RESAMPLED,
     RelevanceFilter,
     RelevancePolicy,
 )
@@ -65,6 +70,12 @@ class ObjectMemoryEngine:
         self.observations_recorded = 0
         self.write_failures = 0
         self.recorded_by_class: dict[str, int] = {}
+        # The sighting currently open per class: (observed_at of the
+        # record already on disk, best score seen since). See
+        # _upgrade_best_score.
+        self._open_sightings: dict[str, tuple[float, float]] = {}
+        self.best_score_upgrades = 0
+        self.upgrade_failures = 0
         # Why detections did NOT become observations. Reported rather
         # than discarded: "the producer wrote 11 records" means nothing
         # without "and declined 4,000, mostly for being off the
@@ -106,6 +117,8 @@ class ObjectMemoryEngine:
             )
             if verdict != RECORD:
                 self.dropped[verdict] = self.dropped.get(verdict, 0) + 1
+                if verdict == RESAMPLED:
+                    self._upgrade_best_score(detection)
                 continue
             observation = self._observation(
                 detection, width, height, observed_at, source_seq
@@ -124,12 +137,63 @@ class ObjectMemoryEngine:
                 )
                 continue
             self._relevance.note_recorded(detection.label, observed_at)
+            self._open_sightings[detection.label] = (observed_at, detection.score)
             self.observations_recorded += 1
             self.recorded_by_class[detection.label] = (
                 self.recorded_by_class.get(detection.label, 0) + 1
             )
             recorded.append(observation)
         return recorded
+
+    def _upgrade_best_score(self, detection) -> None:
+        """Fold a stronger look at an open sighting back into its record.
+
+        The filter records the FIRST detection after each gap, which made
+        the memory needlessly pessimistic: measured over the real corpus,
+        the persisted `laptop` median was 0.601 against a population
+        median of 0.910, and only 4 of 13 records were HIGH where 12 of
+        13 could have been.
+
+        Recording the STRONGEST detection instead would have been worse:
+        the max of ~120 samples stops meaning "how confident the detector
+        was" and starts meaning "the luckiest frame in 30 seconds", and
+        is not comparable between a 2-second and a 30-second sighting. So
+        the record is still written on the first sighting -- observed_at
+        still means "when it came into view", a killed session still
+        loses nothing, recall is unchanged -- and the stronger look is
+        carried alongside in best_score.
+
+        This does not make either number a calibrated probability. It
+        only stops the memory understating what it saw.
+        """
+        open_sighting = self._open_sightings.get(detection.label)
+        if open_sighting is None:
+            # The filter is suppressing a sighting this process did not
+            # write: it survived a restart, or the write failed. There is
+            # no record here to improve.
+            return
+        observed_at, best = open_sighting
+        if detection.score <= best:
+            return
+        try:
+            changed = self._store.update_best_score(
+                detection.label, observed_at, detection.score
+            )
+        except OSError:
+            # Counted, not swallowed, and separate from write_failures:
+            # a failed upgrade loses an improvement to an honest record
+            # already safely on disk, which is not the same accident as
+            # losing the record itself.
+            self.upgrade_failures += 1
+            logger.warning(
+                "[Tower][ObjectMemory] failed to upgrade the best score of "
+                "a %s observation",
+                detection.label,
+            )
+            return
+        self._open_sightings[detection.label] = (observed_at, detection.score)
+        if changed:
+            self.best_score_upgrades += 1
 
     def _observation(
         self,
@@ -158,9 +222,19 @@ class ObjectMemoryEngine:
             # position in a room, and spatial_ref stays None.
             bounding_box=(x1 / width, y1 / height, x2 / width, y2 / height),
             retention_tag="default",
-            privacy_tags=("derived-only",),
+            # Not a flat ("derived-only",): the record holds no imagery,
+            # but session_id + frame_seq resolves to a frame under
+            # data/captures/ that this cartridge's retention does not
+            # govern. See records.privacy_tags_for.
+            privacy_tags=privacy_tags_for(self._session_id, source_seq),
+            # A box in an IMAGE is not a position in a room, and this
+            # is the only place that could ever put one on disk: the read
+            # path nulls spatial_ref unconditionally and prune preserves
+            # unknown keys, so a value written here would be invisible to
+            # every reader and permanent. It stays None.
             spatial_ref=None,
             external_refs=(),
+            best_score=detection.score,
         )
 
     @staticmethod
