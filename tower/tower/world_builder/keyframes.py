@@ -77,6 +77,11 @@ REASON_OVERLAP_FLOOR = "overlap_floor"
 REASON_BLURRED = "blurred"
 REASON_TRACKING_DEGRADED = "tracking_degraded"
 REASON_TRACKING_LOST = "tracking_lost"
+# Below the loss floor, but inside the grace window -- the track may yet
+# recover. Counted under its own name rather than folded into
+# `tracking_degraded`, because how often grace fires is exactly the
+# number needed to tell whether it is set right.
+REASON_TRACKING_HELD = "tracking_held"
 REASON_INSUFFICIENT_MOTION = "insufficient_motion"
 REASON_RATE_LIMITED = "rate_limited"
 REASON_NO_MOTION_EVIDENCE = "no_motion_evidence"
@@ -95,6 +100,25 @@ class KeyframePolicy:
     # Set well below the sharp value because absolute variance-of-Laplacian
     # is strongly scene-dependent; the ratio test below does the real work.
     min_sharpness: float = 25.0
+
+    # Consecutive frames below `loss_survival_ratio` required before a
+    # segment is actually broken.
+    #
+    # This was effectively 1 -- a single frame ended the segment. Replaying
+    # the 2026-08-25 walk showed that verdict is usually wrong: of the 50
+    # declared losses, 47 still had survival above the floor measured
+    # against the PREVIOUS frame, and 40 were above 0.20. Only 3 were
+    # genuine. The rest were a stale reference asked to cross a gap in one
+    # hop, where the next frame would have tracked fine.
+    #
+    # 3, measured: 33 -> 27 segments on that walk and 130 -> 99 across the
+    # eight largest captures, with keyframes FALLING (448 -> 429, 1661 ->
+    # 1607) because fewer spurious breaks means fewer segment seeds.
+    #
+    # The cost is bounded: while held, the reference does not advance, so
+    # staleness grows for up to this many frames. That is the right trade
+    # because a boundary is permanent and staleness is not.
+    loss_grace_frames: int = 3
     # Reject a frame markedly blurrier than its recent neighbours, which
     # catches motion blur during a head turn even in a scene whose
     # absolute sharpness is low throughout.
@@ -221,6 +245,10 @@ class KeyframeSelector:
         self._recent_sharpness: list[float] = []
         self._frames_since_keyframe = 0
         self._has_keyframe = False
+        # Consecutive frames currently below the loss floor. Reset by any
+        # frame that tracks, and by a declared loss, so a fresh segment
+        # starts with a whole grace window rather than a spent one.
+        self._consecutive_loss = 0
 
     @property
     def policy(self) -> KeyframePolicy:
@@ -243,6 +271,7 @@ class KeyframeSelector:
     def note_lost(self) -> None:
         self._has_keyframe = False
         self._frames_since_keyframe = 0
+        self._consecutive_loss = 0
 
     @property
     def is_stalled(self) -> bool:
@@ -276,7 +305,19 @@ class KeyframeSelector:
             return KeyframeDecision(ACCEPT, REASON_SESSION_SEED)
 
         if motion.survival_ratio < policy.loss_survival_ratio:
-            return KeyframeDecision(TRACKING_LOST, REASON_TRACKING_LOST)
+            # A break is permanent -- poses either side share no frame --
+            # so it takes sustained evidence, not one bad hop. 47 of the
+            # 50 losses on the real walk recovered on the very next frame.
+            self._consecutive_loss += 1
+            if self._consecutive_loss >= policy.loss_grace_frames:
+                self._consecutive_loss = 0
+                return KeyframeDecision(TRACKING_LOST, REASON_TRACKING_LOST)
+            return KeyframeDecision(REJECT, REASON_TRACKING_HELD)
+
+        # Anything that tracked at all spends the grace window's credit.
+        # Without this, two unrelated bad hops minutes apart would add up
+        # to a break that neither of them earned.
+        self._consecutive_loss = 0
 
         if motion.survival_ratio < policy.min_survival_ratio:
             return KeyframeDecision(REJECT, REASON_TRACKING_DEGRADED)
