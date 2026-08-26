@@ -50,6 +50,30 @@ struct WorldFragmentsModel: Equatable {
     }
 }
 
+extension WorldFragmentsModel {
+    /// Maps a segment-local `(x, z)` into that segment's OWN tile.
+    ///
+    /// Lifted off the view deliberately: this is the single place a shared
+    /// scale could leak in and composite two fragments that share no
+    /// coordinate frame, so it is the one piece of layout that must be
+    /// directly testable rather than merely structurally correct.
+    static func projector(
+        bounds: WorldBounds, size: CGSize
+    ) -> (Double, Double) -> CGPoint {
+        let spanX = Swift.max(bounds.max[0] - bounds.min[0], 1e-6)
+        let spanZ = Swift.max(bounds.max[2] - bounds.min[2], 1e-6)
+        let scale = Swift.min(size.width / spanX, size.height / spanZ) * 0.9
+        let offsetX = (size.width - spanX * scale) / 2
+        let offsetZ = (size.height - spanZ * scale) / 2
+        return { x, z in
+            CGPoint(
+                x: offsetX + (x - bounds.min[0]) * scale,
+                y: offsetZ + (z - bounds.min[2]) * scale
+            )
+        }
+    }
+}
+
 /// One fragment, drawn top-down in its own frame.
 ///
 /// Top-down `(x, z)` and not 3D because `up_axis` is `"unknown"` — a 3D view
@@ -62,7 +86,7 @@ struct FragmentCanvas: View {
     var body: some View {
         Canvas { context, size in
             guard let chunk, let bounds = summary.bounds else { return }
-            let project = projector(bounds: bounds, size: size)
+            let project = WorldFragmentsModel.projector(bounds: bounds, size: size)
 
             for point in chunk.points where point.count == 3 {
                 let p = project(point[0], point[2])
@@ -93,24 +117,6 @@ struct FragmentCanvas: View {
         }
         .background(Color.secondary.opacity(0.08))
     }
-
-    /// Each fragment is framed to its OWN bounds. Fragments share no scale,
-    /// and pretending otherwise is the fabrication this view exists to avoid.
-    private func projector(
-        bounds: WorldBounds, size: CGSize
-    ) -> (Double, Double) -> CGPoint {
-        let spanX = Swift.max(bounds.max[0] - bounds.min[0], 1e-6)
-        let spanZ = Swift.max(bounds.max[2] - bounds.min[2], 1e-6)
-        let scale = Swift.min(size.width / spanX, size.height / spanZ) * 0.9
-        let offsetX = (size.width - spanX * scale) / 2
-        let offsetZ = (size.height - spanZ * scale) / 2
-        return { x, z in
-            CGPoint(
-                x: offsetX + (x - bounds.min[0]) * scale,
-                y: offsetZ + (z - bounds.min[2]) * scale
-            )
-        }
-    }
 }
 
 /// The gallery: known-but-unregistered fragments, plus honest accounts of the
@@ -119,7 +125,7 @@ struct WorldFragmentsView: View {
     let model: WorldFragmentsModel
     let chunks: [String: WorldSegmentChunk]
 
-    private let columns = [GridItem(.adaptive(minimum: 140), spacing: 12)]
+    private var columns: [GridItem] { [GridItem(.adaptive(minimum: 140), spacing: 12)] }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {

@@ -1,4 +1,5 @@
 import XCTest
+import CoreGraphics
 @testable import Glasses
 
 final class WorldGeometryDecoderTests: XCTestCase {
@@ -243,5 +244,28 @@ final class WorldFragmentsModelTests: XCTestCase {
         )
         let model = WorldFragmentsModel(segments: [registered, registered])
         XCTAssertTrue(model.hasSharedFrame)
+    }
+
+    func testEachFragmentIsScaledToItsOwnBoundsAndNeverToASharedOne() {
+        // The load-bearing guarantee, asserted directly rather than by proxy.
+        // Segments share no coordinate frame and their scales disagree by up to
+        // ~87x on a real walk, so a shared scale would composite independent
+        // reconstructions into one plausible-looking, meaningless map.
+        let size = CGSize(width: 100, height: 100)
+        let small = WorldBounds(json: ["min": [0.0, 0.0, 0.0],
+                                       "max": [1.0, 0.0, 1.0]])!
+        let large = WorldBounds(json: ["min": [0.0, 0.0, 0.0],
+                                       "max": [100.0, 0.0, 100.0]])!
+
+        let projectSmall = WorldFragmentsModel.projector(bounds: small, size: size)
+        let projectLarge = WorldFragmentsModel.projector(bounds: large, size: size)
+
+        // The same world coordinate lands in different places, because each
+        // tile is framed to its own extent.
+        XCTAssertNotEqual(projectSmall(1.0, 1.0), projectLarge(1.0, 1.0))
+
+        // And each fragment's own far corner lands at the same relative spot.
+        XCTAssertEqual(projectSmall(1.0, 1.0).x,
+                       projectLarge(100.0, 100.0).x, accuracy: 0.001)
     }
 }
