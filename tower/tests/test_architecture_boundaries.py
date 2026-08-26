@@ -13,11 +13,25 @@ TOWER = pathlib.Path("tower")
 
 
 def _imports(path: pathlib.Path) -> list[str]:
+    """Every module path an import statement reaches, INCLUDING the names.
+
+    Recording only `node.module` for an `ImportFrom` left a hole wide
+    enough to drive the whole boundary through: `from tower import
+    world_builder` reports the module as `tower`, so a shared module could
+    import a cartridge outright and every rule below would see nothing.
+    Emitting `f"{module}.{name}"` alongside closes it, because the
+    predicates match on the qualified package path.
+
+    This was parked once on the belief that fixing it would surface
+    unrelated latent violations. It surfaces none: across `tower/` the
+    extended form yields zero offenders.
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     names: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
             names.append(node.module)
+            names.extend(f"{node.module}.{alias.name}" for alias in node.names)
         elif isinstance(node, ast.Import):
             names.extend(alias.name for alias in node.names)
     return names
