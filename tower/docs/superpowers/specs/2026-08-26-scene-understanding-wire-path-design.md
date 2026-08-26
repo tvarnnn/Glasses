@@ -74,6 +74,26 @@ Self-describing, in the style Object Memory established:
 corpus `person` boxes **are** the wearer's own torso, and no bystander
 footage exists on this host, so an unqualified count would overclaim.
 
+**Added 2026-08-26 — every count is an UNDERCOUNT, and must say so.**
+Measured against a `fasterrcnn_resnet50_fpn_v2` oracle over 14,128 real
+frames (`research/2026-08-26-detector-oracle-and-the-size-floor.md`), the
+shipped detector's recall is **0.306 for `person`**, 0.497 for
+`cell phone`, 0.209 for `tv` — and it is effectively **blind below ~2% of
+frame area** (recall 0.000 under 1%). Disagreement is overwhelmingly
+missing rather than inventing: 40,075 misses against 5,660 inventions.
+And because the oracle shares COCO training data with the shipped model,
+**0.306 is an upper bound**, not an estimate.
+
+So the payload requires `count_is_lower_bound: true` and a
+`count_limitations` entry naming the size floor. A count published without
+it is a new overclaim of exactly the kind this cartridge's contract exists
+to prevent — and the failure is invisible, because an undercount looks
+like a quiet room.
+
+`SCORE_THRESHOLD` is **not** the lever: the F1 sweep is a plateau (0.512 at
+T=0.20 → 0.467 at 0.40) and lowering it buys +0.05 recall for 1.7x the
+false boxes. The floor is the model's, not the threshold's.
+
 **Every boolean must be wrapped in `bool()`.** `bool` subclasses `int` in
 Python, and a `registered: 1` already shipped once this run and would have
 failed every Swift `as? Bool` decode.
