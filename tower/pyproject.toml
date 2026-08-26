@@ -65,7 +65,16 @@ ml = [
     # unconditionally imports a DPT/beit backbone chain that requires it,
     # even to load the "MiDaS_small" model. Without it, DepthEstimation.load()
     # fails with ModuleNotFoundError: No module named 'timm'.
-    "timm",
+    #
+    # Installed and verified on this host 2026-08-26 at 1.0.28. Unlike the
+    # two above it carries no index trap -- it is pure Python on PyPI --
+    # so it takes a floor rather than an exact pin. What WAS checked is
+    # that installing it does not disturb them: pip reported torch and
+    # torchvision "already satisfied", and afterwards both still report
+    # +cu132 with a real matmul executing on sm_120. Re-check that after
+    # any change here; a resolver that decides to "help" with torch is
+    # exactly the failure this block exists to prevent.
+    "timm>=1.0.28",
 ]
 ocr = [
     # Document Memory's text recognition. Chosen after a pip dry-run
