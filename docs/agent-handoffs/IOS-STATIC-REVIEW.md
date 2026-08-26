@@ -1,5 +1,11 @@
 # iOS static review — `integration/world-builder-lifecycle-v1`
 
+> **iOS ENTRY POINT IS `docs/agent-handoffs/IOS-EXECUTION-PLAN.md`.**
+> This file is **REFERENCE**: deeper detail, still accurate except where
+> the plan says otherwise. Read the plan first — it says what to do now,
+> what is already settled, and what the Tower has measured and refused.
+> Where the two disagree, the plan wins.
+
 Compiler's-eye read of the 18 changed Swift files (4,383 lines) plus the
 unchanged files they depend on for types and signatures. **No Swift toolchain
 was available**: nothing here was compiled. Everything below is either a

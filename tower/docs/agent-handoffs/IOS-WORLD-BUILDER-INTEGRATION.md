@@ -1,5 +1,11 @@
 # World Builder on iOS — what to change, and why
 
+> **SUPERSEDED — 2026-08-26.** iOS ownership moved to the Mac lane and the
+> current instructions live in `docs/agent-handoffs/IOS-EXECUTION-PLAN.md`,
+> with wire truth in `docs/contracts/WORLD-BUILDER-GEOMETRY.md`,
+> `docs/contracts/OBJECT-MEMORY.md` and `docs/contracts/WORLD-BUILDER-IOS.md`.
+> Kept for its reasoning; do not execute from it.
+
 **Written:** 2026-08-25
 **Tower branch:** `integration/world-builder-lifecycle-v1`
 **Audience:** whoever holds the Mac.

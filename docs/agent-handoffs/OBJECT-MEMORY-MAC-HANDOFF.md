@@ -1,5 +1,11 @@
 # Object Memory on iOS — handoff to a machine with a Swift toolchain
 
+> **iOS ENTRY POINT IS `docs/agent-handoffs/IOS-EXECUTION-PLAN.md`.**
+> This file is **REFERENCE**: deeper detail, still accurate except where
+> the plan says otherwise. Read the plan first — it says what to do now,
+> what is already settled, and what the Tower has measured and refused.
+> Where the two disagree, the plan wins.
+
 **Everything described here is UNCOMPILED and UNVERIFIED.** It was written on
 Windows, where `swiftc`, `swift` and `xcodebuild` are all absent. No build has
 been attempted, no test has been executed, no simulator has been launched, and
