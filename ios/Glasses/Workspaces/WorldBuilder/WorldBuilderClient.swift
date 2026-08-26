@@ -65,25 +65,30 @@ extension WorldBuilderClient {
     }
 }
 
-/// The only World Builder client that exists: the Tower has no world builder,
-/// and says so.
+/// A World Builder client with no Tower behind it.
 ///
-/// Not a stub in the pejorative sense — it is the correct and complete
-/// implementation of the current situation. Replacing it later is an addition,
-/// not a correction.
+/// **No longer the only one.** `TowerWorldBuilderClient` is what the app graph
+/// builds, and this is what remains when there is deliberately no connection to
+/// build it from — the `CartridgeClients` default, and the client a test
+/// substitutes when it wants a workspace with no transport underneath it.
+///
+/// Kept rather than deleted because "this build has no Tower-backed client for
+/// this cartridge" is still a state the other three cartridges are in, and
+/// because the shape of a client that reports one constant is the thing the
+/// protocol's default `stateUpdates` was written for.
 @MainActor
 final class UnavailableWorldBuilderClient: WorldBuilderClient {
     /// Written for a person, not a log. The workspace shows this verbatim, so
     /// it has to explain the situation without implying either that something
     /// is broken or that a world is coming imminently.
     ///
-    /// Note what it does **not** say: anything about what the Tower stores.
-    /// This app has no channel through which it could know that, and a
-    /// reassurance it cannot support is worse than silence (Rule 3).
+    /// Note what it does **not** say: anything about what the Tower can or
+    /// cannot do. This client has no channel through which it could know —
+    /// that is precisely what makes it this client — and describing the other
+    /// machine from here would be a fabricated report about it (Rule 3).
     static let reason = """
-        The Tower does not build worlds yet. Frames captured here reach the \
-        Tower and are answered by its current fixed handler with a single \
-        per-frame measurement — not a spatial model.
+        This screen is not connected to a world builder. Nothing is being \
+        asked of the Tower and nothing it may have built is being read.
         """
 
     let cartridgeID = "world-build"

@@ -9,6 +9,7 @@
 //  the actual Tower.
 //
 
+import Combine
 import UIKit
 import XCTest
 
@@ -56,6 +57,21 @@ final class TowerClientTests: XCTestCase {
         return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
 
+    /// `XCTAssertTrue(await waitUntil { … })` does not compile — an autoclosure
+    /// cannot carry an `await` — so the assertion is wrapped rather than
+    /// hoisted at every call site. `#filePath`/`#line` default arguments keep
+    /// the failure pointing at the test rather than at this helper.
+    private func expect(
+        _ message: @autoclosure () -> String = "the condition was never met",
+        timeout: TimeInterval = 3,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ condition: @MainActor () -> Bool
+    ) async {
+        let met = await waitUntil(timeout: timeout, condition)
+        XCTAssertTrue(met, message(), file: file, line: line)
+    }
+
     private func waitUntil(
         timeout: TimeInterval = 3,
         _ condition: @MainActor () -> Bool
@@ -66,6 +82,18 @@ final class TowerClientTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 25_000_000)
         }
         return condition()
+    }
+
+    /// Waits for the connection's own capability request to land.
+    ///
+    /// `TowerClient` sends `{"type":"cartridges"}` once per connection, right
+    /// after the pong. Tests that assert "nothing else reached the wire" have
+    /// to take their baseline *after* it, or they are racing the handshake
+    /// rather than measuring what they claim to measure.
+    private func waitForDiscovery(_ recorder: MessageRecorder) async -> Bool {
+        await waitUntil {
+            recorder.all.compactMap(self.decode).contains { $0["type"] as? String == "cartridges" }
+        }
     }
 
     private func makeTestImage() -> UIImage {
@@ -1187,6 +1215,8 @@ final class TowerClientTests: XCTestCase {
             recorder.all.compactMap(self.decode).contains { $0["type"] as? String == "stream_start" }
         }
         XCTAssertTrue(bracketLanded)
+        let discovered = await waitForDiscovery(recorder)
+        XCTAssertTrue(discovered, "the connection's own discovery never landed")
 
         let baseline = recorder.all.count
 
@@ -1242,6 +1272,8 @@ final class TowerClientTests: XCTestCase {
         client.connect(to: url(port: port))
         let becameOnline = await waitUntil { client.status == .online }
         XCTAssertTrue(becameOnline, "expected .online, got \(client.status)")
+        let discovered = await waitForDiscovery(recorder)
+        XCTAssertTrue(discovered, "the connection's own discovery never landed")
 
         let baseline = recorder.all.count
 
@@ -1310,11 +1342,376 @@ final class TowerClientTests: XCTestCase {
 
         client.disconnect()
     }
+
+    // MARK: - 20. The result channel
+
+    private static let worldBuilderContract = "world_builder.status/2026-08-23"
+
+    private var declarationJSON: String {
+        """
+        {"type":"cartridges",
+         "envelope_contract":"cartridge_results.envelope/2026-08-23",
+         "cartridges":[{"cartridge":"world_builder","result_type":"status",
+                        "contract":"\(Self.worldBuilderContract)",
+                        "available":true,"unavailable_reason":null,
+                        "snapshot_only":true}],
+         "not_offered":[{"cartridge":"document_memory","reason":"no contract offered"}]}
+        """
+    }
+
+    /// A `cartridge_result` carrying a live world, shaped exactly as the Tower's
+    /// `_attach_ios_projection` builds it.
+    private func resultJSON(
+        seq: Int,
+        revision: String,
+        revisionChanged: Bool = true,
+        modelState: String = "receiving",
+        keyframes: Int = 4
+    ) -> String {
+        """
+        {"type":"cartridge_result",
+         "envelope_contract":"cartridge_results.envelope/2026-08-23",
+         "subscription_id":"sub-1","cartridge":"world_builder","result_type":"status",
+         "contract":"\(Self.worldBuilderContract)",
+         "seq":\(seq),"revision":"\(revision)","revision_changed":\(revisionChanged),
+         "coalesced":0,"cursor_status":null,"snapshot":true,
+         "tower_sent_at":1787463092.958,"time_basis":"tower-receipt",
+         "payload":{"model_state":"\(modelState)","model_state_reason":null,
+           "world_snapshot":{"name":"Probe Room","world_id":"be5076",
+             "keyframe_count":\(keyframes),"revision":"\(revision)",
+             "tracking":"good","scale":"relative","mapping_seconds":0.0789,
+             "calibration":"calibrated",
+             "geometry":{"representation":"sparse point cloud","element_count":1360,
+                         "is_incremental":false},
+             "trajectory":{"pose_count":\(keyframes),"path_length":2.853,
+                           "path_length_unit":"world units","scale":"relative"},
+             "persistence":{"state":"saved","revision":"67ccaee7"}}}}
+        """
+    }
+
+    /// Collects result-channel events off the client's publisher.
+    private func collectEvents(_ client: TowerClient) -> EventRecorder {
+        let recorder = EventRecorder()
+        recorder.cancellable = client.cartridgeResults.sink { recorder.record($0) }
+        return recorder
+    }
+
+    /// Discovery must follow the pong, never precede it.
+    ///
+    /// The Tower never speaks first, so nothing can arrive early — but a client
+    /// that asked for capabilities before validating would read its own reply
+    /// into the handshake, which is the one ordering the contract calls out.
+    func testCapabilityDiscoveryIsSentOnceAndOnlyAfterThePong() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = attachRecorder(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+        let discovered = await waitForDiscovery(recorder)
+        XCTAssertTrue(discovered)
+
+        let types = recorder.all.compactMap(decode).compactMap { $0["type"] as? String }
+        XCTAssertEqual(types.first, "ping", "something reached the Tower before the handshake")
+        XCTAssertEqual(
+            types.filter { $0 == "cartridges" }.count,
+            1,
+            "capability discovery was sent more than once for one connection"
+        )
+
+        client.disconnect()
+    }
+
+    /// The declaration is cached, and it is cached as what the Tower said —
+    /// not reduced to a boolean on the way in.
+    func testTheCartridgeDeclarationIsDecodedAndCached() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+
+        server.send(text: declarationJSON)
+        await expect { client.cartridgeDeclaration != nil }
+
+        let offer = client.cartridgeDeclaration?.offer(forTowerCartridge: "world_builder")
+        XCTAssertEqual(offer?.contract, Self.worldBuilderContract)
+        XCTAssertEqual(offer?.resultType, "status")
+        XCTAssertEqual(offer?.available, true)
+        XCTAssertEqual(offer?.snapshotOnly, true)
+        XCTAssertNil(offer?.unavailableReason)
+        XCTAssertEqual(
+            client.cartridgeDeclaration?.envelopeContract,
+            "cartridge_results.envelope/2026-08-23"
+        )
+        // `not_offered` is for operators. Reading presence there as an offer is
+        // the mistake the contract names, so it is not decoded at all.
+        XCTAssertNil(client.cartridgeDeclaration?.offer(forTowerCartridge: "document_memory"))
+
+        client.disconnect()
+    }
+
+    /// What the Tower can do is a property of the Tower's build, not of this
+    /// socket. Clearing the cache on a drop would turn every blip into "this
+    /// will never work" when the truthful reading is "not reachable".
+    func testTheDeclarationSurvivesADisconnect() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+        server.send(text: declarationJSON)
+        await expect { client.cartridgeDeclaration != nil }
+
+        client.disconnect()
+        XCTAssertNotNil(client.cartridgeDeclaration)
+        XCTAssertEqual(
+            TowerCapabilities.availability(
+                for: "world-build",
+                declaredBy: client.cartridgeDeclaration,
+                isTowerReachable: false
+            ),
+            .towerUnreachable
+        )
+    }
+
+    /// The envelope decodes, and the ordering between the ack and the snapshot
+    /// that follows it is preserved — which is why they share one stream.
+    func testTheResultChannelDeliversAckThenSnapshotInOrder() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        let events = collectEvents(client)
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+
+        server.send(text: """
+            {"type":"result_subscribed","envelope_contract":"cartridge_results.envelope/2026-08-23",
+             "subscription_id":"sub-1","cartridge":"world_builder","result_type":"status",
+             "contract":"\(Self.worldBuilderContract)","snapshot_only":true,
+             "world_id":null,"session_id":null,"cursor_status":"absent"}
+            """)
+        server.send(text: resultJSON(seq: 1, revision: "e252f739c1cdedab"))
+
+        await expect { events.all.count >= 2 }
+
+        guard case .subscribed(let ack) = events.all[0] else {
+            return XCTFail("expected the ack first, got \(events.all[0])")
+        }
+        XCTAssertEqual(ack.subscriptionID, "sub-1")
+        XCTAssertEqual(ack.cursorStatus, "absent")
+
+        guard case .result(let envelope) = events.all[1] else {
+            return XCTFail("expected the snapshot second, got \(events.all[1])")
+        }
+        XCTAssertEqual(envelope.sequence, 1)
+        XCTAssertEqual(envelope.revision, "e252f739c1cdedab")
+        XCTAssertTrue(envelope.revisionChanged)
+        XCTAssertEqual(envelope.coalesced, 0)
+        XCTAssertTrue(envelope.isSnapshot)
+        XCTAssertEqual(envelope.payload["model_state"] as? String, "receiving")
+
+        client.disconnect()
+    }
+
+    /// Every `result_error` is non-fatal on this socket, including the two the
+    /// Tower sends unsolicited — which carry no `envelope_contract` at all, and
+    /// would fail a decoder that required one.
+    func testEveryResultErrorLeavesTheFramePathWorking() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        let events = collectEvents(client)
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+
+        // Solicited, with reason-specific extras.
+        server.send(text: """
+            {"type":"result_error","envelope_contract":"cartridge_results.envelope/2026-08-23",
+             "reason":"unknown_cartridge","message":"no such cartridge",
+             "cartridge":"nope","result_type":"status","offered":["world_builder"]}
+            """)
+        // Unsolicited, and deliberately without `envelope_contract`.
+        server.send(text: """
+            {"type":"result_error","reason":"consumer_too_slow","subscription_id":"sub-1",
+             "cartridge":"world_builder","result_type":"status","message":"closed"}
+            """)
+        // Two keys and nothing else.
+        server.send(text: #"{"type":"result_unsubscribed","subscription_id":"sub-1"}"#)
+        // The Tower saying it does not implement something we sent.
+        server.send(text: """
+            {"type":"protocol_error","reason":"unknown_message_type",
+             "message_type":42,"message":"this Tower does not implement that message type"}
+            """)
+
+        await expect { events.all.count >= 3 }
+
+        let errors = events.all.compactMap { event -> CartridgeResultError? in
+            if case .failed(let error) = event { return error }
+            return nil
+        }
+        XCTAssertEqual(errors.map(\.reason), ["unknown_cartridge", "consumer_too_slow"])
+        XCTAssertFalse(errors[0].closesSubscription)
+        XCTAssertTrue(errors[1].closesSubscription)
+        XCTAssertEqual(errors[1].subscriptionID, "sub-1")
+
+        // The whole point: the connection and the frame path are untouched.
+        server.send(text: #"{"type":"frame_result","seq":7,"mean_intensity":0.3,"processing_ms":3.2}"#)
+        await expect { client.frameResultCount >= 1 }
+        XCTAssertEqual(client.status, .online)
+
+        client.disconnect()
+    }
+
+    /// `frame_result` must be field-for-field what it always was while results
+    /// share the socket. One TCP stream, two message families, demultiplexed by
+    /// `type` and nothing else.
+    func testFrameResultIsUnaffectedByResultTrafficOnTheSameSocket() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+
+        server.send(text: declarationJSON)
+        server.send(text: #"{"type":"frame_result","seq":1,"mean_intensity":0.42,"processing_ms":8.5}"#)
+        server.send(text: resultJSON(seq: 1, revision: "aaaa"))
+        server.send(text: #"{"type":"frame_result","seq":2,"mean_intensity":0.51,"processing_ms":3.1}"#)
+
+        await expect { client.frameResultCount >= 2 }
+        XCTAssertEqual(client.latestFrameResult?.sequence, 2)
+        XCTAssertEqual(client.latestFrameResult?.meanIntensity, 0.51)
+        XCTAssertEqual(client.latestFrameResult?.processingMs, 3.1)
+        XCTAssertEqual(client.status, .online)
+
+        client.disconnect()
+    }
+
+    /// A malformed result message is dropped, not escalated. It must not be
+    /// published as an event and must not disturb anything else.
+    func testAnUndecodableResultMessageIsDroppedRatherThanPublished() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        let events = collectEvents(client)
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+
+        // No `payload`, so there is no result to publish.
+        server.send(text: #"{"type":"cartridge_result","cartridge":"world_builder","result_type":"status"}"#)
+        // No `reason`, so there is no error to publish.
+        server.send(text: #"{"type":"result_error","message":"?"}"#)
+        server.send(text: #"{"type":"frame_result","seq":1,"mean_intensity":0.1,"processing_ms":1.0}"#)
+
+        await expect { client.frameResultCount >= 1 }
+        XCTAssertTrue(events.all.isEmpty, "an undecodable message was published as an event")
+        XCTAssertEqual(client.status, .online)
+
+        client.disconnect()
+    }
+
+    /// A subscribe request is exactly the four fields the Tower validates, and
+    /// the contract is included so a disagreement is refused rather than
+    /// misinterpreted.
+    func testSubscribeSendsTheContractSoAMismatchIsRefused() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = attachRecorder(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+
+        client.subscribeToResults(
+            cartridge: "world_builder",
+            resultType: "status",
+            contract: Self.worldBuilderContract
+        )
+        let landed = await waitUntil {
+            recorder.all.compactMap(self.decode).contains { $0["type"] as? String == "result_subscribe" }
+        }
+        XCTAssertTrue(landed)
+
+        let request = recorder.all.compactMap(decode)
+            .first { $0["type"] as? String == "result_subscribe" }
+        XCTAssertEqual(request?["cartridge"] as? String, "world_builder")
+        XCTAssertEqual(request?["result_type"] as? String, "status")
+        XCTAssertEqual(request?["contract"] as? String, Self.worldBuilderContract)
+
+        client.disconnect()
+    }
+
+    /// A result-channel send that fails must not fail the connection.
+    ///
+    /// The contract promises the result channel cannot affect the frame path,
+    /// and tearing down the socket the camera is streaming over because a
+    /// capability query did not land would break exactly that promise. The
+    /// lifecycle markers deliberately do the opposite, because losing one
+    /// corrupts a frame bracket.
+    func testAFailedResultSendIsNotEscalatedToTheConnection() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+
+        // The server goes away without a close frame, so the next send fails
+        // at the socket rather than being refused by the `status` guard.
+        server.dropConnection()
+        server.stop()
+        client.subscribeToResults(
+            cartridge: "world_builder",
+            resultType: "status",
+            contract: Self.worldBuilderContract
+        )
+
+        // The receive loop will still notice the dead link on its own terms —
+        // what must not happen is this client reaching `.failed` *because of
+        // the subscribe*. Give the send's completion time to run and assert the
+        // failure, if any, did not come from here.
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        if case .failed(let message) = client.status {
+            XCTAssertFalse(
+                message.contains("result_subscribe"),
+                "a result-channel send failure was escalated to the connection"
+            )
+        }
+
+        client.disconnect()
+    }
 }
 
 /// Thread-safe capture of every text message a MockTowerServer receives, so
 /// tests can assert on the exact sequence/content sent over the wire.
-private final class MessageRecorder: @unchecked Sendable {
+///
+/// Not `private`: `WorldBuilderIntegrationTests` asserts on the wire for the
+/// same reason this file does — "the client sent exactly one subscribe" is only
+/// checkable against what actually left the socket — and a second copy of this
+/// would be two things that could disagree about what was recorded.
+final class MessageRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var messages: [String] = []
 
@@ -1329,4 +1726,17 @@ private final class MessageRecorder: @unchecked Sendable {
         defer { lock.unlock() }
         return messages
     }
+}
+
+
+/// Collects result-channel events in arrival order.
+///
+/// A class rather than an array so a `sink` can append to it from the escaping
+/// closure, and `@MainActor` because that is where `TowerClient` publishes.
+@MainActor
+final class EventRecorder {
+    private(set) var all: [CartridgeResultEvent] = []
+    var cancellable: AnyCancellable?
+
+    func record(_ event: CartridgeResultEvent) { all.append(event) }
 }

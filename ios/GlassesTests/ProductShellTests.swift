@@ -436,24 +436,183 @@ final class CartridgeIntegrationTests: XCTestCase {
 
     // MARK: What the Tower has declared
 
-    /// The whole current state of Tower integration, asserted rather than
-    /// assumed. When the first real contract lands this test fails, and that
-    /// failure is the intended signal to review every consumer — it is not a
-    /// nuisance to delete.
-    func testTheTowerDeclaresNoCartridgeContracts() {
-        XCTAssertTrue(
-            TowerCapabilities.declared.isEmpty,
-            "a Tower contract appeared; every cartridge's client must be reviewed"
+    /// The state of Tower integration, asserted rather than assumed.
+    ///
+    /// This test used to assert both tables were empty, and its own comment
+    /// said that the first real contract landing should make it fail as a
+    /// signal to review every consumer. That happened: the Tower now declares
+    /// `world_builder.status/2026-08-23` over the socket, and every consumer
+    /// was reviewed. What it pins now is the same property in its new form —
+    /// **exactly one contract is implemented, and it is that one** — so a
+    /// second one appearing is still a review and not a silent widening.
+    func testTheTowerDeclaresOnlyTheWorldBuilderContract() {
+        XCTAssertEqual(
+            TowerCapabilities.supported,
+            [WorldBuilderResultContract.identifier],
+            "this build's implemented contracts changed; every cartridge's client must be reviewed"
         )
         XCTAssertTrue(
-            TowerCapabilities.supported.isEmpty,
-            "this build claims to implement a contract that does not exist"
+            TowerCapabilities.declared.isEmpty,
+            """
+            a contract was hardcoded into the local table. World Builder's arrives \
+            over the socket, and a compile-time copy is a second answer that can \
+            disagree with the Tower's.
+            """
         )
     }
 
-    /// No cartridge becomes usable by connecting. Connectivity is not the thing
-    /// that is missing, and a UI that suggested otherwise would send a user
-    /// round a loop that cannot terminate.
+    /// The Tower's name for a cartridge is not this app's, and exactly one
+    /// cartridge has both.
+    func testTheCartridgeNameMappingCoversOnlyWorldBuilder() {
+        XCTAssertEqual(
+            TowerCapabilities.towerCartridgeNames,
+            ["world-build": "world_builder"]
+        )
+        for cartridge in Cartridge.catalog where cartridge.id != "world-build" {
+            XCTAssertNil(
+                TowerCapabilities.towerCartridgeNames[cartridge.id],
+                "\(cartridge.name) gained a Tower name without a client to use it"
+            )
+        }
+    }
+
+    // MARK: Availability against a live declaration
+
+    private func declaration(
+        cartridge: String = "world_builder",
+        contract: String = WorldBuilderResultContract.identifier,
+        available: Bool = true,
+        reason: String? = nil
+    ) -> TowerCartridgeDeclaration {
+        TowerCartridgeDeclaration(
+            envelopeContract: "cartridge_results.envelope/2026-08-23",
+            offers: [
+                TowerCartridgeOffer(
+                    json: [
+                        "cartridge": cartridge,
+                        "result_type": "status",
+                        "contract": contract,
+                        "available": available,
+                        "unavailable_reason": reason as Any,
+                        "snapshot_only": true,
+                    ]
+                )!
+            ]
+        )
+    }
+
+    /// A Tower that has declared nothing is indistinguishable from one that
+    /// never will — which is correct, because from here it is.
+    func testWorldBuilderIsUnavailableUntilTheTowerDeclaresIt() {
+        XCTAssertEqual(
+            TowerCapabilities.availability(
+                for: "world-build",
+                declaredBy: nil,
+                isTowerReachable: true
+            ),
+            .noContract
+        )
+    }
+
+    /// The declaration is what makes it available, and connectivity is the
+    /// second gate rather than the first.
+    func testADeclaredWorldBuilderContractBecomesAvailableWhenReachable() {
+        let declared = declaration()
+        XCTAssertEqual(
+            TowerCapabilities.availability(
+                for: "world-build",
+                declaredBy: declared,
+                isTowerReachable: true
+            ),
+            .available(
+                CartridgeContract(
+                    cartridgeID: "world-build",
+                    identifier: WorldBuilderResultContract.identifier
+                )
+            )
+        )
+        XCTAssertEqual(
+            TowerCapabilities.availability(
+                for: "world-build",
+                declaredBy: declared,
+                isTowerReachable: false
+            ),
+            .towerUnreachable,
+            "a declared contract must read as disconnected, not as absent, while the socket is down"
+        )
+    }
+
+    /// A Tower speaking a different dated contract is a disagreement, not a
+    /// version to compare. It must reach `.unsupportedContract`, which tells a
+    /// person to update the app rather than to reconnect.
+    func testAnUndatedOrLaterContractIsNotDecodedOnAGuess() {
+        for identifier in ["world_builder.status/2027-01-01", "world_builder.status/2026-01-01", "v2"] {
+            XCTAssertEqual(
+                TowerCapabilities.availability(
+                    for: "world-build",
+                    declaredBy: declaration(contract: identifier),
+                    isTowerReachable: true
+                ),
+                .unsupportedContract(
+                    declared: CartridgeContract(cartridgeID: "world-build", identifier: identifier)
+                ),
+                "contract \(identifier) was treated as compatible"
+            )
+        }
+    }
+
+    /// `available: false` is an offer, not silence. Collapsing it to
+    /// `.noContract` would render "no world root is configured" as "this Tower
+    /// will never do this" — a different and wrong claim, calling for a
+    /// different response from a person.
+    func testAnUnavailableOfferIsStillAnOffer() {
+        XCTAssertEqual(
+            TowerCapabilities.availability(
+                for: "world-build",
+                declaredBy: declaration(available: false, reason: "no world root is configured"),
+                isTowerReachable: true
+            ),
+            .available(
+                CartridgeContract(
+                    cartridgeID: "world-build",
+                    identifier: WorldBuilderResultContract.identifier
+                )
+            )
+        )
+    }
+
+    /// A declaration naming some other cartridge must not make World Builder
+    /// available, and must not make that other cartridge available either —
+    /// this build has no client for it.
+    func testADeclarationForAnotherCartridgeChangesNothing() {
+        let other = declaration(cartridge: "scene_understanding", contract: "scene.v1")
+        XCTAssertEqual(
+            TowerCapabilities.availability(
+                for: "world-build",
+                declaredBy: other,
+                isTowerReachable: true
+            ),
+            .noContract
+        )
+        XCTAssertEqual(
+            TowerCapabilities.availability(
+                for: "scene-understanding",
+                declaredBy: other,
+                isTowerReachable: true
+            ),
+            .noContract,
+            "a cartridge with no name mapping and no client became available"
+        )
+    }
+
+    /// No cartridge becomes usable by connecting **alone**. Connectivity is the
+    /// second gate, never the first: a declaration has to arrive as well, and
+    /// a UI that suggested reconnecting would fix a missing contract would send
+    /// a user round a loop that cannot terminate.
+    ///
+    /// Asserted through the no-declaration entry point, which is still the
+    /// whole truth for the three cartridges the Tower lists under
+    /// `not_offered`.
     func testNoCartridgeIsAvailableWhetherOrNotTheTowerIsReachable() {
         for cartridge in Cartridge.catalog {
             for reachable in [true, false] {

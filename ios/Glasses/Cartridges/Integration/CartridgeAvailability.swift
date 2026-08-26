@@ -84,11 +84,16 @@ enum CartridgeAvailability: Equatable, Sendable {
     func explanation(cartridgeName: String) -> String? {
         switch self {
         case .noContract:
+            // Deliberately says only what is observable from here. It used to
+            // assert that the Tower "has no module runtime at all", which was
+            // true of every cartridge until one of them gained a contract and
+            // is now a claim this app cannot make on the Tower's behalf — the
+            // Tower declares each cartridge separately, and silence about one
+            // says nothing about the others.
             return """
-                The Tower does not run \(cartridgeName) yet. It has no module \
-                runtime at all — frames sent from this app reach its current \
-                fixed handler, which returns a simple per-frame result and \
-                nothing else.
+                This Tower has not declared a \(cartridgeName) contract, so \
+                there is nothing to ask it for. That is a statement about what \
+                the Tower offers, not about this connection.
                 """
         case .unsupportedContract(let contract):
             return """

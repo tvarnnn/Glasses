@@ -10,16 +10,18 @@ import SwiftUI
 /// be drawn, and today the place the app explains that there is not one.
 ///
 /// It renders `WorldModelState` and nothing else, so it cannot show geometry
-/// the Tower did not send. Today the only reachable state is `.unsupported`,
-/// because `UnavailableWorldBuilderClient` is the only client that exists.
+/// the Tower did not send. Every state is now reachable:
+/// `TowerWorldBuilderClient` maps the Tower's `model_state` onto them.
 ///
 /// Deliberately absent, and each for a reason:
 ///
 /// - **No 3D framework.** SceneKit, RealityKit and Metal would all be weight
-///   in exchange for nothing to render. When a representation exists — point
-///   cloud, sparse landmarks, trajectory, or whatever the Tower chooses — it
-///   is added behind `.receiving`/`.finalized` without disturbing anything
-///   here. Nothing in this view assumes which one it will be.
+///   in exchange for nothing to render — and there is still nothing, because
+///   the result channel carries **no imagery, no poses, no points and no
+///   paths**, only counts, states and summaries. The Tower has the trajectory
+///   and the keyframe images on disk; sending them needs a consumer that does
+///   not exist yet, and building the transport first is the fabricated
+///   contract this project refuses.
 /// - **No animated placeholder.** A drifting point cloud would look like
 ///   progress and be a fabrication.
 /// - **No spinner in the unsupported state.** A spinner claims work is
@@ -68,10 +70,13 @@ struct WorldCanvasView: View {
         }
     }
 
+    /// Shown only where the panel has nothing else to say. It describes the
+    /// fields this panel draws **when the Tower reports them** — which is a
+    /// claim about this build, not a promise about the Tower's roadmap.
     private static let futureDescription = """
-        When the Tower can build worlds, this panel will show the model it is \
-        assembling, how well it is tracking, whether its scale is relative or \
-        estimated, and how far the camera travelled. None of those exist yet.
+        When the Tower reports a world, this panel shows the keyframes it kept, \
+        how well it is tracking, whether its scale is relative or unknown, and \
+        what it built. Fields it does not report are not drawn.
         """
 
     // MARK: The panel for a Tower that can actually answer
@@ -96,8 +101,14 @@ struct WorldCanvasView: View {
             unsupported(reason)
 
         case .idle:
-            headline("Not started", systemImage: "cube.transparent")
-            detailText("Start a capture session to begin building a world.")
+            headline("No world yet", systemImage: "cube.transparent")
+            // Not "start a capture session to begin building a world". The
+            // Tower reaches this state by having no world to report, and
+            // capture alone does not create one — reconstruction runs in a
+            // separate Tower process reading the capture from disk, which
+            // this app can neither start nor see. Promising a world in
+            // exchange for a tap would be a claim about the other machine.
+            detailText("The Tower has not reported a world. Frames from a capture session reach it; what it builds from them is its own to start.")
 
         case .awaitingFirstUpdate:
             // The one honest use of a progress indicator: frames really are
@@ -171,8 +182,8 @@ struct WorldCanvasView: View {
 /// drawn as "—". That is the difference between a panel that is early and a
 /// panel that looks broken.
 ///
-/// Unreachable today — no client produces a snapshot — but written now so the
-/// display rule below lands with the data rather than after it.
+/// Reached from `.receiving`, `.finalizing` and `.finalized`, all three of
+/// which `TowerWorldBuilderClient` now produces from real Tower snapshots.
 struct WorldSummaryView: View {
     let snapshot: WorldSnapshot
     let isLive: Bool
@@ -243,10 +254,16 @@ struct WorldSummaryView: View {
         if let poses = snapshot.trajectory.poseCount {
             row("Camera poses", "\(poses)")
         }
-        if snapshot.trajectory.distanceDisplayable, let length = snapshot.trajectory.pathLength {
-            // The Tower's unit, or none. See `ReportedFigure`.
+        if snapshot.trajectory.labelledFigureDisplayable, let length = snapshot.trajectory.pathLength {
+            // The Tower's unit, always. `labelledFigureDisplayable` refuses
+            // when there is none, so `ReportedFigure` cannot be reached here
+            // with a bare number.
             row("Path length", ReportedFigure.format(length, unit: snapshot.trajectory.pathLengthUnit))
-            if snapshot.trajectory.scale.isEstimate {
+            // Said for every scale that is not a plain measurement, not only
+            // for estimates: `.relative` needs the sentence most of all,
+            // because "2.9 world units" is the one figure on this panel a
+            // reader might otherwise take for a distance.
+            if snapshot.trajectory.scale != .measuredMetric {
                 caption(snapshot.trajectory.scale.explanation)
             }
         }

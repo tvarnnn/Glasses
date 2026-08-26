@@ -167,6 +167,39 @@ final class TowerClient: NSObject, ObservableObject {
     /// `ProjectManager`, which owns both.
     private let metrics: SenderMetrics
 
+    // MARK: Result channel
+
+    /// The Tower's most recent capability declaration, cached.
+    ///
+    /// Requested once per connection, immediately after the pong — the contract
+    /// requires discovery to follow handshake validation, and asking earlier
+    /// would read our own reply into the handshake.
+    ///
+    /// **Deliberately not cleared on teardown.** What the Tower can do is a
+    /// property of the Tower's build, not of this socket. Clearing it would
+    /// turn every dropped connection into `.noContract` — "this will never
+    /// work" — when the truthful reading is `.towerUnreachable`, and those two
+    /// call for opposite responses from a person.
+    @Published private(set) var cartridgeDeclaration: TowerCartridgeDeclaration?
+
+    /// Every result-channel message, in arrival order.
+    ///
+    /// A subject rather than four `@Published` properties because ordering
+    /// between them is load-bearing: `result_subscribed` is followed
+    /// immediately by the first `cartridge_result`, and a consumer that saw
+    /// them out of order would file the snapshot against no subscription.
+    private let resultEvents = PassthroughSubject<CartridgeResultEvent, Never>()
+
+    /// The result channel, for whoever owns a cartridge's contract.
+    ///
+    /// `TowerClient` decodes the envelope and nothing else. It does not know
+    /// what a world is, does not subscribe on anyone's behalf, and holds no
+    /// cartridge state — the cartridge client owned by `ProjectManager` does
+    /// all three. That split is what keeps this file cartridge-blind.
+    var cartridgeResults: AnyPublisher<CartridgeResultEvent, Never> {
+        resultEvents.eraseToAnyPublisher()
+    }
+
     private var session: URLSession?
     private var webSocketTask: URLSessionWebSocketTask?
     private var validationTask: Task<Void, Never>?
@@ -677,6 +710,82 @@ final class TowerClient: NSObject, ObservableObject {
     }
     #endif
 
+    // MARK: - Result channel: outbound
+
+    /// Asks the Tower what it can report on.
+    ///
+    /// Sent once per connection, from `validateConnection` after the pong has
+    /// been read — never before. Not `#if DEBUG`: the result channel is
+    /// read-only and says nothing about frames, so a Release build that cannot
+    /// stream is still entitled to a truthful answer about what the Tower can
+    /// do.
+    func requestCartridgeDeclaration() {
+        sendResultMessage(["type": "cartridges"], label: "cartridges")
+    }
+
+    /// Opens a subscription. The reply is a `result_subscribed` followed
+    /// immediately by a complete snapshot, whatever cursor was sent.
+    ///
+    /// `contract` is included so the Tower refuses outright rather than
+    /// serving a payload this build was not written against — a
+    /// `contract_mismatch` error is a better outcome than a silent
+    /// misinterpretation.
+    func subscribeToResults(cartridge: String, resultType: String, contract: String) {
+        sendResultMessage(
+            [
+                "type": "result_subscribe",
+                "cartridge": cartridge,
+                "result_type": resultType,
+                "contract": contract,
+            ],
+            label: "result_subscribe(\(cartridge))"
+        )
+    }
+
+    /// Closes a subscription. Not required before disconnecting — the Tower
+    /// treats a closed socket as sufficient cleanup — so this exists for the
+    /// case where the connection outlives the reason to be subscribed.
+    func unsubscribeFromResults(subscriptionID: String) {
+        sendResultMessage(
+            ["type": "result_unsubscribe", "subscription_id": subscriptionID],
+            label: "result_unsubscribe(\(subscriptionID))"
+        )
+    }
+
+    /// Shared send path for the three result-channel messages.
+    ///
+    /// **A send failure here is logged and not escalated**, which is the one
+    /// way this differs from `sendLifecycleMarker`. A lifecycle marker defines
+    /// a frame bracket and losing one corrupts the counts on both sides, so
+    /// that path fails the connection; a subscribe is a request for a report,
+    /// and tearing down the socket the camera is streaming over because a
+    /// capability query did not land would let the result channel do the one
+    /// thing the contract promises it cannot — affect the frame path. If the
+    /// socket really is gone, the receive loop notices it on its own terms.
+    private func sendResultMessage(_ object: [String: Any], label: String) {
+        guard status == .online, let task = webSocketTask else {
+            log("\(label) not sent — Tower not online (status=\(status))")
+            return
+        }
+        guard
+            let jsonData = try? JSONSerialization.data(withJSONObject: object),
+            let jsonText = String(data: jsonData, encoding: .utf8)
+        else {
+            log("\(label) failed to serialize JSON payload")
+            return
+        }
+        task.send(.string(jsonText)) { [weak self] error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let error {
+                    self.log("\(label) send failed (not escalated): \(error.localizedDescription)")
+                } else {
+                    self.log("\(label) sent")
+                }
+            }
+        }
+    }
+
     /// Sends one ping and validates the pong within a bounded timeout. On
     /// success, hands off to the continuous receive loop.
     private func validateConnection(task: URLSessionWebSocketTask) async {
@@ -713,6 +822,12 @@ final class TowerClient: NSObject, ObservableObject {
             becameOnlineAt = MonotonicClock.now
             status = .online
             startReceiveLoop(task: task)
+            // After the pong, never before. The Tower never speaks first, so
+            // nothing could have arrived early — but asking before validating
+            // would mean reading our own reply into the handshake, which is
+            // the failure the contract warns about. The receive loop is
+            // already running, so the answer has somewhere to land.
+            requestCartridgeDeclaration()
         } catch is CancellationError {
             // disconnect() was called mid-validation; state already handled there.
         } catch {
@@ -803,6 +918,73 @@ final class TowerClient: NSObject, ObservableObject {
             )
             #endif
             metrics.recordFrameResult()
+
+        // MARK: Result channel
+        //
+        // Every case below is additive and none of them can affect the frame
+        // path: they decode, publish, and return. Nothing here touches
+        // `status`, the send window, or the stream bracket — which is the iOS
+        // half of the guarantee the contract makes on the Tower side.
+
+        case "cartridges":
+            let declaration = TowerCartridgeDeclaration(json: json)
+            log(
+                "cartridges declared: "
+                    + declaration.offers
+                    .map { "\($0.cartridge)/\($0.resultType) available=\($0.available)" }
+                    .joined(separator: ", ")
+            )
+            cartridgeDeclaration = declaration
+            resultEvents.send(.declaration(declaration))
+
+        case "result_subscribed":
+            guard let ack = CartridgeSubscriptionAck(json: json) else {
+                log("result_subscribed could not be decoded")
+                return
+            }
+            log("result_subscribed: \(ack.subscriptionID) \(ack.cartridge)/\(ack.resultType)")
+            resultEvents.send(.subscribed(ack))
+
+        case "result_unsubscribed":
+            guard let id = json["subscription_id"] as? String else { return }
+            log("result_unsubscribed: \(id)")
+            resultEvents.send(.unsubscribed(subscriptionID: id))
+
+        case "cartridge_result":
+            guard let envelope = CartridgeResultEnvelope(json: json) else {
+                log("cartridge_result could not be decoded")
+                return
+            }
+            // Decimated like `frame_result`, and for a weaker reason: this
+            // arrives at most twice a second. One line per change rather than
+            // one per heartbeat is still the useful reading.
+            if envelope.revisionChanged {
+                log(
+                    "cartridge_result: \(envelope.cartridge)/\(envelope.resultType)"
+                        + " seq=\(envelope.sequence.map(String.init) ?? "?")"
+                        + " revision=\(envelope.revision ?? "?")"
+                        + " coalesced=\(envelope.coalesced)"
+                )
+            }
+            resultEvents.send(.result(envelope))
+
+        case "result_error":
+            guard let error = CartridgeResultError(json: json) else {
+                log("result_error could not be decoded")
+                return
+            }
+            log("result_error: \(error.reason) — \(error.message)")
+            resultEvents.send(.failed(error))
+
+        case "protocol_error":
+            // The Tower telling us it does not implement something we sent.
+            // Additive on its side and non-fatal on ours: previously an
+            // unrecognised message produced only a server-side log line, so
+            // "not implemented" and "lost in flight" were indistinguishable
+            // from here.
+            let messageType = json["message_type"].map { String(describing: $0) } ?? "nil"
+            log("protocol_error from Tower: \(json["reason"] as? String ?? "?") for \(messageType)")
+
         default:
             log("unknown message type: \(type)")
         }

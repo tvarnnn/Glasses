@@ -89,7 +89,6 @@ final class ProjectManager: ObservableObject {
     ) {
         let metrics = senderMetrics ?? SenderMetrics()
         self.senderMetrics = metrics
-        self.cartridgeClients = cartridgeClients ?? CartridgeClients()
         self.glassesConnection = glassesConnection ?? GlassesConnection(metrics: metrics)
         self.streamManager = streamManager ?? StreamManager()
         // `autoReconnect` is opted into here rather than defaulted on inside
@@ -100,7 +99,18 @@ final class ProjectManager: ObservableObject {
         // good — nothing in the app called `connect()` again except the
         // developer's own button. The stream-bracket reopening wired up below
         // was already written for a reconnect that could not happen.
-        self.towerClient = towerClient ?? TowerClient(metrics: metrics, autoReconnect: true)
+        let tower = towerClient ?? TowerClient(metrics: metrics, autoReconnect: true)
+        self.towerClient = tower
+
+        // Built after the connection and from it, which is the ordering the
+        // whole container was created for: the Tower-backed World Builder
+        // client holds a subscription to the result channel and whatever world
+        // the Tower has reported, and both must outlive every cartridge switch.
+        // It owns no socket — it sends three message types over the one
+        // `TowerClient` already has — so this adds a subscriber, not a
+        // transport.
+        self.cartridgeClients = cartridgeClients
+            ?? CartridgeClients(worldBuilder: TowerWorldBuilderClient(tower: tower))
 
         let health = DeviceHealth()
         self.deviceHealth = health

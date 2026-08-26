@@ -20,31 +20,37 @@ import MWDATCamera
 ///
 /// ## What this screen may and may not claim
 ///
-/// Those two halves are in completely different states, and the whole design of
-/// this view follows from saying so plainly.
+/// Those two halves are still in different states, and the whole design of this
+/// view follows from saying so plainly.
 ///
 /// **The capture half is real.** The iPhone can start the glasses camera, and
 /// frames genuinely reach the Tower — that is the V0.7 pipeline, measured and
 /// working.
 ///
-/// **The world half does not exist.** The Tower runs one fixed frame handler.
-/// It has no module container (V0.8) and no module (V0.9), so it cannot build a
-/// spatial model of anything. Opening this workspace is local navigation on the
-/// phone; it sends nothing to the Tower and selects nothing there.
+/// **The world half is now reported rather than absent.** The Tower declares a
+/// World Builder contract over the socket and reports what it has built, and
+/// `TowerWorldBuilderClient` decodes it. What this screen shows is therefore
+/// whatever the Tower says, and nothing else.
+///
+/// **Starting capture is still not the same as starting a build.** The Tower's
+/// web process writes frames to a capture and answers `frame_result`; the
+/// reconstruction runs in a *separate* process reading that capture from disk.
+/// Whether one is running is not visible from the phone, and this app must not
+/// imply it started one.
 ///
 /// Three consequences, each of which is a deliberate refusal:
 ///
 /// - **No "Start Mapping" button.** A verb-labelled primary button is the
-///   strongest readiness claim a UI can make, and mapping will not happen. The
-///   control says what it does — it starts a capture session — and the world
-///   panel says what does not happen. When the Tower can map, the label
-///   changes, and its arrival is the announcement.
-/// - **No placeholder metrics.** Keyframes, tracking quality and scale all
-///   render as "—" today, and six redacted values read as *broken* rather than
-///   as *early*. The one line of prose in the world panel carries the same
-///   information without pretending there are numbers behind it.
-/// - **No fabricated geometry.** No point cloud, no mesh, no spinner. A spinner
-///   in particular would claim something is in progress when nothing is.
+///   strongest readiness claim a UI can make, and tapping it does not start a
+///   build. The control says what it does — it starts a capture session — and
+///   the world panel reports what the Tower says came of it.
+/// - **No placeholder metrics.** A field the Tower did not report is not drawn
+///   at all, rather than drawn as "—": six redacted values read as *broken*
+///   rather than as *absent*.
+/// - **No fabricated geometry.** No point cloud, no mesh, no spinner outside
+///   the two states where work genuinely is underway. The Tower sends counts,
+///   states and summaries — no imagery, no poses, no points — so there is
+///   nothing here to draw and this build does not pretend otherwise.
 ///
 /// The live preview presents `GlassesConnection.latestCapturedFrame` through
 /// the same `ViewfinderCard` the Home workspace uses. It does not open a second
@@ -117,7 +123,7 @@ struct WorldBuilderWorkspaceView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("World Builder")
                 .font(.title2.weight(.semibold))
-            Text("The workspace this module will use. The Tower cannot build a world yet, so nothing here is a map.")
+            Text("What the glasses see, and what the Tower reports it has built from that. Figures come from the Tower; absent ones are not drawn.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -194,10 +200,15 @@ private extension WorldBuilderWorkspaceView {
                 .disabled(!glasses.hasActiveDevice)
             }
 
+            // Neither string claims a build. The Tower reconstructs in a
+            // separate process reading the capture from disk, and nothing on
+            // the phone can see whether one is running — so the panel above,
+            // which reports only what the Tower said, is where that question
+            // is answered.
             HelperText(
                 isRunning
-                    ? "Frames are streaming to the Tower. No world is being built."
-                    : "Streams frames to the Tower. No world is built."
+                    ? "Frames are streaming to the Tower. What it builds from them is reported above."
+                    : "Streams frames to the Tower. What it builds from them is reported above."
             )
 
             if !glasses.hasActiveDevice && !isRunning {
