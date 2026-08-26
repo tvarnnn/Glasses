@@ -241,6 +241,20 @@ class ObservationStore:
             self._persisted_retention_seconds_locked(), self._retention_seconds
         )
 
+    def effective_retention_seconds(self) -> float | None:
+        """The window this store will actually honour. None means unbounded.
+
+        A read-only view of the clamp, and nothing else: it computes what
+        `_effective_retention_seconds_locked` already computes for every
+        read and prune, and changes no state. It exists so a transport can
+        SHOW the clamp rather than merely be subject to it -- a client that
+        asked for 3650 days and silently received 30 has no way to learn
+        that its question was refused, and a promise nobody can observe
+        being kept is the kind that quietly stops being kept.
+        """
+        with self._lock:
+            return self._effective_retention_seconds_locked()
+
     def _write_manifest_locked(self) -> None:
         """Record the window at first append. Tighten it, never widen it.
 
