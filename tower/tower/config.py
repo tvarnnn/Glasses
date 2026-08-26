@@ -31,6 +31,16 @@ class Settings:
     # while nothing new is being built, and this is the escape hatch if
     # auto-attach ever misbehaves in the field.
     world_autobuild: bool = True
+    # Where object_memory_session.py wrote its observations. Read-only to
+    # the web process, and read by one HTTP route that cannot delete and
+    # cannot widen the retention window it was written under.
+    #
+    # None means the route answers 404 -- "this Tower serves no object
+    # memory", which is a claim about configuration and not about what
+    # was ever observed. Unset by default and deliberately so: a memory of
+    # what a wearer's camera saw does not go on the network because a
+    # process happened to start in a directory that has one.
+    observation_root: str | None = None
     # Keyframes between mid-walk rebuilds in the attached builder.
     #
     # NOT the script's own default, which is 0 -- "build once, at the
@@ -50,6 +60,9 @@ def get_settings() -> Settings:
         cv_device=os.environ.get("TOWER_CV_DEVICE", "auto"),
         capture_root=_optional_path(os.environ.get("TOWER_CAPTURE_ROOT")),
         world_root=_optional_path(os.environ.get("TOWER_WORLD_ROOT")),
+        observation_root=_optional_path(
+            os.environ.get("TOWER_OBSERVATION_ROOT")
+        ),
         world_autobuild=os.environ.get("TOWER_WORLD_AUTOBUILD", "true").lower()
         in ("1", "true", "yes"),
         world_rebuild_every=_non_negative_int(

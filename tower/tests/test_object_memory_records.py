@@ -3,9 +3,12 @@ import dataclasses
 import pytest
 
 from tower.object_memory.records import (
+    DERIVED_ONLY,
+    FRAME_REFERENCED,
     Confidence,
     ObjectObservation,
     object_observation_from_json_dict,
+    privacy_tags_for,
 )
 
 
@@ -83,3 +86,44 @@ def test_observation_is_immutable():
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         observation.object_class = "mutated"
+
+
+def test_best_score_round_trips_beside_the_first_sighting_score():
+    data = _observation(detector_score=0.60, best_score=0.97).to_json_dict()
+
+    assert data["detector_score"] == 0.60
+    assert data["best_score"] == 0.97
+    assert object_observation_from_json_dict(data).best_score == 0.97
+
+
+def test_a_record_written_before_best_score_existed_still_parses():
+    # Read with .get(), not [], on purpose: the 55 records already on
+    # disk have no best_score, and a required key would make
+    # _parse_observations skip every one of them as a schema mismatch --
+    # silently deleting the wearer's memory to add a field.
+    data = _observation().to_json_dict()
+    del data["best_score"]
+
+    restored = object_observation_from_json_dict(data)
+
+    assert restored.best_score is None
+    assert restored.object_class == "keys"
+
+
+def test_privacy_tags_admit_a_record_that_points_back_at_a_stored_frame():
+    # `derived-only` describes the CONTENT (no pixels, no crop). It says
+    # nothing about reach, and session_id + frame_seq is an exact pointer
+    # into data/captures/<id>/frames/, whose retention this cartridge
+    # does not govern.
+    assert privacy_tags_for("cap-1", 7) == (DERIVED_ONLY, FRAME_REFERENCED)
+
+
+def test_privacy_tags_do_not_claim_a_frame_pointer_that_is_not_there():
+    assert privacy_tags_for(None, None) == (DERIVED_ONLY,)
+
+
+def test_a_half_present_frame_pointer_still_counts_as_a_pointer():
+    # A session id alone narrows the imagery to one capture directory,
+    # which is a reach claim worth making.
+    assert privacy_tags_for("cap-1", None) == (DERIVED_ONLY, FRAME_REFERENCED)
+    assert privacy_tags_for(None, 7) == (DERIVED_ONLY, FRAME_REFERENCED)

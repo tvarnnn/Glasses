@@ -203,6 +203,13 @@ only a 227 KB weights file, and face redaction now ships. The *posture*
 in that bullet is still correct for `tower/scene/` — it does no face
 processing — but the *reason* given is false, and a false reason is the
 kind of thing a successor builds on. PROPOSED: fix that bullet.
+**DONE.** The Privacy section of `SCENE-UNDERSTANDING.md` now states the
+posture as a decision rather than a limitation, names the vendored
+`models/face_detection_yunet_2023mar.onnx` and its use in World Builder's
+redaction path, and records that the original search was scoped to `cv2/`
+and missed it. The iOS copy of the same document
+(`ios/Glasses/Project_Overview_Steps/docs/modules/SCENE-UNDERSTANDING.md`)
+is outside Tower's ownership and has NOT been checked.
 
 The relevance here is §6's refusal: any claim about "how many people are
 in this room" that leaned on a face detector would systematically
@@ -221,7 +228,7 @@ most of a room.
 | Positions | `state.py:139` `describe_position` | Normalised image coords, `view_offset`, `side`; refuses when the frame size is unknown |
 | Relations | `state.py:188` `relate` | `left_of` / `right_of` / `higher_in_view` only, with an 8%-of-frame minimum separation |
 | Refusal registry | `state.py:41` `REFUSED_RELATIONSHIPS` | `in_front_of`, `behind`, `on`, `inside`, `near`, `nearer_than_same_class`, each with the evidence that would settle it |
-| Orientation | `tower/scene/orientation.py` | Coarse facing from COCO keypoint *visibility*; 798 ms/call; off by default; every estimate carries its age; expires at 6.0 s |
+| Orientation | `tower/scene/orientation.py` | Coarse facing from COCO keypoint *visibility*; 43.4 ms/call on CUDA, 956.4 ms on CPU (2026-08-26 measurement; the 798 ms here was CPU-with-synthetic-input); off by default because CPU is the default device; every estimate carries its age; expires at 6.0 s |
 | Query layer | `tower/scene/query.py` | `count`, `where_is`, `facing_wearer`, `relationships`, `why_not`; `Answer.answered=False` plus a reason is a complete response |
 | Driver | `scripts/scene_session.py` | Separate process; `--frames`, `--follow-capture`, `--synthetic` |
 
@@ -916,16 +923,23 @@ Each with the evidence that would change the answer, in the style
    correcting in place rather than leaving for a successor to build on:
    - `SCENE-UNDERSTANDING.md:167-169` — "No face detector exists on this
      platform anyway" was corrected on 2026-08-23 (§0.7). The posture is
-     right, the reason is false.
+     right, the reason is false. **FIXED** in the Tower copy; the iOS
+     copy is not Tower's to change.
    - `2026-08-22-scene-understanding-v1-report.md:228-230` — the
      limitations list still says "Greedy IoU association", which §8.2 of
      the same report replaced with maximum-cardinality matching.
 
-7. **An unreconciled measurement.** The plan records detection at 32 ms
-   and keypoints at 744 ms
+7. **An unreconciled measurement — RESOLVED 2026-08-26.** The plan
+   recorded detection at 32 ms and keypoints at 744 ms
    (`docs/superpowers/plans/2026-08-22-scene-understanding-v1.md:107-110`);
-   the report records 33 ms and 798 ms
+   the report recorded 33 ms and 798 ms
    (`2026-08-22-scene-understanding-v1-report.md:96-99`); the code
-   comments say 744 ms (`engine.py:7`, `orientation.py:25`). Small, but
-   the code and the report disagree about the number the code cites as
-   its reason for existing.
+   comments said 744 ms (`engine.py:7`, `orientation.py:25`). All three
+   were CPU measurements on synthetic input that named no device, and all
+   three were optimistic. Measured on 754 real corpus frames
+   (`docs/superpowers/research/2026-08-26-scene-understanding-measurements.md`):
+   **43.4 ms on CUDA, 956.4 ms on CPU**, detection **30.4 / 32.9 ms**,
+   against a delivered frame interval of **83.5 ms**, not ~300 ms. The
+   code, the module doc, the roadmap and the contract now all state the
+   measured pair *with its device*, which is the variable none of the
+   conflicting figures named and the reason they could conflict at all.

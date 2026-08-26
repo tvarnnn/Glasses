@@ -13,11 +13,25 @@ TOWER = pathlib.Path("tower")
 
 
 def _imports(path: pathlib.Path) -> list[str]:
+    """Every module path an import statement reaches, INCLUDING the names.
+
+    Recording only `node.module` for an `ImportFrom` left a hole wide
+    enough to drive the whole boundary through: `from tower import
+    world_builder` reports the module as `tower`, so a shared module could
+    import a cartridge outright and every rule below would see nothing.
+    Emitting `f"{module}.{name}"` alongside closes it, because the
+    predicates match on the qualified package path.
+
+    This was parked once on the belief that fixing it would surface
+    unrelated latent violations. It surfaces none: across `tower/` the
+    extended form yields zero offenders.
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     names: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
             names.append(node.module)
+            names.extend(f"{node.module}.{alias.name}" for alias in node.names)
         elif isinstance(node, ast.Import):
             names.extend(alias.name for alias in node.names)
     return names
@@ -45,7 +59,15 @@ def test_shared_code_does_not_import_a_cartridge():
         if path in _RESULT_CHANNEL_ADAPTERS:
             continue
         for name in _imports(path):
-            if "world_builder" in name:
+            # A bare `"world_builder" in name` also matches
+            # tower.results.world_builder_geometry -- the ADAPTER, not the
+            # cartridge, and a file this rule must let a non-adapter import.
+            # That false positive once pushed a fix into restyling the
+            # import rather than the boundary; match the qualified package
+            # path instead, mirroring the predicate
+            # test_the_result_channel_core_is_cartridge_blind already uses
+            # below.
+            if "tower.world_builder" in name:
                 offenders.append(f"{path} -> {name}")
 
     assert offenders == []
@@ -68,9 +90,18 @@ def test_shared_code_does_not_import_a_cartridge():
 # must not inherit one cartridge's assumptions. An adapter named after its
 # cartridge cannot leak assumptions into the next one, because the next
 # one gets its own file.
+#
+#   tower/results/world_builder_geometry.py
+#                                    the geometry adapter for that same
+#                                    cartridge. Separate from the status
+#                                    adapter because it answers a different
+#                                    question over a different transport --
+#                                    HTTP, because the status socket shares
+#                                    its send lock with the frame path.
 _RESULT_CHANNEL_ADAPTERS = frozenset(
     {
         TOWER / "results" / "world_builder.py",
+        TOWER / "results" / "world_builder_geometry.py",
         TOWER / "results" / "__init__.py",
     }
 )
@@ -323,6 +354,100 @@ def test_the_experimental_cv_lab_does_not_import_a_cartridge():
         for name in _imports(path):
             if "world_builder" in name or "object_memory" in name:
                 offenders.append(f"{path} -> {name}")
+
+    assert offenders == []
+
+
+def test_object_memory_does_not_import_the_experimental_cv_lab():
+    """The producer owns its detector; it does not borrow the Lab's.
+
+    Same reason `tower/scene/detect.py` records and the scene rule below
+    already enforces: the Lab measured these exact weights, but its
+    `ExperimentResult` is a scalar plus a name->number bag and cannot
+    carry a box, and a memory needs the individual detection rather than
+    a count. The stronger half is the direction -- the Lab is a sandbox
+    that may be thrown away, and nothing that can be thrown away should
+    be upstream of a PERSISTENT store.
+
+    A third consumer appeared, and the fix this docstring named is the
+    one that was taken: the detector seam is now `tower/detection.py`,
+    promoted to the platform exactly as `Confidence` was, and this
+    cartridge imports it from there. That changes nothing about the rule
+    below. Depending on a platform module and depending on a sandbox are
+    different acts -- shared code is maintained and its boundary is
+    tested (`test_the_shared_detector_imports_no_cartridge`), a sandbox
+    may be deleted tomorrow -- so an import of `tower.experiments` from
+    here is still forbidden, and still for the direction rather than the
+    duplication.
+    """
+    offenders = []
+    for path in (TOWER / "object_memory").rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        for name in _imports(path):
+            if name.startswith("tower.experiments"):
+                offenders.append(f"{path} -> {name}")
+
+    assert offenders == []
+
+
+def test_the_shared_detector_imports_no_cartridge():
+    """`tower/detection.py` is platform code, so the arrows point one way.
+
+    The detector seam was duplicated in two cartridges and promoted here
+    once a third consumer of the same weights appeared. A promotion is
+    only safe while the promoted module stays ignorant of who calls it:
+    the moment this file imported Object Memory to reach a record shape,
+    or Scene Understanding to reach its `BoundingBox`, every other
+    cartridge would inherit that one's assumptions -- and the two
+    cartridges would be coupled THROUGH the platform, which is precisely
+    the coupling `test_a_cartridge_does_not_import_another_cartridge`
+    forbids directly. Promoting shared code must not open a side door
+    into a rule that is otherwise airtight.
+
+    The Lab is on the list for the additional reason the cartridge rules
+    already give: it is a sandbox that may be thrown away, and nothing
+    that may be thrown away belongs upstream of anything.
+    """
+    offenders = []
+    for name in _imports(TOWER / "detection.py"):
+        for cartridge in _CARTRIDGE_PACKAGES:
+            if f"tower.{cartridge}" in name or name.startswith(f"{cartridge}."):
+                offenders.append(f"detection.py -> {name}")
+        if name.startswith("tower.experiments"):
+            offenders.append(f"detection.py -> {name}")
+
+    assert offenders == []
+
+
+def test_the_shared_detector_holds_no_model_and_no_registry():
+    """Code was promoted; model residency deliberately was not.
+
+    Each cartridge still loads its own 13.4 MB of weights. That is the
+    property that stops a shared module becoming a single point of
+    failure: a cache would give one cartridge's crash, or one
+    cartridge's `release()`, a way to reach another's detector, and an
+    eviction policy would give it a way to reach one MID-FRAME.
+
+    A model manager may well be worth building later -- when a
+    measurement shows contention, which nothing in this repo does today.
+    This test is what makes that a decision rather than a drift: it fails
+    the moment module-level mutable state appears here.
+    """
+    tree = ast.parse((TOWER / "detection.py").read_text(encoding="utf-8"))
+    offenders = []
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if isinstance(value, (ast.Dict, ast.List, ast.Set, ast.DictComp, ast.ListComp)):
+            offenders.append(ast.dump(node)[:60])
+        if isinstance(value, ast.Call):
+            called = getattr(value.func, "id", None) or getattr(
+                value.func, "attr", None
+            )
+            if called in ("dict", "list", "set", "defaultdict", "lru_cache", "cache"):
+                offenders.append(f"module-level {called}()")
 
     assert offenders == []
 

@@ -225,8 +225,8 @@ def _motion_summary(**overrides) -> MotionSummary:
 
 
 class TestKeyframePolicy:
-    def _seeded_selector(self) -> KeyframeSelector:
-        selector = KeyframeSelector()
+    def _seeded_selector(self, policy=None) -> KeyframeSelector:
+        selector = KeyframeSelector(policy)
         selector.note_frame(_quality())
         selector.evaluate(_quality(), None)
         selector.note_accepted()
@@ -276,8 +276,13 @@ class TestKeyframePolicy:
         "collapsed" now means very nearly nothing survived rather than
         one track in seven. A frame at 0.05 exactly is NOT lost -- the
         comparison is strict -- which is why this uses 0.01.
+
+        `loss_grace_frames=1` deliberately: this test is about WHERE the
+        floor is, not how much sustained evidence a break needs. The grace
+        window has its own tests in test_world_builder_loss_grace.py, and
+        mixing the two here would leave neither pinned clearly.
         """
-        selector = self._seeded_selector()
+        selector = self._seeded_selector(KeyframePolicy(loss_grace_frames=1))
         selector.note_frame(_quality())
 
         decision = selector.evaluate(
@@ -422,8 +427,8 @@ class TestRescueWindow:
     walk broke into 36 segments.
     """
 
-    def _seeded_selector(self) -> KeyframeSelector:
-        selector = KeyframeSelector()
+    def _seeded_selector(self, policy=None) -> KeyframeSelector:
+        selector = KeyframeSelector(policy)
         selector.note_frame(_quality())
         selector.evaluate(_quality(), None)
         selector.note_accepted()

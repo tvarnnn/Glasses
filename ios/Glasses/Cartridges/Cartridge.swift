@@ -70,12 +70,23 @@ extension Cartridge {
             specPath: "docs/modules/EXPERIMENTAL-CV.md",
             workspace: .experimentalCV
         ),
+        // The summary used to read "Remembers where objects were last seen",
+        // which is the claim the cartridge's own contract spends four sections
+        // refusing. `spatial_ref` is null in every payload it can produce and
+        // is actively nulled on read: nothing here knows where anything is.
+        // The drawer row is the first sentence a person reads about this
+        // module, so it is the first place the overclaim had to go.
+        //
+        // `status` stays `.planned`. The Tower serving two read-only routes is
+        // not the module runtime arriving, and having a screen never promotes a
+        // roadmap position — see `CartridgeWorkspace`.
         Cartridge(
             id: "object-memory",
             name: "Object Memory",
-            summary: "Remembers where objects were last seen.",
+            summary: "Records that a category of thing was visible to the camera, and when.",
             status: .planned,
-            specPath: "docs/modules/OBJECT-MEMORY.md"
+            specPath: "docs/modules/OBJECT-MEMORY.md",
+            workspace: .objectMemory
         ),
         Cartridge(
             id: "visual-qa",

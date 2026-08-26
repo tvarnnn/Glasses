@@ -1,5 +1,11 @@
 # World Builder integration — current state
 
+> **iOS ENTRY POINT IS `docs/agent-handoffs/IOS-EXECUTION-PLAN.md`.**
+> This file is **REFERENCE**: deeper detail, still accurate except where
+> the plan says otherwise. Read the plan first — it says what to do now,
+> what is already settled, and what the Tower has measured and refused.
+> Where the two disagree, the plan wins.
+
 **Living document.** It describes what is true now, not what changed when.
 Rewrite stale parts; git history is the record of how it got here.
 
@@ -78,8 +84,12 @@ and not DAT.
 
 `GET /health` → `capture.armed: true`, `recording: false`.
 `GET /cartridges` and the socket's `{"type":"cartridges"}` both declare
-`world_builder`/`status`/`world_builder.status/2026-08-23`, `available: true` —
-the contract this build implements.
+`world_builder`/`status`/`world_builder.status/2026-08-23`, `available: true`.
+
+> **Superseded on 2026-08-25.** The identifier is now
+> `world_builder.status/2026-08-25`, and that is what this build implements.
+> The observation above is left as recorded. Only `trajectory.pose_count`
+> changed, and only in meaning: see `WorldBuilderResultContract.identifier`.
 
 On the socket: `pong` is literally `{"type":"pong"}`; `result_subscribed`
 returns `sub-1` with `cursor_status: "absent"`; `cartridge_result` arrives with

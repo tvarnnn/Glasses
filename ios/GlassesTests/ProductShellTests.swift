@@ -852,13 +852,28 @@ final class CartridgeIntegrationTests: XCTestCase {
     }
 }
 
-// MARK: - The four cartridge clients
+// MARK: - The four unavailable cartridge clients
 
-/// One table, four cartridges, one invariant: **nothing in this app produces
-/// Tower data, because the Tower produces none.**
+/// One table, four cartridges, one invariant: **these four clients produce no
+/// Tower data, because the Tower produces none for them.**
 ///
-/// Written as a table rather than four suites so that a fifth cartridge added
-/// without a truthful client fails here rather than passing by omission.
+/// Written as a table rather than four suites so that a cartridge added without
+/// a truthful client fails here rather than passing by omission.
+///
+/// ## Why Object Memory is not in the table
+///
+/// It is the fifth cartridge and the first whose Tower half genuinely answers:
+/// two read-only HTTP routes, serving a real store. Its client therefore
+/// *should* be able to reach `.settled` with records in it, which is precisely
+/// what `testNoClientProducesTowerData` forbids — the invariant here is "no
+/// data from a Tower that produces none", and for Object Memory the premise is
+/// false.
+///
+/// So it is covered by `ObjectMemoryTests` instead, which asserts the stronger
+/// property that actually applies to it: that what it produces is decoded from
+/// what the Tower sent, and that nothing it says about a record overclaims.
+/// `testEveryOpenableCartridgeHasAClient` below still includes it, because
+/// "every screen has a client" is true of all five.
 @MainActor
 final class CartridgeClientTests: XCTestCase {
 
@@ -990,7 +1005,14 @@ final class CartridgeClientTests: XCTestCase {
     /// would have to invent its own state, which is where fabricated data
     /// enters an app.
     func testEveryOpenableCartridgeHasAClient() {
-        let clientIDs = Set(allClients().map(\.cartridgeID))
+        // The four unavailable clients, plus Object Memory's — which is not in
+        // `allClients()` because the invariant that table asserts does not
+        // apply to it. Read off `CartridgeClients` rather than hardcoded, so a
+        // sixth cartridge cannot be satisfied by a string in this file.
+        let clients = CartridgeClients()
+        var clientIDs = Set(allClients().map(\.cartridgeID))
+        clientIDs.insert(clients.objectMemory.cartridgeID)
+
         for cartridge in Cartridge.selectable {
             XCTAssertTrue(
                 clientIDs.contains(cartridge.id),

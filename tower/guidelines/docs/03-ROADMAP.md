@@ -175,7 +175,7 @@ Exit criterion: **met for the Tower half** — a rendered reading session become
 ### V0.9.7 — Scene Understanding V1 (complete, synthetic-only)
 - A live structured view of what is around the wearer: detection, anonymous tracking, counts from CONFIRMED TRACKS, camera-relative positions and relationships, and a query layer that refuses rather than guesses.
 - **Counting uses tracking**, measured rather than asserted: the count of 2 holds exactly through 0%, 10% and 20% detector dropout, and is correct 93.9% of the time at 40%.
-- Coarse head orientation ("appears to be facing your direction") implemented but **OFF by default**: `keypointrcnn_resnet50_fpn` costs 798 ms per call on this CPU, 24x the detector and 2.5x the delivered frame interval. It runs at a cadence with every estimate carrying its age, and it is never called gaze.
+- Coarse head orientation ("appears to be facing your direction") implemented but **OFF by default**: `keypointrcnn_resnet50_fpn` costs 43.4 ms per call on CUDA and 956.4 ms on CPU, and CPU is the default device. Against the measured 83.5 ms delivered frame interval that is 0.52x on CUDA and 11.5x on CPU. It runs at a cadence of 3 frames (~250 ms) with every estimate carrying its age, and it is never called gaze. The earlier "798 ms, 24x the detector, 2.5x the interval" figures were measured on CPU with synthetic input, named no device, and are withdrawn (2026-08-26).
 - **Persists nothing**, enforced by test. This cartridge is the present; Environmental Memory is the past, and that boundary is now real.
 - Relationships the evidence cannot support are refused with the measurement that would settle each one, rather than being silently absent.
 

@@ -72,21 +72,68 @@ frames (live capture or recorded)
 **The 400× cost ratio between detection and OCR is the whole design.**
 The pipeline exists to make the expensive stage rare, not fast.
 
-## The binding constraint: resolution
+## The binding constraint — CORRECTED 2026-08-26
+
+> **This section was wrong in the way that mattered.** It named recognition
+> as the binding constraint and detection as healthy. Running the cartridge
+> against 9,199 real Ray-Ban frames for the first time reversed both halves.
+> Full evidence:
+> `docs/superpowers/research/2026-08-26-document-memory-reality-check.md`.
+
+**Detection fires 6 times in 9,199 real frames — 0.065% — and all six are
+false positives.** One venetian blind and five backlit keyboards. OCR on
+those six crops returned zero characters. Nothing that is actually a page
+has ever been detected, because no capture in `data/captures/` contains a
+single sheet of paper.
+
+**The glyph gate's safety margin was an artefact of the renderer.** This
+document's own Detection section reports blinds and keyboards at 0 row
+transitions against a threshold of 8. On real frames they measure **8.0 and
+19–23**. `MIN_ROW_TRANSITIONS` was tuned against negatives that do not
+resemble the real world, and must be re-derived against the 9,199 real
+negatives that now exist.
+
+**So detection, not recognition, is the binding constraint.** The sentence
+that used to sit here — "Detection still works at that resolution, only
+recognition is starved" — was the exact inverse of the truth.
+
+### Recall, restated in geometries the hardware can actually produce
 
 Measured word recall against known rendered text:
 
-| Frame size | Word recall |
-|---|---|
-| 1280×720 | 0.957 – 1.000 |
-| 640×480 | 0.905 – 1.000 |
-| **640×360 — what the glasses deliver today** | **0.429 – 0.810** |
+| Frame size | Word recall | Reachable? |
+|---|---|---|
+| 1280×720 landscape | 0.957 – 1.000 | **No — DAT has no landscape mode** |
+| 640×480 landscape | 0.905 – 1.000 | **No — 4:3 does not exist either** |
+| 640×360 landscape | 0.429 – 0.810 | **No** |
+| **360×640 portrait — what is actually delivered** | **0.343 – 1.000, mean 0.703** | yes |
+| 504×896 portrait still | **0.886 – 1.000** | yes, DAT's middle rung |
 
-**Tilt barely matters once the page is warped; resolution dominates.** A
-page inside a 640×360 frame warps to roughly 500×320, which puts a 34 px
-rendered font at about 10 px — below what the recogniser needs.
+Three of the four originally published rows are **unreachable geometries**.
+DAT offers 720×1280, 504×896 and 360×640, all 9:16
+(`07-PLATFORM-CONSTRAINTS.md:79`).
 
-Detection still works at that resolution. Only recognition is starved.
+Portrait is not simply worse. Its *worst* case (0.343) does fall below the
+old worst row, confirming the earlier suspicion at the tail — but its mean
+beats landscape's (0.703 against 0.572) and square-on it is far better. Same
+pixel count, different failure mode.
+
+### What this changes
+
+The old conclusion — "not a Tower problem, it is a requirement on iOS to
+raise stream resolution" — no longer follows, and raising the stream is
+actively the wrong move: World Builder measured 720p as **harmful**, with
+73.3% of frames falling below its absolute sharpness floor.
+
+**The tension dissolves once you notice this cartridge does not need a
+stream.** It needs one or two stills per dwell. A 504×896 *still*, captured
+on dwell, buys 0.886–1.000 while the video stream stays at 360×640 for
+World Builder. That is a capture-mode request, not a resolution negotiation.
+
+Two prerequisites before any of it:
+1. Re-derive `MIN_ROW_TRANSITIONS` against the real negatives.
+2. Record a capture in which someone actually looks at a page. **The
+   cartridge has never had a chance to succeed.**
 
 This is not a Tower problem and no Tower work fixes it.
 `CARTRIDGE-GROUNDWORK.md` predicted it — *"Text/Document ... Missing:

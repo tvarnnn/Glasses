@@ -1,5 +1,11 @@
 # Tower → iOS Integration Contract
 
+> **PARTLY SUPERSEDED — 2026-08-26.** For anything you intend to *act* on,
+> start at `docs/agent-handoffs/IOS-EXECUTION-PLAN.md`. This document
+> predates both the result channel and the geometry transport; the
+> surfaces it describes that still exist are unchanged, but it is no
+> longer a to-do list.
+
 > **2026-08-23 — a structured result channel now exists.** The implemented
 > wire contract lives in **`docs/contracts/CARTRIDGE-RESULTS.md`**, and
 > every requirement in the repo-root `IOS-to-Tower.md` is classified in

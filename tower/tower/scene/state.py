@@ -39,15 +39,44 @@ MIN_VERTICAL_SEPARATION_FRACTION = 0.08
 # Kept as data rather than prose so a query layer can answer "why not"
 # with the same words the design used.
 REFUSED_RELATIONSHIPS = {
+    # MEASURED, on 9,199 real corpus frames, 2026-08-26. This entry used
+    # to cite a 6-8% MiDaS flicker figure taken from EPIC-KITCHENS at
+    # 128x256 and reason from it that the ordering would invert. The
+    # figure was about right -- this camera's own frames give 4.8%
+    # per-object frame-to-frame change -- and the inference from it was
+    # wrong, because flicker only breaks an ordering when it exceeds the
+    # SEPARATION, and both objects' depths move together. Measuring the
+    # ordering directly is what settles it, so it was measured.
+    # See docs/superpowers/research/2026-08-26-depth-ordering-on-real-frames.md.
     "in_front_of": (
-        "needs depth. The only depth available is MiDaS relative inverse "
-        "depth, measured by this project at 6-8% temporal flicker; ordering "
-        "two boxes by a flickering field gives a relation that inverts "
-        "frame to frame. To settle it: run the depth experiment over a "
-        "scene with two objects at a known separation and measure how "
-        "often the ordering flips."
+        "needs depth that survives motion, and MiDaS does not. Measured on "
+        "9,199 real frames: ordering two detector boxes by MiDaS relative "
+        "inverse depth reverses on 3.8% of consecutive-frame transitions "
+        "overall (2,700 object pairs), and the rate IS strongly predicted "
+        "by depth separation -- 15.7% below 0.02 separation, 0.0% above "
+        "0.40 -- so the ordering does carry information. It carries it "
+        "only while the scene is still. Binned by inter-frame box motion, "
+        "the same pairs at the same separation go from 0.0% flips (n=124) "
+        "in the most static frames to 11.5% (n=52) in the top motion "
+        "decile, and a separation gate at 0.05 goes from 0.00% (n=507) to "
+        "4.85% (n=206). The corpus's median inter-frame box motion is 4.2 "
+        "px of a 734.8 px diagonal and its 99th percentile is 56 px, so it "
+        "contains no walking at all: the regime this relation would be "
+        "used in is not sampled, and the trend across the bins that do "
+        "exist points the wrong way. Cost is NOT the obstacle -- depth is "
+        "5.73 ms on CUDA and 18.29 ms on CPU against an 83.4 ms frame "
+        "interval, affordable on the default device. To settle it: corpus "
+        "footage with sustained wearer locomotion, and the same motion-by-"
+        "separation table computed on it. Note that none of this is "
+        "accuracy -- there is no ground-truth depth on this host, so it "
+        "measures self-consistency, and a stably wrong model would score "
+        "perfectly."
     ),
-    "behind": "the inverse of in_front_of, and blocked by the same missing depth.",
+    "behind": (
+        "the inverse of in_front_of, and blocked by the same measurement: "
+        "an ordering that holds in a still scene and degrades to 11.5% "
+        "reversals under the little motion this corpus contains."
+    ),
     "on": (
         "needs support-surface reasoning and depth. Box containment is not "
         "it: a laptop IN FRONT OF a desk overlaps its box identically to a "
@@ -67,8 +96,12 @@ REFUSED_RELATIONSHIPS = {
         "2.5 against a 1.5 threshold -- a WRONG relation asserted, not a "
         "weak one. Nothing in a 2-D box separates shape from distance, and "
         "this cartridge's own rule is that a wrong relationship is worse "
-        "than a missing one. Depth would settle it, and depth is what the "
-        "entries above are already waiting for."
+        "than a missing one. Depth was expected to settle it, and as of "
+        "the 2026-08-26 measurement it does not: MiDaS ordering was tested "
+        "on same-class pairs too (laptop/laptop, phone/phone) and fails "
+        "under motion for the same reason `in_front_of` does. This entry "
+        "is no longer waiting on depth; it is waiting on the same footage "
+        "`in_front_of` names."
     ),
 }
 

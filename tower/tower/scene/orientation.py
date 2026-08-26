@@ -19,21 +19,53 @@ orientation evidence:
     one ear                         -> profile
     nothing                         -> unknown, and say so
 
-**The cost, measured, and why this is off by default.**
+**The cost, measured on real frames, and why the device is the whole
+story.** Warm medians over 754 corpus frames at 360x640, decode excluded,
+`torch.cuda.synchronize()` bracketing every CUDA call
+(`docs/superpowers/research/2026-08-26-scene-understanding-measurements.md`):
 
-    ssdlite320 detection      32 ms
-    keypointrcnn_resnet50    744 ms      <- 23x, on this CPU
+                              CUDA        CPU
+    ssdlite320 detection     30.4 ms    32.9 ms
+    keypointrcnn_resnet50    43.4 ms   956.4 ms      <- 22.0x
+    keypointrcnn p95         50.6 ms  1112.8 ms
 
-744 ms is 2.5x the ~300 ms interval the glasses deliver. It cannot run
-per frame; a "current" scene state computed that way would be two frames
-stale before it existed. So this runs at a bounded cadence on person
-tracks only, and **every estimate carries its age** so a consumer can see
-how old the answer is. A person's facing does not change every 300 ms,
-which is what makes a one-second-old estimate useful rather than a lie.
+    delivered frame interval 83.5 ms (12.0 fps, from the corpus journals)
+    orientation / interval      0.52x     11.5x
 
-The unblocker is named rather than vague: torch is CPU-only on this host.
-A restored CUDA build is what would change this decision -- not a
-cleverer algorithm.
+**Every figure this module used to quote was wrong**, and wrong in a way
+that mattered: 744 ms (here and in five other files), 798 ms (in the
+module doc), "23x the detector", "2.5x the ~300 ms interval". They were
+CPU numbers from synthetic input, none of them named a device, and the
+real interval is 83.5 ms rather than 300 ms. On CUDA the detector is
+launch-bound and gains almost nothing from the GPU, so orientation is
+**1.43x** the detector, not 24x; on CPU it is 29.1x. The ratio inverts
+entirely depending on where it runs, which is why the device is now
+stated everywhere the cost is.
+
+Cost is flat in the number of people -- ~1 ms each, 40.0 ms at zero to
+44.3 ms at four -- because the ResNet-50 + FPN backbone runs once
+regardless. A crowded room does not change the budget.
+
+**So it still runs at a cadence**, now ~250 ms rather than 2.0 s (see
+`engine.ORIENTATION_INTERVAL_S` for the arithmetic), and **every estimate
+still carries its age**. The age is not cadence bookkeeping that CUDA
+made redundant: `TorchvisionPoseEstimator` defaults to `device="cpu"`,
+where a call is 11.5x the frame interval and every word of the original
+argument still holds, and `age_estimate`'s clamp guards a clock bug that
+has nothing to do with speed at all.
+
+**The old unblocker is spent.** This module used to say torch was
+CPU-only on this host and that a restored CUDA build was what would
+change the decision. That build exists -- `torch 2.13.0+cu132`, verified
+executing on an RTX 5070 (Blackwell, sm_120), 988 MB reserved of 12 GB --
+and the numbers above are from it. The question is measured and closed.
+
+**What is still NOT measured is accuracy.** There is no bystander footage
+on this host; the corpus's person boxes are almost certainly the wearer's
+own torso (median 21.5% of frame, bottom edge 0.939, 43% frame-clipped).
+`facing_from_keypoints` remains entirely unvalidated against ground
+truth. Nothing above is evidence that orientation *works* -- only that it
+costs 43 ms.
 """
 
 import logging
@@ -80,7 +112,9 @@ MIN_KEYPOINT_SCORE = 3.0
 # How stale an estimate may be before it is reported as unknown rather
 # than as an answer. Generous, because orientation is slow-moving -- but
 # finite, because a person who turned around ten seconds ago is not
-# described by a ten-second-old estimate.
+# described by a ten-second-old estimate. Unchanged by the CUDA
+# measurement: expiry is about how fast a PERSON turns, not how fast the
+# model runs, and 6.0 s is ~24 cadence windows either way.
 MAX_ESTIMATE_AGE_S = 6.0
 
 
@@ -151,6 +185,11 @@ def age_estimate(estimate: FacingEstimate, seconds: float) -> FacingEstimate:
     the capture journal and are wall clock: a backward NTP step produced a
     NEGATIVE age, which quietly pushed the expiry deadline further into
     the future -- the one direction it must never move.
+
+    That clamp is a CLOCK guard, not a latency guard. It is the reason
+    this function survives independently of how fast the pose model is:
+    a GPU that made orientation free would not make a backward NTP step
+    any less able to defer an expiry forever.
     """
     from dataclasses import replace
 
@@ -206,7 +245,19 @@ class FixedPoseEstimator:
 
 
 class TorchvisionPoseEstimator:
-    """`keypointrcnn_resnet50_fpn`. 744 ms per frame on this CPU."""
+    """`keypointrcnn_resnet50_fpn`, and its cost is the device.
+
+    43.4 ms warm median on CUDA, 956.4 ms on CPU, over real corpus
+    frames. **The default is `cpu`**, so the default is the expensive
+    one -- deliberately, because a caller that wants the GPU should have
+    to say so rather than discover it is holding one.
+
+    The first call costs 623.5 ms on CUDA, 14x the warm median, while
+    kernels compile and autotune. Anything that times a single call to
+    decide whether orientation is affordable will be wrong by an order
+    of magnitude, in the same direction this module's documentation was
+    wrong for months.
+    """
 
     name = "keypointrcnn"
 

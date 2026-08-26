@@ -1,5 +1,11 @@
 # World Builder — the Tower↔iOS boundary, reconciled
 
+> **iOS ENTRY POINT IS `docs/agent-handoffs/IOS-EXECUTION-PLAN.md`.**
+> This file is **REFERENCE**: deeper detail, still accurate except where
+> the plan says otherwise. Read the plan first — it says what to do now,
+> what is already settled, and what the Tower has measured and refused.
+> Where the two disagree, the plan wins.
+
 **Living document.** It describes the boundary as it exists now.
 
 **Status:** implemented on both sides and exercised end to end over a real
@@ -19,6 +25,7 @@ Contracts in play:
 |---|---|
 | Envelope | `cartridge_results.envelope/2026-08-23` |
 | World Builder payload | `world_builder.status/2026-08-25` |
+| World Builder geometry | `world_builder.geometry/2026-08-25` — **its own document: [`WORLD-BUILDER-GEOMETRY.md`](WORLD-BUILDER-GEOMETRY.md)**. Different transport (HTTP), versioned independently |
 | Tower cartridge name | `world_builder` |
 | iOS catalog id | `world-build` |
 
@@ -41,17 +48,34 @@ mapping lives in exactly one place: `TowerCapabilities.towerCartridgeNames`.
                                 │              subscription, and the mapping.
                                 │              Built by ProjectManager, so it
                                 │              outlives every workspace switch.
+                                │              ALSO drives the geometry pull
+                                │              below, off geometry.revision.
                                 │ stateUpdates
                                 ▼
                     WorldBuilderViewModel      republishes into SwiftUI.
                                 │
                                 ▼
                       WorldCanvasView          renders facts.
+
+ Tower web process ──http://…/worlds/{id}/geometry/{manifest,segment/{i}}──┐
+                                │  world_builder.geometry/2026-08-25       │
+                                │  PULLED, not pushed. Contract, tables    │
+                                │  and rules: WORLD-BUILDER-GEOMETRY.md    │
+                                ▼                                          │
+                    WorldGeometryClient ── WorldGeometryStore ── WorldFragmentsView
 ```
 
-**No second socket, no second connection, no view-owned transport.** Discovery,
-subscription and results share the socket the camera already streams over.
-`frame_result` is field-for-field unchanged and pinned by a test.
+**No second socket, no second connection, no view-owned transport** for status.
+Discovery, subscription and results share the socket the camera already streams
+over. `frame_result` is field-for-field unchanged and pinned by a test.
+
+**Geometry is the one thing that does not travel that way**, and the reason is
+in the code: `tower/tower/routes/ws.py:38` gives the result sender and the
+frame path a single `asyncio.Lock`, and one session's `points.json` is 1.07 MB
+against a 3,884-byte status snapshot. Sending it there would hold that lock and
+starve `frame_result`. It is an ordinary HTTP `GET` instead, pulled when the
+status payload's `geometry.revision` moves. See
+[`WORLD-BUILDER-GEOMETRY.md`](WORLD-BUILDER-GEOMETRY.md).
 
 ---
 
@@ -127,7 +151,8 @@ cannot carry:
 
 | Not consumed | Why |
 |---|---|
-| pose arrays, point clouds, keyframe images | **The Tower does not send them**, and should not yet: iOS links no 3D framework and has no pose schema. Building the transport before the consumer is the fabricated contract this project refuses |
+| pose arrays, point clouds | Not on **this** channel, and deliberately: they are bulk, and this socket shares its send lock with the frame path. They travel over HTTP under `world_builder.geometry/2026-08-25` instead — see [`WORLD-BUILDER-GEOMETRY.md`](WORLD-BUILDER-GEOMETRY.md) |
+| keyframe images | **The Tower does not send them, on any channel.** `retains_raw_imagery` stays true Tower-side; no byte of imagery crosses to iOS, redacted or not |
 | `progress.frames_observed` | Null while live and genuinely unknowable — an ordinary rejected frame writes no journal event |
 | `lifecycle.build_in_progress` | `null` in every stopped state, and null means **unobservable**, not `false` |
 | `artifacts.*`, `session.retains_raw_imagery` | Real and honest, but no iOS surface asks the question yet. See §6 |
@@ -202,7 +227,7 @@ turn every WiFi blip into "this will never work" when the truthful reading is
 | Missing | What exists Tower-side | What iOS needs |
 |---|---|---|
 | **World picker / reopen a saved world** | `result_subscribe` with `world_id` pins the channel to a stored world — the Tower half of `WorldInspectionMode.inspecting(worldID:)` | A list of worlds and a way to choose one. `WorldInspectionMode` is modelled and always `.live` |
-| **Replay** | `WorldView.trajectory(session_id)` returns per keyframe: pose, segment, pose status, and `image_relpath` — a recorded camera path with a real first-person view at each point. `world_inspect.py --trajectory` renders it today | A 3D framework, a pose schema, world storage. None exist. **Nothing about this crosses the wire, and it should not until the consumer does** |
+| **Replay** | `WorldView.trajectory(session_id)` returns per keyframe: pose, segment, pose status, and `image_relpath` — a recorded camera path with a real first-person view at each point. `world_inspect.py --trajectory` renders it today | The poses and points now cross the wire (geometry contract) and iOS draws them 2D, per segment. What is still missing is the **first-person view**: `image_relpath` and every keyframe byte stay Tower-side, and a 3D view needs a floor plane that does not exist (`up_axis: "unknown"`) |
 | **Privacy disclosure** | `retains_raw_imagery: true` and the redaction process claim are on every session record | A surface that states what the Tower keeps. See §7 |
 | **Calibration status/action** | `calibration` state is on the wire and rendered | Nothing invites or explains calibration, and without it there is no geometry at all (§7) |
 

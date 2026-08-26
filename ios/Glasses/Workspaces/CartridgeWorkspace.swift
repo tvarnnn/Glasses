@@ -57,6 +57,12 @@ enum CartridgeWorkspace: String, Equatable, Sendable, CaseIterable {
     case experimentalCV
     case documentMemory
     case sceneUnderstanding
+    /// The fifth, and the first whose Tower half actually answers. Its
+    /// cartridge `status` stays `.planned` regardless: the module's position on
+    /// the Tower roadmap is unchanged by two read-only HTTP routes existing,
+    /// and `CartridgeWorkspaceTests` pins that separation for every entry in
+    /// the catalog.
+    case objectMemory
 }
 
 extension Cartridge {

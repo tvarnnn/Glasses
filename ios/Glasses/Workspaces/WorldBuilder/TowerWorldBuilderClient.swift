@@ -40,6 +40,36 @@ enum WorldBuilderResultContract {
     static let identifier = "world_builder.status/2026-08-25"
 }
 
+// MARK: - Where the geometry lives
+
+/// The address of the geometry the status payload is describing, plus the
+/// identity that says whether it has moved.
+///
+/// Three strings and no optionals, because a partial address is not a weaker
+/// address — it is no address at all. The Tower's manifest endpoint requires
+/// `session_id`, so a world id without one cannot be fetched, and an absent
+/// `geometry.revision` means the Tower has built nothing to point at rather
+/// than "revision zero".
+///
+/// **Deliberately not folded into `WorldSnapshot`.** That type's doc comment
+/// promises it maps field for field onto the payload's `world_snapshot` block,
+/// and neither of these two values lives there: `session_id` is in the
+/// payload's `session` block and the geometry identity is in its top-level
+/// `geometry` block. Widening `WorldSnapshot` would break that promise and
+/// would put transport addressing inside a presentation type.
+struct WorldGeometryCoordinates: Equatable, Sendable {
+    let worldID: String
+    let sessionID: String
+    /// `geometry.revision`, **not** the snapshot's.
+    ///
+    /// The snapshot revision changes whenever any reported field changes — a
+    /// keyframe count, a tracking state — and most of those changes leave the
+    /// built geometry exactly where it was. Keying the fetch on this one means
+    /// a megabyte of points is pulled when the points moved, and not when the
+    /// keyframe counter did.
+    let revision: String
+}
+
 // MARK: - Payload decoding
 
 /// Turns the Tower's `world_builder.status` payload into the types the
@@ -52,13 +82,13 @@ enum WorldBuilderResultContract {
 /// so that the translation table lives on the machine where changing it is a
 /// restart rather than an App Store release.
 ///
-/// ## The two evidence blocks that are read, and why only those two
+/// ## The blocks that are read, and why only those
 ///
 /// Everything else in the payload is Tower-native evidence for those two
 /// values, and a reader looking for where `lifecycle`, `progress`, `world`,
-/// `tracking`, `calibration`, `scale`, `geometry`, `persistence` or `artifacts`
-/// are consumed will correctly find that they are not. Two exceptions, each for
-/// something the projection cannot carry:
+/// `tracking`, `calibration`, `persistence` or `artifacts` are consumed will
+/// correctly find that they are not. Three exceptions, each for something the
+/// projection cannot carry:
 ///
 /// - **`trajectory`**, for `poses_anchor` and `segments`. The projection keeps
 ///   `pose_count` and drops both, and those are exactly what separates a walk
@@ -67,6 +97,10 @@ enum WorldBuilderResultContract {
 /// - **`session`**, for `capture_id`, `ended_at` and `frame_source`. Not a
 ///   figure and never drawn as one — it answers *whose world this is*, which
 ///   `world_snapshot` cannot, and which `WorldSessionGate` needs.
+/// - **`session.session_id` and `geometry.revision`**, read by
+///   `geometryCoordinates(from:)` for **addressing rather than display**. The
+///   geometry itself is fetched over HTTP and those are what address it.
+///   Neither is rendered.
 ///
 /// ## What it refuses to do
 ///
@@ -143,6 +177,34 @@ enum WorldBuilderResultDecoder {
     static let unexplainedUnsupported = """
         This Tower cannot serve World Builder, and did not say why.
         """
+
+    /// Where the geometry this payload describes can be fetched, or `nil` when
+    /// the payload does not carry all three parts of the address.
+    ///
+    /// All-or-nothing on purpose. `session_id` is a **required** query
+    /// parameter on the Tower's manifest route, not an optional one, so a world
+    /// id on its own addresses nothing; and `geometry.revision` is `null`
+    /// exactly when no build has produced output for this session, which is
+    /// absence and not zero. Returning a half-filled address would turn an
+    /// honest "there is nothing built yet" into a request that 404s every two
+    /// seconds.
+    ///
+    /// `world_id` is read from `world_snapshot` rather than from the top-level
+    /// `world` block: the two carry the same id, and the snapshot is the half
+    /// of the payload this build has already agreed to decode.
+    static func geometryCoordinates(from payload: [String: Any]) -> WorldGeometryCoordinates? {
+        let snapshot = payload["world_snapshot"] as? [String: Any] ?? [:]
+        let session = payload["session"] as? [String: Any] ?? [:]
+        let geometry = payload["geometry"] as? [String: Any] ?? [:]
+        guard
+            let worldID = snapshot["world_id"] as? String,
+            let sessionID = session["session_id"] as? String,
+            let revision = geometry["revision"] as? String
+        else { return nil }
+        return WorldGeometryCoordinates(
+            worldID: worldID, sessionID: sessionID, revision: revision
+        )
+    }
 
     /// `world_snapshot` → `WorldSnapshot`.
     ///
@@ -288,8 +350,9 @@ enum WorldBuilderResultDecoder {
 /// TowerClient            owns the socket, decodes the envelope, knows no cartridge
 ///     ↓ cartridgeResults
 /// TowerWorldBuilderClient   owns the subscription and the World Builder contract
-///     ↓ stateUpdates
-/// WorldBuilderViewModel     republishes into SwiftUI
+///     ↓ stateUpdates, geometryUpdates
+/// WorldBuilderViewModel     republishes into SwiftUI, and fetches geometry
+///                           over HTTP from the address it was handed
 ///     ↓
 /// WorldCanvasView           renders facts
 /// ```
@@ -305,6 +368,12 @@ enum WorldBuilderResultDecoder {
 /// has and sends three message types over it; it never opens a connection,
 /// never reconnects, and never touches the frame path. `GlassesConnection` is
 /// not reachable from here at all.
+///
+/// **And no geometry.** It publishes the *address* of the geometry the Tower
+/// reports and fetches none of it. The points travel over HTTP, from the view
+/// model, because the Tower gives its result sender and its frame path one
+/// shared lock and a megabyte of points down this socket would starve the
+/// frames.
 ///
 /// ## Reconnect
 ///
@@ -360,6 +429,21 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
 
     private let stateSubject = PassthroughSubject<WorldModelState, Never>()
     private let bindingSubject = PassthroughSubject<WorldSessionBinding, Never>()
+    /// The geometry address carried by every snapshot that has one — the
+    /// heartbeat's included.
+    ///
+    /// Unfiltered on purpose, unlike `state`, whose `didSet` drops repeats.
+    /// Deciding whether geometry has moved requires knowing what is already
+    /// held, and what is already held is the view model's cache, not this
+    /// object's. Filtering here as well would give two objects a private and
+    /// separately-wrong opinion about the same revision. What is sent here is a
+    /// fact — "the Tower says its geometry is at this address, under this
+    /// identity" — and the reader decides whether that is news.
+    var geometryUpdates: AnyPublisher<WorldGeometryCoordinates, Never> {
+        geometrySubject.eraseToAnyPublisher()
+    }
+
+    private let geometrySubject = PassthroughSubject<WorldGeometryCoordinates, Never>()
     private let tower: TowerClient
     private var cancellables: Set<AnyCancellable> = []
 
@@ -578,6 +662,18 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         }
         lastReport = (next, WorldBuilderResultDecoder.session(from: envelope.payload))
         publishLastReport()
+
+        // Sent whether or not the state changed, and whether or not the
+        // geometry did. See `geometryUpdates` for why this one is not filtered
+        // here. Absent when the Tower has built nothing yet, which is the
+        // common case for most of a session's first seconds.
+        //
+        // Here rather than in `publishLastReport()` because this is a fact the
+        // Tower just stated, and `publishLastReport()` also runs on a
+        // *bracket* change, where the Tower has said nothing new.
+        if let coordinates = WorldBuilderResultDecoder.geometryCoordinates(from: envelope.payload) {
+            geometrySubject.send(coordinates)
+        }
     }
 
     /// Re-runs the gate over the last thing the Tower said, because the phone's

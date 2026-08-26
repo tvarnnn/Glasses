@@ -15,7 +15,7 @@ from tower.modules.base import Module
 from tower.modules.container import ModuleContainer
 from tower.modules.experimental_cv import ExperimentalCVModule
 from tower.results import build_hub
-from tower.routes import cartridges, health, ws
+from tower.routes import cartridges, geometry, health, observations, ws
 from tower.session import ConnectionTracker
 
 logger = logging.getLogger(__name__)
@@ -134,6 +134,18 @@ def _log_effective_configuration(
     else:
         logger.info("[Tower][Config] world root %s", settings.world_root)
 
+    if settings.observation_root is None:
+        logger.info(
+            "[Tower][Config] TOWER_OBSERVATION_ROOT is unset: "
+            "/object-memory/* will answer 404"
+        )
+    else:
+        logger.info(
+            "[Tower][Config] observation root %s (read-only; this process "
+            "never writes or deletes observations)",
+            settings.observation_root,
+        )
+
     if supervisor.enabled:
         logger.info(
             "[Tower][Config] a builder will be attached to each capture, "
@@ -183,6 +195,10 @@ def create_app() -> FastAPI:
     # Reads no world and writes no world. It starts the process that
     # does, at the moment a capture id comes into existence -- which is
     # the moment nobody outside this process can know it.
+    # Read-only, and read by one HTTP route. The web process never
+    # observes and never deletes: the producer is its own script, and
+    # deletion is a CLI a human types. Unset means that route answers 404.
+    app.state.object_memory_root = settings.observation_root
     app.state.capture_workers = _build_capture_worker_supervisor(settings)
     _log_effective_configuration(settings, app.state.capture_workers)
     # One shared reader for the whole app. It starts no task until a
@@ -196,6 +212,8 @@ def create_app() -> FastAPI:
     asyncio.run(app.state.module_container.load_and_start())
     app.include_router(health.router)
     app.include_router(cartridges.router)
+    app.include_router(geometry.router)
+    app.include_router(observations.router)
     app.include_router(ws.router)
     return app
 

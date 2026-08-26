@@ -32,7 +32,10 @@ final class WorldBuilderPayloadTests: XCTestCase {
         [
             "model_state": modelState,
             "model_state_reason": reason,
-            "world_snapshot": snapshot ?? NSNull(),
+            // `as Any?` is not decoration: `??` must unify `[String: Any]`
+            // and `NSNull` into one `T`, and the only such type is `Any`.
+            // Spelling it out saves the solver a backtrack it may not make.
+            "world_snapshot": (snapshot as Any?) ?? NSNull(),
         ]
     }
 
@@ -336,6 +339,19 @@ final class WorldBuilderPayloadTests: XCTestCase {
     /// the wire on 2026-08-24 from `tower.main:app` at
     /// `world_builder.status/2026-08-23`, after a build that produced 8
     /// keyframes, 2336 points and 7 solved poses.
+    ///
+    /// **Left at `/2026-08-23`, because that is when it was captured.** The
+    /// identifier has since moved to `/2026-08-25`, and this fixture is
+    /// deliberately not relabelled: rewriting the provenance of a captured
+    /// payload would be a claim about a wire nobody listened to. It still
+    /// decodes field for field, which is the point — the bump changed the
+    /// *meaning* of `trajectory.pose_count` (see
+    /// `WorldBuilderResultContract.identifier`) and not the encoding, so the
+    /// bytes are unchanged and only the reading of one number is not. Under
+    /// the old rule this world's 8 was `keyframes - poses_refused`; under the
+    /// new one it is `poses_positioned` — 7 solved plus 1 segment anchor. The
+    /// same 8 for a different reason, and the two agree only because this
+    /// world has exactly one segment and that segment solved something.
     ///
     /// The world it describes is **synthetic** — rendered, not photographed —
     /// which is a fact about the reconstruction and not about the wire. What

@@ -50,19 +50,33 @@ final class CartridgeClients {
     let experimentalCV: any ExperimentalCVClient
     let documentMemory: any DocumentMemoryClient
     let sceneUnderstanding: any SceneUnderstandingClient
+    /// The one client whose default is **not** an unavailable stub.
+    ///
+    /// Object Memory's Tower half exists and answers over HTTP, and its client
+    /// discovers that by asking rather than by being told over the socket — so
+    /// there is no declaration to wait for and nothing for a stub to stand in
+    /// for. Constructed here rather than in the workspace because an answer
+    /// must survive a cartridge switch, which destroys the view's
+    /// `@StateObject`.
+    ///
+    /// It opens nothing on construction. No request is made until a person
+    /// asks a question.
+    let objectMemory: any ObjectMemoryClient
 
     /// Defaults are the unavailable clients, which is the whole truth of the
-    /// current system. Injection points exist so a test can substitute one
-    /// without reaching through `ProjectManager`.
+    /// current system for four of the five. Injection points exist so a test
+    /// can substitute one without reaching through `ProjectManager`.
     init(
         worldBuilder: (any WorldBuilderClient)? = nil,
         experimentalCV: (any ExperimentalCVClient)? = nil,
         documentMemory: (any DocumentMemoryClient)? = nil,
-        sceneUnderstanding: (any SceneUnderstandingClient)? = nil
+        sceneUnderstanding: (any SceneUnderstandingClient)? = nil,
+        objectMemory: (any ObjectMemoryClient)? = nil
     ) {
         self.worldBuilder = worldBuilder ?? UnavailableWorldBuilderClient()
         self.experimentalCV = experimentalCV ?? UnavailableExperimentalCVClient()
         self.documentMemory = documentMemory ?? UnavailableDocumentMemoryClient()
         self.sceneUnderstanding = sceneUnderstanding ?? UnavailableSceneUnderstandingClient()
+        self.objectMemory = objectMemory ?? TowerObjectMemoryClient()
     }
 }

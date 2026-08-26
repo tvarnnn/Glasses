@@ -34,7 +34,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tower.scene.detect import FixedDetector, TorchvisionDetector  # noqa: E402
 from tower.scene.engine import SceneEngine  # noqa: E402
 from tower.scene.records import BoundingBox, Detection  # noqa: E402
-from tower.scene.tracking import Tracker, TrackerPolicy  # noqa: E402
+from tower.scene.tracking import (  # noqa: E402
+    DELIVERED_FRAME_INTERVAL_S,
+    Tracker,
+)
 
 RESOLUTIONS = [(640, 360), (896, 504), (1280, 720)]
 
@@ -114,17 +117,31 @@ def bench_tracker_overhead(repeat: int) -> dict:
     counter = {"at": 0.0}
 
     def step():
-        counter["at"] += 0.3
+        counter["at"] += DELIVERED_FRAME_INTERVAL_S
         engine.observe(frame, received_at=counter["at"])
 
     return _timed(step, repeat)
 
 
-def bench_count_stability(dropout_rates=(0.0, 0.1, 0.2, 0.4)) -> list[dict]:
+def bench_count_stability(
+    dropout_rates=(0.0, 0.1, 0.2, 0.4, 0.6),
+) -> list[dict]:
     """Does the count hold when the detector misses frames?
 
     The brief's requirement, measured rather than asserted. A count that
     flickers with the detector makes the wearer distrust every answer.
+
+    The tracker is built with **no policy argument on purpose**: this
+    bench used to construct `TrackerPolicy(min_hits=3, max_misses=5)`
+    by hand, so it went on reporting the old constants' behaviour after
+    they changed, and a benchmark that cannot see a regression cannot
+    guard against one. Frames are stepped at the real delivered
+    interval for the same reason -- it used to step 0.3 s, the ~3.3 fps
+    that was never the rate.
+
+    The 60% row is new and is where the difference lives: at 40% the
+    old constants already read 0.939, but at 60% they collapse to 0.252
+    while a miss budget of one real second holds 0.783.
     """
     rows = []
     both = [
@@ -133,7 +150,7 @@ def bench_count_stability(dropout_rates=(0.0, 0.1, 0.2, 0.4)) -> list[dict]:
     ]
     for rate in dropout_rates:
         rng = np.random.default_rng(7)
-        tracker = Tracker(TrackerPolicy(min_hits=3, max_misses=5))
+        tracker = Tracker()
         counts = []
         at = 0.0
         for index in range(120):
@@ -141,7 +158,7 @@ def bench_count_stability(dropout_rates=(0.0, 0.1, 0.2, 0.4)) -> list[dict]:
                 detection for detection in both if rng.random() >= rate
             ]
             tracker.update(visible, at=at)
-            at += 0.3
+            at += DELIVERED_FRAME_INTERVAL_S
             if index >= 5:
                 counts.append(tracker.count("person"))
         rows.append(

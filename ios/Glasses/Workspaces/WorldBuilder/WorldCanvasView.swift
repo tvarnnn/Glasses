@@ -15,13 +15,18 @@ import SwiftUI
 ///
 /// Deliberately absent, and each for a reason:
 ///
-/// - **No 3D framework.** SceneKit, RealityKit and Metal would all be weight
-///   in exchange for nothing to render — and there is still nothing, because
-///   the result channel carries **no imagery, no poses, no points and no
-///   paths**, only counts, states and summaries. The Tower has the trajectory
-///   and the keyframe images on disk; sending them needs a consumer that does
-///   not exist yet, and building the transport first is the fabricated
-///   contract this project refuses.
+/// - **No 3D framework.** SceneKit, RealityKit and Metal are still absent, and
+///   now for a sharper reason than "nothing to render". There *is* something to
+///   render — points and poses arrive over HTTP, per segment — but the
+///   manifest's `up_axis` is `"unknown"`, so a 3D view would have to guess
+///   which way is up, and segments are unregistered, so a single scene would
+///   superimpose reconstructions that share no coordinate frame. A top-down
+///   `(x, z)` `Canvas` per fragment is both cheaper and the only honest
+///   projection available. See `WorldFragmentsView`.
+/// - **No single world map.** Each fragment gets its own frame, its own scale
+///   and its own box until the Tower registers them. Per-segment scale
+///   disagrees by up to ~87x on a real walk; one shared scale would draw
+///   something that looks like a room and means nothing.
 /// - **No animated placeholder.** A drifting point cloud would look like
 ///   progress and be a fabrication.
 /// - **No spinner in the unsupported state.** A spinner claims work is
@@ -63,6 +68,16 @@ struct WorldCanvasView: View {
     /// this does is let the waiting state say *why* it is waiting, which is
     /// the sentence nobody could see on 2026-08-24.
     var sessionBinding: WorldSessionBinding = .none
+
+    /// The segments the Tower's manifest names, and their points and poses.
+    ///
+    /// Defaulted to empty so that the states with nothing to draw — and the
+    /// previews, and any caller that only wants the summary rows — construct
+    /// this view exactly as they did before. An empty model draws the
+    /// "nothing mapped yet" sentence, which is what the panel said in that
+    /// situation anyway.
+    var fragments = WorldFragmentsModel(segments: [])
+    var geometryChunks: [String: WorldSegmentChunk] = [:]
 
     var body: some View {
         if let forcedPhase = availability.forcedPhase {
@@ -133,6 +148,7 @@ struct WorldCanvasView: View {
         case .receiving(let snapshot):
             headline(snapshot.name ?? "Building", systemImage: "cube")
             WorldSummaryView(snapshot: snapshot, isLive: true)
+            fragmentGallery
 
         case .finalizing(let snapshot):
             // Progress is honest here — the Tower is genuinely working — but
@@ -145,10 +161,12 @@ struct WorldCanvasView: View {
             }
             WorldSummaryView(snapshot: snapshot, isLive: false)
             detailText("Capture has ended. The Tower is still working, so these figures may still change.")
+            fragmentGallery
 
         case .finalized(let snapshot):
             headline(snapshot.name ?? "World", systemImage: "cube.fill")
             WorldSummaryView(snapshot: snapshot, isLive: false)
+            fragmentGallery
 
         case .failed(let failure):
             headline("World building failed", systemImage: "exclamationmark.triangle.fill")
@@ -191,6 +209,21 @@ struct WorldCanvasView: View {
                 session's capture, so nothing here describes it yet.
                 """
         }
+    }
+
+    /// What the Tower actually built, drawn one fragment at a time.
+    ///
+    /// Below the summary rows and never instead of them. The rows are the
+    /// Tower's own figures; this is the geometry those figures are about, and a
+    /// reader who scrolls past a picture should still find the counts that
+    /// picture came from.
+    ///
+    /// Shown in the three states that carry a snapshot and in no others.
+    /// `.idle` and `.failed` have no world to have geometry for, and drawing an
+    /// empty gallery under them would offer a container where there is not even
+    /// a world.
+    private var fragmentGallery: some View {
+        WorldFragmentsView(model: fragments, chunks: geometryChunks)
     }
 
     /// The state that is actually reachable today.
@@ -282,7 +315,6 @@ struct WorldSummaryView: View {
     private var geometryRows: some View {
         if snapshot.geometry.hasReport {
             row("Geometry", geometryValue)
-            caption("This build cannot draw the Tower's world representation yet.")
         }
     }
 

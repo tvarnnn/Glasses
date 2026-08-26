@@ -160,6 +160,7 @@ the manifest" signal. No new field is added to it.
   "contract": "world_builder.geometry/2026-08-25",
   "world_id": "3dd986b1c2364d4b85de97152f2e39f4",
   "session_id": "dd5d13a2381e430db9b27c7da2cf2928",
+  "current": false,
   "geometry_revision": "…",
   "pose_convention": {
     "pose_type": "T_world_camera", "quaternion_order": "wxyz",
@@ -203,12 +204,46 @@ Field semantics, stated so none is ambiguous:
   others.
 - `bounds` — **3D**, over this segment's points, in the segment's own frame.
   `null` when `point_count == 0`.
+- `current` — whether this geometry reflects **every keyframe accepted so
+  far**. See "Behind is not absent" below. `false` is the *normal* state during
+  a live walk and is not an error.
+
+#### Behind is not absent
+
+The first implementation read the derived tree with `WorldStore.read_derived`'s
+default `verify=True`, which treats a tree whose input digest no longer matches
+the journal as **absent**. During a walk that digest moves with **every
+keyframe**, so a build finished, the next keyframe put it behind, and the
+manifest answered `404` for the rest of the capture — while real geometry sat
+on disk. That contradicted §1.3's promise that a new segment appears as you
+walk: the gallery stayed empty until the session ended.
+
+The Tower had already settled this on the status channel
+(`tower/results/world_builder.py:1058`, `_geometry_block`), and this endpoint
+mirrors that decision rather than inventing a second policy. A build over the
+first N keyframes is not wrong; it is a **correct answer to an older
+question**. So it is served, with `current: false`. Hiding it discarded true
+information; serving it unflagged would let a viewer read a partial world as
+the finished one. **The flag is the whole difference.**
+
+Three states stay distinct, and that is the constraint the design has to hold:
+
+| On disk | Answer |
+|---|---|
+| no derived tree at all | `404` — absent |
+| a tree behind the journal | `200`, `current: false` |
+| a tree matching the journal | `200`, `current: true` |
+
+`current` is **additive**: an older decoder that ignores it reads exactly the
+payload it read before. Per `docs/contracts/CARTRIDGE-RESULTS.md` §12 that is
+not grounds for a contract bump, so the identifier is unchanged.
 
 ### 3.2 `GET /worlds/{world_id}/geometry/segment/{index}?session_id=…&max_points=N`
 
 ```json
 {
   "contract": "world_builder.geometry/2026-08-25",
+  "current": false,
   "segment_index": 19,
   "content_hash": "…",
   "frame_id": "segment:19",
@@ -227,6 +262,10 @@ Field semantics, stated so none is ambiguous:
 
 Rows preserve `poses.json` order, which is index-aligned to `keyframes.jsonl`
 (verified 457/457 on the real world).
+
+`current` carries the same meaning as on the manifest and is **repeated here on
+purpose**: a client that holds a cached chunk and never re-reads the manifest
+would otherwise have no way to know the geometry in its hand is behind.
 
 ### 3.3 Rules that are not negotiable
 
@@ -300,9 +339,64 @@ it is stable exactly when the segment is.
 ### 4.2 Explicitly out of scope here
 
 Segment registration, covisibility, loop closure, bundle adjustment, metric
-scale, higher-resolution capture, and imagery transport. Each is tracked
-separately. The repo's own guidance stands: BA measured 0.00% drift improvement
-because the observation graph is a chain, so **covisibility comes before BA**.
+scale, tracking continuity, higher-resolution capture, and imagery transport.
+
+**This is the scope boundary for the geometry-transport implementation, not
+the end state of World Builder.** Every item above remains subsequent World
+Builder work and is expected to happen; none is abandoned or deferred
+indefinitely. The boundary exists so this contract can be frozen and shipped
+against today's reconstruction, and so the renderer built on it does not have
+to change when the reconstruction improves — which is precisely what §3.4
+guarantees.
+
+Known ordering constraint for that later work: BA measured 0.00% drift
+improvement because the observation graph is a chain with median covisibility
+span 1, so **covisibility comes before bundle adjustment**
+(`WORLD-BUILDER.md:452-461`).
+
+### 4.3 Evidence has since moved two of those items — recorded 2026-08-26
+
+**Tracking continuity is no longer future work; it is done and measured.**
+`docs/superpowers/research/2026-08-26-segment-fragmentation.md` found the
+assumed cause was wrong. Breaks were not imagery the tracker could not
+follow: of 50 declared losses, 47 still had survival above the floor against
+the previous frame. The mechanism was reference staleness — the reference
+advances only on an accept, so a run of blurred frames freezes it while the
+camera keeps moving (max 89 frames stale). Two constants plus a grace window
+took the real walk from **51 to 29 segments** and the eight-capture corpus
+from **171 to 110**, with keyframes falling rather than rising.
+
+That also retires a line in this document's own §1.1. It quoted
+`engine.py:767` — "they are independent windows today, and they must stay
+so" — as though independence were a property of the data. It is a property
+of the *pipeline*. Sampling 130 keyframes and ORB-matching every
+cross-segment pair produced **285 verified links, 258 of them non-adjacent,
+with all 51 segments in a single connected component.** The fragments were
+never geometrically disconnected. Nothing had tried to link them.
+
+**So registration moves from "expected eventually" to the next wave**, and it
+is now the last thing standing between this contract and the product the
+module doc describes. Two things make that cheap rather than disruptive:
+
+1. **The contract already carries it.** §3.4's forward-compatibility hooks —
+   `registered` and `transform_to_world` on every segment, in both the
+   manifest and each chunk — were designed for exactly this and need no
+   change. A registration pass flips a flag and fills a Sim3.
+2. **No cached geometry is invalidated.** Segment-local points and poses do
+   not move; only the *placement* above them does. Every `content_hash`
+   stays valid across a registration pass, so the transport and the client
+   cache are unaffected.
+
+The renderer is likewise ready: `WorldFragmentsModel.hasSharedFrame` already
+merges fragments into one canvas when every segment reports `registered`,
+and `testRegisteredSegmentsWouldShareAFrame` already pins it.
+
+**What remains genuinely unknown** is scale. Each segment normalises its
+first baseline to 1.0, so the ~87x span across segments is arbitrary, and a
+Sim3 needs the scale factor recovered from shared structure. Feasibility of
+that recovery is under investigation; a wrong Sim3 fabricates a
+plausible-looking world, which is the failure this project cares most about,
+so nothing gets `registered: true` without a confidence signal that earns it.
 
 ---
 
@@ -383,6 +477,25 @@ on the Mac. No iOS claim in any report may say "passing" until that happens.
 
 ## 8. Status
 
-**DESIGN APPROVED — NOT IMPLEMENTED.** No code has been written. Physical
-validation of anything below remains pending and cannot be claimed from this
-machine.
+**IMPLEMENTATION COMPLETE — BUILD AND PHYSICAL VALIDATION PENDING.**
+
+Implemented across nine tasks on `integration/world-builder-lifecycle-v1`, plus
+one fix wave after a whole-branch review. See
+`docs/superpowers/plans/2026-08-25-world-builder-geometry-transport.md`.
+
+| Half | State |
+|---|---|
+| Tower | **1218 passed, 32 skipped, 0 failed**, run on this machine |
+| iOS | Written here and **never compiled** — no Swift toolchain exists on this machine (`xcodebuild`, `swift`, `swiftc` all absent). Every iOS commit says BUILD UNVERIFIED |
+
+**Nothing here has met the glasses.** The Tower half is proven by automated
+tests against synthetic and recorded fixtures; the iOS half is proven by
+nothing at all until a Mac compiles it. Neither is evidence that a wearer sees
+fragments appear during a walk — only a physical run is.
+
+One behaviour changed after review and is worth restating, because it is the
+one this design exists for: geometry that is **behind the journal** is now
+served with `current: false` rather than withheld. Withholding it 404'd for an
+entire capture, so the gallery populated only after Stop — which would have
+made §1.3's "a new segment appears as you walk" false in practice while every
+test stayed green.

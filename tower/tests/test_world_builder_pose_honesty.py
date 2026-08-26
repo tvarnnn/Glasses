@@ -73,16 +73,20 @@ def test_an_unsolved_segments_anchor_is_not_counted():
     assert _pose_count(manifest) == 5
 
 
-def test_an_old_manifest_without_the_breakdown_still_reports_something():
-    """Worlds built before this change must stay readable.
+def test_an_old_manifest_without_the_breakdown_reports_absent():
+    """Worlds built before poses_positioned existed do not get a guess.
 
-    Falling back to the old formula is the honest choice for a manifest
-    that cannot answer the better question: it is what the figure has
-    always meant, and refusing outright would blank the trajectory on
-    every world already on disk.
+    This test used to assert that falling back to keyframes - poses_refused
+    was "the honest choice" for a manifest that cannot answer the better
+    question. It was not: that is the exact arithmetic that put "Camera
+    poses: 36" on the phone from a manifest reading poses_solved: 0. An
+    anchor is definitional (identity rotation, zero translation), and the
+    fallback silently promoted every one of them to a measured position.
+    A manifest missing poses_positioned predates the fix that can tell
+    the difference, and absent is the only honest answer for it now.
     """
     manifest = _manifest(keyframes=10, poses_solved=9, poses_refused=0)
-    assert _pose_count(manifest) == 10
+    assert _pose_count(manifest) is None
 
 
 def test_a_manifest_with_nonsense_counts_reports_nothing():

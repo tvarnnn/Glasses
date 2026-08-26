@@ -13,7 +13,13 @@ import numpy as np
 import pytest
 
 from tower.confidence import Confidence
-from tower.document_memory.detect import MIN_ROW_TRANSITIONS, detect_page, warp_page
+from tower.document_memory.detect import (
+    CORPUS_STRUCTURE_CEILING,
+    MIN_ROW_TRANSITIONS,
+    READABLE_PAGE_FLOOR,
+    detect_page,
+    warp_page,
+)
 from tower.document_memory.dwell import DwellPolicy, DwellTracker
 from tower.document_memory.engine import DocumentMemoryEngine
 from tower.document_memory.ocr import FixedTextRecogniser, OcrResult, TextRegion
@@ -148,14 +154,24 @@ class TestStructureIsNotText:
         assert recogniser.calls == 0, f"{name} triggered OCR"
         assert store.count() == 0, f"{name} was persisted as a document"
 
-    def test_real_text_still_clears_the_glyph_gate_by_a_wide_margin(self):
-        """The gate must not have been bought with a false negative."""
+    def test_real_text_still_clears_the_readable_floor(self):
+        """The gate must not have been bought with a false negative.
+
+        Was `> MIN_ROW_TRANSITIONS * 3`, which asserted the threefold
+        margin the 2026-08-26 re-derivation showed does not exist -- a
+        full-frame rendered page measures 72, not 93. The honest bar is
+        the edge the threshold was actually derived from: a page in view
+        must score at or above the smallest placement that still returned
+        usable text (a receipt at 38% of a 360x640 frame, word_recall
+        0.714). Anything below that is a page OCR could not read.
+        """
         frame, _ = fx.place_page(fx.render_page(fx.TRANSFORMER_PAPER))
 
         candidate = detect_page(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
 
         assert candidate is not None
-        assert candidate.row_transitions > MIN_ROW_TRANSITIONS * 3
+        assert candidate.row_transitions >= READABLE_PAGE_FLOOR
+        assert READABLE_PAGE_FLOOR > MIN_ROW_TRANSITIONS > CORPUS_STRUCTURE_CEILING
 
 
 class TestTheClockCannotDestroyADocument:
