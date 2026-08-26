@@ -7,7 +7,7 @@ read off code, tests or data — not off a design document.
 
 ---
 
-> ## Superseded in four places — updated 2026-08-26
+> ## Superseded in six places — updated 2026-08-26
 >
 > This remains the orientation document, but four of its findings have since
 > been acted on or falsified. Read this block before trusting the tables.
@@ -34,6 +34,16 @@ read off code, tests or data — not off a design document.
 > measured in **landscape geometries DAT cannot produce**. Detail:
 > `2026-08-26-document-memory-reality-check.md`.
 >
+> **3b. The gate has since been re-derived, and false positives are now
+> 0 of 9,199** (`MIN_ROW_TRANSITIONS` 8 -> 31, derived in code from the
+> corpus ceiling and the readable-page floor). The deeper finding is that
+> `row_transitions` measures crop size, not glyphiness: real on-screen
+> text scores *below* real negatives, so the ordering is inverted and no
+> threshold on that statistic separates them. A threshold survives only
+> because the overlapping content is unreadable anyway — EasyOCR finds
+> **zero** text regions in those frames. Detail:
+> `2026-08-26-document-gate-rederivation.md`.
+>
 > **4. Object Memory is no longer blocked, and §3.2's ruling is not what
 > gated it.** The Task 4 decision gates registering as a live in-process
 > `Module`; every other cartridge produces out of process by tailing a
@@ -42,6 +52,32 @@ read off code, tests or data — not off a design document.
 > now *sidestepped* rather than pre-empted: a closed whitelist persists only
 > `laptop` and `cell phone`, so no bystander record can be written until a
 > human decides.
+>
+> **4b. Object Memory now has a wire path**, its first:
+> `tower/routes/observations.py`, registered as a fifth router, read-only
+> by construction (`purge`/`prune_expired` unreachable, AST-enforced) and
+> unable to widen retention over HTTP. The payload states its own limits
+> as fields — `claim: category-was-visible-once`, `identity:
+> category-not-instance`, `spatial_ref: null` — because this cartridge
+> does not know where anything is.
+>
+> **5. Scene Understanding's constants were re-derived.** Its tuning
+> assumed **~3.3 fps**; the corpus measures **11.97**. `max_misses = 5`
+> was documented as 1.5 s of absence and was really **0.42 s**, so a
+> person occluded for half a second was recounted as a new person. Now
+> `frames_in(MAX_ABSENCE_S)`. Counting at 60% detector dropout went
+> **0.252 -> 0.783**. Detail: `2026-08-26-tracker-retune.md`.
+>
+> **6. This document is no longer the roadmap.** Its title says "and
+> high-level roadmap"; that half now lives in
+> `docs/agent-handoffs/CARTRIDGE-ROADMAP.md`, which covers all nine
+> cartridges, the five blockers, and the dependency order. **This file
+> remains the archaeology — what exists.** Two blockers named there are
+> not in the tables below: **camera resolution** (360x640 gives ~2 px
+> glyphs) and the fact that the lifecycle ruling of §3.2 now gates Scene
+> Understanding's wire path too, because that cartridge has no store by
+> design and so cannot use the journal-follower escape that freed Object
+> Memory.
 >
 > **What did not change:** there is still no audio path of any kind, so
 > Translator, and the voice halves of Visual Q&A and Accessibility, remain
