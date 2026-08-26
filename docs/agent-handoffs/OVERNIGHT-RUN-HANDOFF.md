@@ -6,8 +6,8 @@ If context is lost, a successor session can resume from this file plus
 
 **Branch:** `integration/world-builder-lifecycle-v1`
 **Run started from:** `3998e5a`
-**Last updated:** 2026-08-26, after Object Memory review + fixes
-**Suite at last update:** 1410 passed, 30 skipped, 0 failed
+**Last updated:** 2026-08-26, after the Scene Understanding tracker retune
+**Suite at last update:** 1444 passed, 30 skipped, 0 failed
 
 `main` is untouched at `35214a1`. Nothing has been merged or pushed.
 
@@ -114,6 +114,34 @@ Implemented, 145 tests, and **never ran on a real frame** until this run.
 - Its recall table was measured in **landscape geometries DAT cannot produce**.
 - **No capture contains a sheet of paper.** The cartridge has never had a
   chance to succeed.
+
+### Scene Understanding — CONSTANTS RE-DERIVED
+
+Its tuning was written against an **assumed ~3.3 fps**. The corpus measures
+**11.97 fps (83.5 ms)** — 3.6x faster — so every constant expressed in frames
+meant something other than what its comment claimed.
+
+- **`max_misses` 5 -> 12.** Documented as "roughly 1.5 seconds of absence";
+  at the real rate it was **0.42 s**. A person occluded for half a second got
+  a new track ID and was **recounted** — landing squarely on the cartridge's
+  headline capability.
+- It is now `frames_in(MAX_ABSENCE_S)` with `MAX_ABSENCE_S = 1.0`, not a
+  literal. If the frame rate changes, the constant follows.
+- **Counting improved and regressed nowhere.** Detector dropout 0/10/20/40/60%:
+  before 1.000/1.000/1.000/0.939/**0.252**, after 1.000/1.000/1.000/0.965/**0.783**.
+- **`min_iou` 0.25 and `min_hits` 3 kept, but newly derived** — the floor that
+  retains >=99.5% of true associations per label, and a two-sided derivation
+  (4 regresses dropout at every non-zero rate, 2 doubles phantom frames).
+- **Orientation cadence** `2.0 s` -> **0.2505 s** = stride 3 x 0.0835 s, where
+  stride 3 is `TrackerPolicy.min_hits`: estimating facing more often than a
+  track can be confirmed buys nothing.
+- **The trade, named:** a departed track now stays confirmed 1.0 s instead of
+  0.42 s, so it can be falsely reported present for longer. Capped at 12
+  because 18 and 24 frames measure *identically* on count stability — going
+  longer would assert more with nothing measurable to show.
+- **Caveat:** corpus `person` boxes are the wearer's torso. `cell phone`
+  (small, external, 0.842) is the proxy that set `min_iou`. Bystander tracking
+  accuracy remains unmeasurable here.
 
 ### Supporting work
 
@@ -225,19 +253,19 @@ decode, and a confidence field that never received its upgrade.
 
 ## 7. Next execution order
 
-1. **Shared detector promotion** — in flight. `scene/detect.py` and
-   `object_memory/detector.py` are 130/190 lines verbatim. Promote the *code*
-   to `tower/detection.py`; explicitly **not** model residency, for which no
-   evidence exists.
-2. **Re-derive `MIN_ROW_TRANSITIONS`** against the 9,199 real negatives.
-   Document Memory's gate was tuned on a renderer and fires only on blinds and
-   keyboards. Directly actionable, no hardware needed.
-3. **Measure orientation and depth on real frames.** KeypointRCNN is free with
-   torchvision. Scene Understanding refused `in_front_of`/`behind` because
-   MiDaS flickers 6–8% — measured *synthetically*. Confirm or refute on real
-   frames. Depth needs `timm`.
+1. ~~Shared detector promotion~~ — **done**, `tower/detection.py`.
+2. ~~Scene Understanding cadence and tracker constants~~ — **done**, above.
+3. **Re-derive `MIN_ROW_TRANSITIONS`** against the 9,199 real negatives — in
+   flight. Document Memory's gate was tuned on a renderer and fires only on
+   blinds and keyboards. Note the honest ceiling: **no capture contains a
+   sheet of paper**, so a correct gate cannot make the cartridge work — it can
+   only stop it being wrong.
 4. **Object Memory iOS surface.** The cartridge has no product surface at all.
-5. **Scene Understanding wire path.** Blocked on the live-module route, which
+   This is now the largest *product* gap that needs no hardware and no ruling.
+5. **Measure depth on real frames.** Needs `timm`. Scene Understanding refused
+   `in_front_of`/`behind` on a **synthetic** 6–8% flicker measurement.
+   Orientation is already measured (43.4 ms CUDA, not the feared 798 ms).
+6. **Scene Understanding wire path.** Blocked on the live-module route, which
    is blocked on the lifecycle ruling. Its status wording currently blames
    persistence, which sends readers toward the wrong fix.
 
