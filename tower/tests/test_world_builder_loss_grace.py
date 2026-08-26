@@ -10,13 +10,18 @@ against the previous frame** and 40 were above 0.20. Only 3 were genuine.
 The rest were a stale reference being asked to cross a gap in one hop --
 and the very next frame would have tracked fine.
 
-So a break now requires N consecutive loss verdicts. Genuine loss still
-breaks, three frames later; a single bad hop does not.
+The mechanism below lets a break require N consecutive loss verdicts, so a
+single bad hop no longer ends a segment.
 
-The cost is bounded and worth stating: while in grace the reference does
-not advance, so staleness grows for up to N frames. That is acceptable
-because the alternative is a segment boundary, and a boundary is
-permanent while staleness is not.
+**It ships disabled (N=1), and that is the interesting part.** Grace looked
+like a clear win on segment count and then cost a third of the
+reconstruction when the full solve was run -- see `TestTheShippedDefault`.
+A held frame neither advances the reference nor becomes a keyframe, so
+holding trades geometry for continuity, and on this footage the trade is
+bad. The mechanism stays because it is sound, tested, and N=2 is untested.
+
+These tests exercise the mechanism at N=3 regardless of the shipped
+default: they pin how holding BEHAVES, not how it is tuned.
 """
 
 import pytest
@@ -46,9 +51,15 @@ def _motion(survival: float, *, overlap: float = 0.9) -> MotionSummary:
     )
 
 
+# The mechanism is exercised at grace 3 regardless of what ships as the
+# default, because these tests pin how holding BEHAVES, not how it is
+# currently tuned. The shipped default has its own test at the bottom.
+GRACE = 3
+
+
 @pytest.fixture
 def selector():
-    sel = KeyframeSelector()
+    sel = KeyframeSelector(KeyframePolicy(loss_grace_frames=GRACE))
     sel.note_frame(_sharp())
     sel.evaluate(_sharp(), None)      # session seed
     sel.note_accepted()
@@ -75,7 +86,7 @@ class TestGraceWindow:
 
     def test_a_sustained_loss_still_breaks(self, selector):
         """The 3-of-50 case. Grace delays a real break, it does not prevent it."""
-        decisions = _feed(selector, 0.01, KeyframePolicy().loss_grace_frames)
+        decisions = _feed(selector, 0.01, GRACE)
 
         assert decisions[-1].outcome == TRACKING_LOST
         assert decisions[-1].reason == REASON_TRACKING_LOST
@@ -83,8 +94,8 @@ class TestGraceWindow:
 
     def test_the_break_arrives_exactly_at_the_grace_bound(self, selector):
         """Not earlier, not later -- an off-by-one here is a silent policy change."""
-        grace = KeyframePolicy().loss_grace_frames
-        decisions = _feed(selector, 0.01, grace)
+        decisions = _feed(selector, 0.01, GRACE)
+        grace = GRACE
 
         assert [d.lost for d in decisions] == [False] * (grace - 1) + [True]
 
@@ -95,7 +106,7 @@ class TestGraceWindow:
         break. Without a reset, an unrelated bad frame minutes later would
         inherit the earlier one's credit.
         """
-        grace = KeyframePolicy().loss_grace_frames
+        grace = GRACE
         _feed(selector, 0.01, grace - 1)
         _feed(selector, 0.90, 1)            # recovered
         decisions = _feed(selector, 0.01, grace - 1)
@@ -104,7 +115,7 @@ class TestGraceWindow:
 
     def test_a_declared_loss_clears_the_count_for_the_next_segment(self, selector):
         """A fresh segment starts with a full grace window, not a spent one."""
-        grace = KeyframePolicy().loss_grace_frames
+        grace = GRACE
         _feed(selector, 0.01, grace)        # breaks
         selector.note_lost()
 
@@ -133,7 +144,7 @@ class TestGraceDoesNotWidenTheLossDefinition:
 
     def test_held_frames_are_never_accepted_as_keyframes(self, selector):
         """A frame the tracker could not follow must not become geometry."""
-        decisions = _feed(selector, 0.01, KeyframePolicy().loss_grace_frames - 1)
+        decisions = _feed(selector, 0.01, GRACE - 1)
 
         assert all(not d.accepted for d in decisions)
 
@@ -159,3 +170,21 @@ class TestGraceIsConfigurableAndAuditable:
         """
         [decision] = _feed(selector, 0.01, 1)
         assert decision.reason == REASON_TRACKING_HELD
+
+
+class TestTheShippedDefault:
+    def test_grace_ships_disabled_because_it_costs_geometry(self):
+        """3 was measured and rejected. This pins the decision, not a taste.
+
+        Segment count called grace 3 a clear win -- 130 -> 99 across eight
+        captures. Running the full solve said otherwise: against reach-only
+        on five real captures it took poses_solved 265 -> 178 and points
+        42,100 -> 27,262, buying 18 segments and destroying a third of the
+        reconstruction.
+
+        A held frame neither advances the reference nor becomes a keyframe,
+        so holding means more staleness and fewer keyframes exactly when
+        correspondence is already struggling. The segment survives and the
+        geometry inside it does not.
+        """
+        assert KeyframePolicy().loss_grace_frames == 1

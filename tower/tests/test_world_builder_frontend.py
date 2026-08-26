@@ -482,11 +482,7 @@ class TestRescueWindow:
         """
         selector = self._seeded_selector()
         outcomes = []
-        # The tail is sustained below the floor rather than a single dip:
-        # a break now needs `loss_grace_frames` consecutive sub-floor
-        # frames, and this test is about what happens BEFORE the break, so
-        # the break has to actually arrive for "before" to mean anything.
-        for survival in (0.90, 0.70, 0.50, 0.30, 0.10, 0.02, 0.02, 0.02):
+        for survival in (0.90, 0.70, 0.50, 0.30, 0.10, 0.02):
             selector.note_frame(_quality())
             decision = selector.evaluate(
                 _quality(),

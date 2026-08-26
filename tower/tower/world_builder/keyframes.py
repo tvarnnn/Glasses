@@ -111,14 +111,32 @@ class KeyframePolicy:
     # genuine. The rest were a stale reference asked to cross a gap in one
     # hop, where the next frame would have tracked fine.
     #
-    # 3, measured: 33 -> 27 segments on that walk and 130 -> 99 across the
-    # eight largest captures, with keyframes FALLING (448 -> 429, 1661 ->
-    # 1607) because fewer spurious breaks means fewer segment seeds.
+    # DEFAULT 1 -- the mechanism is here and tested, but 3 was measured
+    # and REJECTED, and the reason is worth keeping.
     #
-    # The cost is bounded: while held, the reference does not advance, so
-    # staleness grows for up to this many frames. That is the right trade
-    # because a boundary is permanent and staleness is not.
-    loss_grace_frames: int = 3
+    # Segment count said 3 was a clear win: 130 -> 99 across the eight
+    # largest captures. Running the full solve says otherwise. Against
+    # reach-only, on five real captures:
+    #
+    #             segments   poses_solved   points
+    #   reach       114          265         42100
+    #   + grace 3    96          178         27262
+    #
+    # It buys 18 segments and destroys a third of the reconstruction. The
+    # mechanism is clear: a held frame neither advances the reference nor
+    # becomes a keyframe, so holding through three frames means more
+    # staleness and fewer keyframes at exactly the moment correspondence is
+    # already struggling. The segment survives; the geometry inside it does
+    # not.
+    #
+    # This is the trap the fragmentation research named -- setting the loss
+    # floor to 0.0 gives ONE segment and 37 keyframes, and one segment
+    # containing nothing is worse than 51 containing something. Segment
+    # count alone cannot tell you which you have. Anything tuning this must
+    # report poses_solved and points beside it.
+    #
+    # 2 is untested and is the obvious next thing to try if this is revisited.
+    loss_grace_frames: int = 1
     # Reject a frame markedly blurrier than its recent neighbours, which
     # catches motion blur during a head turn even in a scene whose
     # absolute sharpness is low throughout.
