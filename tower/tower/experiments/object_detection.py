@@ -21,7 +21,7 @@ import logging
 import cv2
 import numpy as np
 
-from tower.experiments import ExperimentResult, ExperimentSettings
+from tower.experiments import ExperimentResult, ExperimentSettings, MetricKind
 from tower.instrumentation import StageTimer
 from tower.loading import LoadInvalidation
 from tower.modules.base import FrameProcessingError
@@ -37,6 +37,23 @@ SCORE_THRESHOLD = 0.4
 # Reported individually because a Scene Understanding cartridge asks about
 # them by name. Everything else is folded into `detections`.
 TRACKED_CLASSES = ("person", "chair", "couch", "dining table", "tv", "laptop")
+
+# `score_threshold` is SCORE_THRESHOLD echoed back on every frame: a
+# constant, and the old harness AVERAGED it, which happened to give the
+# right number for the wrong reason. The per-class entries are derived
+# from TRACKED_CLASSES rather than typed out, so a class added above
+# cannot arrive unclassified.
+METRIC_KINDS: dict[str, MetricKind] = {
+    "detections": MetricKind.COUNT,
+    "raw_detections": MetricKind.COUNT,
+    "score_threshold": MetricKind.CONSTANT,
+    "mean_score": MetricKind.RATE,
+    "max_score": MetricKind.RATE,
+    **{
+        f"count_{name.replace(' ', '_')}": MetricKind.COUNT
+        for name in TRACKED_CLASSES
+    },
+}
 
 
 class ObjectDetectionExperiment:

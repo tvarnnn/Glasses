@@ -36,9 +36,34 @@ import numpy as np
 from tower.experiments import (
     ExperimentResult,
     ExperimentSettings,
+    MetricKind,
     decode_gray,
 )
 from tower.instrumentation import StageTimer
+
+# `has_reference`, `resolution_changed` and `reference_stale` are 0/1
+# flags, and a flag's SUM is the number of frames it fired on -- which is
+# exactly the question worth asking of a corpus, so they are counts.
+# `tracked_fraction` is the metric that was being summed to ~768 over the
+# real corpus for a quantity that cannot exceed 1.
+# `dominant_direction_deg` is circular and has no mean; see
+# MetricKind.UNAGGREGATED.
+METRIC_KINDS: dict[str, MetricKind] = {
+    "median_flow_px": MetricKind.RATE,
+    "mean_flow_px": MetricKind.RATE,
+    "max_flow_px": MetricKind.RATE,
+    "tracked_fraction": MetricKind.RATE,
+    "tracked_count": MetricKind.COUNT,
+    "seeded_count": MetricKind.COUNT,
+    "median_forward_backward_px": MetricKind.RATE,
+    "rejected_by_forward_backward": MetricKind.COUNT,
+    "direction_coherence": MetricKind.RATE,
+    "dominant_direction_deg": MetricKind.UNAGGREGATED,
+    "has_reference": MetricKind.COUNT,
+    "resolution_changed": MetricKind.COUNT,
+    "reference_stale": MetricKind.COUNT,
+    "seconds_since_reference": MetricKind.RATE,
+}
 
 MAX_CORNERS = 300
 CORNER_QUALITY = 0.01

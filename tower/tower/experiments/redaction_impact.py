@@ -30,8 +30,31 @@ frame rather than of the redaction.
 import cv2
 import numpy as np
 
-from tower.experiments import ORB_MIN_DIMENSION, ExperimentResult, decode_gray
+from tower.experiments import (
+    ORB_MIN_DIMENSION,
+    ExperimentResult,
+    MetricKind,
+    decode_gray,
+)
 from tower.instrumentation import StageTimer
+
+# Every `keypoints_*` and `survivors_*` number is a tally of keypoints in
+# one frame and adds up across the corpus. The retentions and fractions
+# are ratios and do not. `blur_kernel` is the configured kernel size.
+METRIC_KINDS: dict[str, MetricKind] = {
+    "region_keypoint_retention": MetricKind.RATE,
+    "frame_keypoint_retention": MetricKind.RATE,
+    "keypoints_before": MetricKind.COUNT,
+    "keypoints_after": MetricKind.COUNT,
+    "keypoints_lost": MetricKind.COUNT,
+    "keypoints_in_region_before": MetricKind.COUNT,
+    "keypoints_in_region_after": MetricKind.COUNT,
+    "survivors_near_region": MetricKind.COUNT,
+    "survivors_on_boundary": MetricKind.COUNT,
+    "boundary_fraction": MetricKind.RATE,
+    "region_area_fraction": MetricKind.RATE,
+    "blur_kernel": MetricKind.CONSTANT,
+}
 
 ORB_FEATURES = 1000
 # A centred rectangle covering a quarter of each dimension -- roughly the

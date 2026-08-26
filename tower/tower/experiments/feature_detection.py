@@ -21,8 +21,25 @@ test enforces that.
 import cv2
 import numpy as np
 
-from tower.experiments import ORB_MIN_DIMENSION, ExperimentResult, decode_gray
+from tower.experiments import (
+    ORB_MIN_DIMENSION,
+    ExperimentResult,
+    MetricKind,
+    decode_gray,
+)
 from tower.instrumentation import StageTimer
+
+# Counts of keypoints are counts; the response and size statistics are
+# already per-frame means and must be averaged again, not added.
+# `requested_features` is ORB_FEATURES, the same number on every frame.
+METRIC_KINDS: dict[str, MetricKind] = {
+    "keypoint_count": MetricKind.COUNT,
+    "descriptor_count": MetricKind.COUNT,
+    "spatial_coverage": MetricKind.RATE,
+    "mean_response": MetricKind.RATE,
+    "mean_keypoint_size": MetricKind.RATE,
+    "requested_features": MetricKind.CONSTANT,
+}
 
 ORB_FEATURES = 1000
 COVERAGE_GRID = 8
