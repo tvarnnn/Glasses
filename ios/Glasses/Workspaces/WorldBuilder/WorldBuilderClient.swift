@@ -331,6 +331,7 @@ final class WorldBuilderViewModel: ObservableObject {
             // marker: clearing it then would make that newer fetch's own
             // result look superseded and be refetched from scratch.
             if revision == lastGeometryRevision { lastGeometryRevision = nil }
+            logGeometry("manifest FAILED world=\(worldID) revision=\(revision) — will retry on the next report")
             return
         }
 
@@ -346,6 +347,7 @@ final class WorldBuilderViewModel: ObservableObject {
         guard manifest.poseConvention.matchesThisBuild else {
             fragmentsModel = WorldFragmentsModel(segments: [])
             geometryChunks = [:]
+            logGeometry("manifest REFUSED — pose convention is not the one this build implements")
             return
         }
 
@@ -356,7 +358,15 @@ final class WorldBuilderViewModel: ObservableObject {
         // either refetch what is already in hand or draw what is already gone.
         await geometryStore.retainOnly(Set(manifest.segments.map(\.contentHash)))
 
+        logGeometry(
+            "manifest world=\(worldID) revision=\(revision) segments=\(manifest.segments.count) "
+                + "withPoints=\(manifest.segments.filter { $0.pointCount > 0 }.count) "
+                + "current=\(manifest.current)"
+        )
+
         var chunks: [String: WorldSegmentChunk] = [:]
+        var fetched = 0
+        var cacheHits = 0
         // A segment that could not be fetched is drawn as a blank tile — which
         // is honest — but the world must not be *left* that way. See the clear
         // at the end of this function.
@@ -364,6 +374,7 @@ final class WorldBuilderViewModel: ObservableObject {
         for summary in manifest.segments {
             if let cached = await geometryStore.chunk(forHash: summary.contentHash) {
                 chunks[summary.contentHash] = cached
+                cacheHits += 1
                 continue
             }
             guard let chunk = try? await geometry.segment(
@@ -373,6 +384,7 @@ final class WorldBuilderViewModel: ObservableObject {
                 continue
             }
             await geometryStore.insert(chunk)
+            fetched += 1
             // Filed under the chunk's OWN hash, not the summary's. A rebuild
             // between the two requests returns different geometry under the
             // same segment index, and filing it under the hash we asked for
@@ -404,6 +416,35 @@ final class WorldBuilderViewModel: ObservableObject {
         if anySegmentFailed, revision == lastGeometryRevision {
             lastGeometryRevision = nil
         }
+
+        logGeometry(
+            "segments drawn=\(chunks.count) fetched=\(fetched) cached=\(cacheHits) "
+                + "points=\(chunks.values.reduce(0) { $0 + $1.points.count })"
+                + (anySegmentFailed ? " SOME FAILED — will retry on the next report" : "")
+        )
+    }
+
+    /// The geometry pull, in the console.
+    ///
+    /// ## Why this exists, and what its absence cost
+    ///
+    /// This path had **no logging at all**, and it is the one that answers the
+    /// program's central physical question — *do fragments appear while the
+    /// wearer walks*. On the first real walk the phone produced 482 console
+    /// lines across seven subsystems and **not one of them said whether the
+    /// geometry manifest was ever fetched.** The status channel logs what the
+    /// Tower said; nothing logged what the phone then went and got. So P3 came
+    /// back unanswerable — not failed, unanswerable — and a walk is expensive
+    /// to repeat.
+    ///
+    /// Deliberately one line per *manifest*, not per segment: on a live walk
+    /// the revision moves every couple of seconds and a line per segment would
+    /// be ~50 prints a tick, which is the noise level that made the camera path
+    /// decimate its own logging.
+    private func logGeometry(_ message: String) {
+        #if DEBUG
+        print("[Glasses][Geometry] \(message)")
+        #endif
     }
 
     /// Why the cartridge is or is not usable, given the current connection.

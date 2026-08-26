@@ -251,11 +251,58 @@ recording: false`), so nothing is mid-session and a walk can start clean.
 **This is the closest the program has been to P3.** Everything upstream of a
 wearer is now confirmed working on the actual device.
 
+### 7.1 The walk happened — P3 result: PARTIAL, and P11 still not performed
+
+A full walk was performed and the Tower finalized session
+`8ad340d01e0d477599d701bbcaf9ed29` / world `3d49a7711f6f4329a00c23dd395c95e8`:
+520 frames observed, 141 keyframes, 14 segments, 30 solved poses, 97 refused,
+3,732 points, `classical-sfm`, `scale_state=unknown`. **The room was not
+coherently reconstructed.** Phone-side evidence: 482 console lines captured.
+
+**What the iOS half got right, on hardware, for the first time:**
+
+- The **whole lifecycle** ran: `awaitingFirstUpdate` → `FOREIGN(be4c8ead…)` →
+  `bound(8e1875ed…)` → 83 `receiving` updates → `binding=none` → `finalized`.
+- **The foreign-capture gate fired correctly.** At launch the Tower had another
+  capture open and the phone reported `FOREIGN` rather than claiming it.
+- **A mid-capture reconnect was survived.** The socket dropped, the client
+  re-handshook, re-subscribed, re-sent `stream_start`, and re-bound to the same
+  session — all logged, all truthful.
+- **Nothing was overstated.** `scale=Unknown` was never dressed up as relative
+  across the entire run, and the phone's counts matched the Tower's final
+  summary exactly on keyframes, segments and points.
+
+**Two findings came out of it, both recorded in
+`WORLD-BUILDER-WALK-EVIDENCE-2026-08-26.md` for the World Builder lane:**
+
+1. **The Tower lost ~9 seconds of the walk and cannot see that it did.** A send
+   stall (4 slots outstanding for 2.0 s) replaced the connection; DAT ordinals
+   #747–#963 (216 frames ≈ 9.0 s at 24.04 fps) never reached the Tower while
+   the camera kept delivering. Reconstruction yield collapsed **~14×** across
+   that boundary — 48.5 points/keyframe before, 3.5 after — and never
+   recovered. Stated to that lane as a hypothesis with a mechanism, not a
+   cause; it cannot rule out the wearer entering a lower-texture area.
+2. **`trajectory.pose_count` reads 37 where the Tower solved 30**, with
+   keyframes, segments and points matching to the digit. That is the one field
+   with a history of meaning two things — it is why the `2026-08-25` contract
+   exists. Reported, not "fixed": the phone renders what the payload says, and
+   which number is right is the Tower lane's to confirm.
+
+**P3 — "do fragments appear during a walk" — came back UNANSWERABLE, and that
+was our fault.** The geometry pull had **no logging whatsoever**. 482 lines
+across seven subsystems and not one said whether the manifest was ever fetched.
+The status channel logs what the Tower *said*; nothing logged what the phone
+then went and *got*. Fixed this session: `[Glasses][Geometry]` now reports, per
+manifest, the segment count, how many carry points, fetched vs cached chunks,
+and total points drawn — plus explicit lines for a failed manifest and for a
+pose-convention refusal. **A walk is expensive to repeat and this one could not
+answer the question it was run for.**
+
 **PENDING, and every one needs a wearer:**
 
 | | What it needs |
 |---|---|
-| **P3 — do fragments appear during a walk** | glasses powered on, then a walk. The entire product claim |
+| **P3 — do fragments appear during a walk** | **re-run.** The walk happened; the phone could not report the answer. Now instrumented — see §7.1 |
 | **P11 — the sidestep experiment** | walk *laterally* rather than panning. Highest-leverage: it tests a prediction |
 | P9/P10 — loop closure | a walk that returns to its start |
 | Sender FPS against the physical baseline | a live stream, to measure encode/backlog headroom |
