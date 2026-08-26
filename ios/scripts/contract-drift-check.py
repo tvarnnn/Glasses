@@ -31,6 +31,12 @@ import urllib.request
 SWIFT_ROOT = pathlib.Path(__file__).resolve().parent.parent / "Glasses"
 IDENTIFIER = re.compile(r'"([a-z_]+\.[a-z_]+/20\d{2}-\d{2}-\d{2})"')
 ENVELOPE = re.compile(r'"(cartridge_results\.envelope/20\d{2}-\d{2}-\d{2})"')
+# Tower cartridge names as this build spells them. Deliberately a sweep for the
+# literal rather than a parse of `towerCartridgeNames`: that map's values are
+# constant references (`WorldBuilderResultContract.towerCartridge`), not string
+# literals, so parsing the map alone finds nothing and reports every cartridge
+# as unmapped. A name the Swift never spells cannot be recognised by any of it.
+TOWER_CARTRIDGE_LITERAL = re.compile(r'towerCartridge\s*=\s*"([a-z][a-z_]*)"')
 
 
 def implemented() -> dict[str, str]:
@@ -45,6 +51,20 @@ def implemented() -> dict[str, str]:
     return found
 
 
+def mapped_tower_names() -> set[str]:
+    """The Tower cartridge names this build can recognise in a declaration.
+
+    `TowerCapabilities.towerCartridgeNames` has exactly one row. If the Tower
+    promotes a cartridge out of `not_offered` and starts declaring it, iOS
+    resolves `.noContract` and says nothing — no error, no log, and no test
+    fails. That is the silence this check exists to break.
+    """
+    names: set[str] = set()
+    for path in SWIFT_ROOT.rglob("*.swift"):
+        names.update(TOWER_CARTRIDGE_LITERAL.findall(path.read_text(encoding="utf-8")))
+    return names
+
+
 def fetch(tower: str, path: str) -> tuple[int, object]:
     request = urllib.request.Request(tower.rstrip("/") + path)
     try:
@@ -57,28 +77,33 @@ def fetch(tower: str, path: str) -> tuple[int, object]:
             return error.code, None
 
 
-def served(tower: str) -> tuple[dict[str, str], list[dict]]:
+def served(tower: str) -> tuple[dict[str, str], list[dict], set[str]]:
     """Identifier -> where the Tower stated it, plus the not_offered list."""
     status, body = fetch(tower, "/cartridges")
     if status != 200 or not isinstance(body, dict):
         raise RuntimeError(f"/cartridges answered {status}")
 
     live: dict[str, str] = {}
+    offered_names: set[str] = set()
     if envelope := body.get("envelope_contract"):
         live[envelope] = "/cartridges envelope_contract"
     for offer in body.get("cartridges", []):
+        if name := offer.get("cartridge"):
+            offered_names.add(name)
         if contract := offer.get("contract"):
             live[contract] = f"/cartridges {offer.get('cartridge')}/{offer.get('result_type')}"
 
     # Object Memory is never declared over the socket: its contract travels in
     # the body of an answer, so the only way to learn it is to ask.
+    not_offered = body.get("not_offered", []) if isinstance(body, dict) else []
+
     status, body = fetch(tower, "/object-memory/observations")
     if status == 200 and isinstance(body, dict) and (contract := body.get("contract")):
         live[contract] = "/object-memory/observations"
     elif status == 404:
         live["<object-memory: no root configured>"] = f"/object-memory/observations 404"
 
-    return live, body.get("not_offered", []) if isinstance(body, dict) else []
+    return live, not_offered, offered_names
 
 
 def main() -> int:
@@ -94,7 +119,7 @@ def main() -> int:
         print(f"  {identifier:<45} {where}")
 
     try:
-        live, not_offered = served(args.tower)
+        live, not_offered, offered_names = served(args.tower)
     except Exception as error:
         print(f"\nTOWER UNREACHABLE: {error}", file=sys.stderr)
         return 2
@@ -107,19 +132,49 @@ def main() -> int:
     # build implements but the Tower does not currently offer is not drift:
     # geometry is fetched per-world over HTTP and is absent until a world
     # exists, and Object Memory's is absent until a root is configured.
-    unreadable = {i: w for i, w in live.items() if not i.startswith("<") and i not in build}
+    # The envelope contract is deliberately NOT hardcoded on the iOS side, and
+    # reporting its absence as drift would make this tool cry wolf on every run.
+    # Gating on it was proposed, reviewed and deferred: it has no defined user
+    # state, no precedent at this layer, the largest possible blast radius (one
+    # string comparison failing every cartridge at once), and the field is
+    # absent from three Tower->client messages today, so an "absent means
+    # mismatch" rule would fire against a conforming Tower. See
+    # MAC-INTEGRATION-STATUS.md section 5. It is surfaced below as information.
+    envelope = {i: w for i, w in live.items() if i.startswith("cartridge_results.envelope/")}
+    unreadable = {
+        i: w for i, w in live.items()
+        if not i.startswith("<") and i not in build and i not in envelope
+    }
 
     print()
+    for identifier, where in sorted(envelope.items()):
+        note = "matches this build's fixtures" if identifier in build else "not pinned in Swift, by decision"
+        print(f"Envelope: {identifier}  ({note})")
+    print()
+
     if not_offered:
         print("Tower is deliberately not offering:")
         for entry in not_offered:
             print(f"  {entry.get('cartridge')}: {entry.get('reason', '')[:100]}")
         print()
 
+    unmapped = sorted(offered_names - mapped_tower_names())
+
+    if unmapped:
+        print("DRIFT — the Tower declares cartridges this build cannot even see:")
+        for name in unmapped:
+            print(f"  {name:<45} no row in TowerCapabilities.towerCartridgeNames")
+        print(
+            "  (iOS resolves these to .noContract silently — no error, no log,\n"
+            "   and no test fails. Add the mapping and a client that reads it.)"
+        )
+
     if unreadable:
         print("DRIFT — the Tower serves contracts this build cannot read:")
         for identifier, where in sorted(unreadable.items()):
             print(f"  {identifier:<45} {where}")
+
+    if unreadable or unmapped:
         return 1
 
     print("AGREEMENT — every contract the Tower stated is implemented by this build.")
