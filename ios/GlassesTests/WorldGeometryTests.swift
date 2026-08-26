@@ -163,3 +163,85 @@ final class WorldGeometryStoreTests: XCTestCase {
         XCTAssertEqual(new?.contentHash, "new")
     }
 }
+
+final class WorldFragmentsModelTests: XCTestCase {
+
+    private func summary(
+        index: Int, points: Int, state: WorldSegmentResolution,
+        bounds: WorldBounds? = nil
+    ) -> WorldSegmentSummary {
+        WorldSegmentSummary(
+            segmentIndex: index, contentHash: "h\(index)",
+            frameID: "segment:\(index)", registered: false,
+            resolutionState: state, dominantDegeneracy: "low_parallax",
+            keyframeCount: 10, solvedCount: points > 0 ? 5 : 0,
+            pointCount: points, bounds: bounds
+        )
+    }
+
+    private let box = WorldBounds(json: ["min": [-1.0, 0.0, -1.0],
+                                         "max": [1.0, 2.0, 1.0]])!
+
+    func testUnregisteredSegmentsAreNeverCompositedIntoOneCanvas() {
+        // The load-bearing negative. Segment anchors all sit at the origin and
+        // per-segment scale disagrees by up to ~87x on a real walk, so one
+        // shared canvas would superimpose independent reconstructions.
+        let model = WorldFragmentsModel(segments: [
+            summary(index: 0, points: 100, state: .resolved, bounds: box),
+            summary(index: 1, points: 200, state: .resolved, bounds: box),
+        ])
+
+        XCTAssertEqual(model.fragments.count, 2)
+        XCTAssertFalse(model.hasSharedFrame)
+    }
+
+    func testAnUnresolvedSegmentIsCountedButNeverGivenAFragment() {
+        // We know reconstruction failed. We do not know where. Drawing it as a
+        // region would invent a location.
+        let model = WorldFragmentsModel(segments: [
+            summary(index: 0, points: 100, state: .resolved, bounds: box),
+            summary(index: 1, points: 0, state: .unresolved),
+            summary(index: 2, points: 0, state: .unresolved),
+        ])
+
+        XCTAssertEqual(model.fragments.count, 1)
+        XCTAssertEqual(model.unresolvedCount, 2)
+    }
+
+    func testTheHeadlineCountsFragmentsNotSegments() {
+        let model = WorldFragmentsModel(segments: [
+            summary(index: 0, points: 100, state: .resolved, bounds: box),
+            summary(index: 1, points: 0, state: .unresolved),
+        ])
+
+        XCTAssertEqual(model.headline, "1 fragment, not yet connected")
+    }
+
+    func testAnEmptyWorldSaysNothingIsMappedRatherThanShowingAnEmptyCanvas() {
+        let model = WorldFragmentsModel(segments: [])
+        XCTAssertTrue(model.fragments.isEmpty)
+        XCTAssertEqual(model.headline, "Nothing mapped yet")
+    }
+
+    func testAResolvedSegmentWithoutBoundsIsNotDrawn() {
+        // bounds nil with points > 0 is incoherent; refuse rather than guess
+        // a frame for it.
+        let model = WorldFragmentsModel(segments: [
+            summary(index: 0, points: 100, state: .resolved, bounds: nil),
+        ])
+        XCTAssertTrue(model.fragments.isEmpty)
+    }
+
+    func testRegisteredSegmentsWouldShareAFrame() {
+        // Forward compatibility: when registration lands, the renderer does
+        // not change -- the fragments merge.
+        let registered = WorldSegmentSummary(
+            segmentIndex: 0, contentHash: "h0", frameID: "world",
+            registered: true, resolutionState: .resolved,
+            dominantDegeneracy: nil, keyframeCount: 10, solvedCount: 5,
+            pointCount: 100, bounds: box
+        )
+        let model = WorldFragmentsModel(segments: [registered, registered])
+        XCTAssertTrue(model.hasSharedFrame)
+    }
+}
