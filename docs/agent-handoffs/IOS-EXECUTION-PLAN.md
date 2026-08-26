@@ -46,6 +46,7 @@ criteria. You should not need git history or prior chat to execute.
 | **Scene Understanding orientation cadence 2.0 s → 0.2505 s** | **None today**, same reason. Matters when transport lands — §6.4 |
 | **Document Memory glyph gate re-derived (FP 6 → 0)** | **None.** No wire contract exists for it |
 | **Build settings read directly** | **Resolves two open iOS questions — §4** |
+| **Your capture-clock measurement, corroborated Tower-side** | **NEW FOLLOW-UP — §6.5.** Tower confirms ~24 fps capture vs ~12 fps delivery from `source_seq` stepping by 2 |
 | **One certain Swift compile error fixed** | Already applied; see §4.1 |
 | `timm` installed, tracker/gate work, corpus measurement | None |
 
@@ -316,6 +317,57 @@ rather than treating an estimate as current.
 
 ---
 
+**6.5 Transport DAT's capture timestamp — a contract addition, both halves
+together.** *(FOLLOW-UP. Originated in your lane; the Tower consequences are
+worked out in `tower/docs/superpowers/research/2026-08-26-two-clocks-capture-vs-receipt.md`.)*
+
+**Context.** Your `f77b623` established that DAT's frame timestamps are a
+**capture clock**, not a receipt time — and the jitter argument is what makes
+it stick (`residual_sd/d_host_sd = 1.003`, `d_pts_sd/d_host_sd = 0.141`; a
+1/24 s grid against arrivals scattering from 2.5 ms bursts to 120 ms stalls).
+
+**The Tower-side shadow, which corroborates it independently.** Tower's
+journal carries **no capture timestamp at all** — only `received_at` with
+`time_basis: "tower-receipt"`. And Tower's `source_seq` steps by **2**
+(48 of 74 sampled) against a measured **83.5 ms** delivered interval. Set
+beside your 1/24 s grid: **the camera captures ~24 fps and Tower is
+delivered ~12 fps.** Roughly every other captured frame never arrives. Two
+lanes, two methods, same conclusion — and it explains a step-by-2 quirk the
+depth study had recorded as an unexplained trap.
+
+**Required behaviour.** Send DAT's capture timestamp alongside each frame,
+as an **optional, additive** field. Tower will persist it beside
+`received_at` and distinguish the two via `time_basis`.
+
+**Contract rules (binding).** `null` when unavailable — **never zero, and
+never silently substituted with a phone-side arrival stamp**, which would
+destroy the only property that makes this worth doing. The unit and epoch
+must be stated explicitly on the wire, since DAT's epoch is a
+mach-timescale value, not Unix time.
+
+**What it buys, as decisions it changes:** Object Memory could report when
+the shutter fired instead of when the Tower received the frame — strictly
+more truthful for the question that cartridge exists to answer, and it would
+let its UI drop the receipt-time caveat. Tower could also distinguish "the
+camera slowed" from "the network stalled", which are currently identical in
+`received_at`.
+
+**Blocking prerequisite, and it is yours to settle.** Your own commit
+records that **whether the epoch survives a reconnect is untested** — a
+two-minute test. This matters more to Tower than to iOS: World Builder's
+capture lineage chains across a mid-walk reconnect, and splicing two
+different epochs into one timeline would be worse than having no capture
+clock. **Until that test exists, a transported capture clock is valid only
+within a single uninterrupted connection**, and Tower will treat it that way.
+
+**Acceptance.** The field arrives as `null` when DAT gives nothing; a real
+capture stamp round-trips with its epoch intact; the reconnect behaviour is
+either proven or explicitly documented as unproven at the boundary.
+
+**Do not start this before §3.1 is green.** A first clean build matters more.
+
+---
+
 ## 7. Document map
 
 | Document | Status |
@@ -358,6 +410,12 @@ edge). Redaction on real bystanders cannot be validated here at all.
 ---
 
 ## 9. Changelog
+
+**2026-08-26 (b)** — Added §6.5: the capture-clock contract addition, after
+the iOS lane's `f77b623` was corroborated Tower-side. Records that "the frame
+rate" is now ambiguous — capture ~24 fps and regular, delivery ~12 fps and
+bursty — and that every existing Tower constant correctly uses the delivery
+rate, so nothing measured so far is invalidated.
 
 **2026-08-26** — First edition. Covers: Object Memory route + iOS surface,
 the measured `in_front_of`/`behind` refusal, build-settings findings
