@@ -164,9 +164,22 @@ because the purpose is a live answer:
 - **Nothing persisted.** No store, no imagery, no history.
 - **No identity.** Anonymous, session-scoped track ids, meaningless
   across processes. No appearance matching, so no re-identification.
-- **No face processing.** No face detector exists on this platform
-  anyway. Keypoints locate eyes and ears as anonymous landmarks; they
-  produce no descriptor and support no matching.
+- **No face processing.** Keypoints locate eyes and ears as anonymous
+  landmarks; they produce no descriptor and support no matching.
+
+  This bullet used to add "no face detector exists on this platform
+  anyway", and that justification was **wrong**. `cv2.FaceDetectorYN` is
+  compiled into our OpenCV and needed only a 227 KB weights file, which
+  is now vendored at `models/face_detection_yunet_2023mar.onnx` and used
+  by World Builder to redact faces before a keyframe is written. The
+  original search was scoped to `cv2/` and missed it; the same error was
+  corrected in `reports/2026-08-22-cartridge-run-report.md` on 2026-08-23
+  and missed here.
+
+  **The posture is unchanged and does not depend on that claim.** This
+  cartridge does no face processing because it has no need to, not
+  because it could not. A capability being available is exactly when
+  "we don't do this" has to be a decision rather than a limitation.
 - **Raw pixels are ephemeral**, held only for the frame being processed.
 
 ## Relationship to other cartridges

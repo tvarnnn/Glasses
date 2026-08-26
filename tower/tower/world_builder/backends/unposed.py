@@ -26,6 +26,7 @@ import numpy as np
 
 from tower.world_builder.backend import (
     BackendCapabilities,
+    Extension,
     GeometryBackend,
     GeometryEstimate,
     KeyframeInput,
@@ -56,8 +57,18 @@ CAPABILITIES = BackendCapabilities(
 )
 
 
+# One constant, because both the from-scratch and the incremental path
+# report it and a consumer reading two different strings from the same
+# backend would have to guess which one means what.
+WITHHELD = "no intrinsics; poses withheld"
+
+
 class UnposedBackend(GeometryBackend):
     capabilities = CAPABILITIES
+
+    def __init__(self) -> None:
+        self._previous_features = None
+        self._poses: list[PoseEstimate] = []
 
     def prepare(self, intrinsics: CameraIntrinsics) -> None:
         # Accepts anything, including unknown intrinsics -- that is the
@@ -81,46 +92,85 @@ class UnposedBackend(GeometryBackend):
 
         for current in window[1:]:
             current_features = detect_and_describe(current.image_gray)
-            points_a, points_b = match_descriptors(
-                *previous_features, *current_features
-            )
-
-            inliers = 0
-            displacement = None
-            if len(points_a) >= 8:
-                _, mask = cv2.findFundamentalMat(
-                    points_a, points_b, cv2.FM_RANSAC, RANSAC_THRESHOLD_PX, 0.99
-                )
-                if mask is not None:
-                    kept = mask.ravel() > 0
-                    inliers = int(kept.sum())
-                    if inliers:
-                        displacement = float(
-                            np.median(
-                                np.linalg.norm(
-                                    points_a[kept] - points_b[kept], axis=1
-                                )
-                            )
-                        )
-
             poses.append(
-                PoseEstimate(
-                    keyframe_id=current.keyframe_id,
-                    status=POSE_STATUS_UNAVAILABLE,
-                    degeneracy=DEGENERACY_NO_INTRINSICS,
-                    matches=len(points_a),
-                    inliers=inliers,
-                    inlier_ratio=(
-                        inliers / len(points_a) if len(points_a) else None
-                    ),
-                    median_displacement_px=displacement,
-                    r_h=homography_ratio(points_a, points_b),
+                self._measure(
+                    previous_features, current_features, current.keyframe_id
                 )
             )
             previous, previous_features = current, current_features
 
         return GeometryEstimate(
-            poses=tuple(poses),
-            points=None,
-            diagnostics={"reason": "no intrinsics; poses withheld"},
+            poses=tuple(poses), points=None, diagnostics={"reason": WITHHELD}
+        )
+
+    # -- the incremental seam --------------------------------------------
+    #
+    # Trivial here, and it has to exist anyway: the engine carries one
+    # live solve across observe() calls for whichever backend it was
+    # given, and the default in GeometryBackend re-runs the whole window
+    # per keyframe. This backend's per-pair measurements depend only on
+    # the frame before, so there is nothing to re-run.
+    #
+    # It withholds every pose and returns no points regardless -- that is
+    # the whole point of it, and being incremental does not soften it.
+
+    def begin(self, intrinsics: CameraIntrinsics) -> None:
+        self.prepare(intrinsics)
+        self.reset()
+
+    def reset(self) -> None:
+        self._previous_features = None
+        self._poses = []
+
+    def extend(self, frame: KeyframeInput) -> Extension:
+        features = detect_and_describe(frame.image_gray)
+        if self._previous_features is None:
+            pose = PoseEstimate(
+                keyframe_id=frame.keyframe_id, status=POSE_STATUS_ANCHOR
+            )
+        else:
+            pose = self._measure(self._previous_features, features, frame.keyframe_id)
+        self._previous_features = features
+        self._poses.append(pose)
+        # Never any points, by construction.
+        return Extension(pose=pose)
+
+    def snapshot(self) -> GeometryEstimate:
+        if not self._poses:
+            return GeometryEstimate(poses=())
+        return GeometryEstimate(
+            poses=tuple(self._poses), points=None, diagnostics={"reason": WITHHELD}
+        )
+
+    # -- helpers ----------------------------------------------------------
+
+    def _measure(self, previous_features, current_features, keyframe_id):
+        """Everything that genuinely does not need calibration."""
+        points_a, points_b = match_descriptors(*previous_features, *current_features)
+
+        inliers = 0
+        displacement = None
+        if len(points_a) >= 8:
+            _, mask = cv2.findFundamentalMat(
+                points_a, points_b, cv2.FM_RANSAC, RANSAC_THRESHOLD_PX, 0.99
+            )
+            if mask is not None:
+                kept = mask.ravel() > 0
+                inliers = int(kept.sum())
+                if inliers:
+                    displacement = float(
+                        np.median(
+                            np.linalg.norm(points_a[kept] - points_b[kept], axis=1)
+                        )
+                    )
+
+        return PoseEstimate(
+            keyframe_id=keyframe_id,
+            status=POSE_STATUS_UNAVAILABLE,
+            degeneracy=DEGENERACY_NO_INTRINSICS,
+            matches=len(points_a),
+            inliers=inliers,
+            inlier_ratio=(inliers / len(points_a) if len(points_a) else None),
+            median_displacement_px=displacement,
+            r_h=homography_ratio(points_a, points_b),
         )

@@ -345,11 +345,28 @@ class TestDegeneracyCriterionEvidence:
 
 
 class TestBackendSelection:
-    def test_auto_without_intrinsics_picks_the_unposed_backend(self):
+    def test_auto_without_intrinsics_picks_the_unposed_backend_loudly(self):
+        """AUTO landing on unposed is reported, like every other route to it.
+
+        This used to assert `not was_downgraded`, on the reasoning that
+        AUTO choosing the only backend it CAN choose is a selection
+        rather than a downgrade. That reasoning is defensible and it cost
+        a night: on the 2026-08-24 physical walk AUTO landed here, the
+        session recorded `downgraded_from: null`, and the world came back
+        with 155 keyframes, zero poses and zero points with nothing
+        anywhere saying why.
+
+        The sibling test below already says a silent downgrade "would
+        leave an operator with an empty map and no way to learn that
+        calibration was the reason". That was true of this path too, and
+        the two tests now agree.
+        """
         selection = select_backend(BACKEND_AUTO, CameraIntrinsics.unknown())
 
         assert isinstance(selection.backend, UnposedBackend)
-        assert not selection.was_downgraded
+        assert selection.was_downgraded
+        assert selection.downgraded_from == BACKEND_CLASSICAL
+        assert "intrinsics" in selection.downgrade_reason
 
     def test_auto_with_intrinsics_picks_the_classical_backend(self, intrinsics):
         selection = select_backend(BACKEND_AUTO, intrinsics)

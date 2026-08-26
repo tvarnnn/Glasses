@@ -6,11 +6,15 @@ almost none will. The system, not the wearer, decides which ordinary
 frames earn the expensive path -- that is what reconciles "the wearer
 behaves normally" with "we cannot afford to process everything".
 
-Every threshold below is a documented starting point pending measurement
-on real footage, in the same spirit as tower/object_memory/relevance.py's
-confidence buckets. None is presented as tuned, and the V0.9.3 acceptance
-gate still forbids citing synthetic numbers as validation for the
-platform's own camera.
+Every threshold below started as a documented starting point pending
+measurement on real footage, in the same spirit as
+tower/object_memory/relevance.py's confidence buckets. Three of them --
+`min_survival_ratio`, `loss_survival_ratio` and `min_overlap_ratio` --
+have since been measured against the 2026-08-24 physical walk and are
+documented with those numbers at their definitions; they are still not
+"tuned", because one walk is one walk. The rest remain unmeasured, and
+the V0.9.3 acceptance gate still forbids citing synthetic numbers as
+validation for the platform's own camera.
 
 ## Why this policy does NOT decide degeneracy
 
@@ -97,15 +101,79 @@ class KeyframePolicy:
     min_sharpness_ratio: float = 0.55
     sharpness_window: int = 30
 
-    # Track survival. Below `min` the measurements are untrustworthy;
-    # below `loss` the reference frame is simply gone.
-    min_survival_ratio: float = 0.35
-    loss_survival_ratio: float = 0.15
+    # Track survival, and the overlap floor that rescues a decaying
+    # chain. Below `min` the measurements are untrustworthy; below `loss`
+    # the reference frame is simply gone; below `overlap` correspondence
+    # is about to be lost and a weak keyframe beats a broken chain.
+    #
+    # These three are documented together because the 2026-08-24
+    # physical walk (Ray-Ban Meta -> iPhone -> Tower, 1395 frames,
+    # replayed bit-identically through the real FrameTracker and the real
+    # KeyframeSelector: same 155 keyframes, same 35 losses, same four-way
+    # rejection histogram, zero delta against every persisted sharpness,
+    # survival_ratio and overlap_ratio) showed they are NOT three
+    # independent knobs.
+    #
+    #   overlap 0.45 / minsurv 0.35 / loss 0.15   36 segs, 155 kf, 10 single-kf
+    #   overlap 0.75 / minsurv 0.20 / loss 0.05   20 segs, 260 kf,  4 single-kf
+    #
+    # `overlap_ratio` is not an independent signal from `survival_ratio`
+    # on real footage: the two are EQUAL in 1283 of 1358 measured frames,
+    # max gap 0.029, because tracks die rather than leave frame. An
+    # overlap floor of 0.45 sitting above a survival reject at 0.35 can
+    # therefore only fire in the band survival in [0.35, 0.45) -- 36
+    # frames out of 1395, of which 28 were already being accepted for
+    # parallax anyway. The gate written to guarantee "a usable weak link
+    # beats a broken chain" was very nearly dead, and the chain broke 36
+    # times in one 122-second walk.
+    #
+    # So the rescue window is widened from the TOP, not the bottom.
+    # Raising the overlap floor takes the rescue keyframe while tracking
+    # is decaying but still alive; lowering the reject and loss floors
+    # alone would only postpone the break, because by the time survival
+    # reaches 0.15 the useful correspondence has already gone. Lowering
+    # them as well keeps still-measurable frames out of a segment break,
+    # but the top of the window is what does the work.
+    #
+    # NOT loosened, on the same measurement: the blur thresholds below
+    # and the gate ORDER in evaluate(). `min_sharpness_ratio` 0.45 gives
+    # 43 segments, 0.00 (blur gate off) gives 49, and moving the
+    # survival/overlap gates ahead of blur gives 40 -- all WORSE than the
+    # 36-segment baseline. 77% of blur rejections occur when survival is
+    # ALREADY below 0.15: blur was masking losses that had already
+    # happened, not causing them. The standing hypothesis in
+    # docs/agent-handoffs/WORLD-BUILDER.md section 9.4, "spurious
+    # `blurred` rejections cascading into `tracking_lost`", is refuted.
+    # Do not retry it.
+    #
+    # Recorded honestly, because this is a hypothesis with evidence
+    # behind it and not a tuned constant:
+    #
+    #   * ONE walk, one room, one wearer, one lighting condition. A
+    #     second walk in a different space should reproduce the ordering
+    #     before these numbers are treated as settled.
+    #   * It costs +68% keyframes (155 -> 260) and that cost is
+    #     UNBUDGETED. It falls on keyframe JPEG storage, on the 20.5 ms
+    #     per keyframe of face redaction that sits on the write path, and
+    #     on build time, which is roughly O(N^1.2) per rebuild.
+    #   * It shifts the dominant promotion path from parallax to
+    #     track-decay: overlap_floor accepts go from 28 of 155 to 198 of
+    #     260. Whether track-decay keyframes triangulate as well as
+    #     parallax keyframes is UNMEASURED, and was unmeasurable on this
+    #     walk -- intrinsics were unknown, so BACKEND_AUTO selected the
+    #     unposed backend and the world has 0 solved poses to check
+    #     against. An ORB plus fundamental-matrix proxy says the extra
+    #     pairs are not garbage (median inlier ratio 0.627 -> 0.649, no
+    #     pair below MIN_INLIERS); that is not the same as saying the
+    #     reconstruction is better.
+    min_survival_ratio: float = 0.20
+    loss_survival_ratio: float = 0.05
 
-    # Losing correspondence is worse than a low-parallax keyframe, so a
-    # collapsing overlap forces acceptance rather than waiting for more
-    # parallax that will never arrive.
-    min_overlap_ratio: float = 0.45
+    # The top of the rescue window. See the measurement above: this is
+    # the constant that closed 16 of the 36 segment breaks, and the
+    # ordering loss < min_survival < min_overlap is what makes the
+    # window exist at all.
+    min_overlap_ratio: float = 0.75
 
     # Motion, in fractions of the image diagonal, so the policy transfers
     # across resolutions.
@@ -224,6 +292,9 @@ class KeyframeSelector:
 
         # Correspondence is about to be lost. Take the keyframe now even
         # at low parallax -- a usable weak link beats a broken chain.
+        # Since the 2026-08-24 measurement raised the floor to 0.75 this
+        # is the DOMINANT promotion path on real footage (198 of 260
+        # accepts on that walk), not the rare rescue it was written as.
         if motion.overlap_ratio < policy.min_overlap_ratio:
             return KeyframeDecision(ACCEPT, REASON_OVERLAP_FLOOR)
 
