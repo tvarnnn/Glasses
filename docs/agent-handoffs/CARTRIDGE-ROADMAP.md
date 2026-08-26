@@ -26,7 +26,7 @@ detail), `WORLD-BUILDER-STATUS.md` (P1–P11 physical gates),
 | 1 | **World Builder** | Tower complete, tested | **Yes** — 5 real captures; 51 segments, 3 registered | Mac compile, then a walk |
 | 2 | **Experimental CV Lab** | Implemented, 86 tests | Partly — `baseline` only, 2026-08-21 | Nothing; it is a lab |
 | 3 | **Scene Understanding** | Implemented, persists nothing | **Yes** — constants re-derived at the true 12 fps | The lifecycle ruling |
-| 4 | **Object Memory** | Store + producer + **route** | **Yes** — 55 observations from 9,199 frames | iOS compile; the `person` ruling |
+| 4 | **Object Memory** | Store + producer + route + **iOS surface (UNCOMPILED)** | **Yes** — 55 observations from 9,199 frames | iOS compile; the `person` ruling |
 | 5 | **Document Memory** | Engine + CLI, 145 tests | **Yes, and it falsified the premise** | Camera resolution |
 | 6 | **Environmental Memory** | Design only | None | Its own design says *do not begin* |
 | 7 | **Translator** | Two plans, both stamped DO NOT IMPLEMENT | None | No audio path exists |
@@ -45,8 +45,9 @@ Ranked by how much they hold back, not by how hard they are.
 
 ### 2.1 No Mac — RESOLVABLE, and it gates the most
 
-**4,383 lines of Swift across 18 files have never been compiled by
-anything.** No Swift toolchain exists on this host and none can. This
+**Over 4,383 lines of Swift across 18+ files have never been compiled by
+anything**, and Object Memory's new workspace adds five more files to
+that pile. No Swift toolchain exists on this host and none can. This
 gates every user-visible claim in the program: World Builder's viewer,
 Object Memory's new surface, and any future cartridge UI.
 
@@ -199,3 +200,9 @@ halves of Visual Q&A and Accessibility.
   starting to be useful.
 - **The environment** — the ML stack went from absent (everything
   model-backed inert) to CUDA-verified on Blackwell sm_120.
+- **Object Memory got a UI**, uncompiled, whose copy is enforced rather
+  than reviewed: the view holds **no user-facing string literal**, all
+  copy lives in `ObjectMemoryCopy`, and the tests sweep that same source
+  for phrases the cartridge may not say — "your laptop", "still there",
+  "last seen in session" — including on buttons, because "Find my laptop"
+  on a button would walk straight past a test that only read record rows.
