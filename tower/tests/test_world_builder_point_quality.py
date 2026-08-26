@@ -55,20 +55,54 @@ def _near_parallel_pair():
     return pa, pb, rotation, translation
 
 
-def test_characterisation_near_parallel_point_survives_today():
-    """CHARACTERISATION -- pins current behaviour. Task 3 inverts this.
+def test_near_parallel_point_is_now_discarded():
+    """WAS the Task 1 characterisation, inverted deliberately.
 
-    Do not delete this test when the gate lands. Flip the assertion, so
-    the history records that the behaviour changed deliberately.
+    Kept as an inversion rather than deleted so the history shows the
+    behaviour changed on purpose, and so a regression that reinstates the
+    old behaviour fails here with an explanation attached.
     """
     pa, pb, rotation, translation = _near_parallel_pair()
     points = triangulate_points(pa, pb, rotation, translation, CAMERA)
-    assert len(points) == 1, (
-        "Today triangulate_points keeps a near-parallel pair: cheirality "
-        "and finiteness are its only filters. If this fails, the gate has "
-        "already landed -- flip to the Task 3 assertion rather than "
-        "loosening anything."
+    assert len(points) == 0, (
+        "A pair subtending 0.00006 deg is not distant geometry, it is two "
+        "parallel rays. If this returns a point again, the seed-pair gate "
+        "has been removed or bypassed."
     )
+
+
+def test_triangulate_points_mask_and_counts_agree():
+    rotation = np.eye(3)
+    translation = np.array([-1.0, 0.0, 0.0])
+    world = np.array([[0.0, 0.0, 10.0], [0.0, 0.0, 100000.0]])
+    pa = _project(world, IDENTITY_POSE).astype(np.float32)
+    pb = _project(world, (rotation, translation)).astype(np.float32)
+    points, keep, counts = triangulate_points(
+        pa, pb, rotation, translation, CAMERA,
+        return_mask=True, return_counts=True,
+    )
+    assert len(points) == int(keep.sum())
+    assert (
+        int(keep.sum()) + counts["low_parallax"] + counts["high_reprojection"]
+        == 2
+    )
+
+
+def test_cheirality_rejects_are_not_also_counted_as_gate_rejects():
+    """The accounting identity depends on this. A point behind the camera
+    is dropped by cheirality and must NOT also appear under a gate
+    reason, or the manifest would double-count it."""
+    rotation = np.eye(3)
+    translation = np.array([-1.0, 0.0, 0.0])
+    behind = np.array([[0.0, 0.0, -10.0]])
+    pa = np.array([[100.0, 300.0]], dtype=np.float32)
+    pb = np.array([[100.0, 300.0]], dtype=np.float32)
+    points, counts = triangulate_points(
+        pa, pb, rotation, translation, CAMERA, return_counts=True,
+    )
+    assert len(points) == 0
+    assert counts["low_parallax"] == 0
+    assert counts["high_reprojection"] == 0
 
 
 def test_characterisation_well_conditioned_geometry_survives_today():
@@ -267,3 +301,193 @@ def test_gate_falls_back_rather_than_admitting_everything_without_calibration():
     assert geometry.min_parallax_deg(np.zeros((3, 3))) == (
         geometry.MIN_TRIANGULATION_ANGLE_DEG
     )
+
+
+# ---------------------------------------------------------------------------
+# Mutation-killers. An adversarial review found 7 of 8 mutants surviving the
+# tests above; each test here names the mutant it kills, so a later cleanup
+# that "simplifies" one of them can see what it is giving up.
+# ---------------------------------------------------------------------------
+
+
+def _rot_z(degrees):
+    t = np.radians(degrees)
+    return np.array(
+        [[np.cos(t), -np.sin(t), 0.0], [np.sin(t), np.cos(t), 0.0], [0.0, 0.0, 1.0]]
+    )
+
+
+def test_gate_is_correct_under_non_identity_rotation():
+    """KILLS the `-R.T @ t` -> `-R @ t` mutant.
+
+    Every other test in this file uses R = I, where those two expressions
+    are LITERALLY IDENTICAL, so the camera-centre convention -- the thing
+    that decides where the angle is even measured -- had no coverage at
+    all. The gate is wired into _triangulate_new, whose poses are never
+    identity.
+
+    Built so the correct convention accepts and the wrong one does not:
+    with R = rot_z(30 deg) the two candidate centres differ by 0.58 units,
+    which at this geometry moves the landmark across the bar.
+    """
+    from tower.world_builder.geometry import _camera_centre, landmark_gate
+
+    rotation = _rot_z(30.0)
+    translation = np.array([-0.5, 0.3, 0.2])
+    pose_b = (rotation, translation)
+
+    correct = _camera_centre(pose_b)
+    wrong = -rotation @ translation
+    assert np.linalg.norm(correct - wrong) > 0.5, "scene must separate the two"
+
+    world = np.array([[0.0, 0.0, 6.0]])
+    keep, counts = landmark_gate(
+        world, _project(world, IDENTITY_POSE), _project(world, pose_b),
+        IDENTITY_POSE, pose_b, CAMERA,
+    )
+    assert keep[0]
+    assert counts == {"low_parallax": 0, "high_reprojection": 0}
+
+
+def test_point_failing_both_gates_is_counted_once_as_low_parallax():
+    """KILLS the counted-in-the-other-order mutant.
+
+    The exclusivity docstring claims a point failing BOTH gates is counted
+    under low_parallax. No test contained such a point, so the claim had
+    zero coverage and the counts could have been ordered either way.
+    """
+    from tower.world_builder.geometry import landmark_gate
+
+    pose_b = (np.eye(3), np.array([-0.001, 0.0, 0.0]))
+    world = np.array([[0.0, 0.0, 1000.0]])
+    bad_b = _project(world, pose_b) + np.array([[80.0, 0.0]])
+    keep, counts = landmark_gate(
+        world, _project(world, IDENTITY_POSE), bad_b, IDENTITY_POSE, pose_b, CAMERA,
+    )
+    assert not keep[0]
+    assert counts["low_parallax"] == 1
+    assert counts["high_reprojection"] == 0
+
+
+def test_landmark_on_the_principal_plane_is_rejected_not_admitted():
+    """KILLS the `np.inf` -> `0.0` non-finite-reprojection mutant.
+
+    A landmark at z == 0 in one view has an undefined projection. With the
+    guard replaced by 0.0 it reads as a PERFECT reprojection and is kept.
+
+    The scene is built so the guard is the ONLY thing rejecting: the angle
+    is ~11 deg (gate 1 passes), and view B's observation is set to the
+    landmark's TRUE projection so its error is exactly 0. An earlier
+    version of this test used a fixed observation for both views, which
+    gave view B a 2191 px error -- so the point was rejected on its own
+    merits and the mutant survived. Verified by mutation, not by reading.
+    """
+    from tower.world_builder.geometry import landmark_gate
+
+    pose_b = (np.eye(3), np.array([0.0, 0.0, -1.0]))
+    world = np.array([[5.0, 0.0, 0.0]])
+    on_plane = np.array([[174.88, 323.38]])  # view A: z == 0, undefined
+    exact_b = _project(world, pose_b)        # view B: error exactly 0
+    keep, counts = landmark_gate(
+        world, on_plane, exact_b, IDENTITY_POSE, pose_b, CAMERA,
+    )
+    assert not keep[0]
+    assert counts["high_reprojection"] == 1
+
+
+def test_non_finite_angle_is_rejected_not_silently_compared():
+    """KILLS the removed-isfinite-guard mutant.
+
+    A landmark coincident with a camera centre yields a NaN cosine. NaN >=
+    bar is already False, so deleting the guard leaves every other test
+    green.
+
+    HONEST NOTE, verified by mutation: removing that guard is an
+    EQUIVALENT MUTANT, not a test gap. `nan >= bar` is already False, and
+    `angles` feeds nothing but that comparison, so no observable behaviour
+    changes. The guard is kept because it states the intent -- a
+    non-finite angle is refused deliberately, not by an accident of IEEE
+    comparison semantics -- and because the moment `angles` is ever
+    returned or logged, the mutant stops being equivalent. This test
+    therefore pins the OUTCOME and its reason code; it does not claim to
+    kill that mutant.
+    """
+    from tower.world_builder import geometry
+
+    pose_b = (np.eye(3), np.array([-1.0, 0.0, 0.0]))
+    world = np.array([[0.0, 0.0, 0.0]])  # sits exactly on camera A's centre
+    observed = np.array([[174.88, 323.38]])
+    keep, counts = geometry.landmark_gate(
+        world, observed, observed, IDENTITY_POSE, pose_b, CAMERA,
+    )
+    assert not keep[0]
+    assert counts["low_parallax"] == 1, "must be refused for parallax, not by accident"
+
+
+def test_gate_boundaries_are_inclusive():
+    """KILLS the `>=` -> `>` and `<=` -> `<` mutants on both gates.
+
+    Constructing a point at exactly the bar is unreliable in floating
+    point -- it lands an ulp either side. Instead the point's OWN computed
+    angle is fed back in as `min_angle_deg`, so equality is exact by
+    construction rather than by luck.
+    """
+    from tower.world_builder import geometry
+
+    pose_b = (np.eye(3), np.array([-1.0, 0.0, 0.0]))
+    world = np.array([[0.0, 0.0, 40.0]])
+    centre_a = geometry._camera_centre(IDENTITY_POSE)
+    centre_b = geometry._camera_centre(pose_b)
+    ray_a = centre_a - world[0]
+    ray_b = centre_b - world[0]
+    exact = np.degrees(
+        np.arccos(
+            np.clip(
+                ray_a @ ray_b
+                / (np.linalg.norm(ray_a) * np.linalg.norm(ray_b)),
+                -1.0,
+                1.0,
+            )
+        )
+    )
+    keep, _ = geometry.landmark_gate(
+        world, _project(world, IDENTITY_POSE), _project(world, pose_b),
+        IDENTITY_POSE, pose_b, CAMERA, min_angle_deg=float(exact),
+    )
+    assert keep[0], "an angle exactly AT the bar is admitted, not refused"
+
+    # Reprojection exactly at the cap.
+    near = np.array([[0.0, 0.0, 10.0]])
+    at_cap = _project(near, pose_b) + np.array(
+        [[geometry.MAX_LANDMARK_REPROJECTION_PX, 0.0]]
+    )
+    keep, _ = geometry.landmark_gate(
+        near, _project(near, IDENTITY_POSE), at_cap, IDENTITY_POSE, pose_b, CAMERA,
+    )
+    assert keep[0], "error exactly at the cap is within budget, not over it"
+
+
+def test_gate_refuses_transposed_input_instead_of_deleting_everything():
+    """KILLS nothing by mutation -- guards a defect an adversarial review
+    found by hand.
+
+    A (3, N) array reshapes to (N, 3) cleanly and produces a mask of the
+    CORRECT LENGTH, so a transposed argument rejected every landmark while
+    leaving counts that looked self-consistent. classical.py:706 builds its
+    observation arrays transposed, so this was one argument away, and it
+    failed toward silent deletion of the entire reconstruction.
+    """
+    import pytest
+
+    from tower.world_builder.geometry import landmark_gate
+
+    pose_b = (np.eye(3), np.array([-1.0, 0.0, 0.0]))
+    world = np.array([[0.0, 0.0, 10.0], [1.0, 0.5, 12.0], [-1.0, -0.5, 9.0], [0.5, 0.0, 11.0]])
+    pa, pb = _project(world, IDENTITY_POSE), _project(world, pose_b)
+
+    with pytest.raises(ValueError, match="xyz must be"):
+        landmark_gate(world.T.copy(), pa, pb, IDENTITY_POSE, pose_b, CAMERA)
+    with pytest.raises(ValueError, match="points_a must be"):
+        landmark_gate(world, pa.T.copy(), pb, IDENTITY_POSE, pose_b, CAMERA)
+    with pytest.raises(ValueError, match="points_b must be"):
+        landmark_gate(world, pa, pb.T.copy(), IDENTITY_POSE, pose_b, CAMERA)

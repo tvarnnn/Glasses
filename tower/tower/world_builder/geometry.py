@@ -284,7 +284,24 @@ def landmark_gate(
     is a low_parallax point. That keeps
     `kept + low_parallax + high_reprojection == len(xyz)` exact.
     """
-    xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+    # Shape is validated, not coerced. A (3, N) array reshapes to (N, 3)
+    # perfectly cleanly and yields a mask of the CORRECT LENGTH, so a
+    # transposed argument would sail through, reject every landmark, and
+    # leave counts that look self-consistent. _triangulate_new builds its
+    # observation arrays transposed (classical.py:706), so this is one
+    # careless argument away, and it fails toward silent deletion.
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise ValueError(
+            f"xyz must be (N, 3), got {xyz.shape}. If this is (3, N), "
+            f"transpose it -- do not let it reshape."
+        )
+    for name, observed in (("points_a", points_a), ("points_b", points_b)):
+        shape = np.asarray(observed).shape
+        if shape != (len(xyz), 2):
+            raise ValueError(
+                f"{name} must be ({len(xyz)}, 2) to match xyz, got {shape}."
+            )
     if min_angle_deg is None:
         min_angle_deg = min_parallax_deg(camera_matrix)
     counts = {"low_parallax": 0, "high_reprojection": 0}
@@ -314,7 +331,7 @@ def landmark_gate(
             uv = (camera_matrix @ cam.T).T
             uv = uv[:, :2] / uv[:, 2:3]
         error = np.linalg.norm(
-            uv - np.asarray(observed, dtype=np.float64).reshape(-1, 2), axis=1
+            uv - np.asarray(observed, dtype=np.float64), axis=1
         )
         # Behind the camera or on the principal plane: not a small error,
         # no error at all. Refuse rather than admit on a NaN comparison.
@@ -337,6 +354,7 @@ def triangulate_points(
     translation: np.ndarray,
     camera_matrix: np.ndarray,
     return_mask: bool = False,
+    return_counts: bool = False,
 ):
     """Triangulate into the FIRST camera's frame, dropping bad points.
 
@@ -355,7 +373,36 @@ def triangulate_points(
     in_front_a = xyz[:, 2] > 0
     xyz_b = (rotation @ xyz.T).T + translation.reshape(3)
     in_front_b = xyz_b[:, 2] > 0
-    keep = np.isfinite(xyz).all(axis=1) & in_front_a & in_front_b
+    cheirality_keep = np.isfinite(xyz).all(axis=1) & in_front_a & in_front_b
+
+    # Cheirality and finiteness say the point is in front of both
+    # cameras. They do not say the two rays actually MEET there. Without
+    # the gate below, landmarks survive at up to 33,363 baselines out,
+    # and the bounding box the phone frames each fragment card against
+    # ends up 329x larger than the geometry inside it.
+    #
+    # The gate runs only on rows cheirality already accepted, so a point
+    # dropped for being behind a camera is never also counted under a
+    # gate reason and the accounting identity stays exact.
+    keep = np.zeros(len(xyz), dtype=bool)
+    counts = {"low_parallax": 0, "high_reprojection": 0}
+    if cheirality_keep.any():
+        pa = np.asarray(points_a, dtype=np.float64).reshape(-1, 2)
+        pb = np.asarray(points_b, dtype=np.float64).reshape(-1, 2)
+        subset_keep, counts = landmark_gate(
+            xyz[cheirality_keep],
+            pa[cheirality_keep],
+            pb[cheirality_keep],
+            (np.eye(3), np.zeros(3)),
+            (rotation, translation),
+            camera_matrix,
+        )
+        keep[cheirality_keep] = subset_keep
+
+    if return_mask and return_counts:
+        return xyz[keep], keep, counts
+    if return_counts:
+        return xyz[keep], counts
     if return_mask:
         return xyz[keep], keep
     return xyz[keep]
