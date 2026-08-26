@@ -1153,3 +1153,93 @@ final class ObjectMemoryCopyTests: XCTestCase {
         XCTAssertEqual(cartridge.status, .planned, "a screen does not promote a roadmap position")
     }
 }
+
+// MARK: - Pinned against a real Tower
+
+/// The three branches, decoded from **bytes taken verbatim off a running
+/// Tower** rather than from a reading of its contract.
+///
+/// The composed fixtures above prove the decoder reads what this build
+/// expects. These prove the Tower sends it — and in particular that all three
+/// arrive as HTTP 200 with the same envelope, which is the single most likely
+/// functional bug here: absence is not a 404, and the two silences are not the
+/// same silence.
+final class ObjectMemoryRealTowerTests: XCTestCase {
+
+    private func answer(_ text: String) throws -> LastSeenAnswer {
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
+        )
+        return try ObjectMemoryDecoder.lastSeen(from: json)
+    }
+
+    /// Recordable, and seen inside the window.
+    func testARealSeenAnswerDecodesFieldForField() throws {
+        let seen = try answer(Self.seenFromTower)
+
+        XCTAssertEqual(seen.envelope.contract, "object_memory.observations/2026-08-26")
+        XCTAssertEqual(seen.envelope.claim, "category-was-visible-once")
+        XCTAssertEqual(seen.envelope.identity, "category-not-instance")
+        XCTAssertEqual(seen.envelope.absenceMeans, "not-observed-by-this-cartridge")
+        XCTAssertEqual(seen.envelope.recordedClasses, ["laptop", "cell phone"])
+
+        XCTAssertTrue(seen.recordable)
+        XCTAssertTrue(seen.observed)
+        let observation = try XCTUnwrap(seen.observation)
+
+        // "Where" is a pointer back into a recording, never a place. The Tower
+        // nulls `spatial_ref` on read, and this build must carry that through
+        // rather than inventing a location from the frame reference.
+        XCTAssertEqual(observation.frame.camera, "glasses-camera")
+        XCTAssertEqual(observation.frame.imageryRetention, "capture-side")
+        XCTAssertEqual(observation.frame.frameSeq, 3214)
+        XCTAssertEqual(observation.privacyTags, ["derived-only", "frame-referenced"])
+    }
+
+    /// Recordable, and **nothing inside the window** — a real statement about
+    /// what the camera captured.
+    func testARealUnobservedAnswerIsARecordableClassWithNoRecord() throws {
+        let narrowed = try answer(Self.narrowedFromTower)
+
+        XCTAssertTrue(narrowed.recordable, "the class is one the cartridge writes")
+        XCTAssertFalse(narrowed.observed)
+        XCTAssertNil(narrowed.observation, "absent, not an empty observation")
+    }
+
+    /// **Never looked for.** Carries no information at all, and must not read
+    /// to a person the way the case above does.
+    func testARealNeverLookedForAnswerIsTheWeakerSilence() throws {
+        let never = try answer(Self.neverFromTower)
+
+        XCTAssertFalse(never.recordable, "person is not in the whitelist")
+        XCTAssertFalse(never.observed)
+        XCTAssertNil(never.observation)
+
+        // The distinction the whole screen turns on: both say "no record", and
+        // only one of them is a statement about the world.
+        let narrowed = try answer(Self.narrowedFromTower)
+        XCTAssertNotEqual(
+            never.recordable, narrowed.recordable,
+            "the two silences must stay tellable apart after decoding"
+        )
+    }
+
+    /// `GET /object-memory/last-seen/laptop`, verbatim.
+    private static let seenFromTower = """
+        {"contract":"object_memory.observations/2026-08-26","claim":"category-was-visible-once","identity":"category-not-instance","absence_means":"not-observed-by-this-cartridge","spatial_ref":null,"recorded_classes":["laptop","cell phone"],"retention":{"requested_days":null,"effective_days":30.0,"clamped":false,"policy":"min(persisted, requested): a reader may narrow this window and can never widen it"},"object_class":"laptop","recordable":true,"observed":true,"observation":{"object_class":"laptop","claim":"category-was-visible-once","identity":"category-not-instance","confidence":"high","detector_score":0.5121034979820251,"best_score":0.9853731989860535,"observed_at":1787695274.3187459,"time_basis":"tower-receipt","recorded_at":1787730238.1640532,"module_id":"object-memory","retention_tag":"default","privacy_tags":["derived-only","frame-referenced"],"where":{"kind":"frame-reference","spatial_ref":null,"session_id":"22e9d4289cb440fbb3f14e6da369a136","frame_seq":3214,"camera":"glasses-camera","bounding_box_normalized":[0.1120081901550293,0.6517109870910645,0.44075003729926215,0.9019964218139649],"imagery_retention":"capture-side"}},"where":{"kind":"frame-reference","spatial_ref":null,"session_id":"22e9d4289cb440fbb3f14e6da369a136","frame_seq":3214,"camera":"glasses-camera","bounding_box_normalized":[0.1120081901550293,0.6517109870910645,0.44075003729926215,0.9019964218139649],"imagery_retention":"capture-side"}}
+        """
+
+    /// `GET /object-memory/last-seen/laptop?retention_days=1e-07`, verbatim.
+    /// A window narrowed past every record. `clamped` is false because the
+    /// reader narrowed rather than tried to widen.
+    private static let narrowedFromTower = """
+        {"contract":"object_memory.observations/2026-08-26","claim":"category-was-visible-once","identity":"category-not-instance","absence_means":"not-observed-by-this-cartridge","spatial_ref":null,"recorded_classes":["laptop","cell phone"],"retention":{"requested_days":1e-7,"effective_days":1e-7,"clamped":false,"policy":"min(persisted, requested): a reader may narrow this window and can never widen it"},"object_class":"laptop","recordable":true,"observed":false,"observation":null,"where":null}
+        """
+
+    /// `GET /object-memory/last-seen/person`, verbatim. The corpus holds zero
+    /// `person` observations and `person` is not a recordable class, so this is
+    /// the third branch and it is still HTTP 200.
+    private static let neverFromTower = """
+        {"contract":"object_memory.observations/2026-08-26","claim":"category-was-visible-once","identity":"category-not-instance","absence_means":"not-observed-by-this-cartridge","spatial_ref":null,"recorded_classes":["laptop","cell phone"],"retention":{"requested_days":null,"effective_days":30.0,"clamped":false,"policy":"min(persisted, requested): a reader may narrow this window and can never widen it"},"object_class":"person","recordable":false,"observed":false,"observation":null,"where":null}
+        """
+}
