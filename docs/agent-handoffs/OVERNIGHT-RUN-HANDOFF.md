@@ -6,8 +6,8 @@ If context is lost, a successor session can resume from this file plus
 
 **Branch:** `integration/world-builder-lifecycle-v1`
 **Run started from:** `3998e5a`
-**Last updated:** 2026-08-26, after the Scene Understanding tracker retune
-**Suite at last update:** 1444 passed, 30 skipped, 0 failed
+**Last updated:** 2026-08-26, after the Object Memory route
+**Suite at last update:** 1497 passed, 30 skipped, 0 failed
 
 `main` is untouched at `35214a1`. Nothing has been merged or pushed.
 
@@ -99,6 +99,33 @@ still pending for whoever needs a live module.
   persisted in a manifest and every read clamps to `min(persisted, requested)`.
 - **Confidence follows the evidence**: 19 high/36 medium → 50 high/5 medium,
   and the remaining 5 are genuinely weak (best 0.721–0.794), not a tautology.
+
+**Object Memory now has a wire path — its first.** `tower/routes/observations.py`,
+registered as the fifth router. Two GET endpoints,
+`/object-memory/observations` and `/object-memory/last-seen/{object_class}`,
+both sync `def` so the disk read stays off the event loop.
+
+- **Read-only by construction.** `purge()` and `prune_expired()` are
+  unreachable from the wire, guarded by an AST test. Deletion stays in the
+  CLI where a human types it — an unauthenticated HTTP endpoint that erases
+  a user's memory is not a feature.
+- **Retention cannot be widened over HTTP.** Verified by the controller
+  against a real corpus copy with one record backdated 40 days: 3650 days
+  and 0 ("forever") both return **54, not 55**, reporting
+  `effective_days: 30.0, clamped: true`. Narrowing still works.
+  **Retention keys on `recorded_at`, not `observed_at`** — it measures how
+  long *we* have held the record, not when the event happened. (The
+  controller's first check backdated the wrong field and had to be redone.)
+- **The payload refuses to overclaim.** It carries `claim:
+  "category-was-visible-once"`, `identity: "category-not-instance"`,
+  `absence_means: "not-observed-by-this-cartridge"`, and an explicit
+  `spatial_ref: null`. "Where" is a **frame reference** — session, frame_seq,
+  camera — a pointer into a recording, **not a place**. Nothing in this
+  cartridge knows where anything is in a room.
+- Booleans verified as JSON `true`/`false` on the wire, not `1`/`0`.
+
+**Still missing: the iOS surface.** The route is the verifiable half; the
+screen is not built.
 
 ### Document Memory — PREMISE FALSIFIED
 
