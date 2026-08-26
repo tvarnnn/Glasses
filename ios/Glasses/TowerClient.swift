@@ -401,6 +401,22 @@ final class TowerClient: NSObject, ObservableObject {
     /// scheduled reconnect advances through the backoff rather than resetting
     /// it and retrying forever.
     private func openConnection(to url: URL) {
+        // A different Tower is a different set of capabilities.
+        //
+        // `cartridgeDeclaration` deliberately survives a teardown, and that is
+        // right: what a Tower can do is a property of its build, not of one
+        // socket, so clearing it on every drop would turn a reconnect into
+        // "this will never work". None of that reasoning applies when the
+        // endpoint itself changes — the previous Tower's declaration says
+        // nothing about this one. Left standing, it would race the new
+        // connection's own `cartridges` reply and could drive the first
+        // `result_subscribe` with the old Tower's contract, which the new one
+        // answers with `contract_mismatch` and prose about the wrong thing.
+        if let previous = reconnectURL, previous != url {
+            log("endpoint changed \(previous) -> \(url); dropping the previous Tower's declaration")
+            cartridgeDeclaration = nil
+        }
+
         // Recorded before the in-flight guard below, so that a connect made
         // while one is already under way still retargets a later reconnect. Do
         // not move this after the guard: a pending reconnect would then quietly

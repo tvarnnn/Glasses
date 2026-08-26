@@ -244,8 +244,28 @@ private extension HomeWorkspaceView {
                 value: snapshot.frameResults.formatted(),
                 footnote: "frames processed"
             )
-            // The Tower's own reading of the most recent frame. The only thing
-            // it currently reports about a frame's *content*, and real.
+            // The running experiment's own answer, which this app decoded and
+            // then dropped on the floor for as long as it has existed. The
+            // Tower sends `result_value` and `result_label` on **every** frame;
+            // `TowerFrameResult` modelled neither, and the Experimental CV Lab
+            // workspace told the wearer the Tower could not run experiments.
+            //
+            // The label is the caption, not decoration: `result_value` is a
+            // bare number whose meaning belongs to the experiment, so rendering
+            // it without the experiment's own name for it would invent a unit.
+            // Both or neither — which is why this is one `if let` over the
+            // pair rather than two independent tiles.
+            if let value = tower.latestFrameResult?.resultValue,
+               let label = tower.latestFrameResult?.resultLabel {
+                MetricTile(
+                    caption: label,
+                    value: String(format: "%.2f", value),
+                    footnote: "the Tower's experiment, latest frame"
+                )
+            }
+            // Optional on the wire — omitted when the experiment reported none
+            // — so its absence is unknown, not dark, and the tile disappears
+            // rather than showing a zero.
             if let intensity = tower.latestFrameResult?.meanIntensity {
                 MetricTile(
                     caption: "Mean intensity",

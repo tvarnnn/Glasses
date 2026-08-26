@@ -2446,3 +2446,51 @@ final class CameraReadinessTests: XCTestCase {
         XCTAssertNil(connection.errorMessage, "an automatic read must never raise an alert")
     }
 }
+
+// MARK: - Connection lifetime
+
+@MainActor
+final class ConnectionLifetimeTests: XCTestCase {
+
+    /// The retain cycle, made a failing test rather than an argument.
+    ///
+    /// `GlassesConnection` stores the three `Task`s it creates in `init`. If a
+    /// task body holds `self` strongly for the life of an unbounded
+    /// `for await` — which `guard let self else { return }` placed *outside*
+    /// the loop does — then the object owns the task and the task owns the
+    /// object, and the `isolated deinit` that stops the camera and the device
+    /// session can never run.
+    ///
+    /// Written after the fix, and verified against the code before it: this
+    /// test fails on the old shape and passes on the new one. Without it
+    /// nothing in the suite would notice the cycle being reintroduced, and the
+    /// pattern is idiomatic enough to come back by accident.
+    func testGlassesConnectionDeallocatesWhenReleased() async {
+        weak var weakConnection: GlassesConnection?
+        do {
+            let wearables = ScriptedWearables(permissionResults: [.success(.granted)])
+            let connection = GlassesConnection(wearables: wearables)
+            weakConnection = connection
+            // The `init` tasks subscribe asynchronously, and the probe only
+            // means anything once they are actually suspended on their
+            // streams — that suspension is where the strong reference would
+            // be held. Asserted rather than merely waited for, so this fails
+            // loudly instead of passing over streams that were never live.
+            for _ in 0..<20 where !wearables.isSubscribed {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            XCTAssertTrue(wearables.isSubscribed, "the probe needs live streams to be meaningful")
+            withExtendedLifetime(connection) {}
+        }
+        // Deallocation follows task cancellation in `deinit`, which is not
+        // synchronous with the scope exit.
+        for _ in 0..<50 {
+            if weakConnection == nil { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertNil(
+            weakConnection,
+            "GlassesConnection outlived its last strong reference — isolated deinit never ran"
+        )
+    }
+}

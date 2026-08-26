@@ -1167,6 +1167,62 @@ final class TowerClientTests: XCTestCase {
         client.disconnect()
     }
 
+    /// The declaration survives a reconnect and does NOT survive a retarget.
+    ///
+    /// Keeping it across a drop is deliberate — what a Tower can do belongs to
+    /// its build, not to one socket, and clearing it would turn every dropped
+    /// connection into "this will never work" when the truth is "cannot reach
+    /// it". That reasoning stops at the endpoint: a *different* Tower's
+    /// capabilities are not this one's. Left standing, the stale declaration
+    /// races the new connection's own `cartridges` reply and can drive the
+    /// first `result_subscribe` with the previous Tower's contract.
+    func testTheDeclarationDoesNotFollowTheClientToADifferentTower() async throws {
+        let first = try MockTowerServer()
+        let firstPort = try await first.start()
+        first.onText = { text in
+            guard text.contains("\"ping\"") || text.contains("cartridges") else { return }
+            if text.contains("\"ping\"") {
+                first.send(text: #"{"type":"pong"}"#)
+            } else {
+                first.send(text: """
+                    {"type":"cartridges",
+                     "envelope_contract":"cartridge_results.envelope/2026-08-23",
+                     "cartridges":[{"cartridge":"world_builder","result_type":"status",
+                        "contract":"world_builder.status/2026-08-25","available":true,
+                        "unavailable_reason":null,"snapshot_only":true}],
+                     "not_offered":[]}
+                    """)
+            }
+        }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: firstPort))
+        let declared = await waitUntil { client.cartridgeDeclaration != nil }
+        XCTAssertTrue(declared, "the first Tower never declared anything")
+
+        // A drop, not a retarget: the declaration must survive this.
+        first.stop()
+        _ = await waitUntil { client.status != .online }
+        XCTAssertNotNil(
+            client.cartridgeDeclaration,
+            "a dropped connection cleared what the Tower can do, which is a different claim"
+        )
+
+        // A different endpoint. The previous Tower's answer must not follow.
+        let second = try MockTowerServer()
+        let secondPort = try await second.start()
+        defer { second.stop() }
+        XCTAssertNotEqual(firstPort, secondPort, "the two mock servers shared a port")
+
+        client.connect(to: url(port: secondPort))
+        XCTAssertNil(
+            client.cartridgeDeclaration,
+            "the previous Tower's declaration followed the client to a different Tower"
+        )
+
+        client.disconnect()
+    }
+
     /// A connect that never completes must terminate, not hang forever.
     ///
     /// `validateConnection` bounded the pong at 6 s and left the `send` beside
@@ -1380,7 +1436,7 @@ final class TowerClientTests: XCTestCase {
     /// the view models own, which is the half of a cartridge switch that can be
     /// tested without a view hierarchy. The other half (SwiftUI actually tearing
     /// a workspace down, and the camera surviving it) needs DAT and a device,
-    /// and no mock `WearablesInterface` exists. The structural argument stands
+    /// and `ScriptedWearables` covers the DAT half separately (see `ConnectionLifetimeTests`). The structural argument stands
     /// in for it — no view model is handed a `GlassesConnection`, and
     /// `ContentView` passes one to World Builder only — and it is a
     /// Simulator/device check.

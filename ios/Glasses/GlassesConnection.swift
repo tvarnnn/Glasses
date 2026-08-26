@@ -187,9 +187,16 @@ final class GlassesConnection: ObservableObject {
         // createSession can throw DeviceSessionError.noEligibleDevice."
         let selector = AutoDeviceSelector(wearables: wearables)
         deviceSelector = selector
+        // `guard let self` **inside** the loop, not outside it. Outside, the
+        // guard promotes the weak capture to a strong reference held for the
+        // whole life of an unbounded `for await` — so `self` owns the task and
+        // the task owns `self`, the retain cycle is closed, and the
+        // `isolated deinit` below (which stops the camera and the device
+        // session) can never run. Inside, the strong reference lasts one
+        // iteration. `deviceStateTask` already does it this way.
         activeDeviceTask = Task { [weak self] in
-            guard let self else { return }
             for await activeDeviceId in selector.activeDeviceStream() {
+                guard let self else { return }
                 self.hasActiveDevice = activeDeviceId != nil
                 print("[Glasses][Camera] activeDeviceStream changed: \(String(describing: activeDeviceId)) (hasActiveDevice=\(self.hasActiveDevice))")
                 // A third chance at the read, not a guarantee of one:
@@ -208,8 +215,8 @@ final class GlassesConnection: ObservableObject {
         #endif
 
         registrationTask = Task { [weak self] in
-            guard let self else { return }
             for await state in wearables.registrationStateStream() {
+                guard let self else { return }
                 self.registrationState = state
                 #if DEBUG
                 print("[Glasses][Registration] state changed: \(state)")
@@ -218,8 +225,8 @@ final class GlassesConnection: ObservableObject {
         }
 
         deviceStreamTask = Task { [weak self] in
-            guard let self else { return }
             for await devices in wearables.devicesStream() {
+                guard let self else { return }
                 self.devices = devices
                 #if DEBUG
                 print("[Glasses][Devices] devicesStream changed: count=\(devices.count) ids=\(devices)")

@@ -26,6 +26,7 @@ Every row below was produced from a clean `derivedDataPath` in this session.
 | Signed device build | **0 errors, 0 warnings** — `Apple Development: tv.lloyd@icloud.com` |
 | XCTest | **396 passed, 0 failed** (was 388 at the start of this lane's session) |
 | Install on physical iPhone 16 Pro | **done** — `com.tristanvarner.Glasses` |
+| Re-install of the instrumented build | **blocked** — device locked (`CoreDeviceError 4016`). Unlock the phone and re-run `xcrun devicectl device install app`; nothing else gates it |
 
 **The `warning:` lines from `appintentsmetadataprocessor` are not compiler
 warnings.** They are a tool notice that the target declares no
@@ -202,6 +203,65 @@ than on the await. A watchdog now tears the connection down if a whole attempt
 has not resolved. **The same caveat applies to the pong's existing 6 s
 `withTimeout`** — it bounds the ordinary case, it is not a guarantee — and that
 is now written where the next reader will find it.
+
+### 4.5.4 The Experimental CV fix was only half a fix
+
+§4.1 corrected the decode so `result_value` and `result_label` stop being
+dropped. They then still went nowhere: `HomeWorkspaceView` rendered only
+`mean_intensity`. The running experiment's own answer is now a tile, captioned
+by the experiment's own label — **both or neither**, in one `if let` over the
+pair, because `result_value` is a bare number whose meaning belongs to the
+experiment and showing it without the label would invent a unit.
+
+This is the first time the Experimental CV Lab's actual output is visible in
+the app. It is a decode-and-display path; **the render itself is untested**,
+consistent with every other view in this project.
+
+### 4.5.5 Three retain cycles that defeated `isolated deinit`
+
+`activeDeviceTask`, `registrationTask` and `deviceStreamTask` each ran
+`Task { [weak self] in guard let self else { return }; for await … }`. The
+guard *outside* an unbounded `for await` promotes the weak capture to a strong
+reference held for the whole life of the task — so `self` owns the task and the
+task owns `self`, and the `isolated deinit` that stops the camera and the
+device session can never run. The same file already had the correct shape for
+`deviceStateTask`: guard per iteration, and the stream's owner hoisted out so
+it is captured directly rather than through `self`.
+
+**Correction: this lane claimed it could not be tested, and that was wrong.**
+`ScriptedWearables: WearablesInterface` already exists in the test target
+(`ProductShellTests.swift`), and six sites already construct a
+`GlassesConnection` from it. The comment in `TowerClientTests.swift` asserting
+no mock existed was stale, and repeating it here nearly cost a regression test
+on a bug that is easy to reintroduce — `guard let self` outside a loop is
+idiomatic enough to come back by accident.
+
+`ConnectionLifetimeTests.testGlassesConnectionDeallocatesWhenReleased` now pins
+it: it asserts `wearables.isSubscribed` *before* probing, so it fails loudly
+rather than passing over streams that were never live, and it fails on the old
+shape with `GlassesConnection outlived its last strong reference`.
+
+**The cycle was confirmed empirically, not by argument** — an independent
+reviewer reproduced it on this toolchain and against the real type, on a
+throwaway worktree at HEAD.
+
+Two corrections that review also produced, both applied:
+
+- The `let wearables = self.wearables` hoist added alongside the fix was a
+  **no-op with a false comment**. Inside `init`, a bare `wearables` is the
+  init *parameter*, already captured directly — it was never reached through
+  `self`, so nothing was being hoisted out of anything. The comment was copied
+  from `observeDeviceState`, where the hoist genuinely is required because that
+  is a method. Removed rather than reworded.
+- **One instance of the same bug in a different shape was missed** and is *not*
+  fixed: `TowerClient.swift` — `receiveTask = Task { [weak self] in await
+  self?.receiveLoop(task: task) }`. `self?.method()` holds `self` strongly for
+  the whole call, and the call is a `while !Task.isCancelled` loop, so the
+  cycle is the same. Lower severity — `TowerClient` has no `deinit` and
+  `teardownConnection` cancels the task, so it leaks only a `TowerClient`
+  dropped while still online — and the fix needs `receiveLoop` restructured
+  into per-iteration steps. **Left as a follow-up rather than restructured
+  unreviewed at the end of a session.**
 
 ---
 
@@ -382,14 +442,13 @@ are on.** It is: open the app, press Start, and walk. See §9.
 
 1. ~~Subscribe ack has no timeout.~~ **FIXED — §4.5.1.**
 2. ~~`noContract` and `unsupportedContract` render identically.~~ **FIXED — §4.5.2.**
-3. **Three retain cycles defeat `GlassesConnection.isolated deinit`**
-   (`:190, :210, :220`): `Task { [weak self] in guard let self else … }` over an
-   unbounded DAT stream promotes the capture to strong. The correct pattern is
-   in the same file at `:807-822`. Blast radius is currently limited — multiple
-   scenes are not enabled — but it is unmitigated.
+3. ~~Three retain cycles defeat `GlassesConnection.isolated deinit`.~~
+   **FIXED — §4.5.5, but untested; there is no mock `WearablesInterface`.**
 4. **`towerCartridgeNames` has one row.** If Tower promotes `experimental_cv`,
    `document_memory` or `scene_understanding` out of `not_offered`, iOS cannot
-   see it — silently, with no test failing.
+   see it. **The silence is now broken** — `contract-drift-check.py` flags a
+   declared cartridge this build cannot spell — but the mapping and a client
+   that reads it still have to be written when it happens.
 5. **`cartridgeDeclaration` is not invalidated on endpoint change**, so a
    retarget can race a stale contract into the first subscribe.
 6. **The iOS docs tree is a stale fork.**
@@ -408,8 +467,11 @@ are on.** It is: open the app, press Start, and walk. See §9.
    handshake-leg lines before changing anything.** They answer P3 and they
    settle which of the three reconnect hypotheses is real. Do not tune a
    transport constant before those numbers exist.
-3. Fix §8.3 (the three retain cycles) — it is the largest remaining correctness
-   item that does not need a wearer.
+3. Fix the `receiveTask` cycle in `TowerClient` (§4.5.5) — same bug as the
+   three that were fixed, different shape, and the regression test pattern to
+   copy already exists. It needs `receiveLoop` split into per-iteration steps.
+   Grep for `self?.` immediately preceding a long-running call, not just for
+   `guard let self`; the syntax sweep misses this shape.
 4. When a wearer is available, run P11 before P3: it tests a prediction rather
    than gathering data.
 5. Do not re-open §5. Those were argued and refused on evidence, and one of
