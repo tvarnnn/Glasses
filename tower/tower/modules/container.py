@@ -52,22 +52,32 @@ class ModuleContainer:
     def __init__(
         self,
         module: Module,
-        lifecycle_timeout_s: float = LIFECYCLE_TIMEOUT_S,
+        lifecycle_timeout_s: float | None = None,
         load_timeout_s: float | None = None,
     ) -> None:
         self._module = module
-        self._lifecycle_timeout_s = lifecycle_timeout_s
+        # The question both defaults answer is "did the caller specify a
+        # bound?", not "what number did they pick?". A caller that
+        # narrows the container to 50 ms is not asking for 50 ms
+        # everywhere EXCEPT load, which may take two minutes -- it is
+        # asking for a tightly bounded container, and load is part of it.
+        #
+        # This used to compare `lifecycle_timeout_s >= LIFECYCLE_TIMEOUT_S`
+        # instead, which cannot tell a caller who passed 10.0 on purpose
+        # from one who passed nothing. That made the load bound
+        # discontinuous and non-monotonic: 9.999 gave a 9.999 s load
+        # bound and 10.0 gave 120 s (a 12,000x swing on a 1 ms change),
+        # while an explicit 300 -- a caller widening everything -- got a
+        # TIGHTER 120 s load bound than they asked for. A `None` sentinel
+        # asks the real question, so explicit 9.999 stays 9.999, explicit
+        # 300 stays 300, and only an unspecified bound gets the default.
         if load_timeout_s is None:
-            # The generous default applies only while the general bound is
-            # at its default. A caller that narrows the container to 50 ms
-            # is not asking for 50 ms everywhere EXCEPT load, which may
-            # take two minutes -- it is asking for a tightly bounded
-            # container, and load is part of it.
             load_timeout_s = (
-                LOAD_TIMEOUT_S
-                if lifecycle_timeout_s >= LIFECYCLE_TIMEOUT_S
-                else lifecycle_timeout_s
+                LOAD_TIMEOUT_S if lifecycle_timeout_s is None else lifecycle_timeout_s
             )
+        if lifecycle_timeout_s is None:
+            lifecycle_timeout_s = LIFECYCLE_TIMEOUT_S
+        self._lifecycle_timeout_s = lifecycle_timeout_s
         self._load_timeout_s = load_timeout_s
 
     @property

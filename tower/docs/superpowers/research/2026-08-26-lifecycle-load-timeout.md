@@ -102,13 +102,48 @@ for "50 ms everywhere except load, which may take two minutes".
 
 ```python
 experiment = self._experiment
-await asyncio.to_thread(experiment.load, self._settings)
+await run_abandonable(experiment.load, self._settings)
 ```
 
 One line, in `ExperimentalCVModule._do_load` — the only `Module` subclass
 in the repo, and the one whose experiments block. The blocking work now
 runs on a worker thread, so the event loop stays live, the timer fires,
 and `wait_for` can actually cancel.
+
+### 4a. Amendment, 2026-08-26: why not `asyncio.to_thread`
+
+This line was `await asyncio.to_thread(...)` as first shipped, and the
+adversarial review (C1) found that it gave the bound straight back at the
+one place it runs in production.
+
+`to_thread` submits to the loop's **default** executor.
+`create_app()` drives startup through `asyncio.run`, and
+`asyncio.run` → `Runner.close` → `loop.shutdown_default_executor`
+**joins that executor**, waiting up to `THREAD_JOIN_TIMEOUT = 300` s. So
+the timeout returned on schedule and startup then sat waiting for the
+orphan anyway. Measured against a 3 s stall behind a 0.05 s bound:
+`load_and_start` returned in **0.063 s** and `asyncio.run` took
+**3.006 s**. Worst case was the 120 s bound *plus* a 300 s join.
+
+`tower.loading.run_abandonable` replaces it: same `await`, same exception
+and result relay, but the work runs on a **`daemon` thread that nothing
+ever joins** — not `asyncio.run`, not interpreter shutdown. After the
+change the same scenario measures **0.056 s** end to end.
+
+Not joining a thread on purpose needs justifying, and the justification
+is the premise of the bound itself: a load that overran it is
+*abandoned*. The caller has already marked the module FAILED and released
+it, and §5's token guarantees the orphan's product is discarded and freed
+by the orphan itself. Joining it would only make startup wait for work
+whose result is thrown away.
+
+**Alternatives considered and rejected:**
+
+| Option | Why not |
+|---|---|
+| A dedicated `ThreadPoolExecutor` instead of the default one | Fixes the `asyncio.run` join, but `concurrent.futures.thread` registers an atexit hook that joins its (non-daemon) threads at interpreter shutdown. A genuinely stuck download would turn a startup hang into a shutdown hang. |
+| Stop using `asyncio.run` in `create_app()` | It is load-bearing — see the comment at `main.py:208`. Every pre-existing test constructs `TestClient(create_app())` without `with client:`, which never runs ASGI lifespan, so a module loaded in `lifespan` would stay UNLOADED forever. Moving the load there is a change to app wiring, not to this bound. (A hand-rolled `new_event_loop()` / `run_until_complete()` / `close()` would dodge the join, since `loop.close()` shuts the default executor down with `wait=False` — but it relies on that undocumented detail and still leaves the atexit join.) |
+| Keep the behaviour, make the documentation honest | The point of the change was to bound startup. A bound that is accurate about not bounding the thing it exists for is not a fix. |
 
 **Not in `Module`/`ModuleContainer`.** That is option B. It changes the
 execution model of the contract every module depends on, and V1.1 owns
@@ -196,12 +231,20 @@ against deliberately broken production code before being trusted:
 
 | Test | Proves | Goes red when |
 |---|---|---|
-| `test_a_synchronous_blocking_load_is_actually_interrupted` | the bound now fires on blocking work, and fires *early* (elapsed assertion, not just state) | `to_thread` removed |
+| `test_a_synchronous_blocking_load_is_actually_interrupted` | the bound now fires on blocking work, and fires *early* — timed around the **whole** `asyncio.run`, so a startup that joins the orphan fails it | the off-thread call reverted to `asyncio.to_thread` (measured red at 2.01 s) |
+| `test_startup_does_not_wait_for_the_orphan_it_just_abandoned` | C1 as its own claim: the gate is never opened, so a startup that joins the orphan hangs and fails | the same (measured red at 4.01 s) |
+| `test_the_abandonable_runner_still_relays_results_and_exceptions` | not joining costs no ordinary correctness: results and exceptions still reach the awaiting caller | `run_abandonable` drops either relay path |
+| `test_the_load_bound_is_continuous_and_never_inverts` | C6: no cliff at 10.0, monotonic across the range, explicit bounds honoured in both directions | the `None` sentinel reverted to the value comparison |
 | `test_a_load_that_lands_after_the_timeout_leaves_no_model_behind` | no leak; the abandoned loader discards what it built | the token's `publish` stops honouring invalidation |
 | `test_the_depth_experiment_discards_a_model_that_arrives_after_release` | the same, against real `DepthEstimation.load` with `torch.hub` monkeypatched — no download, no weights read | either of the above |
 | `test_a_slow_but_legitimate_load_still_succeeds` | E did its job: a 300 ms load survives a 50 ms *general* bound | load falls back to the general bound |
 | `test_load_is_bounded_generously_by_default_and_the_rest_stays_tight` | the two numbers are actually different | E reverted |
 | `test_narrowing_the_general_bound_narrows_load_with_it` | a tightly bounded container stays tightly bounded | the resolution rule changes |
+
+`tests/test_load_invalidation_atomicity.py` covers the token itself —
+the lock and the teardown — after the adversarial review found both
+correct and both unprotected. See that file's docstring, and §3 of
+`2026-08-26-lifecycle-adversarial-findings.md`.
 
 **The leak test is deterministic, not timing-dependent.** The fake
 loader blocks on an event; the test opens that event only *after*

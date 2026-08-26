@@ -4,7 +4,7 @@
 **Reviewed:** commit `767a633` — the E+A lifecycle ruling
 **Reviewer:** an agent that did not write the code
 **Verdict:** the core guarantee **holds**. Everything around it does not.
-**Status:** findings recorded; fixes tracked in §3.
+**Status:** all findings reproduced and fixed; see §3.
 
 ---
 
@@ -112,15 +112,126 @@ Both shipped teardowns are safe today. Teardown also re-runs on every
 
 ## 3. Fixes
 
-The right shape for C6 is to stop comparing values and ask the real
-question — *did the caller specify a bound?* — with a `None` sentinel:
-an explicit `9.999` stays `9.999`, an explicit `300` stays `300`, and an
-unspecified bound gets `LOAD_TIMEOUT_S`. No cliff, no inversion.
+**Status: all six fixed, plus S1. 2026-08-26.** Every finding above was
+reproduced first, by an agent that wrote none of the code under repair.
+None failed to reproduce.
 
-C1 is the one that needs a decision rather than a patch: bounding
-`load_and_start` is pointless while `asyncio.run` joins the executor
-afterwards. Either startup stops using `asyncio.run` for this, or the
-bound must be honest about covering only the awaited portion.
+### C1 — startup no longer waits for the orphan
 
-C4 and C5 are test defects, and they are why C2 and C3 survived review:
-the suite cannot currently distinguish a working token from a gutted one.
+Reproduced exactly: `load_and_start` returned in 0.055 s while
+`asyncio.run` took **3.006 s** for a 3 s stall behind a 0.05 s bound.
+
+`ExperimentalCVModule._do_load` now calls
+`tower.loading.run_abandonable` instead of `asyncio.to_thread`. It is the
+same `await`, with the same result and exception relay, but the blocking
+call runs on a **`daemon` thread that nothing ever joins** — not
+`asyncio.run`'s `shutdown_default_executor`, not interpreter shutdown.
+Same scenario after the change: **0.056 s** end to end.
+
+Deliberately not joining a thread is unusual, so it is justified in
+`run_abandonable`'s docstring and it is the premise of the bound itself:
+a load that overran its bound is *abandoned*, the module is already
+FAILED and released, and the invalidation token guarantees the orphan
+frees whatever it built rather than installing it. Joining it would make
+startup wait for work whose result is thrown away.
+
+Rejected alternatives, and why — recorded in full in §4a of
+`2026-08-26-lifecycle-load-timeout.md`:
+
+* **A dedicated `ThreadPoolExecutor`.** Dodges the `asyncio.run` join,
+  but `concurrent.futures.thread` registers an atexit hook that joins its
+  non-daemon threads at interpreter shutdown. A stuck download would
+  become a shutdown hang instead of a startup hang — the bug moved, not
+  removed.
+* **Stop using `asyncio.run` in `create_app()`.** The comment at
+  `main.py:208` is load-bearing: every pre-existing test builds
+  `TestClient(create_app())` without `with client:`, which never runs
+  ASGI lifespan, so a module loaded there stays UNLOADED forever. That is
+  a change to app wiring, not to this bound.
+* **Keep the behaviour and document the bound honestly.** The purpose of
+  the change was to bound startup. Accurate prose about not doing that is
+  not a fix.
+
+**Test 1's evasion is gone.** It no longer opens its gate from inside the
+coroutine, and it is now timed around the *whole* `asyncio.run` rather
+than the await inside it. A new
+`test_startup_does_not_wait_for_the_orphan_it_just_abandoned` never opens
+the gate at all. Reverting to `asyncio.to_thread` turns them red at
+2.01 s and 4.01 s respectively.
+
+### C2 — the device is read under the lock
+
+Both `depth.release()` and `ObjectDetectionExperiment.release()` now read
+`self._device` *inside* the teardown callback, so one lock covers the
+question and the answer. `empty_cache()` still runs outside the lock,
+where nothing depends on holding it.
+
+Covered by `test_release_frees_cuda_even_if_the_model_lands_mid_release`
+(parametrised over both experiments). Rather than hoping to hit a
+few-bytecode window, it wraps the token's `invalidate` and publishes a
+CUDA model at exactly the contested moment — deterministic, no sleeps.
+Reverting either `release()` to the unlocked read turns it red.
+
+### C3 — the raise-after-build window is guarded
+
+Confirmed, and confirmed in the shape that matters: the container calls
+`mark_failed()` → `release()` from *inside* its `except` block, where the
+live traceback still pins the loader frame and its `model` local. A
+weakref showed the model alive during `release()`.
+
+`depth.load()` now wraps `model.to(...)` / `model.eval()` / the second
+`torch.hub.load` in `try/except BaseException`, freeing the model (and
+`empty_cache()` on CUDA) before re-raising. `object_detection.load()`
+gets the same guard, and additionally builds `weights.transforms()` and
+the category list *before* the publish rather than inside the install
+lambda, where a raise would happen under the token's lock.
+
+Covered by `test_depth_frees_the_model_when_the_second_hub_load_raises`,
+which probes the weakref from inside `release()`.
+
+### C4 and C5 — the token is now protected by tests that run
+
+New file: `tests/test_load_invalidation_atomicity.py`. Fakes only — no
+model download, no GPU, no `TOWER_RUN_MODEL_TESTS` gate. The token-level
+tests need no torch at all.
+
+Measured against deliberately broken production code:
+
+| Mutation | Tests that go red |
+|---|---|
+| `publish()` checks under the lock and installs outside it | 2 |
+| `invalidate()` sets the flag and skips the teardown | 9 |
+| `release()` reads the device outside the lock (depth) | 1 |
+| `release()` reads the device outside the lock (object detection) | 1 |
+| the C3 `except` guard removed | 1 |
+| `asyncio.to_thread` restored | 2 |
+| the C6 value comparison restored | 1 |
+
+The atomicity tests are deterministic rather than stress-based: a
+publisher parks *inside* its install callback while an invalidator runs,
+which is exactly the interleaving a non-atomic implementation gets wrong.
+
+### C6 — a `None` sentinel, not a value comparison
+
+`ModuleContainer.__init__` now takes `lifecycle_timeout_s: float | None`
+and asks *did the caller specify a bound?*. Explicit `9.999` stays
+`9.999`, explicit `10.0` stays `10.0`, explicit `300` stays `300`, and
+only an unspecified bound gets `LOAD_TIMEOUT_S`. Verified continuous and
+monotonic across `0.05 … 300`. No caller passed either bound
+positionally, so the signature change is safe.
+
+### S1 — confirmed, then split
+
+Both halves reproduced.
+
+* **The reentrancy deadlock is real and is kept.** A teardown that reads
+  `.invalidated` hangs. Making the lock reentrant would let a teardown
+  observe the latch mid-teardown, which is the atomicity C4 exists to
+  protect — so this is documented in `invalidate()`'s docstring (matching
+  the warning `publish()` already carried) and pinned by
+  `test_a_teardown_that_touches_the_token_deadlocks_as_documented`, whose
+  failure message points anyone who "fixes" it at the tests to re-examine.
+* **The re-running teardown is fixed.** `invalidate()` now runs its
+  teardown at most once per token. It cannot ever be needed twice: the
+  latch is one-way, so after the first invalidation nothing can be
+  installed again and there is never anything new to tear down.

@@ -88,11 +88,30 @@ class DepthEstimation:
         # 2026-08-20 Amendment for how this was discovered.
         midas_ref = "intel-isl/MiDaS:454597711a62eabcbf7d1e89f3fb9f569051ac9b"
         model = torch.hub.load(midas_ref, "MiDaS_small", trust_repo=True)
-        model.to(torch_device)
-        model.eval()
-        transform = torch.hub.load(
-            midas_ref, "transforms", trust_repo=True
-        ).small_transform
+        try:
+            model.to(torch_device)
+            model.eval()
+            # A SECOND hub.load, after the weights are already resident.
+            # It can raise -- a corrupt hub cache, a transient network
+            # error on a fresh clone -- and the invalidation token guards
+            # only the publish, so nothing else covers this window.
+            # Without the `except`, `release()` sees `_device is None`,
+            # skips `empty_cache()`, and the model stays alive anyway:
+            # the container catches this exception and calls
+            # `mark_failed()` from inside the `except` block, so the live
+            # traceback still holds this frame and its `model` local.
+            # Measured with a weakref: alive during `release()`.
+            transform = torch.hub.load(
+                midas_ref, "transforms", trust_repo=True
+            ).small_transform
+        except BaseException:
+            # This frame owns the model and nothing installed it, so this
+            # frame frees it -- before the traceback that would otherwise
+            # pin it escapes.
+            del model
+            if torch_device.type == "cuda":
+                torch.cuda.empty_cache()
+            raise
         load_ms = (time.perf_counter() - start) * 1000
 
         if not self._invalidation.publish(
@@ -140,23 +159,39 @@ class DepthEstimation:
         self.last_depth_array = None
 
     def release(self) -> None:
-        is_cuda = self._device is not None and self._device.type == "cuda"
-        if is_cuda:
-            import torch
+        # `self._device` is read INSIDE the teardown, so the same lock
+        # covers the question and the answer. Reading it out here first
+        # -- as this used to -- is a TOCTOU: an abandoned loader that
+        # publishes between the read and the invalidation makes
+        # `publish()` return True, so the loader skips its own
+        # `empty_cache()`; `_clear` then drops that CUDA model; and
+        # `is_cuda` is still the stale False, so `empty_cache()` runs
+        # NOWHERE and the freed blocks stay in torch's caching allocator.
+        freed: dict[str, float] = {}
 
-            peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        def _teardown() -> None:
+            # Runs under the token's lock, and must not touch the token.
+            if self._device is not None and self._device.type == "cuda":
+                import torch
+
+                freed["peak_mb"] = torch.cuda.max_memory_allocated() / (1024 * 1024)
+            self._clear()
 
         # Invalidate and clear together, under the token's lock. Clearing
         # first and invalidating afterwards would leave the exact window
         # this is here to close: a loader that passed the check installs
         # into a slot that has just been emptied.
-        self._invalidation.invalidate(self._clear)
+        self._invalidation.invalidate(_teardown)
 
-        if is_cuda:
+        # Outside the lock on purpose: `empty_cache()` synchronises with
+        # the device, and no correctness depends on it holding the lock.
+        if freed:
+            import torch
+
             torch.cuda.empty_cache()
             logger.info(
                 "[Tower][Module] depth experiment released; peak cuda allocation %.1fMB",
-                peak_mb,
+                freed["peak_mb"],
             )
 
     def run(self, raw_bytes: bytes) -> ExperimentResult:

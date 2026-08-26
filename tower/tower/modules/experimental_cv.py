@@ -1,6 +1,5 @@
-import asyncio
-
 from tower.experiments import EXPERIMENTS, ExperimentResult, ExperimentSettings
+from tower.loading import run_abandonable
 from tower.modules.base import Module, ModuleDataBehavior, ModuleDescriptor
 
 DESCRIPTOR = ModuleDescriptor(
@@ -67,6 +66,12 @@ class ExperimentalCVModule(Module):
         # websocket -- for as long as it takes, with a 120 s timer
         # watching and unable to act.
         #
+        # `run_abandonable`, not `asyncio.to_thread`: `to_thread` runs on
+        # the loop's DEFAULT executor, and `create_app()` drives this
+        # through `asyncio.run`, which joins that executor on close. The
+        # bound would be handed straight back at the one place it runs in
+        # production. See tower/loading.py for the measurement.
+        #
         # Deliberately in this module rather than in `Module.load()`:
         # moving every module's `_do_load` off-thread changes the
         # execution model of the shared lifecycle contract, and V1.1 owns
@@ -76,7 +81,7 @@ class ExperimentalCVModule(Module):
         # Read into a local first: a timeout marks the module FAILED and
         # clears `self._experiment` while this call is still in flight.
         experiment = self._experiment
-        await asyncio.to_thread(experiment.load, self._settings)
+        await run_abandonable(experiment.load, self._settings)
 
     async def _do_start(self) -> None:
         return None

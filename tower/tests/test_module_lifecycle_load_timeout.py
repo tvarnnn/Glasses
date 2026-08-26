@@ -34,7 +34,7 @@ import time
 import pytest
 
 from tower.experiments import ExperimentSettings
-from tower.loading import LoadInvalidation
+from tower.loading import LoadInvalidation, run_abandonable
 from tower.modules.base import ModuleState
 from tower.modules.container import (
     LIFECYCLE_TIMEOUT_S,
@@ -137,24 +137,31 @@ def test_a_synchronous_blocking_load_is_actually_interrupted():
     "reached FAILED" after sitting through the whole blocking load would
     not have enforced anything.
     """
-    gate = threading.Event()
+    gate = threading.Event()  # NOT set before the timing ends: see below
     experiment = _SyncBlockingExperiment(gate, hold_s=BLOCKING_LOAD_S)
     container = _container(experiment, lifecycle_timeout_s=10.0, load_timeout_s=0.05)
 
-    async def scenario() -> float:
-        started = time.perf_counter()
-        await container.load_and_start()
-        elapsed = time.perf_counter() - started
-        # Let the orphan out before asyncio.run() joins the executor.
-        gate.set()
-        return elapsed
-
-    elapsed = asyncio.run(scenario())
+    # Timed around `asyncio.run` in full, not around the await inside it.
+    # This test used to open the gate from inside the coroutine, with the
+    # comment "let the orphan out before asyncio.run() joins the
+    # executor" -- which is to say it worked around the exact defect it
+    # should have caught. `asyncio.run` -> `Runner.close` ->
+    # `loop.shutdown_default_executor` JOINS the orphaned loader, for up
+    # to THREAD_JOIN_TIMEOUT = 300 s, and `create_app()` is an
+    # `asyncio.run` call site. Bounding only the awaited portion buys
+    # nothing there. Measured before the fix: the await returned in
+    # 0.063 s and `asyncio.run` took 3.006 s for a 3 s stall.
+    started = time.perf_counter()
+    asyncio.run(container.load_and_start())
+    elapsed = time.perf_counter() - started
+    gate.set()
 
     assert container.state == ModuleState.FAILED
     assert elapsed < BLOCKING_LOAD_S / 2, (
-        f"load_and_start took {elapsed:.2f}s: the 0.05s bound did not "
-        "interrupt the blocking load, it merely outlived it"
+        f"startup took {elapsed:.2f}s: the 0.05s bound did not bound "
+        "startup. Either it failed to interrupt the blocking load, or "
+        "the load ran on a thread that asyncio.run joins on close -- "
+        "which hands the bound straight back."
     )
 
 
@@ -311,3 +318,105 @@ def test_the_depth_experiment_discards_a_model_that_arrives_after_release(
     assert experiment._model is None
     assert experiment._transform is None
     assert experiment._device is None
+
+
+def test_the_load_bound_is_continuous_and_never_inverts():
+    """The default is a `None` sentinel, not a value comparison.
+
+    This pins the boundary that a value comparison got wrong. The old
+    rule was `LOAD_TIMEOUT_S if lifecycle_timeout_s >= LIFECYCLE_TIMEOUT_S
+    else lifecycle_timeout_s`, which cannot tell a caller who passed
+    `10.0` deliberately from one who passed nothing. It produced a
+    12,000x swing across a 1 ms change (9.999 -> 9.999s, 10.0 -> 120s),
+    and it INVERTED: a caller who widened everything to 300 s got a
+    tighter 120 s load bound than they asked for.
+
+    The question is "did the caller specify a bound?", so:
+    """
+    experiment = _SyncBlockingExperiment(threading.Event(), hold_s=0.0)
+
+    def load_bound(**timeouts) -> float:
+        return _container(experiment, **timeouts)._load_timeout_s
+
+    # Unspecified: the generous default, because nobody asked otherwise.
+    assert load_bound() == LOAD_TIMEOUT_S
+
+    # Either side of the old cliff, and no cliff between them.
+    assert load_bound(lifecycle_timeout_s=9.999) == 9.999
+    assert load_bound(lifecycle_timeout_s=LIFECYCLE_TIMEOUT_S) == LIFECYCLE_TIMEOUT_S
+
+    # Widening must never tighten. This was 120.0 before.
+    assert load_bound(lifecycle_timeout_s=300.0) == 300.0
+
+    # Monotonic across the whole range, which is what "no cliff" means.
+    bounds = [
+        load_bound(lifecycle_timeout_s=value)
+        for value in (0.05, 1.0, 9.999, 10.0, 10.001, 50.0, 300.0)
+    ]
+    assert bounds == sorted(bounds)
+
+    # An explicit load bound still wins outright, in both directions.
+    assert load_bound(lifecycle_timeout_s=300.0, load_timeout_s=0.05) == 0.05
+    assert load_bound(lifecycle_timeout_s=0.05, load_timeout_s=300.0) == 300.0
+
+    # And the general bound keeps its own default when only load is given.
+    assert (
+        _container(experiment, load_timeout_s=0.05)._lifecycle_timeout_s
+        == LIFECYCLE_TIMEOUT_S
+    )
+
+
+def test_startup_does_not_wait_for_the_orphan_it_just_abandoned():
+    """C1, stated as its own claim: the bound must bound STARTUP.
+
+    `create_app()` calls `asyncio.run(container.load_and_start())`, and
+    `asyncio.run` joins the loop's default executor on close. A load run
+    via `asyncio.to_thread` lives in that executor, so the timeout
+    returned on schedule and then startup sat and waited for the orphan
+    anyway -- worst case the 120 s bound PLUS a 300 s join.
+
+    The gate is never opened, so the orphan is still blocked when
+    `asyncio.run` returns. If startup joins it, this test hangs for
+    `hold_s` and fails on the elapsed assertion rather than passing
+    quietly.
+    """
+    gate = threading.Event()  # never set
+    experiment = _SyncBlockingExperiment(gate, hold_s=BLOCKING_LOAD_S * 2)
+    container = _container(experiment, load_timeout_s=0.05)
+
+    started = time.perf_counter()
+    asyncio.run(container.load_and_start())
+    elapsed = time.perf_counter() - started
+
+    assert container.state == ModuleState.FAILED
+    assert elapsed < BLOCKING_LOAD_S / 2, (
+        f"asyncio.run took {elapsed:.2f}s for a 0.05s bound: startup "
+        "joined the thread it had already given up on"
+    )
+    assert not experiment.loaded, (
+        "the orphan finished, so this run never exercised the join at all"
+    )
+    gate.set()
+
+
+def test_the_abandonable_runner_still_relays_results_and_exceptions():
+    """Not joining the thread must not cost us ordinary correctness.
+
+    A load that finishes inside its bound has to deliver its return
+    value, and one that raises has to deliver the exception to the
+    awaiting caller -- otherwise `load_and_start` could never mark a
+    genuinely broken module FAILED.
+    """
+
+    def happy(a, b):
+        return a + b
+
+    def angry():
+        raise ValueError("load blew up")
+
+    async def scenario():
+        assert await run_abandonable(happy, 2, 3) == 5
+        with pytest.raises(ValueError, match="load blew up"):
+            await run_abandonable(angry)
+
+    asyncio.run(scenario())

@@ -99,14 +99,26 @@ class ObjectDetectionExperiment:
         # CUDA resident GPU memory, to a FAILED module that will never be
         # released again.
         torch_device = torch.device(device)
-        model.to(torch_device)
+        try:
+            model.to(torch_device)
+            # Built out here rather than inside the publish lambda: they
+            # can raise, and raising inside `install` would do so while
+            # the token's lock is held, with the model already resident
+            # and nothing covering it. The token guards the publish, not
+            # the build, so the build guards itself.
+            transform = weights.transforms()
+            categories = list(weights.meta["categories"])
+        except BaseException:
+            # This frame owns the model and nothing installed it, so this
+            # frame frees it -- before the traceback that would otherwise
+            # pin it escapes to the container's `except` block, which
+            # calls `release()` while the traceback is still live.
+            del model
+            if torch_device.type == "cuda":
+                torch.cuda.empty_cache()
+            raise
         if not self._invalidation.publish(
-            lambda: self._install(
-                model,
-                weights.transforms(),
-                list(weights.meta["categories"]),
-                torch_device,
-            )
+            lambda: self._install(model, transform, categories, torch_device)
         ):
             del model
             if torch_device.type == "cuda":
@@ -124,11 +136,25 @@ class ObjectDetectionExperiment:
         self._device = None
 
     def release(self) -> None:
-        was_cuda = self._device is not None and self._device.type == "cuda"
+        # The device is read INSIDE the teardown so that one lock covers
+        # both the question and the answer. Reading it before invalidating
+        # -- as this used to -- is a TOCTOU: an abandoned loader that
+        # publishes in between makes `publish()` return True, so the
+        # loader skips its own `empty_cache()`, `_clear` drops the CUDA
+        # model, and the stale False here means `empty_cache()` runs
+        # nowhere at all. Same shape as depth.py's `release()`.
+        was_cuda: list[bool] = []
+
+        def _teardown() -> None:
+            # Runs under the token's lock, and must not touch the token.
+            if self._device is not None and self._device.type == "cuda":
+                was_cuda.append(True)
+            self._clear()
+
         # Invalidate and clear as one critical section: clearing first
         # would leave a window in which an abandoned loader installs into
         # a slot that has just been emptied.
-        self._invalidation.invalidate(self._clear)
+        self._invalidation.invalidate(_teardown)
         if was_cuda:
             import torch
 
