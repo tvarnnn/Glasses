@@ -6,7 +6,7 @@ If context is lost, a successor session can resume from this file plus
 
 **Branch:** `integration/world-builder-lifecycle-v1`
 **Run started from:** `3998e5a`
-**Last updated:** 2026-08-26, after the Object Memory route
+**Last updated:** 2026-08-26, after the Object Memory iOS surface
 **Suite at last update:** 1497 passed, 30 skipped, 0 failed
 
 `main` is untouched at `35214a1`. Nothing has been merged or pushed.
@@ -46,6 +46,7 @@ Orientation documents, in reading order:
 | easyocr | 1.7.2 (pulled scikit-image, which un-gated 12 redaction tests) |
 | cv2 | 5.0.0 headless — **one** cv2, verified |
 | numpy | 2.5.2 |
+| timm | **1.0.28**, added 2026-08-26 for MiDaS. Verified it did NOT disturb torch: still `+cu132`, kernel executing on `sm_120` |
 
 **The trap, documented in `pyproject.toml`:** a bare `pip install .[ml]`
 resolves **CPU-only** torch from PyPI on Windows. It imports, it runs, and it
@@ -124,8 +125,28 @@ both sync `def` so the disk read stays off the event loop.
   cartridge knows where anything is in a room.
 - Booleans verified as JSON `true`/`false` on the wire, not `1`/`0`.
 
-**Still missing: the iOS surface.** The route is the verifiable half; the
-screen is not built.
+**The iOS surface now exists, UNCOMPILED.**
+`ios/Glasses/Workspaces/ObjectMemory/` — model, copy, client, view — plus
+`ObjectMemoryTests.swift`, registered in `project.pbxproj` at all four
+points. (App sources need no registration: that target uses a
+`PBXFileSystemSynchronizedRootGroup`, which is why existing files like
+`ContentView` are also absent from the pbxproj. On inspection this looks
+like a defect and is not.)
+
+**Its honesty is enforced, not reviewed.** The view holds **no
+user-facing string literal** — verified; the only literal is an SF Symbol
+name. All copy lives in `ObjectMemoryCopy`, and the tests sweep that same
+source, so what is rendered and what is tested cannot drift apart. The
+sweep covers chrome as well as records, because "Find my laptop" on a
+button would walk straight past a test that only read record rows, and it
+asserts the string set is non-empty first — the guard against the vacuous
+pass this run shipped twice.
+
+Found: *"A laptop was visible ... A category was in view once. That is the
+whole claim: it does not say anything about now, and it cannot tell one
+laptop from another."* Empty: distinguishes "no record within the window
+it can see" from a class never looked for, whose *"absence carries no
+information at all."*
 
 ### Document Memory — PREMISE FALSIFIED
 
