@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-26
 **Branch:** `world-builder/next-generation` (based on `origin/integration/world-builder-lifecycle-v1` @ `25eb794`)
-**Status:** IN IMPLEMENTATION — §2.2 threshold superseded by §2.7 on measured evidence
+**Status:** IMPLEMENTED AND MEASURED — see §5.5. §2.2 threshold superseded by §2.7; §2.2/§2.6 gate *placement* superseded by §5.6.
 **Scope:** Tower only. No `ios/` changes. No registration changes.
 
 ---
@@ -364,6 +364,52 @@ this list: it is the one that catches a change doing something other than what
 this design says it does.
 
 Failure to hold any of these is a refusal, not a threshold to retune.
+
+## 5.5 MEASURED OUTCOME
+
+Run on the pinned eight, same instrument both arms, `cv2.setRNGSeed(0)`.
+
+| metric | arm A (ungated) | arm B (gated) | pass condition |
+|---|---|---|---|
+| poses_solved | 346 | **346, +0 on every capture** | must not fall — HELD |
+| segments | 127 | **127, identical** | must be invariant — HELD |
+| keyframes | 1712 | **1712, identical** | must be invariant — HELD |
+| points | 59,786 | 47,429 | falls by exactly the refused count — HELD (7251 + 5106 = 12,357) |
+| legible fragments | 28 of 48 | **47 of 48** | must rise, fall nowhere — HELD |
+| worst bbox blowup | 387.68x | **4.44x** | >= 5x reduction — HELD (87x) |
+| zero-yield control `4fea31e2` | 0 poses, 0 points | **0 poses, 0 points** | must stay zero — HELD |
+
+Per-capture legibility: 2->4, 5->10, 10->16, 1->3, 7->8, 2->4, 1->2, 0->0.
+No capture regressed on any metric.
+
+### 5.6 The first attempt failed this bar, and how
+
+The first implementation dropped refused landmarks **at triangulation**.
+Measured, it cost **26 solved poses** (346 -> 320) across four captures,
+with refusals rising by exactly 26. Chain extension needs
+`MIN_PNP_CORRESPONDENCES` 3-D-to-2-D matches against *existing*
+landmarks, so removing them from the map starves PnP and breaks chains
+early.
+
+Segments and keyframes never moved, which is what localised the fault:
+nothing had leaked into tracking or keyframe selection, so the damage was
+confined to the map.
+
+**The distinction that was missed:** a landmark whose *depth* is
+unconstrained still has a perfectly good *bearing*. It is a fine
+correspondence anchor and a bad thing to publish a coordinate for.
+
+So the gate now decides **publication**, not what the solver may use.
+Refused landmarks stay in the map; filtering happens at the emission
+boundary (`_publishable_block`), which is the only place where removing a
+point provably cannot change which poses were solved.
+
+This is recorded because the pass condition did its job. A gate judged
+only on blowup and legibility would have shipped the first attempt: it
+scored *better* on both headline numbers (48/48 legible, 3.97x blowup)
+while quietly costing 7.5% of the reconstruction.
+
+---
 
 ---
 
