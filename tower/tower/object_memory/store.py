@@ -5,6 +5,7 @@ import threading
 import time
 from pathlib import Path
 
+from tower.confidence import Confidence
 from tower.object_memory.records import (
     ObjectObservation,
     object_observation_from_json_dict,
@@ -127,6 +128,21 @@ class ObservationStore:
         seconds later inside the resample window, is folded back into
         that record here rather than becoming a second one.
 
+        `confidence` moves with it, in the same rewrite. That field is
+        the INTERPRETATION a consumer reads, and the claim a record makes
+        is "this category was in view" -- the strength of the evidence for
+        that claim is the best look during the sighting, not the first
+        one. A record left saying "medium" about a laptop the detector
+        went on to see at 0.97 under-reports what the system knows. Both
+        raw scores stay exactly as written, so the record remains
+        auditable back to the sighting that created it.
+
+        This is not the tautology the resample review warned about: that
+        was raising min_score to MEDIUM_CONFIDENCE_MAX, which would make
+        every record HIGH by construction. Here the label follows
+        evidence actually observed, so a sighting the detector never saw
+        clearly keeps its honest label.
+
         Returns whether anything changed; a score no better than the one
         already stored is not written. This makes the store no longer
         purely append-only: an upgrade is an O(n) rewrite, negligible at
@@ -145,6 +161,10 @@ class ObservationStore:
                 if self._is_number(current) and current >= best_score:
                     continue
                 raw["best_score"] = best_score
+                # The second of the two places confidence is derived.
+                # The first is the engine's initial write, where the best
+                # look IS the first look; both are pinned by tests.
+                raw["confidence"] = Confidence.from_score(best_score).value
                 changed = True
             if changed:
                 # Raw dicts, like every other rewrite here, so reserved

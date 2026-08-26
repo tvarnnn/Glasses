@@ -291,7 +291,6 @@ def test_a_stronger_look_inside_the_window_upgrades_best_score_in_place(tmp_path
     assert observation.detector_score == pytest.approx(0.60)
     assert observation.observed_at == 900.0
     assert observation.frame_seq == 0
-    assert observation.confidence is Confidence.MEDIUM
 
 
 def test_a_weaker_look_inside_the_window_does_not_lower_the_best(tmp_path):
@@ -352,3 +351,42 @@ def test_an_upgrade_that_fails_to_reach_disk_is_counted_not_swallowed(tmp_path):
     # The record itself is still there: an upgrade is an improvement on
     # an honest record, never a precondition for having one.
     assert len(store.appended) == 1
+
+
+def test_the_upgrade_reinterprets_confidence_from_the_best_look(tmp_path):
+    # confidence is derived in TWO places now -- at the first write from
+    # the sighting that created the record, and again on every in-window
+    # upgrade -- so it needs pinning in both. Leaving it on
+    # detector_score here makes the memory report "medium" about a
+    # laptop it saw at 0.97 five seconds later.
+    store, engine = _engine(
+        tmp_path,
+        [[_detection(score=0.60)], [_detection(score=0.97)]],
+        policy=RelevancePolicy(resample_seconds=30.0),
+    )
+
+    engine.observe(_frame(), received_at=900.0, source_seq=0)
+    engine.observe(_frame(), received_at=905.0, source_seq=1)
+
+    (observation,) = store.all_observations()
+    assert observation.confidence is Confidence.HIGH
+    # Both raw scores survive, so the record stays auditable: it was
+    # first seen at 0.60 and best seen at 0.97.
+    assert observation.detector_score == pytest.approx(0.60)
+    assert observation.best_score == pytest.approx(0.97)
+
+
+def test_a_weak_sighting_that_never_improves_stays_weak(tmp_path):
+    # The label follows the evidence, so it is not a tautology: a
+    # sighting the detector never saw clearly keeps its honest label.
+    store, engine = _engine(
+        tmp_path,
+        [[_detection(score=0.55)], [_detection(score=0.58)]],
+        policy=RelevancePolicy(resample_seconds=30.0),
+    )
+
+    engine.observe(_frame(), received_at=900.0, source_seq=0)
+    engine.observe(_frame(), received_at=905.0, source_seq=1)
+
+    (observation,) = store.all_observations()
+    assert observation.confidence is Confidence.MEDIUM

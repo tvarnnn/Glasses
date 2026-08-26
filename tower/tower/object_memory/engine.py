@@ -207,6 +207,10 @@ class ObjectMemoryEngine:
         return ObjectObservation(
             object_class=detection.label,
             detector_score=detection.score,
+            # Derived, never asserted -- and derived from the best look,
+            # which at the first write is this look. A stronger look
+            # later in the same sighting moves it, in
+            # ObservationStore.update_best_score.
             confidence=Confidence.from_score(detection.score),
             observed_at=observed_at,
             time_basis=TIME_BASIS,

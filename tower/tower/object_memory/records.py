@@ -64,15 +64,27 @@ class ObjectObservation:
     so a later cross-module need does not require rewriting already-persisted
     records (see 2026-08-20-canonical-memory-architecture.md).
 
-    detector_score and best_score are two different measurements and must
-    not be collapsed. detector_score is how confident the detector was in
-    the frame that FIRST brought this class into view -- the frame this
-    record's observed_at, frame_seq and bounding_box all describe.
-    best_score is the strongest score seen while that same sighting stayed
-    in view, filled in afterwards by the producer. `confidence` is derived
-    from detector_score, so it too describes the first look.
+    THREE FIELDS ABOUT STRENGTH, AND WHICH TO TRUST FOR WHAT.
 
-    Neither number is a calibrated probability. They are detector output.
+    detector_score is PROVENANCE: how confident the detector was in the
+    frame that FIRST brought this class into view -- the one frame this
+    record's observed_at, frame_seq and bounding_box all describe. It is
+    what makes the record auditable, and it never moves.
+
+    best_score is EVIDENCE: the strongest score seen while that same
+    sighting stayed in view, filled in afterwards by the producer as the
+    sighting continues. Also never revised downwards.
+
+    confidence is the INTERPRETATION, and it is the field a consumer
+    reads. The claim a record makes is "this category was in view", so it
+    is derived from best_score -- the best evidence for that claim --
+    and moves with it. A record first seen at 0.601 and then seen at
+    0.962 is a HIGH-confidence record about a laptop, with 0.601 still on
+    it saying how the sighting started. At the first write the two scores
+    are equal, so the initial label is derived from either.
+
+    None of the three is a calibrated probability. They are detector
+    output, and an interpretation of detector output.
     """
 
     object_class: str

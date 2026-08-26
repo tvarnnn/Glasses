@@ -847,3 +847,94 @@ def test_update_best_score_reports_when_there_is_nothing_to_upgrade(tmp_path):
     )
 
     assert store.update_best_score("laptop", 900.0, 0.97) is False
+
+
+def test_update_best_score_reinterprets_the_confidence_label(tmp_path):
+    # confidence is the INTERPRETED field a consumer reads, and the claim
+    # a record makes is "this category was in view". The strength of the
+    # evidence for that claim is the best look in the window, not the
+    # first one -- a record whose best look was 0.97 must not tell a
+    # retrieval surface "medium". Both raw scores stay, so the record is
+    # still auditable back to the sighting that created it.
+    store = ObservationStore(
+        tmp_path, retention_seconds=None, allowed_classes=TEST_CLASSES
+    )
+    store.append(
+        ObjectObservation(
+            object_class="laptop",
+            detector_score=0.60,
+            confidence=Confidence.MEDIUM,
+            observed_at=900.0,
+            time_basis="tower-receipt",
+            recorded_at=900.0,
+            source="glasses-camera",
+            module_id="object-memory",
+            session_id=None,
+            frame_seq=None,
+            bounding_box=None,
+            retention_tag="default",
+            privacy_tags=("derived-only",),
+            spatial_ref=None,
+            external_refs=(),
+            best_score=0.60,
+        )
+    )
+
+    assert store.update_best_score("laptop", 900.0, 0.97) is True
+
+    (observation,) = store.all_observations()
+    assert observation.confidence is Confidence.HIGH
+    assert observation.best_score == pytest.approx(0.97)
+    assert observation.detector_score == pytest.approx(0.60)
+
+
+def test_a_refused_upgrade_leaves_the_confidence_label_alone(tmp_path):
+    # Clock injected: these records are written raw, so the store has no
+    # manifest and reads them under the documented default window.
+    store = ObservationStore(
+        tmp_path,
+        retention_seconds=None,
+        clock=lambda: 1000.0,
+        allowed_classes=TEST_CLASSES,
+    )
+    _write_raw_line(
+        tmp_path,
+        _raw_record(
+            object_class="laptop",
+            observed_at=900.0,
+            detector_score=0.97,
+            best_score=0.97,
+            confidence="high",
+        ),
+    )
+
+    assert store.update_best_score("laptop", 900.0, 0.60) is False
+
+    (observation,) = store.all_observations()
+    assert observation.confidence is Confidence.HIGH
+
+
+def test_an_upgrade_inside_one_bucket_does_not_invent_a_promotion(tmp_path):
+    # The label follows the evidence; it does not climb on its own. A
+    # better look that is still MEDIUM leaves the record MEDIUM.
+    store = ObservationStore(
+        tmp_path,
+        retention_seconds=None,
+        clock=lambda: 1000.0,
+        allowed_classes=TEST_CLASSES,
+    )
+    _write_raw_line(
+        tmp_path,
+        _raw_record(
+            object_class="laptop",
+            observed_at=900.0,
+            detector_score=0.55,
+            best_score=0.55,
+            confidence="medium",
+        ),
+    )
+
+    assert store.update_best_score("laptop", 900.0, 0.70) is True
+
+    (observation,) = store.all_observations()
+    assert observation.confidence is Confidence.MEDIUM

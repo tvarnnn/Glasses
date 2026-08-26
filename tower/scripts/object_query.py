@@ -151,12 +151,15 @@ def main(argv=None) -> int:
     best = "not tracked" if observation.best_score is None else observation.best_score
     print(f"=== last observed {observation.object_class} ===")
     print(f"  when          {age_minutes:.1f} min ago (tower-receipt time)")
-    print(f"  confidence    {observation.confidence.value} (of the first look)")
+    # Three fields about strength, in the order a reader should trust
+    # them: the interpretation first, then the two raw numbers it is
+    # accountable to. confidence follows the BEST look, because the claim
+    # is "this was in view" and that is the best evidence for it; the
+    # first-sighting score stays visible so the record is auditable.
+    # Records written before best_score existed say "not tracked" rather
+    # than borrowing the other number.
+    print(f"  confidence    {observation.confidence.value} (from the best look)")
     print(f"  score         {observation.detector_score} (when it came into view)")
-    # Two numbers because they measure two things: the first look is what
-    # observed_at, frame_seq and the box all describe, while best_score is
-    # the strongest look during the same sighting. Records written before
-    # best_score existed say so rather than borrowing the other number.
     print(f"  best score    {best} (strongest look while in view)")
     print(f"  capture       {observation.session_id}")
     print(f"  frame_seq     {observation.frame_seq}")
