@@ -32,7 +32,10 @@ final class WorldBuilderPayloadTests: XCTestCase {
         [
             "model_state": modelState,
             "model_state_reason": reason,
-            "world_snapshot": snapshot ?? NSNull(),
+            // `as Any?` is not decoration: `??` must unify `[String: Any]`
+            // and `NSNull` into one `T`, and the only such type is `Any`.
+            // Spelling it out saves the solver a backtrack it may not make.
+            "world_snapshot": (snapshot as Any?) ?? NSNull(),
         ]
     }
 

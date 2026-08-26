@@ -128,7 +128,7 @@ final class WorldGeometryDecoderTests: XCTestCase {
                  "degeneracy": "low_parallax",
                  "rotation": NSNull(), "translation": NSNull()],
             ],
-            "points": [], "points_sent": 0, "points_total": 0,
+            "points": [[Double]](), "points_sent": 0, "points_total": 0,
             "point_sampling": "none",
         ]
 
@@ -142,7 +142,7 @@ final class WorldGeometryDecoderTests: XCTestCase {
             "contract": "world_builder.geometry/2026-08-25",
             "segment_index": 0, "content_hash": "h0", "frame_id": "segment:0",
             "registered": false, "transform_to_world": NSNull(),
-            "poses": [], "points": [[1.0, 2.0, 3.0]],
+            "poses": [[String: Any]](), "points": [[1.0, 2.0, 3.0]],
             "points_sent": 1, "points_total": 3000, "point_sampling": "stride",
         ]
 
