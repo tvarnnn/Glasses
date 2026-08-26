@@ -1,5 +1,6 @@
 import XCTest
 import CoreGraphics
+import Combine
 @testable import Glasses
 
 final class WorldGeometryDecoderTests: XCTestCase {
@@ -267,5 +268,166 @@ final class WorldFragmentsModelTests: XCTestCase {
         // And each fragment's own far corner lands at the same relative spot.
         XCTAssertEqual(projectSmall(1.0, 1.0).x,
                        projectLarge(100.0, 100.0).x, accuracy: 0.001)
+    }
+}
+
+// MARK: - The contract this build adopted
+
+/// The status contract moved, and this pins which one is in force.
+///
+/// It is a whole test class for one string because the move was **not** a
+/// version bump for its own sake. Nothing in the encoding changed; one number
+/// changed meaning, and a number that quietly means something else is the exact
+/// failure a dated identifier exists to make loud.
+final class WorldBuilderContractAdoptionTests: XCTestCase {
+
+    /// Moved from `/2026-08-23` because `trajectory.pose_count` changed
+    /// **meaning**.
+    ///
+    /// It used to be `keyframes - poses_refused`, which counted a segment
+    /// anchor — identity rotation, zero translation, one per segment,
+    /// definitional rather than measured — as a camera position. That is what
+    /// displayed "Camera poses: 36" for a world whose own manifest read
+    /// `poses_solved: 0, points: 0`. It is now `poses_positioned`: solved poses
+    /// plus the anchor of each segment that actually solved something.
+    func testTheStatusContractIsTheOneThisTowerServes() {
+        XCTAssertEqual(
+            WorldBuilderResultContract.identifier,
+            "world_builder.status/2026-08-25"
+        )
+    }
+
+    /// Same date, different agreement.
+    ///
+    /// The two were adopted together and it would be easy to start treating
+    /// "2026-08-25" as one version of one thing. They are two contracts on two
+    /// transports — status over the WebSocket, geometry over HTTP — and either
+    /// can move without the other.
+    func testTheGeometryContractIsSeparateFromTheStatusContract() {
+        XCTAssertNotEqual(
+            WorldGeometryContract.identifier,
+            WorldBuilderResultContract.identifier
+        )
+    }
+
+    /// The identifier this build subscribes with is the identifier it
+    /// implements. A bump that reached one and not the other would leave the
+    /// app refusing a Tower that was speaking its own contract.
+    func testTheAdoptedContractIsTheOneThisBuildDeclaresItImplements() {
+        XCTAssertEqual(
+            TowerCapabilities.supported,
+            [WorldBuilderResultContract.identifier],
+            "the subscribe guard reads `supported`; a bump that missed it stops the subscription"
+        )
+    }
+}
+
+// MARK: - Where the geometry lives
+
+/// Reading the fetch address out of the status payload.
+///
+/// The address is the one part of the payload outside `world_snapshot` that
+/// this build reads at all, so what it refuses matters as much as what it
+/// accepts.
+final class WorldGeometryCoordinatesTests: XCTestCase {
+
+    /// `nil` for a block means the Tower sent `null` there, which is how the
+    /// wire says "absent" — so each parameter defaults to a present block and
+    /// is passed `nil` by the test that wants it gone.
+    private func payload(
+        worldSnapshot: [String: Any]? = ["world_id": "w1", "revision": "snapshot-rev"],
+        session: [String: Any]? = ["session_id": "s1"],
+        geometry: [String: Any]? = ["revision": "g1"]
+    ) -> [String: Any] {
+        var json: [String: Any] = [
+            "model_state": "receiving",
+            "world_snapshot": NSNull(),
+            "session": NSNull(),
+            "geometry": NSNull(),
+        ]
+        if let worldSnapshot { json["world_snapshot"] = worldSnapshot }
+        if let session { json["session"] = session }
+        if let geometry { json["geometry"] = geometry }
+        return json
+    }
+
+    func testAllThreePartsOfTheAddressAreRead() {
+        let coordinates = WorldBuilderResultDecoder.geometryCoordinates(from: payload())
+        XCTAssertEqual(coordinates?.worldID, "w1")
+        XCTAssertEqual(coordinates?.sessionID, "s1")
+        XCTAssertEqual(coordinates?.revision, "g1")
+    }
+
+    /// `session_id` is a **required** query parameter on the Tower's manifest
+    /// route. A world id on its own therefore addresses nothing, and half an
+    /// address must not become a request.
+    func testAMissingSessionRefusesTheWholeAddress() {
+        XCTAssertNil(
+            WorldBuilderResultDecoder.geometryCoordinates(from: payload(session: nil))
+        )
+    }
+
+    /// `null` is absent, never zero. No build has produced output for this
+    /// session, so there is nothing to point at — which is a different thing
+    /// from geometry at "revision nothing".
+    func testANullGeometryRevisionMeansNothingIsBuiltNotRevisionZero() {
+        XCTAssertNil(
+            WorldBuilderResultDecoder.geometryCoordinates(
+                from: payload(geometry: ["available": false, "revision": NSNull()])
+            )
+        )
+    }
+
+    /// The load-bearing distinction. The snapshot revision changes whenever any
+    /// reported field changes — a keyframe count, a tracking state — and most
+    /// of those leave the built points exactly where they were. Keying the
+    /// fetch on the snapshot's revision would pull a megabyte for a counter.
+    func testTheRevisionComesFromTheGeometryBlockAndNotFromTheSnapshot() {
+        let coordinates = WorldBuilderResultDecoder.geometryCoordinates(
+            from: payload(geometry: ["revision": "geometry-rev"])
+        )
+        XCTAssertEqual(coordinates?.revision, "geometry-rev")
+        XCTAssertNotEqual(coordinates?.revision, "snapshot-rev")
+    }
+
+    /// A payload from a Tower with no session and no build — the shape of most
+    /// of a session's first seconds — addresses nothing rather than 404ing
+    /// every two seconds.
+    func testAnIdleTowerAddressesNothing() {
+        XCTAssertNil(
+            WorldBuilderResultDecoder.geometryCoordinates(
+                from: payload(worldSnapshot: nil, session: nil, geometry: nil)
+            )
+        )
+    }
+}
+
+@MainActor
+final class WorldBuilderViewModelGeometryTests: XCTestCase {
+
+    /// An incomplete address is refused at the view model too, not only at the
+    /// decoder, so that a future caller reaching `geometryDidChange` from
+    /// somewhere else cannot compose a URL out of what it happened to have.
+    func testAnIncompleteAddressFetchesNothing() async {
+        let viewModel = WorldBuilderViewModel(client: UnavailableWorldBuilderClient())
+        await viewModel.geometryDidChange(worldID: "w1", sessionID: nil, revision: "g1")
+        await viewModel.geometryDidChange(worldID: nil, sessionID: "s1", revision: "g1")
+        await viewModel.geometryDidChange(worldID: "w1", sessionID: "s1", revision: nil)
+        XCTAssertTrue(viewModel.fragmentsModel.segments.isEmpty)
+        XCTAssertTrue(viewModel.geometryChunks.isEmpty)
+    }
+
+    /// A client with no Tower behind it publishes no geometry address, so a
+    /// view model built on one issues no request of any kind. This is the HTTP
+    /// half of what
+    /// `TowerClientTests.testCartridgeViewModelsSendNothingToTheTower` asserts
+    /// about the socket.
+    func testAClientWithNoTowerBehindItNeverAddressesGeometry() async {
+        let client = UnavailableWorldBuilderClient()
+        var received: [WorldGeometryCoordinates] = []
+        let cancellable = client.geometryUpdates.sink { received.append($0) }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        cancellable.cancel()
+        XCTAssertTrue(received.isEmpty)
     }
 }

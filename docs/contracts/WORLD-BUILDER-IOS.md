@@ -17,7 +17,8 @@ Contracts in play:
 | | |
 |---|---|
 | Envelope | `cartridge_results.envelope/2026-08-23` |
-| World Builder payload | `world_builder.status/2026-08-23` |
+| World Builder payload | `world_builder.status/2026-08-25` |
+| World Builder geometry | `world_builder.geometry/2026-08-25` |
 | Tower cartridge name | `world_builder` |
 | iOS catalog id | `world-build` |
 

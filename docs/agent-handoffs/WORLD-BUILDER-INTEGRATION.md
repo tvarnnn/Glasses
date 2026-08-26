@@ -76,8 +76,12 @@ and not DAT.
 
 `GET /health` → `capture.armed: true`, `recording: false`.
 `GET /cartridges` and the socket's `{"type":"cartridges"}` both declare
-`world_builder`/`status`/`world_builder.status/2026-08-23`, `available: true` —
-the contract this build implements.
+`world_builder`/`status`/`world_builder.status/2026-08-23`, `available: true`.
+
+> **Superseded on 2026-08-25.** The identifier is now
+> `world_builder.status/2026-08-25`, and that is what this build implements.
+> The observation above is left as recorded. Only `trajectory.pose_count`
+> changed, and only in meaning: see `WorldBuilderResultContract.identifier`.
 
 On the socket: `pong` is literally `{"type":"pong"}`; `result_subscribed`
 returns `sub-1` with `cursor_status: "absent"`; `cartridge_result` arrives with

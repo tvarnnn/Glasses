@@ -52,6 +52,21 @@ protocol WorldBuilderClient: CartridgeClient {
 
     /// Every state after the one `state` held when the view model was built.
     var stateUpdates: AnyPublisher<WorldModelState, Never> { get }
+
+    /// Where the world's geometry can be fetched from, each time the Tower
+    /// reports an address for it.
+    ///
+    /// A second publisher rather than a field inside `WorldModelState`, because
+    /// the two answer different questions. The state says what to *draw*; this
+    /// says where to *fetch*, and the fetch does not happen over the socket the
+    /// state arrived on. Folding a session id and a transport revision into
+    /// `WorldSnapshot` would put addressing inside a presentation type and
+    /// would break that type's standing promise to map field for field onto the
+    /// payload's `world_snapshot` block — which carries neither value.
+    ///
+    /// Emits nothing at all for a client with no Tower behind it, which is the
+    /// correct and complete behaviour rather than an omission.
+    var geometryUpdates: AnyPublisher<WorldGeometryCoordinates, Never> { get }
 }
 
 extension WorldBuilderClient {
@@ -61,6 +76,13 @@ extension WorldBuilderClient {
     /// day a real client replaces this and a completed publisher would have
     /// already torn the subscription down.
     var stateUpdates: AnyPublisher<WorldModelState, Never> {
+        Empty(completeImmediately: false).eraseToAnyPublisher()
+    }
+
+    /// Never emits, for the same reason and in the same shape. A client with no
+    /// Tower behind it has no geometry to address, and an open-but-silent
+    /// stream says exactly that.
+    var geometryUpdates: AnyPublisher<WorldGeometryCoordinates, Never> {
         Empty(completeImmediately: false).eraseToAnyPublisher()
     }
 }
@@ -112,6 +134,23 @@ final class UnavailableWorldBuilderClient: WorldBuilderClient {
 /// cartridge is deselected loses nothing real and tears nothing down. That is
 /// what makes it safe as a workspace-owned `@StateObject`.
 ///
+/// ## It does make HTTP requests, and that is not a contradiction
+///
+/// Geometry is fetched here, over HTTP, from the address the client hands it.
+/// That is deliberate on both counts. **Over HTTP** because the Tower gives its
+/// result sender and its frame path one shared lock, and a megabyte of points
+/// down the WebSocket would starve `frame_result`. **From here** rather than
+/// from the client because the fetch has no lifecycle: a request in flight when
+/// this object is destroyed resolves into a `[weak self]` that is gone, and
+/// nothing is left open. `URLSession.shared` is the app's, not this object's;
+/// `WorldGeometryStore` is an actor holding a dictionary. Neither is a
+/// connection, neither is torn down, and the wire this type still may not touch
+/// — the socket — it still does not.
+///
+/// `TowerClientTests.testCartridgeViewModelsSendNothingToTheTower` remains the
+/// enforcement of that, and remains true: it holds the socket to account, and
+/// the client it is given publishes no geometry address to fetch from.
+///
 /// It holds a *subscription to its client*, which is a different thing: the
 /// client is owned by `ProjectManager` and outlives the workspace, so a client
 /// that has accumulated a partly-built world still has it when the cartridge is
@@ -135,8 +174,38 @@ final class WorldBuilderViewModel: ObservableObject {
     /// there is no stored world to open.
     @Published private(set) var inspection: WorldInspectionMode = .live
 
+    /// The segments the Tower's manifest currently names, in the shape the
+    /// gallery draws them.
+    ///
+    /// Empty until a manifest arrives, and emptied again when one arrives under
+    /// a pose convention this build does not implement — an empty gallery says
+    /// "nothing mapped", which is a true thing to say about geometry that
+    /// cannot be read, whereas drawing it under the wrong convention would look
+    /// like a room and mean nothing.
+    @Published private(set) var fragmentsModel = WorldFragmentsModel(segments: [])
+
+    /// The points and poses for those segments, keyed by content hash.
+    ///
+    /// Keyed by hash and not by index so that a segment re-solved under the
+    /// same index cannot be drawn from the previous solve's points. A segment
+    /// whose chunk failed to fetch is simply absent here, and `FragmentCanvas`
+    /// draws an empty tile for it rather than guessing.
+    @Published private(set) var geometryChunks: [String: WorldSegmentChunk] = [:]
+
     private let client: any WorldBuilderClient
     private var cancellables: Set<AnyCancellable> = []
+
+    /// Geometry transport. A `struct` and an `actor`, neither of which holds a
+    /// connection: `URLSession.shared` is the app's, and the store is a
+    /// dictionary. So the claim in this type's doc comment — that it holds no
+    /// runtime references and tears nothing down — still stands.
+    private let geometry = WorldGeometryClient()
+    private let geometryStore = WorldGeometryStore()
+
+    /// The `geometry.revision` whose manifest is currently on screen, or `nil`
+    /// when there is none — including after a fetch that failed, so the next
+    /// report retries rather than being locked out.
+    private var lastGeometryRevision: String?
 
     /// No default argument, deliberately.
     ///
@@ -154,6 +223,111 @@ final class WorldBuilderViewModel: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in self?.state = state }
             .store(in: &cancellables)
+
+        client.geometryUpdates
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] coordinates in self?.fetchGeometry(at: coordinates) }
+            .store(in: &cancellables)
+    }
+
+    /// The synchronous half of the fetch: start it, and return.
+    ///
+    /// The `sink` closure must not block — it runs on the main queue, on the
+    /// same turn the Tower's snapshot arrived — so the work goes into a `Task`
+    /// and this returns immediately. `[weak self]` because the task outlives
+    /// the sink call: a cartridge switch during a fetch leaves the request to
+    /// resolve into a `self` that is gone, which drops it and opens nothing.
+    private func fetchGeometry(at coordinates: WorldGeometryCoordinates) {
+        Task { [weak self] in
+            await self?.geometryDidChange(
+                worldID: coordinates.worldID,
+                sessionID: coordinates.sessionID,
+                revision: coordinates.revision
+            )
+        }
+    }
+
+    /// Fetch the geometry the Tower has just named, unless it is the geometry
+    /// already on screen.
+    ///
+    /// **Keyed on the revision, never on arrival.** The status channel
+    /// heartbeats an unchanged snapshot about every two seconds, so a fetch
+    /// triggered by a message rather than by a *changed* identity would pull a
+    /// megabyte of points twice a second for a world that is standing still.
+    ///
+    /// Optional parameters, though `WorldGeometryCoordinates` carries none, so
+    /// that the guard reads as one statement and so a future caller reaching
+    /// this from a partially-known address is refused here rather than
+    /// composing a URL out of what it happened to have.
+    func geometryDidChange(worldID: String?, sessionID: String?, revision: String?) async {
+        guard
+            let worldID, let sessionID, let revision,
+            revision != lastGeometryRevision
+        else { return }
+        lastGeometryRevision = revision
+
+        guard let manifest = try? await geometry.manifest(
+            worldID: worldID, sessionID: sessionID
+        ) else {
+            // Cleared rather than kept. A manifest that failed once — a 404
+            // from a world root that was not configured yet, a request that
+            // raced a rebuild — would otherwise be locked out until the world
+            // happened to change again, and a *finalized* world never changes
+            // again. The retry costs one small request on the next report.
+            //
+            // Guarded, because a newer call may already have claimed the
+            // marker: clearing it then would make that newer fetch's own
+            // result look superseded and be refetched from scratch.
+            if revision == lastGeometryRevision { lastGeometryRevision = nil }
+            return
+        }
+
+        // A newer report may have started its own fetch while this one was in
+        // flight — likely on a live walk, where the revision moves about as
+        // often as a fetch takes. The last writer must be the newest report and
+        // not the slowest request, so a superseded fetch publishes nothing and
+        // simply ends here.
+        guard revision == lastGeometryRevision else { return }
+
+        // A convention this build does not implement renders plausibly and
+        // wrongly, so it renders not at all.
+        guard manifest.poseConvention.matchesThisBuild else {
+            fragmentsModel = WorldFragmentsModel(segments: [])
+            geometryChunks = [:]
+            return
+        }
+
+        // Everything the manifest still names is kept and everything else is
+        // dropped, so a long walk does not accumulate superseded segments
+        // forever. The cache and the published copy are rebuilt from the same
+        // list in the same pass: a hash held by one and not the other would
+        // either refetch what is already in hand or draw what is already gone.
+        await geometryStore.retainOnly(Set(manifest.segments.map(\.contentHash)))
+
+        var chunks: [String: WorldSegmentChunk] = [:]
+        for summary in manifest.segments {
+            if let cached = await geometryStore.chunk(forHash: summary.contentHash) {
+                chunks[summary.contentHash] = cached
+                continue
+            }
+            guard let chunk = try? await geometry.segment(
+                worldID: worldID, sessionID: sessionID, index: summary.segmentIndex
+            ) else { continue }
+            await geometryStore.insert(chunk)
+            // Filed under the chunk's OWN hash, not the summary's. A rebuild
+            // between the two requests returns different geometry under the
+            // same segment index, and filing it under the hash we asked for
+            // would draw the new points inside the old segment's bounds. Filed
+            // under its own, it simply does not match and is not drawn — which
+            // is the honest outcome, and the next manifest resolves it.
+            chunks[chunk.contentHash] = chunk
+        }
+
+        // Checked again, for the same reason: the segment fetches above are the
+        // slow part, and a newer manifest may have landed during them.
+        guard revision == lastGeometryRevision else { return }
+        geometryChunks = chunks
+        fragmentsModel = WorldFragmentsModel(segments: manifest.segments)
     }
 
     /// Why the cartridge is or is not usable, given the current connection.

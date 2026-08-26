@@ -47,10 +47,13 @@ import MWDATCamera
 /// - **No placeholder metrics.** A field the Tower did not report is not drawn
 ///   at all, rather than drawn as "—": six redacted values read as *broken*
 ///   rather than as *absent*.
-/// - **No fabricated geometry.** No point cloud, no mesh, no spinner outside
-///   the two states where work genuinely is underway. The Tower sends counts,
-///   states and summaries — no imagery, no poses, no points — so there is
-///   nothing here to draw and this build does not pretend otherwise.
+/// - **No fabricated geometry.** No mesh, no spinner outside the two states
+///   where work genuinely is underway, and no single world map. The Tower now
+///   does send points and poses — over HTTP, per segment, never down the
+///   socket that carries the frames — and this screen draws exactly those,
+///   each segment in its own frame because the Tower has not registered them
+///   into a shared one. What it will not do is composite them into a room
+///   nobody measured.
 ///
 /// The live preview presents `GlassesConnection.latestCapturedFrame` through
 /// the same `ViewfinderCard` the Home workspace uses. It does not open a second
@@ -59,9 +62,10 @@ struct WorldBuilderWorkspaceView: View {
     @ObservedObject var glasses: GlassesConnection
     @ObservedObject var tower: TowerClient
 
-    /// The world-model boundary. `UnavailableWorldBuilderClient` is the only
-    /// implementation that exists, and it reports exactly one thing: the Tower
-    /// cannot do this yet.
+    /// The world-model boundary. Two implementations exist:
+    /// `TowerWorldBuilderClient`, which is what the app graph builds, and
+    /// `UnavailableWorldBuilderClient`, which reports exactly one thing — that
+    /// this screen is not connected to a world builder at all.
     ///
     /// A `@StateObject` so it is constructed once per workspace installation
     /// rather than on every render. It holds no runtime resources — no camera,
@@ -106,7 +110,9 @@ struct WorldBuilderWorkspaceView: View {
                 state: world.state,
                 availability: world.availability(isTowerReachable: isTowerReachable),
                 explanation: world.unavailableExplanation(isTowerReachable: isTowerReachable),
-                inspection: world.inspection
+                inspection: world.inspection,
+                fragments: world.fragmentsModel,
+                geometryChunks: world.geometryChunks
             )
 
             #if DEBUG
