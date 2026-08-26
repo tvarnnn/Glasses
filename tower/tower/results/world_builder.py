@@ -1452,20 +1452,13 @@ def _pose_count(manifest):
     """
     positioned = manifest.get("poses_positioned")
     if isinstance(positioned, bool) or not isinstance(positioned, int):
-        if positioned is not None:
-            # Present and not an integer: a manifest we cannot read is
-            # not a manifest to guess at.
-            return None
-        # A world built before poses_positioned existed. Fall back to
-        # what the figure has always meant rather than blanking the
-        # trajectory on every world already on disk -- and note that for
-        # a classical build, which is what those worlds are, the two
-        # agree except across a segment that resolved nothing.
-        keyframes = manifest.get("keyframes")
-        refused = manifest.get("poses_refused")
-        if not isinstance(keyframes, int) or not isinstance(refused, int):
-            return None
-        return max(0, keyframes - refused)
+        # No fallback. The old arithmetic -- keyframes - poses_refused --
+        # counted a segment ANCHOR as a camera position, and an anchor is
+        # definitional: identity rotation, zero translation, one per segment.
+        # That is where "Camera poses: 36" came from on a world whose manifest
+        # read poses_solved: 0. A manifest without poses_positioned predates
+        # the fix, and absent is the only honest answer for it.
+        return None
     return max(0, positioned)
 
 

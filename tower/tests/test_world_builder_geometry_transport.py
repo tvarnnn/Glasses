@@ -346,3 +346,19 @@ def test_the_routes_are_sync_so_fastapi_runs_them_off_the_event_loop():
 
     assert not inspect.iscoroutinefunction(geometry_routes.geometry_manifest)
     assert not inspect.iscoroutinefunction(geometry_routes.geometry_segment)
+
+
+def test_a_manifest_without_poses_positioned_reports_absent_not_arithmetic():
+    """The fallback promoted every segment anchor to a camera pose.
+
+    That is what produced 'Camera poses: 36' from a world with zero solved
+    poses. An absent figure is the honest answer; a plausible wrong one is
+    the failure the contract bump exists to prevent.
+    """
+    from tower.results.world_builder import _pose_count
+
+    manifest = {"keyframes": 457, "poses_refused": 312, "segments": 51}
+    assert _pose_count(manifest) is None
+
+    manifest["poses_positioned"] = 113
+    assert _pose_count(manifest) == 113
