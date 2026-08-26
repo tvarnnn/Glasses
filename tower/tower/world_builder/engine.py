@@ -404,6 +404,11 @@ class WorldBuilderEngine:
 
         pose_rows: list[dict] = []
         point_rows: list[list[float]] = []
+        # [segment_index, frame_index, feature_index, point_index] per row.
+        # Flat integers rather than dicts: this table is several times
+        # longer than points.json's and carries no names worth repeating a
+        # few hundred thousand times.
+        support_rows: list[list[int]] = []
 
         for segment in segments:
             members = [k for k in keyframes if k.segment_index == segment]
@@ -488,6 +493,23 @@ class WorldBuilderEngine:
                 )
                 total_points += len(estimate.points)
 
+                # Which 2-D feature in which keyframe produced which of
+                # those points. Tagged with the same segment, and BOTH
+                # indices stay segment-local: `frame_index` is a position
+                # within this segment's ordered keyframes, so it joins
+                # against the poses this loop just appended, and
+                # `point_index` is a position within this segment's
+                # points, so it joins against the rows just above. Neither
+                # is a session-wide ordinal -- a segment is the only frame
+                # of reference the two share, since segments do not share
+                # a coordinate frame either.
+                support = estimate.points.support_views
+                if support is not None:
+                    support_rows.extend(
+                        [segment, frame, feature, point]
+                        for frame, feature, point in support.tolist()
+                    )
+
         backend.release()
 
         # Scale becomes "relative" only once something actually solved:
@@ -526,6 +548,7 @@ class WorldBuilderEngine:
             session_id,
             poses=pose_rows,
             points=point_rows,
+            support=support_rows,
             manifest={
                 "schema_version": world.schema_version,
                 "input_digest": compute_input_digest(keyframes),

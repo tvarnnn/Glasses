@@ -104,6 +104,36 @@ class PointBlock:
 
     xyz: np.ndarray
     rgb: np.ndarray | None = None
+    # Which 2-D feature in which keyframe produced which landmark: a flat
+    # (M, 3) int32 table of rows [frame_index, feature_index,
+    # landmark_index]. `None` means a backend does not report it, which is
+    # different from "this block was observed by nothing".
+    #
+    # Flat and numpy-native rather than ragged (a dict, or a list per
+    # landmark) for three reasons: it is the shape every consumer wants
+    # anyway -- registration filters it by frame and joins it against
+    # matched feature indices, which is a boolean mask on a column; it
+    # costs 12 bytes a row instead of ~200 for a dict entry, and this
+    # table is the one piece of solve state that CANNOT be pruned
+    # (_Chain.forget_before); and it round-trips to JSON as integers with
+    # no dtype contract to get wrong.
+    #
+    # CONVENTIONS, both of which a consumer has to know to join anything:
+    #
+    #   frame_index    position within the window this block was solved
+    #                  from, 0 == the anchor. NOT session-relative -- a
+    #                  backend is handed one window and does not know
+    #                  where it sits in a session. The engine tags the
+    #                  rows with a segment on the way to disk, where the
+    #                  same index reads as "position within the segment".
+    #   feature_index  index into detect_and_describe()'s keypoints for
+    #                  that frame. Reproducible, because detection is
+    #                  deterministic; it is not a stored measurement.
+    #   landmark_index row of THIS block's own `xyz`, never of some
+    #                  accumulated map. Extension.new_points is a delta,
+    #                  so its table names only the landmarks that delta
+    #                  carries -- re-observations of older landmarks are
+    #                  not expressible there and appear in snapshot().
     support_views: np.ndarray | None = None
 
     def __len__(self) -> int:

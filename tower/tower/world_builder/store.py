@@ -356,7 +356,14 @@ class WorldStore:
         return data
 
     def write_derived(
-        self, world_id: str, session_id: str, *, poses, points, manifest
+        self,
+        world_id: str,
+        session_id: str,
+        *,
+        poses,
+        points,
+        manifest,
+        support=None,
     ) -> None:
         """Write the rebuildable reconstruction outputs.
 
@@ -367,6 +374,15 @@ class WorldStore:
         large enough that a viewer needs partial or memory-mapped reads --
         the same "small enough that rewriting wholesale is fine" reasoning
         object memory's store already documents for itself.
+
+        `support` is the 2-D/3-D association -- which feature in which
+        keyframe produced which point -- and goes in its OWN file rather
+        than into a points.json row. points.json is the source for a live
+        cross-platform wire contract (docs/contracts/
+        WORLD-BUILDER-GEOMETRY.md) whose row shape is pinned by test; a
+        second file costs a reader one open and costs that contract
+        nothing. `None` writes no file at all, which is what every world
+        built before this existed looks like on disk.
         """
         # Under the same lock as purge_world. Without it an in-flight
         # build can recreate a world directory that purge has just
@@ -376,6 +392,8 @@ class WorldStore:
             derived = self.derived_dir(world_id) / session_id
             write_json_atomic(derived / "poses.json", {"poses": poses})
             write_json_atomic(derived / "points.json", {"points": points})
+            if support is not None:
+                write_json_atomic(derived / "support.json", {"support": support})
             write_json_atomic(self.derived_manifest_path(world_id), manifest)
 
     def read_derived(
@@ -389,6 +407,13 @@ class WorldStore:
         prevent: the numbers look fine, they are just answers to an older
         question. Returning None makes a stale tree indistinguishable from
         an absent one, which is the honest outcome -- both mean "rebuild".
+
+        `support` is OPTIONAL and reads as None when the file is not
+        there. It arrived after ~29 worlds were already on disk, and a
+        reconstruction is complete without it -- it is an index into the
+        reconstruction, not part of it. A missing support.json is
+        therefore absent, never an error, and never a reason to refuse
+        poses and points that are perfectly good.
         """
         if verify:
             digest = compute_input_digest(
@@ -410,9 +435,33 @@ class WorldStore:
             return {
                 "poses": read_json_closed(poses_path)["poses"],
                 "points": read_json_closed(points_path)["points"],
+                "support": self._read_support(derived),
             }
         except (json.JSONDecodeError, KeyError):
             logger.warning("world builder: derived output unreadable for %s", world_id)
+            return None
+
+    def _read_support(self, derived: Path):
+        """The association, or None. Never raises, never refuses a read.
+
+        Unreadable is treated the same as missing on purpose. Poses and
+        points do not become wrong because an index beside them is
+        truncated, and refusing the whole derived tree over it would turn
+        an optional file into a hard dependency by the back door -- which
+        is precisely what keeping it out of points.json was meant to
+        avoid. Logged, because a corrupt file is still worth knowing about.
+        """
+        path = derived / "support.json"
+        if not path.exists():
+            return None
+        try:
+            return read_json_closed(path)["support"]
+        except (json.JSONDecodeError, KeyError):
+            logger.warning(
+                "world builder: support association unreadable at %s; "
+                "treating as absent",
+                path,
+            )
             return None
 
     def derived_is_current(self, world_id: str, input_digest: str) -> bool:

@@ -63,6 +63,30 @@ from tower.world_builder.schema import (
 MIN_PNP_CORRESPONDENCES = 12
 PNP_REPROJECTION_ERROR_PX = 3.0
 
+# Rows of PointBlock.support_views: [frame index, feature index, landmark
+# index]. int32, not int64: ORB is capped at a few thousand features per
+# frame and a segment holds tens of thousands of landmarks, so every
+# column is bounded three orders of magnitude below the type, and this is
+# the one piece of solve state that is never pruned -- half the width is
+# half the resident cost for the whole walk.
+SUPPORT_DTYPE = np.int32
+
+
+def _support_block(rows) -> np.ndarray:
+    """(m, 3) int32 from an iterable of (frame, feature, landmark)."""
+    flat = np.fromiter(
+        (value for row in rows for value in row), dtype=SUPPORT_DTYPE
+    )
+    return flat.reshape(-1, 3)
+
+
+def _support_table(blocks: list) -> np.ndarray:
+    """A solve's per-keyframe blocks concatenated, in creation order."""
+    if not blocks:
+        return np.zeros((0, 3), dtype=SUPPORT_DTYPE)
+    return np.concatenate(blocks, axis=0)
+
+
 CAPABILITIES = BackendCapabilities(
     backend_id="classical-sfm",
     version="2",
@@ -139,9 +163,26 @@ class ClassicalTwoViewBackend(GeometryBackend):
         # (frame index, feature index) -> landmark index, so a later frame
         # can find 3-D correspondences for the features it matched.
         observed: dict[tuple[int, int], int] = {}
+        # The same association, accumulated rather than derived. `observed`
+        # is a LOOKUP -- one landmark per (frame, feature) key, last writer
+        # wins -- and the live path prunes it (see _Chain.forget_before), so
+        # neither its contents nor its lifetime can stand in for the record
+        # of what was triangulated. Rows are appended where landmarks are
+        # created, in both this method and extend(), and nowhere else.
+        support: list[np.ndarray] = []
+        seed: list[tuple[int, int, int]] = []
         for offset, (index_a, index_b) in enumerate(pair.inlier_index_pairs):
             observed[(0, index_a)] = offset
             observed[(1, index_b)] = offset
+            # Emitted regardless of whether the dict write above collided:
+            # match_indices guarantees one entry per query index, not per
+            # train index, so two of frame 0's features can name the same
+            # feature of frame 1. Both statements are true about the solve,
+            # and dropping one would leave a landmark with a single view --
+            # which is not a thing that can be triangulated.
+            seed.append((0, index_a, offset))
+            seed.append((1, index_b, offset))
+        support.append(_support_block(seed))
 
         # -- extend by PnP ----------------------------------------------
         for current in range(2, len(window)):
@@ -171,13 +212,28 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 break
             absolute[current] = (estimate.rotation, estimate.translation)
             observed.update(reobserved)
+            support.append(
+                _support_block(
+                    (frame, feature, landmark)
+                    for (frame, feature), landmark in reobserved.items()
+                )
+            )
             base = len(landmarks)
             landmarks.extend(new_points)
             for key, offset in new_observed.items():
                 observed[key] = base + offset
+            support.append(
+                _support_block(
+                    (frame, feature, base + offset)
+                    for (frame, feature), offset in new_observed.items()
+                )
+            )
 
         block = (
-            PointBlock(xyz=np.asarray(landmarks, dtype=np.float32))
+            PointBlock(
+                xyz=np.asarray(landmarks, dtype=np.float32),
+                support_views=_support_table(support),
+            )
             if landmarks
             else None
         )
@@ -238,6 +294,10 @@ class ClassicalTwoViewBackend(GeometryBackend):
 
         features = detect_and_describe(frame.image_gray)
         new_points: list = []
+        # Rows for THIS keyframe's delta block, landmark indices local to
+        # it. The chain's own copy carries the same rows shifted into the
+        # accumulated map.
+        delta_support: list[tuple[int, int, int]] = []
 
         if index == 0:
             pose = PoseEstimate(
@@ -261,6 +321,11 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 ):
                     chain.observed[(0, index_a)] = offset
                     chain.observed[(1, index_b)] = offset
+                    delta_support.append((0, index_a, offset))
+                    delta_support.append((1, index_b, offset))
+                # The seed block IS the whole map so far, so delta-local
+                # and map-relative indices coincide here and only here.
+                chain.support.append(_support_block(delta_support))
         else:
             pose, triangulated, new_observed, reobserved = self._extend(
                 chain.previous_features,
@@ -277,11 +342,28 @@ class ClassicalTwoViewBackend(GeometryBackend):
             else:
                 chain.absolute[index] = (pose.rotation, pose.translation)
                 chain.observed.update(reobserved)
+                chain.support.append(
+                    _support_block(
+                        (frame, feature, landmark)
+                        for (frame, feature), landmark in reobserved.items()
+                    )
+                )
                 base = len(chain.landmarks)
                 chain.landmarks.extend(triangulated)
                 new_points = triangulated
                 for key, offset in new_observed.items():
                     chain.observed[key] = base + offset
+                    delta_support.append((key[0], key[1], offset))
+                chain.support.append(
+                    _support_block(
+                        (frame, feature, base + landmark)
+                        for frame, feature, landmark in delta_support
+                    )
+                )
+                # A re-observation names a landmark this delta does not
+                # carry, so it is not expressible in the delta's own index
+                # space. It reaches a consumer through snapshot(), which is
+                # the authoritative view anyway.
 
         chain.poses.append(pose)
         chain.count += 1
@@ -291,7 +373,10 @@ class ClassicalTwoViewBackend(GeometryBackend):
         return Extension(
             pose=pose,
             new_points=(
-                PointBlock(xyz=np.asarray(new_points, dtype=np.float32))
+                PointBlock(
+                    xyz=np.asarray(new_points, dtype=np.float32),
+                    support_views=_support_block(delta_support),
+                )
                 if new_points
                 else None
             ),
@@ -302,7 +387,10 @@ class ClassicalTwoViewBackend(GeometryBackend):
         if chain is None or chain.count == 0:
             return GeometryEstimate(poses=())
         block = (
-            PointBlock(xyz=np.asarray(chain.landmarks, dtype=np.float32))
+            PointBlock(
+                xyz=np.asarray(chain.landmarks, dtype=np.float32),
+                support_views=_support_table(chain.support),
+            )
             if chain.landmarks
             else None
         )
@@ -643,11 +731,11 @@ class ClassicalTwoViewBackend(GeometryBackend):
 class _Chain:
     """The carried state of one forward-only solve, and nothing else.
 
-    Exactly the three locals estimate_window() builds -- `absolute`,
-    `landmarks`, `observed` -- plus the poses emitted so far and the
-    latch recording where the chain stopped. If anything else ever has
-    to live here, this backend has stopped being forward-only, and the
-    equivalence test is the thing that will say so.
+    Exactly the four locals estimate_window() builds -- `absolute`,
+    `landmarks`, `observed`, `support` -- plus the poses emitted so far
+    and the latch recording where the chain stopped. If anything else
+    ever has to live here, this backend has stopped being forward-only,
+    and the equivalence test is the thing that will say so.
     """
 
     __slots__ = (
@@ -658,6 +746,7 @@ class _Chain:
         "observed",
         "poses",
         "previous_features",
+        "support",
     )
 
     def __init__(self) -> None:
@@ -665,8 +754,17 @@ class _Chain:
         self.previous_features = None
         self.absolute: dict[int, tuple] = {}
         self.landmarks: list = []
-        # (frame index, feature index) -> landmark index.
+        # (frame index, feature index) -> landmark index. PRUNED.
         self.observed: dict[tuple[int, int], int] = {}
+        # The support table, one (m, 3) int32 block per keyframe that
+        # added something, concatenated by snapshot(). NOT pruned, and it
+        # is the only thing here that is not: `observed` can be dropped
+        # because nothing will ever look up an old frame again, whereas
+        # this IS the output. A list of small arrays rather than one
+        # grown array so appending stays O(m) with no reallocation, and
+        # rather than a list of tuples so the cost is 12 bytes a row
+        # instead of the ~200 a dict entry cost before the prune.
+        self.support: list = []
         self.poses: list[PoseEstimate] = []
         # Degeneracy of the first frame that refused, or None.
         self.broken: str | None = None
@@ -679,6 +777,14 @@ class _Chain:
         older than it. estimate_window() keeps them all because it is
         over in one call. A live solve is not over, and unpruned this
         dict grows by roughly two entries per ORB match per keyframe.
+
+        `support` is deliberately NOT pruned here. It holds the same
+        association and is the reason this backend records anything at
+        all about 2-D/3-D linkage, so pruning it would silently give the
+        live path one frame's worth of a field the rebuild path fills
+        completely. It is affordable precisely because it is not this
+        dict: 12 bytes a row against ~200 bytes an entry, so the 26.1 MB
+        below is ~1.3 MB, and the 142.9 MB is ~8 MB.
 
         Measured, 480x360 synthetic walk, retained `observed` unpruned
         against pruned: 26.1 MB vs 0.15 MB at 155 keyframes, 142.9 MB vs
