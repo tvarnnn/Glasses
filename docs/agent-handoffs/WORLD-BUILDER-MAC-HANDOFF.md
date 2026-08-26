@@ -2,7 +2,7 @@
 
 **Cartridge:** World Builder
 **Windows branch:** `integration/world-builder-lifecycle-v1`
-**Range:** `3998e5a..HEAD` (36 commits)
+**Range:** `3998e5a..HEAD` (48 commits)
 **Written:** 2026-08-26, on Windows, with no Apple toolchain
 **Supersedes:** `tower/docs/agent-handoffs/2026-08-25-GEOMETRY-TRANSPORT-PHYSICAL-TEST.md`
 (absorbed whole — that file is now redundant)
@@ -21,7 +21,11 @@ contract, update this file rather than adding another.
 | **MAC VALIDATION PENDING** | §7-9. Nothing in the Swift half has been compiled or run by anything |
 | **PHYSICAL VALIDATION PENDING** | §10. Nothing here has met the glasses |
 
-**Tower:** 1218 passed, 32 skipped, 0 failed — run on the Windows box.
+**Tower:** 1260 passed, 32 skipped, 0 failed — run on the Windows box.
+Note the Tower has moved since the iOS half was written: tracking was
+fixed and a landmark-association artifact added. Neither changes the
+geometry wire contract, so the Swift below is unaffected — see §10 for
+the revised numbers to expect on a walk.
 **iOS:** 66 tests written across two files, **0 executed**.
 
 ---
