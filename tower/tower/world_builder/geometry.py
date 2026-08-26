@@ -38,6 +38,19 @@ MIN_INLIER_RATIO = 0.05
 # Below this there is not enough evidence to fit anything at all.
 MIN_INLIERS = 15
 
+# The per-landmark reprojection bar. This is the same 3.0 px budget
+# solvePnPRansac already uses to call a POSE an inlier
+# (classical.PNP_REPROJECTION_ERROR_PX) -- applied to the landmark that
+# comes out, which nothing did before. A point reprojecting worse than
+# the pose that produced it is inconsistent with that pose by the
+# pipeline's own standard.
+#
+# Deliberately NOT a new tuning constant. The argument for gating at all
+# is that the pipeline already declares what counts as geometry and then
+# fails to enforce it per point; inventing a fresh threshold here would
+# undercut that argument.
+MAX_LANDMARK_REPROJECTION_PX = 3.0
+
 ORB_FEATURES = 1500
 LOWE_RATIO = 0.75
 RANSAC_THRESHOLD_PX = 1.0
@@ -188,6 +201,96 @@ def motion_direction(rotation: np.ndarray, translation: np.ndarray) -> np.ndarra
     direction = -rotation.T @ np.asarray(translation, dtype=np.float64).reshape(3)
     norm = np.linalg.norm(direction)
     return direction / norm if norm > 1e-12 else direction
+
+
+def _camera_centre(pose):
+    """World-frame position of a camera, given a world->camera pose."""
+    rotation, translation = pose
+    return -np.asarray(rotation, dtype=np.float64).T @ np.asarray(
+        translation, dtype=np.float64
+    ).reshape(3)
+
+
+def landmark_gate(
+    xyz,
+    points_a,
+    points_b,
+    pose_a,
+    pose_b,
+    camera_matrix,
+    min_angle_deg: float = MIN_TRIANGULATION_ANGLE_DEG,
+    max_reprojection_px: float = MAX_LANDMARK_REPROJECTION_PX,
+):
+    """Which triangulated landmarks are geometry, and why the rest are not.
+
+    Two gates, both enforcing invariants this module already declares:
+
+    1. The angle subtended AT the landmark by the two camera centres must
+       reach `min_angle_deg`. Below that the rays are near-parallel and
+       where they "meet" is set by numerical noise, not by the scene.
+       MIN_TRIANGULATION_ANGLE_DEG has always been this module's answer to
+       "is this pair real geometry"; it was applied once, to the median
+       angle of a pair, and never to an individual landmark.
+    2. The landmark must reproject into BOTH source views within
+       `max_reprojection_px`.
+
+    Why it matters, measured on real captures: without these, landmarks
+    survive at up to 33,363 baselines from the camera, 12.2% of a real
+    world sits beyond the 50-baseline cull horizon, and the resulting
+    bounding box is 329x larger than the geometry inside it. The phone
+    fits each fragment card to that box, so the room collapses to a dot.
+
+    `xyz` is (N,3) in the frame the poses map FROM. `points_a`/`points_b`
+    are (N,2) observed pixels. Each pose is (rotation (3,3),
+    translation (3,)) mapping world->camera.
+
+    Returns (keep, counts). Every rejected landmark is counted under
+    exactly ONE reason: gate 1 is evaluated first, so a point failing both
+    is a low_parallax point. That keeps
+    `kept + low_parallax + high_reprojection == len(xyz)` exact.
+    """
+    xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+    counts = {"low_parallax": 0, "high_reprojection": 0}
+    if len(xyz) == 0:
+        return np.zeros(0, dtype=bool), counts
+
+    ray_a = _camera_centre(pose_a) - xyz
+    ray_b = _camera_centre(pose_b) - xyz
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cosines = np.einsum("ij,ij->i", ray_a, ray_b) / (
+            np.linalg.norm(ray_a, axis=1) * np.linalg.norm(ray_b, axis=1)
+        )
+    angles = np.degrees(np.arccos(np.clip(cosines, -1.0, 1.0)))
+    # A zero baseline, or a camera centre coincident with the landmark,
+    # makes the cosine non-finite. Treat that as zero parallax rather than
+    # letting a NaN compare False by accident -- the outcome is the same
+    # but the reason is now stated.
+    angles = np.where(np.isfinite(angles), angles, 0.0)
+    parallax_ok = angles >= min_angle_deg
+
+    def _reprojection_error(pose, observed):
+        rotation, translation = pose
+        cam = (np.asarray(rotation, dtype=np.float64) @ xyz.T).T + np.asarray(
+            translation, dtype=np.float64
+        ).reshape(3)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            uv = (camera_matrix @ cam.T).T
+            uv = uv[:, :2] / uv[:, 2:3]
+        error = np.linalg.norm(
+            uv - np.asarray(observed, dtype=np.float64).reshape(-1, 2), axis=1
+        )
+        # Behind the camera or on the principal plane: not a small error,
+        # no error at all. Refuse rather than admit on a NaN comparison.
+        return np.where(np.isfinite(error), error, np.inf)
+
+    reprojection_ok = (
+        _reprojection_error(pose_a, points_a) <= max_reprojection_px
+    ) & (_reprojection_error(pose_b, points_b) <= max_reprojection_px)
+
+    keep = parallax_ok & reprojection_ok
+    counts["low_parallax"] = int((~parallax_ok).sum())
+    counts["high_reprojection"] = int((parallax_ok & ~reprojection_ok).sum())
+    return keep, counts
 
 
 def triangulate_points(

@@ -82,3 +82,138 @@ def test_characterisation_well_conditioned_geometry_survives_today():
     pb = _project(world, (rotation, translation)).astype(np.float32)
     points = triangulate_points(pa, pb, rotation, translation, CAMERA)
     assert len(points) == 3
+
+
+# ---------------------------------------------------------------------------
+# Task 2: the gate helper itself.
+# ---------------------------------------------------------------------------
+
+
+def test_gate_rejects_near_parallel_landmark():
+    from tower.world_builder.geometry import landmark_gate
+
+    pose_b = (np.eye(3), np.array([-0.001, 0.0, 0.0]))
+    world = np.array([[0.0, 0.0, 1000.0]])
+    keep, counts = landmark_gate(
+        world,
+        _project(world, IDENTITY_POSE),
+        _project(world, pose_b),
+        IDENTITY_POSE,
+        pose_b,
+        CAMERA,
+    )
+    assert not keep[0]
+    assert counts["low_parallax"] == 1
+    assert counts["high_reprojection"] == 0
+
+
+def test_gate_keeps_distant_but_well_triangulated_landmark():
+    """ADVERSARIAL, REQUIRED.
+
+    A gate that discards everything satisfies every other test in this
+    file. Distance alone is not the defect -- an unconstrained ray is.
+    Baseline 30 at depth 1000 subtends ~1.7 deg, comfortably above the
+    0.5 deg bar, and MUST survive. If this test ever fails, the gate has
+    become a truncation and the reconstruction is being thrown away.
+    """
+    from tower.world_builder.geometry import landmark_gate
+
+    pose_b = (np.eye(3), np.array([-30.0, 0.0, 0.0]))
+    world = np.array([[0.0, 0.0, 1000.0]])
+    keep, counts = landmark_gate(
+        world,
+        _project(world, IDENTITY_POSE),
+        _project(world, pose_b),
+        IDENTITY_POSE,
+        pose_b,
+        CAMERA,
+    )
+    assert keep[0], "a genuinely distant, well-triangulated point must survive"
+    assert counts == {"low_parallax": 0, "high_reprojection": 0}
+
+
+def test_gate_rejects_high_reprojection_landmark():
+    from tower.world_builder.geometry import landmark_gate
+
+    pose_b = (np.eye(3), np.array([-1.0, 0.0, 0.0]))
+    world = np.array([[0.0, 0.0, 10.0]])
+    good_a = _project(world, IDENTITY_POSE)
+    bad_b = _project(world, pose_b) + np.array([[40.0, 0.0]])
+    keep, counts = landmark_gate(
+        world, good_a, bad_b, IDENTITY_POSE, pose_b, CAMERA
+    )
+    assert not keep[0]
+    assert counts["high_reprojection"] == 1
+    assert counts["low_parallax"] == 0
+
+
+def test_gate_handles_coincident_camera_centres_without_raising():
+    """Degenerate pair: zero baseline. The angle is undefined, and the
+    honest answer is that this is not geometry. Must not raise, divide by
+    zero, or emit a non-finite angle that silently compares False."""
+    from tower.world_builder.geometry import landmark_gate
+
+    pose_b = (np.eye(3), np.zeros(3))
+    world = np.array([[0.0, 0.0, 10.0]])
+    keep, counts = landmark_gate(
+        world,
+        _project(world, IDENTITY_POSE),
+        _project(world, pose_b),
+        IDENTITY_POSE,
+        pose_b,
+        CAMERA,
+    )
+    assert not keep[0]
+    assert counts["low_parallax"] == 1
+
+
+def test_gate_counts_are_mutually_exclusive_and_total_correctly():
+    """Accounting: kept + low_parallax + high_reprojection == produced.
+
+    A point failing both gates is counted once, under low_parallax,
+    because gate 1 is evaluated first.
+    """
+    from tower.world_builder.geometry import landmark_gate
+
+    pose_b = (np.eye(3), np.array([-1.0, 0.0, 0.0]))
+    world = np.array(
+        [[0.0, 0.0, 10.0], [0.0, 0.0, 100000.0], [1.0, 0.0, 10.0]]
+    )
+    pa = _project(world, IDENTITY_POSE)
+    pb = _project(world, pose_b)
+    pb[2] = pb[2] + np.array([50.0, 0.0])
+    keep, counts = landmark_gate(world, pa, pb, IDENTITY_POSE, pose_b, CAMERA)
+    assert (
+        int(keep.sum()) + counts["low_parallax"] + counts["high_reprojection"]
+        == 3
+    )
+    assert set(counts) == {"low_parallax", "high_reprojection"}
+
+
+def test_gate_on_empty_input_returns_empty_mask_and_zero_counts():
+    from tower.world_builder.geometry import landmark_gate
+
+    keep, counts = landmark_gate(
+        np.zeros((0, 3)),
+        np.zeros((0, 2)),
+        np.zeros((0, 2)),
+        IDENTITY_POSE,
+        (np.eye(3), np.array([-1.0, 0.0, 0.0])),
+        CAMERA,
+    )
+    assert keep.shape == (0,)
+    assert counts == {"low_parallax": 0, "high_reprojection": 0}
+
+
+def test_gate_threshold_is_the_declared_invariant_not_a_new_constant():
+    """The whole argument for this change is that it introduces no new
+    tuning constant. Pin that: gate 1's default IS the module's declared
+    triangulation-angle bar."""
+    from tower.world_builder import geometry
+
+    assert (
+        geometry.landmark_gate.__defaults__[0]
+        == geometry.MIN_TRIANGULATION_ANGLE_DEG
+    )
+    assert geometry.MIN_TRIANGULATION_ANGLE_DEG == 0.5
+    assert geometry.MAX_LANDMARK_REPROJECTION_PX == 3.0
