@@ -77,7 +77,23 @@ ocr = [
     #
     # Adds: scipy, scikit-image, imageio, tifffile, lazy-loader, ninja,
     # pyclipper, python-bidi, shapely. `pip check` clean before and after.
-    "easyocr",
+    #
+    # PINNED, for the same reason the `ml` extra pins torch: the version
+    # is load-bearing on a measurement. Installed and verified on this
+    # host 2026-08-26 -- `pip check` clean, `cv2.__version__` still
+    # 5.0.0 with `opencv-python-headless` the ONLY cv2 distribution
+    # present, `numpy` still 2.5.2, `torch` still 2.13.0+cu132 with CUDA
+    # available. The 2026-08-26 reality check
+    # (docs/superpowers/research/2026-08-26-document-memory-reality-check.md)
+    # reproduced the published 640x480 and 1280x720 recall rows exactly
+    # against THIS version; an unpinned upgrade would silently move the
+    # baseline those rows are compared to.
+    #
+    # It does NOT pull torch from PyPI when torch is already present, but
+    # `easyocr` does list `torch` as a requirement -- install the cu132
+    # wheels from the `ml` extra FIRST, or a bare resolve will fetch the
+    # CPU-only Windows wheel over them.
+    "easyocr==1.7.2",
 ]
 
 [build-system]
