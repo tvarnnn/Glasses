@@ -126,8 +126,19 @@ prevents "document detected" from meaning "rectangle detected".
 
 A quad must be present, of stable size and position, for a minimum number
 of consecutive frames **and** a minimum wall-clock duration. Both, because
-frame rate is not fixed: at the delivered ~3.3 fps, "10 frames" is three
-seconds; at 12 fps it is under one.
+frame rate is not fixed: at ~3.3 fps, "10 frames" is three seconds; at
+12 fps it is under one.
+
+> **Correction, 2026-08-26.** The delivered rate is **11.97 fps
+> (83.5 ms)**, measured over 9,199 real frames — not the ~3.3 fps this
+> paragraph called "delivered". **The design is unaffected, and that is
+> the point.** Requiring a frame count *and* a wall-clock duration was
+> chosen here precisely because the rate was not trusted, and
+> `dwell.py:118-123` implements both, so a dwell means the same thing at
+> either rate. Scene Understanding assumed the same wrong number and
+> expressed its constants in frames alone; `max_misses = 5` was
+> documented as 1.5 s and was really 0.42 s, which recounted people. See
+> `research/2026-08-26-tracker-retune.md`.
 
 A dwell ends when the quad is lost for a few consecutive frames — a page
 turn, a glance away, or the wearer moving on.
