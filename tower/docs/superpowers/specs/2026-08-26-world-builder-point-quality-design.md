@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-26
 **Branch:** `world-builder/next-generation` (based on `origin/integration/world-builder-lifecycle-v1` @ `25eb794`)
-**Status:** DESIGN APPROVED — not yet implemented
+**Status:** IN IMPLEMENTATION — §2.2 threshold superseded by §2.7 on measured evidence
 **Scope:** Tower only. No `ios/` changes. No registration changes.
 
 ---
@@ -194,6 +194,80 @@ is accepted; this table only establishes that the change is worth measuring.
 
 0.5 is chosen over 1.0 because it is the already-declared invariant. 1.0 is a new
 constant and is not adopted on the strength of a proxy simulation.
+
+### 2.7 MEASURED CORRECTION — the 0.5 deg bar was wrong
+
+**Superseded: §2.2 and §2.6 above. Recorded, not rewritten, so the
+reasoning that failed stays visible.**
+
+§2.6 projected a 1-3% discard from a proxy that used each segment's MAX
+camera baseline. The real gate uses the baseline of the specific pair that
+produced each landmark, which is smaller. The proxy was optimistic in the
+dangerous direction.
+
+Measured against real `support.json` landmark-to-keyframe associations,
+recovering the true camera pair behind every landmark:
+
+```
+TRUE inter-ray angle, world 3dd986b1 (12,023 landmarks):
+  p1 0.0132  p5 0.0634  p10 0.1182  p25 0.2928  p50 0.8904  p75 1.9694  max 149.0
+
+  discarded at 0.10 deg:  1010 / 12023   (8.4%)
+  discarded at 0.25 deg:  2598 / 12023  (21.6%)
+  discarded at 0.50 deg:  4439 / 12023  (36.9%)
+```
+
+A 0.5 deg landmark gate discards **36.9%** of world `3dd986b1` and
+**43.9%** of the live-run world `4cae0b26`. Not 1-3%.
+
+Re-running the sweep at TRUE angles puts the knee at 0.05 deg:
+
+| gate | 3dd986b1 kept / blowup / legible | 4cae0b26 kept / blowup / legible |
+|---|---|---|
+| none | 100.0% / 329x / 10 of 19 | 100.0% / 238x / 4 of 7 |
+| 0.05 | 96.1% / 16x / 17 of 19 | 96.4% / 11x / 6 of 7 |
+| 0.25 | 78.4% / 9x / 18 of 19 | 79.6% / 7x / 7 of 7 |
+| 0.50 | 63.1% / 5x / 19 of 19 | 56.1% / 5x / 7 of 7 |
+
+Nearly all the legibility comes from removing the extreme tail. The extra
+33 percentage points of discard buy 16x -> 5x and two fragments.
+
+**This project has already ruled on that trade.** Loss-grace-3 was
+rejected for destroying a third of the reconstruction
+(`keyframes.py:117-136`). A 0.5 deg landmark gate destroys 37-44%. Same
+trade, same verdict.
+
+#### What was actually wrong: two questions were conflated
+
+`MIN_TRIANGULATION_ANGLE_DEG` asks *is this PAIR good enough to trust a
+pose from*. At 0.5 deg that is a 26% depth error -- imprecise, but real
+geometry.
+
+The landmark gate must ask a different question: *is this a measurement at
+all*. That bar is derivable rather than chosen. For two-view triangulation
+
+```
+    sigma_d / d  =  sigma_px / (f * theta)
+```
+
+so an error bar as wide as the measurement itself -- one that reaches
+infinity -- sits at `theta = sigma_px / f`. Using the pipeline's own
+`RANSAC_THRESHOLD_PX` (1.0) and the real calibration (f ~ 438):
+
+```
+    theta_min = 0.1308 deg      (exactly 100% depth uncertainty)
+```
+
+Implemented as `geometry.min_parallax_deg(camera_matrix)`. It is **better**
+than the constant it replaces on the criterion §2.1 actually cared about:
+it is derived from existing constants, and it scales with focal length, so
+it does not silently change meaning if delivered resolution moves. A
+garbage camera matrix falls back to `MIN_TRIANGULATION_ANGLE_DEG` rather
+than deriving a zero bar that would admit every unconstrained ray.
+
+**The §2.1 principle survives; the §2.2 application of it did not.**
+
+---
 
 ---
 
