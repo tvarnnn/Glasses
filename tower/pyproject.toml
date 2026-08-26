@@ -25,14 +25,41 @@ dev = [
     "websockets>=12.0",
 ]
 ml = [
-    "torch",
+    # PINNED, AND THE INDEX IS NOT OPTIONAL.
+    #
+    #   pip install --index-url https://download.pytorch.org/whl/cu132 \
+    #       "torch==2.13.0+cu132" "torchvision==0.28.0+cu132"
+    #
+    # Install these two FIRST, from that index, before anything else in
+    # this extra or in `ocr`. A bare `pip install .[ml]` resolves torch
+    # from PyPI, whose Windows wheel is CPU-only (122 MB against 1.92 GB)
+    # -- and CPU torch does not announce itself. It imports, it runs, and
+    # every GPU figure in the docs silently becomes a CPU figure. That is
+    # not hypothetical: it is how this venv arrived at torch 2.13.0+cpu
+    # and stayed there (weekend run report, item 5).
+    #
+    # cu132 rather than cu128: the RTX 5070 is Blackwell, sm_120. Verified
+    # on this host 2026-08-26 -- get_device_capability() == (12, 0),
+    # arch_list includes sm_120, and a real matmul executed on device.
+    # Note that general web search still recommends "nightly cu128 or
+    # WSL2" for Blackwell; that advice is stale, cu128/cu129 were removed
+    # from the build matrix, and following it wastes an afternoon.
+    #
+    # Needs driver >= 580 (this host: 596.21). No CUDA Toolkit install --
+    # the Windows wheel bundles its own runtime.
+    "torch==2.13.0+cu132",
     # torchvision is now a DIRECT dependency, not only a transitive one:
     # tower/experiments/object_detection.py uses its
     # ssdlite320_mobilenet_v3_large with COCO weights (~13.4 MB, downloaded
     # on first use). No new package was added for it -- it was already
     # here, which is most of why that detector was chosen over one that
     # would have cost a dependency.
-    "torchvision",
+    #
+    # Also pinned to the cu132 index, same reason as torch above. And it
+    # carries more than the detector: KeypointRCNN, which Scene
+    # Understanding's coarse orientation needs, is torchvision-only. That
+    # capability costs no additional package.
+    "torchvision==0.28.0+cu132",
     # timm: not a Tower dependency directly, but MiDaS's hubconf.py
     # (intel-isl/MiDaS, loaded via torch.hub in tower/experiments/depth.py)
     # unconditionally imports a DPT/beit backbone chain that requires it,
