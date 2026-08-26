@@ -358,6 +358,33 @@ def test_the_experimental_cv_lab_does_not_import_a_cartridge():
     assert offenders == []
 
 
+def test_object_memory_does_not_import_the_experimental_cv_lab():
+    """The producer owns its detector; it does not borrow the Lab's.
+
+    Same reason `tower/scene/detect.py` records and the scene rule below
+    already enforces: the Lab measured these exact weights, but its
+    `ExperimentResult` is a scalar plus a name->number bag and cannot
+    carry a box, and a memory needs the individual detection rather than
+    a count. The stronger half is the direction -- the Lab is a sandbox
+    that may be thrown away, and nothing that can be thrown away should
+    be upstream of a PERSISTENT store.
+
+    The two share weights, not code, and the duplication is the price of
+    that. If a third consumer appears, the fix is a shared detector
+    promoted to `tower/` (as `Confidence` was), never an import of the
+    sandbox.
+    """
+    offenders = []
+    for path in (TOWER / "object_memory").rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        for name in _imports(path):
+            if name.startswith("tower.experiments"):
+                offenders.append(f"{path} -> {name}")
+
+    assert offenders == []
+
+
 def test_no_experiment_persists_anything():
     """The Lab's descriptor declares persists_data=False. Keep it true.
 

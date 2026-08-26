@@ -94,7 +94,9 @@ def test_purge_really_deletes_the_backing_file(tmp_path):
 
 
 def test_prune_expired_removes_only_observations_past_retention(tmp_path):
-    store = ObservationStore(tmp_path, retention_seconds=100.0)
+    store = ObservationStore(
+        tmp_path, retention_seconds=100.0, clock=lambda: 1000.0
+    )
     store.append(_observation("old", observed_at=0.0))
     store.append(_observation("new", observed_at=950.0))
 
@@ -135,7 +137,9 @@ def test_purge_returns_count_of_observations_not_corrupt_lines(tmp_path):
 def test_prune_expired_cleans_corrupt_lines_even_when_nothing_expires(tmp_path):
     # Finding 2: with retention configured, corrupt lines are rewritten away
     # even if no valid records have expired.
-    store = ObservationStore(tmp_path, retention_seconds=100.0)
+    store = ObservationStore(
+        tmp_path, retention_seconds=100.0, clock=lambda: 1000.0
+    )
     store.append(_observation("fresh", observed_at=950.0))
     with (tmp_path / "observations.jsonl").open("a", encoding="utf-8") as handle:
         handle.write("{not json\n")
@@ -152,7 +156,9 @@ def test_prune_expired_cleans_corrupt_lines_even_when_nothing_expires(tmp_path):
 
 def test_prune_expired_removes_both_expired_obs_and_corrupt_lines(tmp_path):
     # Finding 2: when valid records expire, corrupt lines are also removed.
-    store = ObservationStore(tmp_path, retention_seconds=100.0)
+    store = ObservationStore(
+        tmp_path, retention_seconds=100.0, clock=lambda: 1000.0
+    )
     store.append(_observation("old", observed_at=0.0))
     store.append(_observation("fresh", observed_at=950.0))
     with (tmp_path / "observations.jsonl").open("a", encoding="utf-8") as handle:
@@ -304,7 +310,9 @@ def test_negative_retention_seconds_is_rejected(tmp_path):
 def test_prune_expired_cutoff_applies_to_recorded_at_not_observed_at(tmp_path):
     # observed_at is long expired but recorded_at (the privacy-relevant
     # clock) is not -- the record must survive.
-    store = ObservationStore(tmp_path, retention_seconds=100.0)
+    store = ObservationStore(
+        tmp_path, retention_seconds=100.0, clock=lambda: 1000.0
+    )
     observation = ObjectObservation(
         object_class="keys",
         detector_score=0.9,
@@ -336,3 +344,133 @@ def test_last_seen_returns_newest_by_timestamp_when_appended_out_of_order(tmp_pa
     store.append(_observation("keys", observed_at=100.0))
 
     assert store.last_seen("keys").observed_at == 300.0
+
+
+# --- FIX 5: retention is a promise about AVAILABILITY, not about disk ---
+#
+# all_observations()/last_seen() used to serve every line in the file
+# regardless of age, so a reader on a long-running tower was handed
+# expired observations indefinitely and the retention claim was only true
+# for whoever happened to call prune_expired(). 06-PRIVACY-DATA.md makes
+# retention a bound on how long data is AVAILABLE, so reads must apply it
+# too. Filtering is the default; a caller has to ask for expired records
+# by name.
+
+
+def test_all_observations_hides_records_past_retention(tmp_path):
+    store = ObservationStore(
+        tmp_path, retention_seconds=100.0, clock=lambda: 1000.0
+    )
+    store.append(_observation("old", observed_at=0.0))
+    store.append(_observation("fresh", observed_at=950.0))
+
+    assert [o.object_class for o in store.all_observations()] == ["fresh"]
+
+
+def test_last_seen_ignores_an_observation_past_retention(tmp_path):
+    # The dangerous shape: the ONLY sighting of a class is expired, so an
+    # unfiltered last_seen answers "your laptop was on the desk" from data
+    # the wearer was promised had been forgotten.
+    store = ObservationStore(
+        tmp_path, retention_seconds=100.0, clock=lambda: 1000.0
+    )
+    store.append(_observation("laptop", observed_at=0.0))
+
+    assert store.last_seen("laptop") is None
+
+
+def test_last_seen_falls_back_to_the_newest_unexpired_sighting(tmp_path):
+    store = ObservationStore(
+        tmp_path, retention_seconds=100.0, clock=lambda: 1000.0
+    )
+    store.append(_observation("laptop", observed_at=0.0))
+    store.append(_observation("laptop", observed_at=920.0))
+
+    assert store.last_seen("laptop").observed_at == 920.0
+
+
+def test_reads_are_unfiltered_when_retention_is_none(tmp_path):
+    # "Keep forever" is a real setting, not an oversight -- with no
+    # retention there is no cutoff and every record stays readable.
+    store = ObservationStore(tmp_path, retention_seconds=None)
+    store.append(_observation("ancient", observed_at=0.0))
+
+    assert [o.object_class for o in store.all_observations()] == ["ancient"]
+
+
+def test_a_caller_must_opt_out_of_the_retention_filter_by_name(tmp_path):
+    # The opt-out exists for maintenance paths that must see what is
+    # physically on disk. It is deliberately not the default.
+    store = ObservationStore(
+        tmp_path, retention_seconds=100.0, clock=lambda: 1000.0
+    )
+    store.append(_observation("old", observed_at=0.0))
+
+    assert store.all_observations() == []
+    assert len(store.all_observations(include_expired=True)) == 1
+    assert store.last_seen("old") is None
+    assert store.last_seen("old", include_expired=True) is not None
+
+
+def test_read_filtering_uses_recorded_at_not_observed_at(tmp_path):
+    # Same clock choice prune_expired documents: retention bounds how long
+    # WE have held the record, not how old the sighting claims to be.
+    store = ObservationStore(
+        tmp_path, retention_seconds=100.0, clock=lambda: 1000.0
+    )
+    store.append(
+        ObjectObservation(
+            object_class="laptop",
+            detector_score=0.9,
+            confidence=Confidence.HIGH,
+            observed_at=0.0,
+            time_basis="tower-receipt",
+            recorded_at=990.0,
+            source="glasses-camera",
+            module_id="object-memory",
+            session_id=None,
+            frame_seq=None,
+            bounding_box=None,
+            retention_tag="default",
+            privacy_tags=("derived-only",),
+            spatial_ref=None,
+            external_refs=(),
+        )
+    )
+
+    assert len(store.all_observations()) == 1
+
+
+def test_a_record_with_no_usable_recorded_at_is_not_served(tmp_path):
+    # Matches prune_expired: a record that cannot be SHOWN to be within
+    # retention is treated as expired rather than given the benefit of
+    # the doubt.
+    store = ObservationStore(
+        tmp_path, retention_seconds=100.0, clock=lambda: 1000.0
+    )
+    _write_raw_line(tmp_path, _raw_record(recorded_at="not-a-number"))
+
+    assert store.all_observations() == []
+
+
+def test_purge_still_counts_and_deletes_expired_records(tmp_path):
+    # purge() deletes the file outright, so it must count what it is
+    # actually removing -- including records reads would no longer serve.
+    store = ObservationStore(
+        tmp_path, retention_seconds=100.0, clock=lambda: 1000.0
+    )
+    store.append(_observation("old", observed_at=0.0))
+    store.append(_observation("fresh", observed_at=950.0))
+
+    assert store.purge() == 2
+    assert not any(tmp_path.iterdir())
+
+
+def test_prune_expired_defaults_to_the_stores_own_clock(tmp_path):
+    store = ObservationStore(
+        tmp_path, retention_seconds=100.0, clock=lambda: 1000.0
+    )
+    store.append(_observation("old", observed_at=0.0))
+    store.append(_observation("fresh", observed_at=950.0))
+
+    assert store.prune_expired() == 1

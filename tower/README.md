@@ -664,6 +664,20 @@ tower/
     engine.py             Cheap per frame, expensive per dwell
     retrieval.py          BM25 by content, window by time, and an explicit
                           refusal when there is no record
+  object_memory/
+    records.py            ObjectObservation: a CATEGORY was visible at a
+                          time, never "my keys" and never a position
+    relevance.py          Which detections are worth remembering.
+                          PERSISTED_CLASSES is a closed whitelist --
+                          laptop and cell phone, the only two classes the
+                          real corpus supports above 0.8. `person` is
+                          excluded and there is no flag to re-admit it
+    detector.py           Detector seam: torchvision SSDLite320 + a fast
+                          fake. Does NOT import the Lab
+    engine.py             Detect, filter, persist -- and count everything
+                          it declined, and why
+    store.py              Append-only JSONL, real purge, and a retention
+                          cutoff applied on READ as well as on prune
   scene/
     records.py            Detection / Track / Relation / FacingEstimate.
                           A track_id is "the same blob one frame later",
@@ -717,6 +731,14 @@ scripts/
                           Detection cost per frame, retrieval latency and
                           storage growth, plus read quality swept over
                           frame size and tilt
+  object_memory_session.py
+                          Remember which object categories were visible,
+                          from a capture (live or recorded). Runs in a
+                          separate process, so no module lifecycle has to
+                          bound a model load
+  object_query.py         Ask Object Memory when it last saw something.
+                          "Where" is a FRAME reference, not a place --
+                          this slice stores no spatial position
   scene_session.py        What is around the wearer, from a frame stream.
                           Answers the questions in the run that observed
                           the frames -- nothing is persisted, so there is

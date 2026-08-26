@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 from tower.object_memory.records import (
@@ -33,7 +34,13 @@ class ObservationStore:
     records. Rewriting raw dicts keeps that promise true.
     """
 
-    def __init__(self, directory: Path, retention_seconds: float | None) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        retention_seconds: float | None,
+        *,
+        clock=time.time,
+    ) -> None:
         if retention_seconds is not None and retention_seconds < 0:
             raise ValueError(
                 "retention_seconds must be non-negative or None, got "
@@ -41,6 +48,11 @@ class ObservationStore:
             )
         self._directory = Path(directory)
         self._retention_seconds = retention_seconds
+        # Injected so a READ can apply the retention cutoff without every
+        # caller having to pass the time in. prune_expired keeps its
+        # explicit `now`, so the deterministic tests it was written for
+        # read exactly as before; this only supplies a default.
+        self._clock = clock
         self._path = self._directory / OBSERVATIONS_FILENAME
         self._temp_path = self._path.with_suffix(TEMP_SUFFIX)
         # Guards append (called from the live frame path) against purge
@@ -105,19 +117,73 @@ class ObservationStore:
                 )
         return observations
 
-    def _all_observations_locked(self) -> list[ObjectObservation]:
+    def _retention_cutoff(self) -> float | None:
+        """The oldest recorded_at a read may still serve; None means no bound."""
+        if self._retention_seconds is None:
+            return None
+        return self._clock() - self._retention_seconds
+
+    @staticmethod
+    def _is_within_retention(raw: dict, cutoff: float | None) -> bool:
+        """Shared by reads and prune so the two can never disagree.
+
+        recorded_at, not observed_at: retention is about how long WE have
+        held the data, which is the privacy-relevant clock. They are
+        equal today, but diverge the moment a real capture timestamp is
+        threaded through. A missing or non-numeric recorded_at can't be
+        shown to be within retention, so it is treated as expired.
+        (bool is excluded: it's an int subclass in Python.)
+        """
+        if cutoff is None:
+            return True
+        recorded_at = raw.get("recorded_at")
+        is_numeric = isinstance(recorded_at, (int, float)) and not isinstance(
+            recorded_at, bool
+        )
+        return is_numeric and recorded_at >= cutoff
+
+    def _all_observations_locked(
+        self, cutoff: float | None
+    ) -> list[ObjectObservation]:
         raw_records, _ = self._read_raw_records()
+        if cutoff is not None:
+            raw_records = [
+                raw for raw in raw_records if self._is_within_retention(raw, cutoff)
+            ]
         return self._parse_observations(raw_records)
 
-    def all_observations(self) -> list[ObjectObservation]:
-        with self._lock:
-            return self._all_observations_locked()
+    def _read_cutoff(self, include_expired: bool) -> float | None:
+        return None if include_expired else self._retention_cutoff()
 
-    def last_seen(self, object_class: str) -> ObjectObservation | None:
+    def all_observations(
+        self, *, include_expired: bool = False
+    ) -> list[ObjectObservation]:
+        """Every observation still within retention.
+
+        Filtering is the DEFAULT and the opt-out has to be asked for by
+        name. Retention under 06-PRIVACY-DATA.md is a promise about how
+        long data stays AVAILABLE, not merely about how long it sits on
+        disk; a read that ignored the cutoff made that promise true only
+        for whoever remembered to call prune_expired(), which on a tower
+        that stays up for days is nobody.
+
+        `include_expired=True` exists for maintenance paths that must see
+        what is physically on disk -- purge counting what it deletes, an
+        operator auditing the file. It is never the right answer for
+        anything a wearer will be shown.
+        """
+        with self._lock:
+            return self._all_observations_locked(self._read_cutoff(include_expired))
+
+    def last_seen(
+        self, object_class: str, *, include_expired: bool = False
+    ) -> ObjectObservation | None:
         with self._lock:
             matching = [
                 o
-                for o in self._all_observations_locked()
+                for o in self._all_observations_locked(
+                    self._read_cutoff(include_expired)
+                )
                 if o.object_class == object_class
             ]
         if not matching:
@@ -133,33 +199,33 @@ class ObservationStore:
         file (left behind by a crash mid-_rewrite) are removed regardless.
         """
         with self._lock:
-            count = len(self._all_observations_locked())
+            # Counted WITHOUT the retention cutoff: purge deletes the
+            # files outright, so it must report what it actually removed
+            # rather than only the part a read was still willing to serve.
+            count = len(self._all_observations_locked(None))
             for artifact in (self._path, self._temp_path):
                 artifact.unlink(missing_ok=True)
             return count
 
-    def prune_expired(self, now: float) -> int:
+    def prune_expired(self, now: float | None = None) -> int:
+        """Delete expired records from disk. Reads already refuse to serve them.
+
+        Still required, and not merely tidiness: read-time filtering stops
+        expired data being SERVED, while 06-PRIVACY-DATA.md wants it gone.
+        `now` stays explicit so the deterministic tests keep working, and
+        defaults to the store's clock for a caller with nothing to say.
+        """
         if self._retention_seconds is None:
             return 0
+        if now is None:
+            now = self._clock()
         with self._lock:
             raw_records, corrupt = self._read_raw_records()
             cutoff = now - self._retention_seconds
             kept = []
             removed = 0
             for raw in raw_records:
-                recorded_at = raw.get("recorded_at")
-                # recorded_at, not observed_at: retention is about how
-                # long WE have held the data, which is the
-                # privacy-relevant clock. They are equal today, but
-                # diverge the moment a real capture timestamp is
-                # threaded through. A missing or non-numeric recorded_at
-                # can't be shown to be within retention, so it is
-                # treated as expired -- that was always the intent.
-                # (bool is excluded: it's an int subclass in Python.)
-                is_numeric = isinstance(recorded_at, (int, float)) and not isinstance(
-                    recorded_at, bool
-                )
-                if is_numeric and recorded_at >= cutoff:
+                if self._is_within_retention(raw, cutoff):
                     kept.append(raw)
                 else:
                     removed += 1
