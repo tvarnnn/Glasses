@@ -23,9 +23,9 @@ detail), `WORLD-BUILDER-STATUS.md` (P1–P11 physical gates),
 
 | # | Cartridge | Code | Evidence on real frames | Gated by |
 |---|---|---|---|---|
-| 1 | **World Builder** | Tower complete, tested | **Yes** — 5 real captures; 51 segments, 3 registered | Mac compile, then a walk |
+| 1 | **World Builder** | Tower complete, tested | **Yes** — 5 real captures; 51 segments, 3 registered | **Owned by `world-builder/next-generation`; frozen to this lane** |
 | 2 | **Experimental CV Lab** | Implemented, 86 tests | Partly — `baseline` only, 2026-08-21 | Nothing; it is a lab |
-| 3 | **Scene Understanding** | Implemented, persists nothing | **Yes** — constants re-derived at the true 12 fps | The lifecycle ruling |
+| 3 | **Scene Understanding** | Implemented, persists nothing | **Yes** — constants re-derived at the true 12 fps delivery rate | **UNBLOCKED 2026-08-26** — needs a wire path built |
 | 4 | **Object Memory** | Store + producer + route + **iOS surface (UNCOMPILED)** | **Yes** — 55 observations from 9,199 frames | iOS compile; the `person` ruling |
 | 5 | **Document Memory** | Engine + CLI, 145 tests | **Yes, and it falsified the premise** | Camera resolution |
 | 6 | **Environmental Memory** | Design only | None | Its own design says *do not begin* |
@@ -80,6 +80,31 @@ route, which is exactly what this ruling gates.
 So the ruling is no longer one cartridge's implementation detail. **It is
 the sole blocker on Scene Understanding reaching a user at all**, and it
 is the single highest-value decision available.
+
+> ## RULED AND IMPLEMENTED — 2026-08-26
+>
+> **E + A**, decided by the Tower lane under an explicit autonomy grant,
+> because research had already resolved it: five costed options, both
+> failure consequences named, and a recommendation. Reversible; **B is
+> still the V1.1 destination.**
+>
+> - `LOAD_TIMEOUT_S = 120.0`, derived from measured download sizes — a cold
+>   depth load fetches 119.0 MB, so the old 10 s bound meant *deterministic
+>   first-run failure*, not safety.
+> - `tower/loading.py` adds `LoadInvalidation`, closing an ordering bug in
+>   which an orphaned loader installed a model into an already-released
+>   module — on CUDA, holding VRAM nothing would ever free.
+> - An adversarial reviewer then found **six** confirmed defects around it,
+>   all since fixed. The worst: `asyncio.run`'s executor shutdown **joined
+>   the orphan**, so the new bound did not bound startup at the only place
+>   it runs. Now 0.055 s against a 0.05 s bound, measured, where it was
+>   3.006 s.
+>
+> **Consequence: Scene Understanding's wire path is UNBLOCKED.** A live
+> in-process module can now load a model under a bound that is real. This
+> is the next major cartridge work available to the Tower lane.
+> Evidence: `research/2026-08-26-lifecycle-load-timeout.md` and
+> `research/2026-08-26-lifecycle-adversarial-findings.md`.
 
 ### 2.3 Camera resolution — newly identified, and it is physics
 
