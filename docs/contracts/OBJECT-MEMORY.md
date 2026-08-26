@@ -11,10 +11,20 @@
 | Store | `tower/tower/object_memory/store.py` |
 | CLI (same questions, plus deletion) | `tower/scripts/object_query.py` |
 | Tests | `tower/tests/test_object_memory_transport.py` |
-| iOS consumer | none yet |
+| iOS consumer | `ios/Glasses/Workspaces/ObjectMemory/` (4 files) |
+| iOS tests | `ios/GlassesTests/ObjectMemoryTests.swift` |
 
 **Status:** Tower half implemented and exercised against the real 55-observation
-corpus in `tower/data/object_memory`. No client has been written against it.
+corpus in `tower/data/object_memory`. The iOS half is **written and
+uncompiled** — there is no Swift toolchain on the machine it was authored on;
+see `docs/agent-handoffs/OBJECT-MEMORY-MAC-HANDOFF.md`.
+
+**One correction the client found by reading the route rather than this
+document.** §4.4 below lists `confidence` as `low | medium | high`.
+`tower/confidence.py` defines a fourth value, `unknown`, and
+`Confidence.from_score(None)` returns it — so a record written before scores
+were tracked carries it, and a decoder built from the table alone refuses a real
+record. The Swift decoder accepts all four. The table is corrected in place.
 
 The contract identifier is **opaque and dated**. It is compared for equality and
 nothing else — never parsed, never split on `/`, never ordered. A newer date is
@@ -181,7 +191,7 @@ class — see §1.
 | `object_class` | string | One of `recorded_classes`. |
 | `claim` | string | `category-was-visible-once`, repeated per record so a client holding one record out of context still has it. |
 | `identity` | string | `category-not-instance`, likewise. |
-| `confidence` | string | `low` \| `medium` \| `high`. **The field a consumer should read.** Derived from `best_score` — the claim is "this was in view", and the best look is the best evidence for it. |
+| `confidence` | string | `unknown` \| `low` \| `medium` \| `high`. **The field a consumer should read.** Derived from `best_score` — the claim is "this was in view", and the best look is the best evidence for it. `unknown` is what `Confidence.from_score(None)` returns, so it reaches the wire on any record whose `best_score` is `null`; a decoder that accepts only the other three refuses a real record. |
 | `detector_score` | float \| **null** | **Provenance.** How confident the detector was in the frame that *first* brought the class into view — the one frame `observed_at`, `frame_seq` and the box all describe. Never revised. |
 | `best_score` | float \| **null** | **Evidence.** Strongest score while that sighting stayed in view. `null` means *not tracked* — a record written before this field existed. Never `0.0`, which would be a claim of no evidence. |
 | `observed_at` | float (epoch seconds) | When the category came into view. Qualified by `time_basis`. |

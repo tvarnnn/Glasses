@@ -370,3 +370,18 @@ solved 94 poses from 457 keyframes — real, but 64% of keyframes resolved to
 nothing. **This test measures whether the transport and viewer work. It does not
 measure whether the world is good, and a disappointing map is not a failure of
 this wave.**
+
+---
+
+## Also waiting on this Mac: Object Memory
+
+A second, unrelated body of uncompiled iOS work landed on the same branch:
+Object Memory's first product surface, consuming the two read-only routes in
+`docs/contracts/OBJECT-MEMORY.md`. Four new files under
+`ios/Glasses/Workspaces/ObjectMemory/`, one new test file, one new
+`CartridgeWorkspace` case, and one new arm in `ContentView`.
+
+It touches nothing World Builder owns. Its own handoff —
+`docs/agent-handoffs/OBJECT-MEMORY-MAC-HANDOFF.md` — carries the file list, the
+compiler-sensitive areas, how to serve the route locally, and what only physical
+validation can settle.

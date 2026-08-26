@@ -189,6 +189,18 @@ struct ContentView: View {
                         client: project.cartridgeClients.sceneUnderstanding
                     )
                 }
+            // Object Memory joins the three above rather than World Builder: it
+            // shows what the Tower already recorded, has no session control,
+            // and is handed no `GlassesConnection`. Its data arrives over HTTP
+            // when a person asks for it, so the one fact it needs from the
+            // socket is still just "is the Tower reachable".
+            case .objectMemory:
+                TowerReachabilityReader(tower: project.towerClient) { isTowerReachable in
+                    ObjectMemoryWorkspaceView(
+                        isTowerReachable: isTowerReachable,
+                        client: project.cartridgeClients.objectMemory
+                    )
+                }
             }
         } else {
             HomeWorkspaceView(
