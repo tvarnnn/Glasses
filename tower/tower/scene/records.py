@@ -120,10 +120,13 @@ class Detection:
 class FacingEstimate:
     """Coarse head/body orientation, and how stale it is.
 
-    `age_seconds` is not optional decoration. Estimating this costs ~744 ms
-    on this CPU, so it runs at a bounded cadence rather than per frame,
-    and a consumer that cannot see the age would treat a two-second-old
-    answer as current.
+    `age_seconds` is not optional decoration. Estimating this costs
+    ~956 ms on CPU and ~43 ms on CUDA, so it runs at a bounded cadence
+    rather than per frame, and a consumer that cannot see the age would
+    treat a stale answer as current. The gap between those two numbers is
+    why the field cannot be dropped now that a fast device exists: the
+    same payload crosses the wire from both, and only the age says which
+    one produced it.
     """
 
     state: str = FACING_UNKNOWN

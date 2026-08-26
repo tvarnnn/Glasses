@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 r"""What is around the wearer, from a frame stream.
 
-Runs in a SEPARATE PROCESS from the Tower. Detection costs ~32 ms and the
-optional orientation stage ~744 ms; neither belongs on the frame path.
+Runs in a SEPARATE PROCESS from the Tower. Detection costs ~30 ms and the
+optional orientation stage 43 ms on CUDA or 956 ms on CPU; neither
+belongs on the frame path, and the second belongs there least of all on
+the device it defaults to.
 
 Frame sources:
 
@@ -81,8 +83,9 @@ def main(argv=None) -> int:
         "--facing",
         action="store_true",
         help=(
-            "Estimate coarse head orientation. OFF by default: ~744 ms per "
-            "call on this CPU, 2.5x the interval the glasses deliver. It is "
+            "Estimate coarse head orientation. OFF by default: ~956 ms per "
+            "call on CPU (11.5x the measured 83.5 ms frame interval) and "
+            "~43 ms on CUDA, and the default device is CPU. It is "
             "orientation evidence, never gaze."
         ),
     )

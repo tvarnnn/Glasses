@@ -39,18 +39,25 @@ class TrackerPolicy:
     them, and a threshold that cannot be swept cannot be chosen from data.
     """
 
-    # Below this two boxes are not the same thing one frame later. At the
-    # ~3.3 fps the glasses deliver, a walking person moves a long way
-    # between frames, so this is deliberately permissive.
+    # Below this two boxes are not the same thing one frame later. This
+    # was chosen against an assumed ~3.3 fps; the corpus's own journals
+    # measure the delivered rate at 12.0 fps (83.5 ms between frames), so
+    # a walking person moves LESS between frames than this was tuned for.
+    # Left permissive rather than retuned: a threshold that is too
+    # forgiving costs an occasional wrong association, and retuning it is
+    # a sweep against real footage, not an edit against a corrected
+    # number. Recorded here so the next sweep starts from the truth.
     min_iou: float = 0.25
     # How many CONSECUTIVE frames a track must be seen before it counts.
     # One detection is a flicker; so is one every six frames, which is why
     # this is a streak and not a lifetime total.
     min_hits: int = 3
-    # How many consecutive misses before a track is dropped. At 3.3 fps
-    # this is roughly 1.5 seconds of absence -- long enough to survive a
-    # detector dropout, short enough that someone who left the room stops
-    # being counted.
+    # How many consecutive misses before a track is dropped. This was
+    # justified as "roughly 1.5 seconds of absence" at an assumed 3.3
+    # fps; at the measured 12.0 fps it is 0.42 s, which is short enough
+    # that a person walking behind a doorframe can be dropped and
+    # recounted as new. Same caveat as `min_iou`: the number is now
+    # honest about what it buys, and changing it is a sweep, not an edit.
     max_misses: int = 5
 
 

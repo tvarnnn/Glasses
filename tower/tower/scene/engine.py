@@ -1,12 +1,21 @@
 """Frames in, a live scene state out.
 
-    every frame     detect, associate into tracks       ~32 ms
-    optional        keypoints on person tracks         ~744 ms
+    every frame     detect, associate into tracks       ~30 ms
+    at a cadence    keypoints on person tracks           43 ms CUDA
+                                                        956 ms CPU
 
 Nothing is persisted and nothing runs on the Tower event loop. Like World
 Builder and Document Memory this is an engine plus a driver, in a separate
-process -- and the 744 ms orientation stage is the clearest illustration
-of why that separation matters.
+process -- and the orientation stage is the clearest illustration of why
+that separation matters, because **the device decides its cost by a
+factor of 22** and the process boundary is what lets a slow device fall
+behind without taking the Tower with it.
+
+Costs are warm medians over 754 real corpus frames
+(`docs/superpowers/research/2026-08-26-scene-understanding-measurements.md`).
+Every earlier figure in this cartridge -- 744 ms, 798 ms, "24x the
+detector", "2.5x the ~300 ms interval" -- was measured on CPU with
+synthetic input, named no device, and is wrong.
 """
 
 import logging
@@ -20,12 +29,48 @@ from tower.scene.tracking import Tracker, TrackerPolicy
 
 logger = logging.getLogger(__name__)
 
-# How often the expensive orientation stage may run, in seconds. At 744 ms
-# a call, anything more frequent than this spends more time estimating
-# facing than observing the room. Orientation is slow-moving, so a
-# two-second cadence loses little -- and every estimate carries its age so
-# the loss is visible rather than assumed away.
-ORIENTATION_INTERVAL_S = 2.0
+# The interval at which frames actually arrive, in seconds. Measured from
+# the corpus's own `frames.jsonl` receipt timestamps across the 14
+# captures with more than 50 frames: a median gap of 83.5 ms, i.e. 12.0
+# fps, with per-capture medians of 68.5-87.6 ms. This cartridge used to
+# say "~300 ms", which the corpus contradicts by 3.6x, and which had
+# every ratio in the module's documentation stacked on top of it.
+DELIVERED_FRAME_INTERVAL_S = 0.0835
+
+# How many delivered frames one orientation estimate may skip. Three,
+# because that is `TrackerPolicy.min_hits` -- the consecutive-frame
+# streak a track must survive before it is confirmed and can be reported
+# at all. Estimating facing more often than a track can be confirmed
+# buys nothing; less often, and a track can appear, be reported and be
+# dropped without its facing ever being measured once.
+ORIENTATION_FRAME_STRIDE = 3
+
+# How often the orientation stage may run, in seconds. The arithmetic,
+# so the next person can re-derive it instead of trusting it:
+#
+#   delivered frame interval          83.5 ms   (12.0 fps, measured)
+#   detector, warm median             30.4 ms CUDA / 32.9 ms CPU
+#   orientation, warm median          43.4 ms CUDA / 956.4 ms CPU
+#   orientation, warm p95             50.6 ms CUDA
+#
+# Detector plus orientation is 73.8 ms against an 83.5 ms budget on
+# CUDA, so per-frame orientation fits at the median -- and at p95 the
+# same pair is 86.4 ms, which overruns. A per-frame design would run at
+# an 88% duty cycle with no headroom, on a GPU that is not exclusively
+# this cartridge's, and would still fall behind on the tail. So the
+# cadence survives; the constant does not.
+#
+# At a stride of 3 the call occupies 43.4 / 250.5 = 17% of wall clock
+# instead of 52%, which is what leaves the detector's own 36% room
+# inside the budget. There is no accuracy cost: a person's facing does
+# not change in 83 ms, so the skipped frames carry nothing this module
+# could use.
+#
+# On CPU, at 956 ms, no cadence makes orientation keep up -- it is 11.5x
+# the frame interval. That is not a constant this cartridge can fix, and
+# it is why every estimate still carries its age (see `_age_orientation`
+# and `orientation.age_estimate`).
+ORIENTATION_INTERVAL_S = ORIENTATION_FRAME_STRIDE * DELIVERED_FRAME_INTERVAL_S
 
 
 class SceneEngine:
@@ -49,9 +94,13 @@ class SceneEngine:
         self._detector = detector
         self._tracker = Tracker(tracker_policy)
         self._clock = clock
-        # OFF unless a caller supplies one. 744 ms per frame on this CPU
-        # is 2.5x the interval the glasses deliver; a scene state computed
-        # that way would be stale before it existed.
+        # OFF unless a caller supplies one, because the default device
+        # is the one it cannot run on: `TorchvisionPoseEstimator` defaults
+        # to `device="cpu"`, where a call costs 956 ms -- 11.5x the 83.5
+        # ms interval the glasses deliver, so a scene state computed that
+        # way would be stale before it existed. On CUDA it is 43 ms and
+        # affordable, but a caller has to ask for that device, which is
+        # exactly the decision this default refuses to make for them.
         self._pose = pose_estimator
         self._orientation_interval = orientation_interval_s
         self._score_threshold = score_threshold
@@ -211,6 +260,20 @@ class SceneEngine:
         would reset that reading's age to nearly zero on every run, so a
         ten-second-old "facing toward you" would report as one second old
         and would never reach the expiry that exists to catch it.
+
+        **Why the age field survived a 22x speedup.** Its original
+        justification was cost -- "orientation is far slower than the
+        frame interval" -- and on CUDA that is no longer true. Two other
+        reasons hold it up, neither of which a faster GPU touches:
+
+        1. CPU is still a supported device, and the default one, at 956
+           ms per call: 11.5x the frame interval. Removing the age would
+           make this module correct on CUDA and silently lying on the
+           device most callers get.
+        2. `age_estimate` carries a correctness guard unrelated to cost.
+           Its clamp exists because a backward NTP step produced a
+           negative age, which pushed the expiry deadline further into
+           the future -- the one direction it must never move.
         """
         if self._pose is None:
             return

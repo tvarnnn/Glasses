@@ -10,7 +10,7 @@ part deliberately off by default.
 | Object detection, anonymous tracking, counts from tracks | **CURRENTLY IMPLEMENTED** |
 | Camera-relative positions and relationships | **CURRENTLY IMPLEMENTED** |
 | Query layer, including refusals | **CURRENTLY IMPLEMENTED** |
-| Coarse head orientation ("appears to be facing your direction") | **IMPLEMENTED, OFF BY DEFAULT** — 798 ms per call on this CPU. See Orientation |
+| Coarse head orientation ("appears to be facing your direction") | **IMPLEMENTED, OFF BY DEFAULT** — 43.4 ms per call on CUDA, 956.4 ms on CPU, and CPU is the default device. See Orientation |
 | World-anchored positions | **BLOCKED** — no live world pose exists. Camera-relative is the honest alternative and is what ships |
 | Depth-dependent relationships (`in_front_of`, `on`, `inside`) | **REFUSED**, each with the evidence it would need |
 | Registration as a production module | **BLOCKED** at the same V1.0/V1.1 boundary as every other cartridge |
@@ -95,21 +95,58 @@ Real evidence exists: COCO keypoints include eyes and ears, and their
 and an ear means the front of the head is toward the camera; both ears
 and no eyes means the back of it.
 
-Measured cost:
+Measured cost — warm medians over **754 real corpus frames** at 360×640,
+decode excluded, `torch.cuda.synchronize()` bracketing every CUDA call
+(`docs/superpowers/research/2026-08-26-scene-understanding-measurements.md`):
 
-| Model | Per frame, CPU |
-|---|---|
-| `ssdlite320_mobilenet_v3_large` (detection) | **33 ms** |
-| `keypointrcnn_resnet50_fpn` (keypoints) | **798 ms** |
+| Model | CUDA | CPU |
+|---|---|---|
+| `ssdlite320_mobilenet_v3_large` (detection) | **30.4 ms** | **32.9 ms** |
+| `keypointrcnn_resnet50_fpn` (keypoints) | **43.4 ms** | **956.4 ms** |
+| keypoints, p95 | 50.6 ms | 1112.8 ms |
 
-798 ms is **24× the detector** and **2.5× the ~300 ms interval the
-glasses deliver**. It cannot run per frame, so it runs at a bounded
-cadence on person tracks and **every estimate carries its age**, expiring
-to `unknown` rather than being deleted — a missing field would read as
-"not facing".
+**The device is the variable that matters, and none of this document's
+earlier figures named one.** This section used to say 798 ms, "24× the
+detector" and "2.5× the ~300 ms interval the glasses deliver". All four
+numbers are wrong:
 
-**The unblocker is named:** torch is CPU-only on this host. A restored
-CUDA build is what changes this decision, not a different algorithm.
+- Orientation is **43.4 ms on CUDA** and **956.4 ms on CPU** — a 22.0×
+  spread, and the CPU figure is *worse* than either number previously
+  documented, because those were measured on synthetic input.
+- The detector is launch-bound at an internal 320 px and gains almost
+  nothing from the GPU, so orientation is **1.43× the detector on CUDA**
+  and 29.1× on CPU. The ratio inverts with the device.
+- The delivered frame interval, measured from the corpus's own
+  `frames.jsonl` receipt timestamps, is **83.5 ms (12.0 fps)**, not
+  ~300 ms — the docs were off by 3.6×. Against the real interval
+  orientation is **0.52× on CUDA** and 11.5× on CPU.
+- Cost is flat in the number of people: ~1 ms each, 40.0 ms at zero to
+  44.3 ms at four. VRAM peaks at 988 MB reserved of 12 GB.
+
+**The cadence survives; its constant did not.** Detector plus orientation
+is 73.8 ms against an 83.5 ms budget on CUDA — per-frame fits at the
+median and overruns at p95 (86.4 ms), at an 88% duty cycle with no
+headroom and no accuracy to show for it, since a person's facing does not
+change in 83 ms. So `ORIENTATION_INTERVAL_S` is now **3 delivered frames,
+~250 ms**, not 2.0 s. The stride is `TrackerPolicy.min_hits`: estimating
+facing more often than a track can be confirmed buys nothing.
+
+**Every estimate still carries its age**, expiring to `unknown` rather
+than being deleted — a missing field would read as "not facing". CUDA did
+*not* make that bookkeeping redundant, for two reasons unrelated to 43 ms:
+`TorchvisionPoseEstimator` defaults to `device="cpu"`, where the original
+argument holds in full at 956 ms; and `age_estimate`'s clamp guards a
+backward NTP step that pushed an expiry deadline into the future, which is
+a clock bug, not a latency one.
+
+**The old unblocker is spent.** This document used to say torch was
+CPU-only on this host and a restored CUDA build was what would change the
+decision. That build exists — `torch 2.13.0+cu132`, verified executing on
+an RTX 5070 (Blackwell, sm_120) — and the numbers above came from it. The
+cost question is closed. **Accuracy is not measured and cannot be here**:
+there is no bystander footage on this host, and the corpus's person boxes
+are almost certainly the wearer's own torso, so `facing_from_keypoints`
+remains unvalidated against ground truth.
 
 ### It is never gaze
 
