@@ -8,7 +8,7 @@ import Foundation
 /// The geometry agreement this build implements. Separate from the status
 /// contract so either may move without the other, and opaque: compared for
 /// equality only.
-enum WorldGeometryContract {
+nonisolated enum WorldGeometryContract {
     static let identifier = "world_builder.geometry/2026-08-25"
 }
 
@@ -22,7 +22,7 @@ enum WorldGeometryContract {
 /// `translationUnits`) before drawing anything. `upAxis` is deliberately
 /// excluded — see `matchesThisBuild` below — because the 2D top-down view
 /// does not depend on which way is up.
-struct WorldPoseConvention: Equatable, Sendable {
+nonisolated struct WorldPoseConvention: Equatable, Sendable {
     let poseType: String
     let quaternionOrder: String
     let handedness: String
@@ -48,7 +48,7 @@ struct WorldPoseConvention: Equatable, Sendable {
 }
 
 // In an extension so the memberwise initialiser survives, as above.
-extension WorldPoseConvention {
+nonisolated extension WorldPoseConvention {
     init?(json: [String: Any]) {
         guard
             let poseType = json["pose_type"] as? String,
@@ -74,12 +74,12 @@ extension WorldPoseConvention {
 }
 
 /// Whether a segment produced geometry, or produced nothing while looking.
-enum WorldSegmentResolution: String, Equatable, Sendable {
+nonisolated enum WorldSegmentResolution: String, Equatable, Sendable {
     case resolved
     case unresolved
 }
 
-struct WorldBounds: Equatable, Sendable {
+nonisolated struct WorldBounds: Equatable, Sendable {
     let min: [Double]
     let max: [Double]
 
@@ -94,7 +94,7 @@ struct WorldBounds: Equatable, Sendable {
     }
 }
 
-struct WorldSegmentSummary: Equatable, Sendable {
+nonisolated struct WorldSegmentSummary: Equatable, Sendable {
     let segmentIndex: Int
     let contentHash: String
     let frameID: String
@@ -117,7 +117,7 @@ struct WorldSegmentSummary: Equatable, Sendable {
 // The JSON initialiser lives in an extension ON PURPOSE. Declaring an `init`
 // inside the struct body suppresses Swift's memberwise initialiser, and the
 // tests build these values directly rather than from JSON.
-extension WorldSegmentSummary {
+nonisolated extension WorldSegmentSummary {
     init?(json: [String: Any]) {
         guard
             let segmentIndex = json["segment_index"] as? Int,
@@ -143,7 +143,7 @@ extension WorldSegmentSummary {
     }
 }
 
-struct WorldGeometryManifest: Equatable, Sendable {
+nonisolated struct WorldGeometryManifest: Equatable, Sendable {
     let worldID: String
     let sessionID: String
     /// Whether this geometry reflects every keyframe the Tower has accepted.
@@ -171,7 +171,7 @@ struct WorldGeometryManifest: Equatable, Sendable {
     }
 }
 
-struct WorldPose: Equatable, Sendable {
+nonisolated struct WorldPose: Equatable, Sendable {
     let keyframeID: String
     let status: String
     let degeneracy: String
@@ -182,7 +182,7 @@ struct WorldPose: Equatable, Sendable {
 }
 
 // In an extension so the memberwise initialiser survives, as above.
-extension WorldPose {
+nonisolated extension WorldPose {
     init?(json: [String: Any]) {
         guard
             let keyframeID = json["keyframe_id"] as? String,
@@ -196,7 +196,7 @@ extension WorldPose {
     }
 }
 
-struct WorldSegmentChunk: Equatable, Sendable {
+nonisolated struct WorldSegmentChunk: Equatable, Sendable {
     let segmentIndex: Int
     let contentHash: String
     let registered: Bool
@@ -211,7 +211,7 @@ struct WorldSegmentChunk: Equatable, Sendable {
     var isSampled: Bool { pointsSent < pointsTotal }
 }
 
-enum WorldGeometryDecoder {
+nonisolated enum WorldGeometryDecoder {
 
     static func manifest(from json: [String: Any]) -> WorldGeometryManifest? {
         guard

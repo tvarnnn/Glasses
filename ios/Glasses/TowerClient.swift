@@ -598,7 +598,13 @@ final class TowerClient: NSObject, ObservableObject {
             // which are opposite diagnoses and were previously folded into a
             // single unmeasured number.
             let completedAt = MonotonicClock.now
-            Task { @MainActor in
+            // `[weak self]` on the Task itself, not inherited from the send
+            // completion's capture. A weak capture is a mutable binding, and
+            // reading the enclosing closure's copy from concurrently-executing
+            // code is an error under the Swift 6 language mode. Re-capturing
+            // here is evaluated when the Task is created, which is allowed,
+            // and keeps the lifetime semantics identical.
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 // A completion for a socket this client no longer owns: its
                 // reservation was already cleared by teardown, so `release`
@@ -707,7 +713,8 @@ final class TowerClient: NSObject, ObservableObject {
             return false
         }
         task.send(.string(jsonText)) { [weak self] error in
-            Task { @MainActor in
+            // Re-captured weakly here for the same reason as in `sendFrame`.
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 if let error {
                     self.log("\(type) send failed: \(error.localizedDescription)")

@@ -37,14 +37,14 @@ actor WorldGeometryStore {
     }
 }
 
-enum WorldGeometryFetchError: Error, Equatable {
+nonisolated enum WorldGeometryFetchError: Error, Equatable {
     case notFound
     case undecodable
     case transport(String)
 }
 
 /// Fetches geometry over HTTP. Deliberately not on the WebSocket.
-struct WorldGeometryClient {
+nonisolated struct WorldGeometryClient {
     var baseURL: URL = TowerConfiguration.httpBaseURL
     var session: URLSession = .shared
 

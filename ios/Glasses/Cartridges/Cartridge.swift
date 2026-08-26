@@ -14,7 +14,7 @@ import Foundation
 /// (docs/04-MODULE-SYSTEM.md). Adding an "available" state here before the
 /// runtime exists would violate Rule 3, Truthful State Only
 /// (docs/02-DEVELOPMENT-RULES.md).
-enum CartridgeStatus: Equatable {
+nonisolated enum CartridgeStatus: Equatable {
     /// First in line for implementation.
     case next
     /// Specified and scheduled, but not started.

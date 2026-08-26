@@ -532,7 +532,12 @@ final class GlassesConnection: ObservableObject {
             deviceSessionState = .starting
             try session.start()
             print("[Glasses][Camera] session.start() called — createSession succeeded with an eligible device present")
-        } catch let error as DeviceSessionError {
+        } catch {
+            // Untyped: `createSession` and `start()` throw `DeviceSessionError`
+            // and nothing else, so `catch let error as DeviceSessionError` was
+            // a test the compiler proves is always true. The clause was already
+            // exhaustive — this function does not rethrow — so dropping the
+            // pattern changes nothing but the warning.
             print("[Glasses][Camera] session creation/start failed: \(error.localizedDescription)")
             errorMessage = error.localizedDescription
             deviceSession = nil

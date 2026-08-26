@@ -179,7 +179,7 @@ struct RememberedDocument: Equatable, Identifiable, Sendable {
 ///
 /// **No voice input is implemented, required, or assumed.** The origin exists
 /// so that adding one later is a new case and a new call site, not a redesign.
-enum DocumentQuery: Equatable, Sendable {
+nonisolated enum DocumentQuery: Equatable, Sendable {
     /// The most recently observed documents.
     case recent(limit: Int)
     /// Documents whose text contains this, by whatever matching the Tower does.

@@ -60,7 +60,7 @@ enum ObjectMemoryFetchError: Error, Equatable {
 /// would show a record as current that the retention window may since have
 /// closed over, which is the one kind of staleness this cartridge cannot
 /// tolerate.
-struct ObjectMemoryHTTPClient {
+nonisolated struct ObjectMemoryHTTPClient {
     var baseURL: URL = TowerConfiguration.httpBaseURL
     var session: URLSession = .shared
     /// Long enough for a Tailscale round trip to a Tower reading a JSONL file,

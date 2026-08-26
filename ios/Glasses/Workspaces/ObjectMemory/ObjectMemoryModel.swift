@@ -50,7 +50,7 @@ import Foundation
 /// that a Tower which changed what its data *means* — the most breaking change
 /// this contract can carry — fails a decode in one place instead of quietly
 /// rendering under the old wording.
-enum ObjectMemoryContract {
+nonisolated enum ObjectMemoryContract {
     static let identifier = "object_memory.observations/2026-08-26"
 
     static let categoryClaim = "category-was-visible-once"
@@ -86,7 +86,7 @@ enum ObjectMemoryContract {
 ///
 /// None of these is a calibrated probability. They are an interpretation of
 /// detector output.
-enum ObjectMemoryConfidence: String, Equatable, Sendable, CaseIterable {
+nonisolated enum ObjectMemoryConfidence: String, Equatable, Sendable, CaseIterable {
     case unknown
     case low
     case medium
@@ -117,7 +117,7 @@ enum ObjectMemoryConfidence: String, Equatable, Sendable, CaseIterable {
 /// covered (`tower/object_memory/engine.py` divides by width and height in that
 /// order). It says where in the *picture*, and the only rendering allowed for
 /// it is one that says so.
-struct FrameReference: Equatable, Sendable {
+nonisolated struct FrameReference: Equatable, Sendable {
     /// The capture this frame belongs to. `nil` when the record carries no
     /// capture provenance at all — an older record, not a zeroth session.
     let sessionID: String?
@@ -160,7 +160,7 @@ struct FrameReference: Equatable, Sendable {
 /// Every field is what the Tower sent. Nothing is derived, nothing is
 /// defaulted, and no two records are related to each other — there is no
 /// instance identity in this cartridge and this type must never grow one.
-struct ObjectObservation: Equatable, Identifiable, Sendable {
+nonisolated struct ObjectObservation: Equatable, Identifiable, Sendable {
     /// One of the envelope's `recorded_classes`. A **category**.
     let objectClass: String
     /// The interpretation of the strength fields, and the one a consumer should
@@ -243,7 +243,7 @@ struct ObjectObservation: Equatable, Identifiable, Sendable {
 /// `effectiveDays == nil` is **unbounded**, reachable only when the store
 /// itself was written unbounded. It is never `0`: zero days would mean "nothing
 /// is visible", which is the opposite claim.
-struct ObjectMemoryRetention: Equatable, Sendable {
+nonisolated struct ObjectMemoryRetention: Equatable, Sendable {
     let requestedDays: Double?
     let effectiveDays: Double?
     let clamped: Bool
@@ -261,7 +261,7 @@ struct ObjectMemoryRetention: Equatable, Sendable {
 
 /// The header both endpoints carry, including the three claims that limit what
 /// any of it may be rendered as.
-struct ObjectMemoryEnvelope: Equatable, Sendable {
+nonisolated struct ObjectMemoryEnvelope: Equatable, Sendable {
     let contract: String
     let claim: String
     let identity: String
@@ -302,7 +302,7 @@ struct ObjectMemoryEnvelope: Equatable, Sendable {
 // MARK: - Answers
 
 /// `GET /object-memory/observations`.
-struct ObservationListing: Equatable, Sendable {
+nonisolated struct ObservationListing: Equatable, Sendable {
     let envelope: ObjectMemoryEnvelope
     /// Newest first by `observed_at`, as the Tower sorted them. Not re-sorted
     /// here: a second opinion about ordering is a second thing that can be
@@ -336,7 +336,7 @@ struct ObservationListing: Equatable, Sendable {
 /// `observed`, never `present`. There is no 404 case: "no record of a laptop"
 /// answered as Not Found reads as "there is no laptop", which is a claim about
 /// the world this cartridge cannot make.
-struct LastSeenAnswer: Equatable, Sendable {
+nonisolated struct LastSeenAnswer: Equatable, Sendable {
     let envelope: ObjectMemoryEnvelope
     /// The class that was asked about, echoed by the Tower.
     let objectClass: String
@@ -457,7 +457,7 @@ enum ObjectMemoryAnswer: Equatable, Sendable {
 /// - A **row that will not decode**, which drops the whole payload rather than
 ///   silently shrinking the answer. `WorldGeometryDecoder` makes the same
 ///   choice for the same reason.
-enum ObjectMemoryDecoder {
+nonisolated enum ObjectMemoryDecoder {
 
     /// `nil` when the payload is not this contract at all.
     ///

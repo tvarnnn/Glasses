@@ -15,7 +15,7 @@ import Foundation
 /// means "we are not talking about the same agreement", which is neither newer
 /// nor older, and `CartridgeAvailability.unsupportedContract` is the honest
 /// rendering of it.
-enum WorldBuilderResultContract {
+nonisolated enum WorldBuilderResultContract {
     /// The **Tower's** name for the cartridge. Not this app's catalog id
     /// (`"world-build"`); the two strings are different and the mapping lives
     /// in `TowerCapabilities`.

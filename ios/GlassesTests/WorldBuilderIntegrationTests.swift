@@ -467,7 +467,10 @@ final class WorldBuilderPayloadTests: XCTestCase {
 @MainActor
 final class TowerWorldBuilderClientTests: XCTestCase {
 
-    private static let contract = "world_builder.status/2026-08-25"
+    /// `nonisolated` because it is read as a default argument below, and a
+    /// default argument is evaluated in the caller's context rather than in
+    /// this class's. A constant string has no isolation to give up.
+    private nonisolated static let contract = "world_builder.status/2026-08-25"
 
     private func url(port: UInt16) -> URL { URL(string: "ws://127.0.0.1:\(port)/")! }
 
