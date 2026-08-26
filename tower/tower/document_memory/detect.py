@@ -15,11 +15,24 @@ courses, floor tiles and a striped shirt all produce rows of dark pixels
 just as reliably as text does**, and an adversarial review drove a brick
 wall all the way through detection, dwell, OCR and persistence.
 
-The third gate is what separates them, and it comes from what text
-actually IS. A line of text is made of glyphs -- many short dark runs with
-gaps between them. A slat, a mortar course or a stripe is ONE run
-spanning the width. Counting dark/light transitions along each inky row
-tells them apart with an enormous margin (measured below).
+The third gate counts dark/light transitions along each inky row, on the
+theory that a line of text is many short runs while a slat or a mortar
+course is one run spanning the width.
+
+**That theory is half true, and the honest version is below.** Against
+9,199 real frames the gate separates page-shaped crops by SIZE, not by
+glyphiness: a real backlit keyboard scores 19-26 where this docstring
+used to claim 0, while all thirteen crops of real on-screen text that
+could be found in that corpus -- laptop and phone displays, the only
+real text there is -- score 0-8, BELOW the keyboard. At 360x640 the
+glyphs are about two pixels tall and the keycaps are fifteen, so the
+keyboard is the more glyph-like of the two.
+
+The gate still earns its place, because it is the only thing standing
+between a brick wall and OCR, but it earns it on a 10-wide window
+derived in `MIN_ROW_TRANSITIONS` below, not on an enormous margin.
+Evidence: `docs/superpowers/research/2026-08-26-document-gate-
+rederivation.md`, guarded by `tests/test_document_detect_corpus.py`.
 """
 
 from dataclasses import dataclass
@@ -54,21 +67,52 @@ MIN_TEXT_ROW_FRACTION = 0.08
 MIN_INK_FRACTION = 0.004
 MAX_INK_FRACTION = 0.60
 
-# The glyph gate, and the margin is not close. Median dark/light
-# transitions along an inky row, measured on the probe:
+# The glyph gate. RE-DERIVED 2026-08-26 against 9,199 real frames, after
+# the original derivation turned out to describe the renderer.
 #
-#     rendered text   43 - 86
-#     blinds           0
-#     bricks           0
-#     floor tiles      0
-#     striped shirt    0
-#     keyboard         0
+# What it used to say, from synthetic negatives: rendered text 43-86,
+# blinds/bricks/tiles/stripes/keyboard all 0, threshold 8, "an order of
+# magnitude below the text floor". Run over `data/captures/`, a real
+# venetian blind measures 8.0 -- exactly the threshold -- and a real
+# backlit keyboard 19-26. The margin never existed outside the renderer:
+# a rendered slat is one clean run, while a real slat has a rail, a
+# bracket, a gap and a highlight, and a real backlit keyboard is a grid of
+# small light patches separated by dark gaps, which is a tolerable
+# description of a line of glyphs.
 #
-# A threshold of 8 sits an order of magnitude below the text floor and
-# well above every structure measured. Chosen from that distribution
-# rather than from taste -- the same discipline that set World Builder's
-# ChArUco tilt threshold after a first guess landed below the noise floor.
-MIN_ROW_TRANSITIONS = 8
+# READ THIS BEFORE CHANGING THE NUMBER. `row_transitions` does not
+# separate text from structure. It separates LARGE crops from SMALL ones:
+# on the same rendered page, shrinking it from 59% of a 360x640 frame to
+# 14% takes a receipt from 40 transitions to 24, straight through the
+# keyboard's 19-26. The two populations genuinely overlap, and no
+# threshold on this statistic tells a page from a keyboard by shape. What
+# makes a threshold derivable at all is a second fact that happens to
+# coincide at this resolution, and both edges are measured, not chosen:
+
+# Ceiling of the real negatives. The worst case in 1,395 page-shaped
+# quads across 9,199 frames of ordinary indoor life -- one backlit laptop
+# keyboard. The median over those quads is 0 and p99 is 5; this is the
+# tail, and it rests on a single keyboard in a single capture.
+CORPUS_STRUCTURE_CEILING = 26.0
+
+# Floor of the pages worth detecting. The smallest rendered placement that
+# still yielded usable text at 360x640: a receipt at 38% of the frame,
+# word_recall 0.714. Every placement below it measured 0.000 recall -- so
+# the pages this gate now rejects are pages OCR could not have read.
+READABLE_PAGE_FLOOR = 36.0
+
+# Halfway, because neither edge is soft. Sitting at the ceiling would ship
+# with no margin against the next keyboard; sitting at the floor would
+# reject the last page that still reads. This buys 5 transitions of
+# headroom on each side, and that is the whole budget -- it is a 10-wide
+# window, not the order of magnitude the old comment claimed.
+#
+# THIS IS PINNED TO 360x640. Both edges are functions of how many pixels
+# the crop has: raise the stream or move to higher-resolution stills, as
+# `2026-08-26-document-memory-reality-check.md` recommends, and the
+# structure ceiling and the readable floor both move. Re-derive against
+# `tests/test_document_detect_corpus.py`'s real negatives, do not scale.
+MIN_ROW_TRANSITIONS = round((CORPUS_STRUCTURE_CEILING + READABLE_PAGE_FLOOR) / 2)
 
 
 @dataclass(frozen=True)

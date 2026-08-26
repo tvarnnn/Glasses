@@ -59,11 +59,20 @@ class TestItFindsAPage:
         assert square.squareness > tilted.squareness
 
     def test_sharpness_collapses_on_a_blurred_frame(self):
-        """This is what best-frame selection inside a dwell runs on."""
+        """This is what best-frame selection inside a dwell runs on.
+
+        Kernel 5, not the fixture default of 15. Blur destroys row
+        transitions as surely as distance does -- the same page measures
+        74 sharp, 41 at kernel 5 and 14 at kernel 15 -- so past the glyph
+        gate there is no candidate left to read a sharpness off. That is
+        the gate working (kernel 9 and beyond returns word_recall 0.000),
+        but it means this test has to stay inside the detectable band to
+        measure the thing it is about.
+        """
         frame, _ = fx.place_page(fx.render_page(fx.TRANSFORMER_PAPER))
 
         sharp = detect_page(_gray(frame))
-        blurred = detect_page(_gray(fx.blur(frame)))
+        blurred = detect_page(_gray(fx.blur(frame, kernel=5)))
 
         assert sharp is not None and blurred is not None
         assert blurred.sharpness < sharp.sharpness / 10
