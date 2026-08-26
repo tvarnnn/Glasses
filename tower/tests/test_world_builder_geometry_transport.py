@@ -362,3 +362,100 @@ def test_a_manifest_without_poses_positioned_reports_absent_not_arithmetic():
 
     manifest["poses_positioned"] = 113
     assert _pose_count(manifest) == 113
+
+
+# --- currency: geometry that is real but BEHIND ---------------------------
+#
+# The defect these pin: `read_derived` verifies the input digest by default,
+# and during a walk that digest moves with EVERY keyframe. So the adapter got
+# None, the route answered 404 for the whole capture, and the fragment gallery
+# stayed empty until the session ended -- while real geometry sat on disk.
+# `tower/results/world_builder.py:1058` had already made the opposite call on
+# the status channel for the same reason; these mirror it.
+
+
+def _put_the_derived_tree_behind(store, world_id, session_id, keyframe_factory):
+    """Append a keyframe AFTER the build, so the digest no longer matches.
+
+    This is the live-walk shape exactly: nothing about the derived tree
+    changes, and it becomes stale purely because the journal grew.
+    """
+    store.append_keyframe(world_id, keyframe_factory(session_id, 9, 1))
+
+
+def test_a_current_derived_tree_says_so_in_the_manifest_and_the_chunk(derived_world):
+    store, world_id, session_id = derived_world
+
+    assert build_manifest(store, world_id, session_id)["current"] is True
+    assert build_segment(store, world_id, session_id, 0)["current"] is True
+
+
+def test_geometry_behind_the_journal_is_served_and_flagged_not_hidden(
+    derived_world, keyframe_factory
+):
+    """The regression test for the headline defect.
+
+    Against the old `verify=True` read both of these were None, and the
+    route was a 404 -- for the entire duration of a live walk.
+    """
+    store, world_id, session_id = derived_world
+    _put_the_derived_tree_behind(store, world_id, session_id, keyframe_factory)
+
+    manifest = build_manifest(store, world_id, session_id)
+    assert manifest is not None, "behind is not absent; it must still be served"
+    assert manifest["current"] is False
+    # The geometry itself is unchanged -- it is the same real answer to a
+    # slightly older question.
+    assert manifest["segment_count"] == 2
+
+    chunk = build_segment(store, world_id, session_id, 0)
+    assert chunk is not None
+    assert chunk["current"] is False
+    assert chunk["points"] == [[1.0, 2.0, 3.0], [-1.0, 0.0, 5.0]]
+
+
+def test_the_manifest_route_serves_behind_geometry_with_200(
+    derived_world, keyframe_factory
+):
+    store, world_id, session_id = derived_world
+    _put_the_derived_tree_behind(store, world_id, session_id, keyframe_factory)
+
+    response = _client(store).get(
+        f"/worlds/{world_id}/geometry/manifest", params={"session_id": session_id}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["current"] is False
+
+
+def test_the_segment_route_serves_behind_geometry_with_200(
+    derived_world, keyframe_factory
+):
+    """A client that fetches only a chunk must still learn it is behind."""
+    store, world_id, session_id = derived_world
+    _put_the_derived_tree_behind(store, world_id, session_id, keyframe_factory)
+
+    response = _client(store).get(
+        f"/worlds/{world_id}/geometry/segment/0", params={"session_id": session_id}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["current"] is False
+
+
+def test_an_absent_derived_tree_is_still_absent_and_still_404(derived_world):
+    """Absent and behind must not collapse into one answer.
+
+    Serving behind-but-real geometry is only defensible while "nothing was
+    ever built" remains a 404.
+    """
+    store, world_id, session_id = derived_world
+    (store.derived_dir(world_id) / session_id / "poses.json").unlink()
+
+    assert build_manifest(store, world_id, session_id) is None
+    assert build_segment(store, world_id, session_id, 0) is None
+
+    response = _client(store).get(
+        f"/worlds/{world_id}/geometry/manifest", params={"session_id": session_id}
+    )
+    assert response.status_code == 404

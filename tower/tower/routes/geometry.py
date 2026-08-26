@@ -34,9 +34,11 @@ def _store(request: Request):
 def geometry_manifest(world_id: str, session_id: str, request: Request) -> dict:
     manifest = build_manifest(_store(request), world_id, session_id)
     if manifest is None:
-        # Absent and stale are deliberately the same answer: both mean
-        # "there is nothing here you may render".
-        raise HTTPException(status_code=404, detail="no current geometry")
+        # 404 now means ABSENT only. Geometry that is real but behind the
+        # newest keyframes is served with `current: false` instead of
+        # hidden -- during a walk the digest moves with every keyframe, so
+        # refusing it meant the gallery stayed empty for the whole capture.
+        raise HTTPException(status_code=404, detail="no geometry for this session")
     return manifest
 
 

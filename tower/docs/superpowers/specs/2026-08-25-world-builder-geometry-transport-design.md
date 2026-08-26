@@ -160,6 +160,7 @@ the manifest" signal. No new field is added to it.
   "contract": "world_builder.geometry/2026-08-25",
   "world_id": "3dd986b1c2364d4b85de97152f2e39f4",
   "session_id": "dd5d13a2381e430db9b27c7da2cf2928",
+  "current": false,
   "geometry_revision": "…",
   "pose_convention": {
     "pose_type": "T_world_camera", "quaternion_order": "wxyz",
@@ -203,12 +204,46 @@ Field semantics, stated so none is ambiguous:
   others.
 - `bounds` — **3D**, over this segment's points, in the segment's own frame.
   `null` when `point_count == 0`.
+- `current` — whether this geometry reflects **every keyframe accepted so
+  far**. See "Behind is not absent" below. `false` is the *normal* state during
+  a live walk and is not an error.
+
+#### Behind is not absent
+
+The first implementation read the derived tree with `WorldStore.read_derived`'s
+default `verify=True`, which treats a tree whose input digest no longer matches
+the journal as **absent**. During a walk that digest moves with **every
+keyframe**, so a build finished, the next keyframe put it behind, and the
+manifest answered `404` for the rest of the capture — while real geometry sat
+on disk. That contradicted §1.3's promise that a new segment appears as you
+walk: the gallery stayed empty until the session ended.
+
+The Tower had already settled this on the status channel
+(`tower/results/world_builder.py:1058`, `_geometry_block`), and this endpoint
+mirrors that decision rather than inventing a second policy. A build over the
+first N keyframes is not wrong; it is a **correct answer to an older
+question**. So it is served, with `current: false`. Hiding it discarded true
+information; serving it unflagged would let a viewer read a partial world as
+the finished one. **The flag is the whole difference.**
+
+Three states stay distinct, and that is the constraint the design has to hold:
+
+| On disk | Answer |
+|---|---|
+| no derived tree at all | `404` — absent |
+| a tree behind the journal | `200`, `current: false` |
+| a tree matching the journal | `200`, `current: true` |
+
+`current` is **additive**: an older decoder that ignores it reads exactly the
+payload it read before. Per `docs/contracts/CARTRIDGE-RESULTS.md` §12 that is
+not grounds for a contract bump, so the identifier is unchanged.
 
 ### 3.2 `GET /worlds/{world_id}/geometry/segment/{index}?session_id=…&max_points=N`
 
 ```json
 {
   "contract": "world_builder.geometry/2026-08-25",
+  "current": false,
   "segment_index": 19,
   "content_hash": "…",
   "frame_id": "segment:19",
@@ -227,6 +262,10 @@ Field semantics, stated so none is ambiguous:
 
 Rows preserve `poses.json` order, which is index-aligned to `keyframes.jsonl`
 (verified 457/457 on the real world).
+
+`current` carries the same meaning as on the manifest and is **repeated here on
+purpose**: a client that holds a cached chunk and never re-reads the manifest
+would otherwise have no way to know the geometry in its hand is behind.
 
 ### 3.3 Rules that are not negotiable
 
