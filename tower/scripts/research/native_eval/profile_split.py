@@ -33,9 +33,63 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import cv2  # noqa: E402
 
-from scripts.world_builder_corpus_benchmark import MAIN_WORLD_ROOT  # noqa: E402
+from scripts.world_build_session import (  # noqa: E402
+    first_observed_frame,
+    observed_size_of,
+    resolve_intrinsics,
+)
+from scripts.world_builder_corpus_benchmark import (  # noqa: E402
+    DEFAULT_CAPTURES_ROOT,
+    MAIN_WORLD_ROOT,
+    journal_frames,
+)
 from tower.world_builder.engine import WorldBuilderEngine  # noqa: E402
+from tower.world_builder.intrinsics_store import IntrinsicsStore  # noqa: E402
 from tower.world_builder.store import WorldStore  # noqa: E402
+
+
+def replay_once(capture_prefix: str, scratch: Path, run: int) -> None:
+    """One full observe()-only replay into a FRESH store.
+
+    A fresh store per run because a session cannot be re-observed, and
+    profile() deliberately runs the callable twice (clean, then
+    profiled) so the two numbers describe the same work.
+    """
+    cv2.setRNGSeed(0)
+    matches = [
+        d for d in sorted(DEFAULT_CAPTURES_ROOT.iterdir())
+        if d.name.startswith(capture_prefix)
+    ]
+    if len(matches) != 1:
+        raise SystemExit(f"prefix matched {len(matches)} captures")
+    capture_dir = matches[0]
+    frames = journal_frames(capture_dir)
+    first, frames = first_observed_frame(frames)
+    intrinsics = resolve_intrinsics(
+        IntrinsicsStore(MAIN_WORLD_ROOT),
+        observed_size_of(first),
+        frame_source="capture-journal-replay",
+    )
+    if not intrinsics.is_known:
+        raise SystemExit("no calibration")
+    engine = WorldBuilderEngine(WorldStore(scratch / f"prof{run}-{capture_prefix}"))
+    world_id = engine.create_world(f"prof:{capture_prefix}")
+    session_id = engine.start_session(
+        world_id,
+        intrinsics=intrinsics,
+        frame_source="capture-journal-replay",
+        declared_size=None,
+        capture_id=capture_dir.name,
+    )
+    for frame in frames:
+        engine.observe(
+            frame.payload,
+            received_at=frame.received_at,
+            source_seq=frame.source_seq,
+            wire_seq=frame.wire_seq,
+            tx_seq=frame.tx_seq,
+        )
+    engine.stop_session()
 
 
 def split(stats: pstats.Stats):
@@ -139,7 +193,13 @@ def main(argv=None) -> int:
     reg.add_argument("--root", required=True, type=Path)
     reg.add_argument("--world", required=True)
     reg.add_argument("--session", required=True)
+    reg.add_argument("--source", type=Path, help="pinned world_registration.py")
     reg.add_argument("--out", type=Path)
+
+    rep = sub.add_parser("replay", help="profile the live observe() path")
+    rep.add_argument("--capture", required=True)
+    rep.add_argument("--scratch", required=True, type=Path)
+    rep.add_argument("--out", type=Path)
 
     args = ap.parse_args(argv)
 
@@ -157,13 +217,33 @@ def main(argv=None) -> int:
             WorldBuilderEngine(WorldStore(args.root)).build(args.world, args.session)
 
         profile(f"cold build {args.world[:8]}", fn, args.out)
-    else:
-        from scripts import world_registration as wr
+    elif args.mode == "registration":
+        if args.source:
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location(
+                "world_registration_pinned", args.source
+            )
+            wr = importlib.util.module_from_spec(spec)
+            sys.modules["world_registration_pinned"] = wr
+            spec.loader.exec_module(wr)
+        else:
+            from scripts import world_registration as wr
+        print(f"registration source {wr.__file__}")
+        print(f"  has _residuals_packed: {hasattr(wr, '_residuals_packed')}")
 
         def fn():
             wr.register(WorldStore(args.root), args.world, args.session)
 
         profile(f"registration {args.world[:8]}", fn, args.out)
+    else:
+        counter = [0]
+
+        def fn():
+            counter[0] += 1
+            replay_once(args.capture, args.scratch, counter[0])
+
+        profile(f"replay observe() {args.capture}", fn, args.out)
     return 0
 
 
