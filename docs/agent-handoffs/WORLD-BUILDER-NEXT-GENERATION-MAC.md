@@ -3,8 +3,9 @@
 **From:** World Builder lane (Tower)
 **Branch:** `world-builder/next-generation`
 **Base:** `origin/integration/world-builder-lifecycle-v1` @ `25eb794`
-**Status:** **NO IOS CHANGE REQUIRED.** Two FOLLOW-UPs, one FUTURE.
-**Covers:** point-quality gates, refusal accounting, solve-chain segmentation.
+**Status:** **ONE IOS CHANGE NOW REQUIRED** (§4b). Two FOLLOW-UPs.
+**Covers:** point-quality gates, refusal accounting, solve-chain segmentation,
+registration persisted and served.
 **Tower tests:** 430 passed, 10 skipped.
 
 ---
@@ -141,6 +142,80 @@ tolerate this one.
 
 ---
 
+## 4b. REQUIRED NOW: segments can be registered, and the cache must notice
+
+This is the first change in this branch that iOS cannot ignore.
+
+### What changed
+
+Registration was an offline script that wrote nothing back, and the contract
+carried `registered: false` / `transform_to_world: null` as literals. Both are
+now real. On capture `2e6cffa2` the Tower places **3 of 29 segments carrying
+1,917 of 4,317 points (44%)**; on `e1c52b9f`, 3 of 10 carrying 5,603 of 22,520
+(25%).
+
+### New fields, on BOTH the manifest rows and the segment chunks
+
+| field | type | meaning |
+|---|---|---|
+| `registered` | bool | unchanged in meaning; now actually reaches `true` |
+| `registration_state` | `"unplaced"` / `"registered"` / `"refused"` | see below |
+| `transform_to_world` | object or null | `{rotation_wxyz[4], translation[3], scale, reference_segment, frame_revision}` |
+| `registration_refusal_reason` | string or null | why this segment is not placed |
+| `placement_hash` | string (16 hex) | **cache key — see the trap below** |
+
+`registration_state` exists because `registered: false` conflated *"we tried and
+the two independent solves disagreed"* with *"nobody looked"*. On the real corpus
+the refusal is usually **"the wearer stood still"** — which is a message to the
+person wearing the glasses, not a software fault, and it is worth surfacing.
+
+### ⚠️ THE CACHE TRAP — this is the part that will bite
+
+`content_hash` covers **poses and points only**, deliberately, so that a segment
+gaining a placement keeps its content hash and cached geometry stays valid.
+
+That is safe **only** because `placement_hash` changes instead.
+
+**`WorldGeometryStore` is keyed on `contentHash` alone
+(`WorldGeometryClient.swift`). It must become `(contentHash, placementHash)`.**
+
+Without that change, the day a segment gains a placement the client keeps its
+cached chunk forever and draws an **unplaced** version of a segment the world
+now knows how to place. Nothing would look broken; the fragment would simply sit
+in the wrong place, permanently.
+
+`geometry_revision` now rolls up **both** hashes, so the status-channel trigger
+does fire. The stale-cache risk is entirely in the per-chunk store.
+
+### Also required
+
+`WorldGeometryDecoder.chunk` does **not read `transform_to_world` at all** today
+— it is absent from the decoder guard list, and `WorldSegmentChunk` has nowhere
+to put it. So even with the Tower emitting a Sim3, iOS would silently drop it.
+
+### Applying the transform
+
+`transform_to_world` maps this segment's own frame into the frame of
+`reference_segment`. Registered segments sharing a `reference_segment` are in one
+space and may be drawn together. **Segments with different reference segments
+are not**, and must not be composited.
+
+`frame_revision` stamps which gauge the Sim3 is expressed in. A coordinate
+stamped with one revision may not be reinterpreted under another; if it ever
+differs from the world's, refuse to draw rather than guess.
+
+### Acceptance
+
+- A world with placements draws its registered segments in one space, and every
+  other segment stays a separate fragment.
+- Changing only a placement (same points) refetches and re-places. This is the
+  regression to test deliberately, because it is invisible if you get it wrong.
+- A refused segment shows its reason rather than reading as untried.
+- A world with **no** placements behaves exactly as before — every world built
+  before this exists in that state, and it must stay a no-op.
+
+---
+
 ## 5. FOLLOW-UP (not required now)
 
 Tower now knows, per build, how many landmarks it refused and why. Nothing
@@ -189,13 +264,10 @@ So on the day a segment gains a placement without its points changing:
 - the status revision does not move,
 - and iOS would keep drawing the cached, unplaced version.
 
-`test_no_segment_claims_registration` would not catch it — it asserts only that
-the fields are still constants.
-
-**When registration lands, iOS needs (a) to decode `transform_to_world`, and
-(b) a cache key of `(content_hash, placement_hash)` rather than `content_hash`
-alone.** That is a breaking client-side change and should be planned, not
-retrofitted. No action today.
+**This has now landed — see §4b, which supersedes this section.** The Tower side
+is done: `placement_hash` exists, the revision rollup covers it, and a test
+asserts `content_hash` holds still while the placement hash and the rollup move.
+The client-side half is the required work.
 
 ## 7. Physical validation procedure
 
