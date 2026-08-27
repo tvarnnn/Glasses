@@ -993,6 +993,37 @@ def _poses_in_segment_frame(rows: list) -> dict:
     return poses
 
 
+
+def pair_is_hopeless(source, target, thresholds) -> str | None:
+    """Why this pair cannot register, decided before any matching.
+
+    `admit()` refuses on min(forward.target_span_over_depth,
+    reverse.target_span_over_depth). The forward fit's target is `target`
+    and the reverse fit's target is `source`, so that minimum is just the
+    smaller of the two segments' own span/depth -- a number computable
+    from poses.json and points.json alone, which is what
+    `span_over_depth` above already says it is for.
+
+    Using it only AFTER matching meant every hopeless pair paid a full
+    keyframe cross-product of brute-force ORB plus a MAGSAC
+    essential-matrix fit to reach a conclusion already available. Measured
+    before this: 139 s for a seven-segment world, which is why
+    registration cannot run anywhere near the live path.
+
+    Returns the refusal reason, or None if the pair is worth matching.
+    Deliberately the SAME bar as the gate: a prune stricter than admit()
+    would silently refuse pairs the gate would have taken.
+    """
+    span = min(source.span_over_depth, target.span_over_depth)
+    if span < thresholds.min_span_over_depth:
+        return (
+            f"the wearer stood still: one segment's cameras span only "
+            f"{span:.3f} of the scene depth, so its scale is not "
+            "recoverable from them at any quality of match"
+        )
+    return None
+
+
 def cross_matches(source, target, *, min_inliers: int = MIN_INLIERS) -> list:
     """Verified feature correspondences between two segments' keyframes.
 
@@ -1047,6 +1078,17 @@ def register(store: WorldStore, world_id: str, session_id: str,
     verdicts, admitted = [], []
     for position, left in enumerate(indices):
         for right in indices[position + 1:]:
+            hopeless = pair_is_hopeless(
+                segments[left], segments[right], thresholds
+            )
+            if hopeless is not None:
+                # Refused on evidence already in hand, without paying for
+                # the matching. Same verdict, same reason string as the
+                # gate would have produced -- only sooner.
+                verdicts.append(
+                    Verdict((left, right), False, hopeless, float("nan"), {})
+                )
+                continue
             matches = cross_matches(segments[left], segments[right])
             if not matches:
                 continue

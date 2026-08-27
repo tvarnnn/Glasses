@@ -814,3 +814,92 @@ def test_rotation_disagreement_is_reported_even_when_it_passes():
     assert evidence.rotation_disagreement_deg < 1e-6
     verdict = admit(evidence, Thresholds())
     assert "rotation_disagreement_deg" in verdict.clauses
+
+
+def _segment_with_span(span):
+    """A stand-in segment whose cameras span  of the scene depth."""
+    import numpy as _np
+
+    class _Seg:
+        index = 0
+        span_over_depth = span
+        points = _np.zeros((10, 3))
+
+    return _Seg()
+
+
+def _segment_with_span(value):
+    """A stand-in segment whose cameras span `value` of the scene depth."""
+
+    class _Seg:
+        index = 0
+        span_over_depth = value
+
+    return _Seg()
+
+
+# ---------------------------------------------------------------------------
+# Cheap refusal before expensive matching.
+#
+# `admit()` refuses on min(forward.target_span_over_depth,
+# reverse.target_span_over_depth), so if EITHER segment's cameras span too
+# little of the scene depth, the pair is refused no matter how well the
+# imagery matches. That value is computable from poses.json and
+# points.json alone, before any ORB.
+#
+# It was not used that way: every pair paid a full keyframe cross-product
+# of brute-force ORB matching plus a MAGSAC essential-matrix fit, and then
+# was refused on a number known before any of it ran. Measured: 139 s for
+# a 7-segment world, which is why registration cannot run live.
+#
+# On the real 19-segment world, 16 segments fail span/depth -- so all but
+# a handful of the 74 candidate pairs were being matched to reach a
+# foregone conclusion.
+# ---------------------------------------------------------------------------
+
+
+def test_a_pair_is_refused_on_span_before_any_matching(monkeypatch):
+    """The prune must not change the verdict, only when it is reached."""
+    from scripts import world_registration as wr
+
+    calls = {"cross_matches": 0}
+    real = wr.cross_matches
+
+    def _counting(*args, **kwargs):
+        calls["cross_matches"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(wr, "cross_matches", _counting)
+
+    still = _segment_with_span(0.01)
+    moving = _segment_with_span(0.40)
+    assert wr.pair_is_hopeless(still, moving, Thresholds()) is not None
+    assert wr.pair_is_hopeless(moving, moving, Thresholds()) is None
+    assert calls["cross_matches"] == 0, (
+        "deciding a pair is hopeless must not require matching it"
+    )
+
+
+def test_the_prune_names_the_real_reason():
+    """A pruned pair must say the wearer stood still, not 'neither
+    direction could be solved' -- those are different facts and the second
+    one would send a reader looking for a correspondence problem."""
+    from scripts import world_registration as wr
+
+    reason = wr.pair_is_hopeless(
+        _segment_with_span(0.01), _segment_with_span(0.40), Thresholds()
+    )
+    assert reason is not None
+    assert "stood still" in reason or "span" in reason
+
+
+def test_the_prune_uses_the_same_bar_as_the_gate():
+    """If the prune were stricter than admit(), it would silently refuse
+    pairs the gate would have accepted."""
+    from scripts import world_registration as wr
+
+    thresholds = Thresholds()
+    just_above = _segment_with_span(thresholds.min_span_over_depth + 1e-6)
+    assert wr.pair_is_hopeless(just_above, just_above, thresholds) is None
+    just_below = _segment_with_span(thresholds.min_span_over_depth - 1e-6)
+    assert wr.pair_is_hopeless(just_below, just_above, thresholds) is not None
