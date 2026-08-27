@@ -8,6 +8,7 @@ from tower.capture import END_REASON_DISCONNECT, END_REASON_STOP
 from tower.frames import FrameError, parse_and_decode_frame
 from tower.metrics import SessionMetrics
 from tower.modules.base import FrameSkippedError, ModuleUnavailableError
+from tower.results.envelope import json_safe
 from tower.routes import cv_lab_ws, results_ws
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,22 @@ class _ConnectionSender:
     uncontended asyncio.Lock costs well under a microsecond against a
     frame budget of several milliseconds, and a connection with no
     subscription never contends at all, because no second sender exists.
+
+    Every send is passed through `json_safe`, and THIS is the boundary
+    that has to do it rather than any producer. `NaN` and `Infinity` are
+    not JSON; Python emits them bare because `allow_nan` defaults True,
+    and Starlette's `send_json` takes that default -- so one non-finite
+    float anywhere in a payload makes the ENTIRE message unparseable by a
+    strict decoder, and Swift's is strict. The result channel sanitised
+    at its envelope and the CV Lab at its document builder, and between
+    them they still left `frame_result` -- the highest-volume message on
+    this socket -- emitting a bare `NaN` for any experiment that produced
+    one. Sanitising at the socket is the only place that covers every
+    message by construction, including the next one somebody adds.
+
+    Measured at 0.045 ms for a 7.8 KB status document and proportionally
+    less for a ~500-byte frame result, against a frame budget of
+    milliseconds.
     """
 
     __slots__ = ("_websocket", "_lock")
@@ -39,7 +56,7 @@ class _ConnectionSender:
 
     async def send(self, payload: dict) -> None:
         async with self._lock:
-            await self._websocket.send_json(payload)
+            await self._websocket.send_json(json_safe(payload))
 
     async def send_bounded(self, payload: dict, *, lock_timeout: float,
                            send_timeout: float) -> None:
@@ -54,7 +71,8 @@ class _ConnectionSender:
         await asyncio.wait_for(self._lock.acquire(), timeout=lock_timeout)
         try:
             await asyncio.wait_for(
-                self._websocket.send_json(payload), timeout=send_timeout
+                self._websocket.send_json(json_safe(payload)),
+                timeout=send_timeout,
             )
         finally:
             self._lock.release()
@@ -73,11 +91,15 @@ async def _handle_frame_message(
         logger.warning("%s", exc)
         if metrics is not None:
             metrics.record_frame_rejected()
+        # The Lab never sees this frame, so it cannot count it -- and
+        # without the count, "the phone is sending garbage" and "the phone
+        # is sending nothing" are the same reading. Told, not inferred.
+        _note_cv_lab_rejection(websocket)
         # seq may legitimately be absent -- a frame message can fail
         # validation before seq is known. Report null rather than
         # inventing one (Rule 3: unknown stays unknown).
         await _send_frame_error(
-            sender, message.get("seq"), "invalid_frame", str(exc)
+            sender, _echo_safe(message.get("seq")), "invalid_frame", str(exc)
         )
         return
 
@@ -105,13 +127,25 @@ async def _handle_frame_message(
     try:
         result = module_container.process(frame.raw_bytes)
     except FrameSkippedError as exc:
+        reason = getattr(exc, "reason", None)
         logger.warning(
-            "[Tower][Frame] #%s: frame-level failure, module still active: %s",
+            "[Tower][Frame] #%s: frame-level %s, module still active: %s",
             frame.seq,
+            "refusal" if reason else "failure",
             exc,
         )
         if metrics is not None:
-            metrics.record_frame_processing_error()
+            # A REFUSAL is not a processing error. A module that names a
+            # reason declined the frame on purpose -- it is paused, or
+            # idle, or arming -- and nothing failed. Counting those as
+            # `frame_processing_errors` made a Lab paused for five minutes
+            # report hundreds of errors in its session summary.
+            #
+            # `frames_rejected` still counts them, and correctly: it
+            # answers "how many arriving frames are missing from the
+            # numbers below", and a refused frame is missing from them.
+            if reason is None:
+                metrics.record_frame_processing_error()
             metrics.record_frame_rejected()
         # The module's own code when it named one, `frame_skipped`
         # otherwise. This transport does not know what the codes mean and
@@ -120,10 +154,7 @@ async def _handle_frame_message(
         # the module knows which one this was. See
         # `FrameProcessingError.reason`.
         await _send_frame_error(
-            sender,
-            frame.seq,
-            getattr(exc, "reason", None) or "frame_skipped",
-            str(exc),
+            sender, frame.seq, reason or "frame_skipped", str(exc)
         )
         return
     except ModuleUnavailableError as exc:
@@ -204,6 +235,20 @@ async def _handle_frame_message(
         logger.info("[Tower][Session] summary: %s", metrics.snapshot())
 
 
+def _note_cv_lab_rejection(websocket) -> None:
+    """Tell the Lab a frame arrived and was refused before it. Never raises."""
+    lab = getattr(websocket.app.state, "cv_lab", None)
+    if lab is None:
+        return
+    try:
+        lab.note_frame_rejected_before_processing()
+    except Exception:
+        logger.exception(
+            "[Tower][Frame] could not record a pre-Lab rejection; the "
+            "frame_error is sent regardless"
+        )
+
+
 def _cv_lab_provenance(websocket):
     """Attribution for the frame result just produced, or None.
 
@@ -264,6 +309,21 @@ def _record_capture(websocket, frame) -> None:
             logger.exception(
                 "[Tower][Capture] frame #%s not recorded; continuing", frame.seq
             )
+
+
+def _echo_safe(value):
+    """A client-supplied `seq` on its way back out, bounded.
+
+    The contract types `seq` as a number and a well-formed client sends
+    one, but a `frame` message can fail validation before `seq` has been
+    checked -- so whatever arrived is what gets echoed. A 40,000-character
+    string in that field produced a 40,000-character reply. Numbers pass
+    through untouched; anything else is clipped, because the alternative
+    is letting a remote party choose the size of our messages.
+    """
+    if value is None or isinstance(value, (int, float)):
+        return value
+    return str(value)[:120]
 
 
 async def _send_frame_error(
@@ -464,6 +524,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 continue
 
             message_type = message.get("type")
+            if not isinstance(message_type, str):
+                # `{"type": {"nested": 1}}` used to reach a
+                # `message_type in <frozenset>` test and raise
+                # `TypeError: unhashable type: 'dict'`, which nothing
+                # caught -- one malformed message killed a connection
+                # that was answering frames. The dispatch below assumes a
+                # string; this is where that assumption is checked.
+                logger.warning(
+                    "received a message whose type is not a string, "
+                    "ignoring: %.80r",
+                    message_type,
+                )
+                continue
 
             if message_type == "ping":
                 await sender.send({"type": "pong"})
@@ -519,7 +592,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     {
                         "type": "protocol_error",
                         "reason": "unknown_message_type",
-                        "message_type": message_type,
+                        # Clipped. This is a value the client chose, going
+                        # straight back out, and a remote party must not
+                        # be able to pick the size of a message this Tower
+                        # sends.
+                        "message_type": message_type[:120],
                         "message": (
                             "this Tower does not implement that message type"
                         ),

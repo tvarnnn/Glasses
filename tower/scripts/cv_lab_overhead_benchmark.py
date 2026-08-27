@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import gc
 import io
+import tracemalloc
 import json
 import logging
 import statistics
@@ -260,12 +261,22 @@ def measure_channel_cost(repeat: int) -> dict:
 
 
 def measure_memory(frames: int) -> dict:
-    """Does a long run grow.
+    """Does a long run grow. Measured with TWO instruments, on purpose.
 
     `handoff.md` 9.3 says a `stream_stop` MAY NEVER ARRIVE, so a run is
     open for as long as the Tower is up. A run that grew per frame would
-    be the unbounded store this whole design avoids -- measured rather
-    than asserted.
+    be the unbounded store this whole design avoids.
+
+    RSS alone cannot answer it. RSS is what the process has asked the OS
+    for, and in a process running OpenCV and numpy that includes their own
+    pools -- which grow, shrink and hold memory on their own schedule.
+    Two runs of an earlier version of this benchmark, over identical
+    work, reported -524 KB and +2.8 MB. A quantity that changes sign
+    between runs is not measuring the thing.
+
+    So `tracemalloc` runs alongside it and attributes PYTHON allocations
+    to the lines that made them. That one answers "did the Lab keep
+    anything", and RSS stays as context for "what did the process do".
     """
     process = psutil.Process()
     payload = _frame()
@@ -286,6 +297,8 @@ def measure_memory(frames: int) -> dict:
     # up.
     checkpoints = []
     baseline_rss = process.memory_info().rss
+    tracemalloc.start()
+    before = tracemalloc.take_snapshot()
     step = max(1, frames // 5)
     processed = 0
     start = time.perf_counter()
@@ -304,6 +317,22 @@ def measure_memory(frames: int) -> dict:
         )
     elapsed = time.perf_counter() - start
 
+    after = tracemalloc.take_snapshot()
+    stats = after.compare_to(before, "lineno")
+    tracked = sum(stat.size_diff for stat in stats)
+    # The lines the Lab itself owns, separated from the interpreter's own
+    # bookkeeping and from tracemalloc's.
+    lab_lines = [
+        {
+            "line": str(stat.traceback[0]),
+            "bytes": stat.size_diff,
+            "objects": stat.count_diff,
+        }
+        for stat in stats[:20]
+        if "tower" in str(stat.traceback[0]) and stat.size_diff > 0
+    ][:5]
+    tracemalloc.stop()
+
     document = lab.status()
     lab.release()
     growth = checkpoints[-1]["growth_bytes"]
@@ -314,6 +343,9 @@ def measure_memory(frames: int) -> dict:
     steady_frames = checkpoints[-1]["frames"] - checkpoints[0]["frames"]
     return {
         "frames": processed,
+        "tracked_bytes": tracked,
+        "tracked_bytes_per_frame": round(tracked / max(processed, 1), 4),
+        "tracked_lab_lines": lab_lines,
         "checkpoints": checkpoints,
         "rss_growth_bytes": growth,
         "steady_growth_bytes": steady,
@@ -377,9 +409,21 @@ def _render(report: dict) -> str:
             f"  ({checkpoint['growth_bytes']:+d} B since warm-up)"
         )
     lines += [
-        f"  first -> last checkpoint: {memory['steady_growth_bytes']:+d} B over"
-        f" {memory['frames'] - memory['checkpoints'][0]['frames']} frames"
+        f"  RSS first -> last checkpoint: {memory['steady_growth_bytes']:+d} B"
+        f" over {memory['frames'] - memory['checkpoints'][0]['frames']} frames"
         f" ({memory['steady_growth_bytes_per_frame']:+.4f} B/frame)",
+        "  -- RSS includes OpenCV/numpy pools and changes sign between"
+        " runs. The next line is the one that answers the question --",
+        f"  tracemalloc net: {memory['tracked_bytes']:+d} B over"
+        f" {memory['frames']} frames"
+        f" ({memory['tracked_bytes_per_frame']:+.4f} B/frame)",
+    ]
+    for entry in memory["tracked_lab_lines"]:
+        lines.append(
+            f"    {entry['bytes']:+8d} B  {entry['objects']:+5d} obj"
+            f"  {entry['line']}"
+        )
+    lines += [
         f"  document still {memory['document_bytes']} B with"
         f" {memory['tracked_metrics']} metrics",
     ]

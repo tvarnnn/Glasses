@@ -74,9 +74,17 @@ STATE_PAUSED = "paused"
 # stopped by a person. iOS renders it as `.completed` because that is the
 # case its state machine has; the Tower says what actually happened.
 STATE_STOPPED = "stopped"
-# The last start failed, or a run died. `reason` says how. Recoverable:
-# another start may be sent, and this is the difference between a Lab
-# failure and a module failure.
+# The last start failed. `reason` says how, and another start may be
+# sent -- which is the difference between a Lab failure and a module
+# failure.
+#
+# Reached ONLY from a failed arm. A run that dies mid-frame -- an
+# experiment raising something that is not a `FrameProcessingError` --
+# does not land here: `ModuleContainer` marks the MODULE failed, which is
+# terminal by design, and the Lab reports `unavailable` until the Tower
+# restarts. That is a limitation of the shared module lifecycle rather
+# than of the Lab, it is stated in the contract's Known Limitations, and
+# an earlier version of this comment claimed the opposite.
 STATE_FAILED = "failed"
 
 LIFECYCLE_STATES = (
@@ -126,10 +134,24 @@ ERR_INVALID_STATE = "invalid_state"
 # would be the wrong run stopped by the wrong person.
 ERR_STALE_RUN = "stale_run"
 # The Lab itself cannot serve anything -- see STATE_UNAVAILABLE.
+# TERMINAL from a client's point of view: iOS renders it as
+# `.unsupported`, which tells a person this Tower cannot do this rather
+# than inviting them to try again.
 ERR_LAB_UNAVAILABLE = "lab_unavailable"
-# The experiment was found, accepted and then failed to load. Distinct
-# from `experiment_unavailable`, which is known in advance.
-ERR_START_FAILED = "start_failed"
+# The Tower failed while answering, and the request did not take effect.
+# Deliberately NOT `lab_unavailable`: a handler bug is transient and
+# retryable, and reporting it as the terminal condition would tell a
+# person to give up on a Tower that is working. The Tower does not know
+# what went wrong -- if it did, this would be a different reason.
+ERR_INTERNAL = "internal_error"
+# There is deliberately NO `start_failed` refusal. An arm is
+# asynchronous -- that is the whole reason a start returns immediately --
+# so by the time a load fails the command has already been answered
+# `accepted`, and a second reply to a reply is not a thing the wire has.
+# The outcome arrives as STATE: `lifecycle.state` goes `failed` with a
+# reason, pushed on the result channel or read with `cv_lab_status`. That
+# is the shape iOS's own `run(_:)` already has, and the constant that
+# used to sit here was declared, imported, and never emitted.
 
 REFUSAL_REASONS = (
     ERR_MALFORMED,
@@ -139,7 +161,7 @@ REFUSAL_REASONS = (
     ERR_INVALID_STATE,
     ERR_STALE_RUN,
     ERR_LAB_UNAVAILABLE,
-    ERR_START_FAILED,
+    ERR_INTERNAL,
 )
 
 
@@ -155,6 +177,12 @@ FRAME_REFUSED_STARTING = "cv_lab_starting"
 FRAME_REFUSED_PAUSED = "cv_lab_paused"
 FRAME_REFUSED_STOPPED = "cv_lab_stopped"
 FRAME_REFUSED_FAILED = "cv_lab_failed"
+# A defensive default rather than a state a client will normally see:
+# when the Lab is `unavailable` the module behind it is FAILED or
+# UNLOADED, so `ModuleContainer.process` refuses the frame with
+# `module_unavailable` before the Lab is reached at all. It stays because
+# `process()` falls back to it for any state not in the map below, and a
+# fallback that names the wrong thing is worse than one that names this.
 FRAME_REFUSED_UNAVAILABLE = "cv_lab_unavailable"
 
 FRAME_REFUSAL_REASONS = {
@@ -194,6 +222,16 @@ MAX_REPORTED_METRICS = 16
 # excluded and counted below instead. The bound is the declaration, and
 # `test_the_accumulator_is_bounded_by_the_declared_metric_set` is what
 # says so.
+
+# The most distinct STAGE names one run will accumulate. Unlike the
+# metric accumulator -- bounded by the experiment's own `METRIC_KINDS`
+# declaration -- a stage name is whatever an experiment passed to
+# `StageTimer.stage()`, with nothing declaring it in advance. An
+# experiment naming a stage per frame grew this to 926,280 entries over
+# 15,438 frames in a probe, which is exactly the unbounded store a run
+# open "for as long as the Tower is up" must not have. Sixteen, because
+# the most stages any registered experiment uses is four.
+MAX_TRACKED_STAGES = 16
 
 # The most unclassified metric names reported. An experiment emitting a
 # metric it never classified is a bug caught by

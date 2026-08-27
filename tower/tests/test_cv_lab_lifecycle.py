@@ -30,7 +30,6 @@ from tower.cv_lab.contracts import (
     ERR_LAB_UNAVAILABLE,
     ERR_MALFORMED,
     ERR_STALE_RUN,
-    ERR_START_FAILED,
     ERR_UNKNOWN_EXPERIMENT,
     FRAME_REFUSED_IDLE,
     FRAME_REFUSED_PAUSED,
@@ -223,20 +222,55 @@ def test_stop_ends_the_run_releases_the_experiment_and_keeps_the_summary():
     assert caught.value.reason == FRAME_REFUSED_STOPPED
 
 
-def test_a_stopped_lab_still_counts_the_frames_it_refused():
-    """"I pressed Stop, is the phone still streaming?" is a real question
-    and `frames_offered` is the only honest answer to it."""
+def test_a_stopped_run_stops_counting_and_the_tower_does_not():
+    """"I pressed Stop, is the phone still streaming?" is a real question,
+    and the answer belongs to the TOWER rather than to a run that ended.
+
+    A stopped run publishes `ended_at`, which freezes `elapsed_s`. It used
+    to keep counting refused frames against that frozen window, so
+    `offered_fps` climbed forever with nothing happening -- measured at
+    45.3 fps from a nine-second window that had seen eight frames. The
+    Tower says in as many words that "the last run's figures are final";
+    now they are.
+    """
     lab = asyncio.run(armed_lab("baseline"))
+    lab.process(jpeg_bytes())
     lab.stop()
-    for _ in range(3):
+    frozen = lab.status()["run"]
+
+    for _ in range(30):
         with pytest.raises(FrameProcessingError):
             lab.process(jpeg_bytes())
 
     status = lab.status()
-    assert status["run"]["frames_refused"] == 3
-    assert status["run"]["frames_offered"] == 3
-    assert status["source"]["frames_offered_total"] == 3
+    assert status["run"] == frozen, "a stopped run's figures must not move"
+    assert status["run"]["frames_refused"] == 0
+    assert status["run"]["frames_offered"] == 1
+    # The Tower keeps counting, which is what answers the question.
+    assert status["source"]["frames_offered_total"] == 31
     assert status["source"]["receiving_frames"] is True
+
+
+def test_the_four_frame_counters_always_sum_to_frames_offered():
+    """The invariant IS the diagnostic, so it must be true at every read.
+
+    `frames_offered` used to be a fourth counter incremented on arrival,
+    with the outcome recorded afterwards. A status read taken between the
+    two -- and the status is built on a worker thread while the frame path
+    runs on the loop -- published four numbers that did not add up, 2,741
+    times over one run. It is derived now.
+    """
+    lab = asyncio.run(armed_lab("baseline"))
+    for index in range(20):
+        try:
+            lab.process(b"" if index % 5 == 0 else jpeg_bytes())
+        except FrameProcessingError:
+            pass
+        run = lab.status()["run"]
+        assert (
+            run["frames_processed"] + run["frames_refused"] + run["frames_failed"]
+            == run["frames_offered"]
+        )
 
 
 def test_a_lab_that_never_saw_a_frame_says_so():
@@ -397,6 +431,48 @@ def test_a_stop_during_an_arm_wins_and_the_arm_installs_nothing():
 # -- failure is recoverable ---------------------------------------------
 
 
+def test_a_command_on_a_released_lab_says_the_lab_is_gone():
+    """`invalid_state` tells a client to try from another state, of a
+    condition no state change can fix. `lab_unavailable` is the true one,
+    and they are two codes on a closed set for a reason."""
+    lab = asyncio.run(armed_lab("baseline"))
+    lab.release("the module was unloaded")
+
+    outcomes = {
+        "start": lab.start("baseline"),
+        "pause": lab.pause(),
+        "resume": lab.resume(),
+        "stop": lab.stop(),
+    }
+    for name, outcome in outcomes.items():
+        assert outcome.accepted is False, name
+        assert outcome.reason == ERR_LAB_UNAVAILABLE, name
+
+
+def test_a_released_lab_ends_the_run_it_was_holding():
+    """Otherwise the document keeps publishing `ended_at: null` with
+    `elapsed_s` growing, for a Lab that is gone."""
+    clock = [1000.0]
+    lab = asyncio.run(armed_lab("baseline", clock=lambda: clock[0]))
+    lab.process(jpeg_bytes())
+    lab.release("the module was unloaded")
+    ended = lab.status()["run"]["ended_at"]
+
+    clock[0] += 600.0
+    assert lab.status()["run"]["ended_at"] == ended
+    assert lab.status()["run"]["elapsed_s"] == 0.0
+
+
+def test_a_failed_arm_ends_the_run_it_never_started():
+    clock = [1000.0]
+    lab = asyncio.run(armed_lab("baseline", clock=lambda: clock[0]))
+    lab._fail_arm(lab.status()["lifecycle"]["run_id"], "no weights")
+
+    assert lab.status()["run"]["ended_at"] is not None
+    clock[0] += 600.0
+    assert lab.status()["run"]["elapsed_s"] == 0.0
+
+
 def test_an_interactive_start_that_fails_leaves_the_lab_usable():
     """The distinction this whole design turns on.
 
@@ -463,6 +539,10 @@ def test_a_released_lab_reports_unavailable_and_refuses_commands():
     assert available is False
     assert "unloaded" in reason
     assert lab.start("baseline").reason == ERR_LAB_UNAVAILABLE
+    # And the switch flag is not left set behind it. Nothing can reach
+    # `start()` past the released check today; the flag stopping being an
+    # invariant is the defect.
+    assert lab._switching is False
 
 
 def test_an_experiment_needing_a_missing_extra_is_refused_before_it_is_tried(
@@ -470,13 +550,18 @@ def test_an_experiment_needing_a_missing_extra_is_refused_before_it_is_tried(
 ):
     """Known in advance, so it is a refusal rather than a start that fails.
 
-    `experiment_unavailable` and `start_failed` are different reasons for
-    that reason: one is a property of this Tower, the other is a thing
-    that went wrong.
+    Checked PER EXPERIMENT rather than by one global torch probe: `depth`
+    needs torch and timm, `object_detection` needs torchvision, and a
+    single torch probe reported `object_detection` available on a Tower
+    that could not run it.
     """
     import tower.cv_lab.lab as lab_module
 
-    monkeypatch.setattr(lab_module, "_torch_is_installed", lambda: False)
+    monkeypatch.setattr(
+        lab_module,
+        "_module_is_installed",
+        lambda name: name not in ("torch", "torchvision", "timm"),
+    )
     lab = asyncio.run(armed_lab("baseline"))
     outcome = lab.start("depth")
 
@@ -541,3 +626,65 @@ def test_an_idle_lab_refuses_with_an_instruction():
         lab.process(jpeg_bytes())
     assert caught.value.reason == FRAME_REFUSED_IDLE
     assert "cv_lab_start" in str(caught.value)
+
+
+def test_a_superseded_arm_does_not_clear_its_successors_busy_flag():
+    """`lab_busy` must mean what it says, at every moment.
+
+    A cancelled task does not always raise: `stop()` cancels and a
+    `start()` may arm again, and if the first task had already passed its
+    last await it runs to completion regardless. Clearing `_switching`
+    unconditionally then cleared the SECOND start's flag and let a third
+    start race it. The wrong experiment still could not be installed --
+    the run-id check sees to that -- but a guarantee that holds only most
+    of the time is not one.
+    """
+    import threading
+
+    class _Slow:
+        name = "slow"
+        gate = threading.Event()
+        released = 0
+
+        def load(self, settings):
+            type(self).gate.wait(5)
+
+        def run(self, raw_bytes):
+            raise AssertionError("never armed")
+
+        def release(self):
+            type(self).released += 1
+
+    async def scenario():
+        from tower.experiments import EXPERIMENTS
+
+        lab = await armed_lab("baseline")
+        original = EXPERIMENTS["edge_detection"]
+        EXPERIMENTS["edge_detection"] = _Slow
+        try:
+            lab.start("edge_detection")          # arm A, blocked in load
+            first_task = lab._arm_task
+            lab.stop()                            # cancels A, clears the flag
+            lab.start("frame_quality")            # arm B sets the flag again
+            second_task = lab._arm_task
+            # Let A finish. It is cancelled, but its load had no await to
+            # be cancelled at, so it runs to completion.
+            _Slow.gate.set()
+            busy_during_b = lab.start("baseline")
+            await lab.wait_until_armed()
+            for task in (first_task, second_task):
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        finally:
+            EXPERIMENTS["edge_detection"] = original
+        return lab, busy_during_b
+
+    lab, busy = asyncio.run(scenario())
+
+    # The third start, issued while B was arming, was refused.
+    assert busy.accepted is False
+    assert busy.reason == ERR_LAB_BUSY
+    # And B is the one that ended up armed.
+    assert lab.status()["selected"] == "frame_quality"

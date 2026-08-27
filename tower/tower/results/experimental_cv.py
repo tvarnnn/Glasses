@@ -26,14 +26,35 @@ transition and around building the document. This module inherits that
 and adds nothing of its own.
 
 `revision` is derived from the payload rather than counted, so it cannot
-drift from the content. There are no volatile paths to exclude: unlike a
-World Builder status, where elapsed mapping seconds advance with nothing
-having happened, every figure that moves here moves because a frame was
-processed. A CV Lab whose revision changes twice a second is a CV Lab
-that measured something twice a second.
+drift from the content -- but three of the figures in it advance with
+WALL CLOCK rather than with anything happening, and those are excluded
+before hashing.
+
+An earlier version of this module claimed the opposite: "every figure
+that moves here moves because a frame was processed". It does not.
+`elapsed_s` and the two throughput rates derived from it change on every
+read, so `compute_revision` produced a new value on every poll and
+`revision_changed: true` -- the field the channel defines as "news, not a
+heartbeat" -- fired twice a second on a Lab that had seen no frame at
+all. Measured over the wire: four polls, zero new frames, four distinct
+revisions.
+
+`capacity_fps` is NOT excluded: it is derived from measured per-frame
+cost alone and moves only when a frame is processed. Nor is
+`source.receiving_frames`, which flips without a frame arriving but flips
+precisely BECAUSE frames stopped arriving -- that is the news.
 """
 
 from tower.results.envelope import Snapshot, compute_revision
+
+# Dotted paths removed before hashing. Each one advances with the clock
+# and with nothing else, so a change in it is not a change in what the
+# Tower knows.
+VOLATILE_PATHS = (
+    "run.elapsed_s",
+    "run.throughput.processed_fps",
+    "run.throughput.offered_fps",
+)
 
 
 class ExperimentalCVStatusProducer:
@@ -49,24 +70,46 @@ class ExperimentalCVStatusProducer:
 
     def snapshot(self) -> Snapshot:
         payload = self._lab.status()
-        return Snapshot(payload=payload, revision=compute_revision(payload))
+        return Snapshot(
+            payload=payload,
+            revision=compute_revision(payload, VOLATILE_PATHS),
+            volatile_fields=VOLATILE_PATHS,
+        )
 
 
 def unavailable_payload(reason: str) -> dict:
-    """What the channel says when this Tower has no Lab at all.
+    """What this Tower says when it has no Lab at all.
 
     Shaped like a status document with everything hollow rather than as a
     bare error, so a client decodes one thing whichever it gets. The
     lifecycle state is `unavailable`, which iOS renders as "the Tower
     cannot do this" rather than as "wait a moment" -- a different
     instruction to a person, and the right one.
+
+    The contract identifiers are REAL, not null. They describe what this
+    BUILD speaks, which is true whether or not a Lab is loaded -- and the
+    whole point of iOS's third state ("offered, implemented, unreachable")
+    is that those are separable. An earlier version nulled them, which
+    would have handed a client an identifier to compare for equality that
+    could never equal anything.
+
+    Used by the result channel's producer and by the control-plane
+    handler, so that a refusal on a Tower with no Lab still carries a
+    document.
     """
+    from tower.cv_lab.contracts import (
+        CONTROL_CONTRACT,
+        FRAME_RESULT_CONTRACT,
+        STATUS_CONTRACT,
+        TIME_BASIS,
+    )
+
     return {
-        "contract": None,
-        "control_contract": None,
-        "frame_result_contract": None,
+        "contract": STATUS_CONTRACT,
+        "control_contract": CONTROL_CONTRACT,
+        "frame_result_contract": FRAME_RESULT_CONTRACT,
         "tower_instance_id": None,
-        "time_basis": None,
+        "time_basis": TIME_BASIS,
         "lifecycle": {
             "state": "unavailable",
             "reason": reason,
@@ -83,6 +126,7 @@ def unavailable_payload(reason: str) -> dict:
             "receiving_frames": False,
             "last_frame_at": None,
             "frames_offered_total": 0,
+            "frames_rejected_before_lab": 0,
             "idle_after_s": None,
         },
     }

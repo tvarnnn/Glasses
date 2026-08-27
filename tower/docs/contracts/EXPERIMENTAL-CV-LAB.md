@@ -92,17 +92,25 @@ never its first ("the Tower says nothing → not built yet").
 
 ### 2.2 What experiments exist?
 
-Three surfaces, one document, byte-identical:
+Three surfaces, **one document from one function**:
 
 ```
 GET /cv-lab                          → {"contract", "control_contract", "status"}
 {"type": "cv_lab_status"}            → {"type": "cv_lab_status", ..., "status"}
-result_subscribe experimental_cv/status → cartridge_result.payload == the same "status"
+result_subscribe experimental_cv/status → cartridge_result.payload IS that "status"
 ```
 
-A test asserts the three agree. `GET /cv-lab` exists for the operator with
-a terminal; the Tower is normally driven over Tailscale where a
-server-side log line is invisible.
+A test asserts the three agree. **Not byte-identical across time**, and do
+not build anything on that: `elapsed_s`, the three `throughput` figures,
+`last_frame_at`, `receiving_frames` and `clients_connected` are clock- or
+connection-derived, so two reads a second apart differ for reasons that
+are not the contract. Two reads at the same instant would be identical;
+you cannot take two reads at the same instant. The claim that holds is
+structural — same keys, same types, same meanings, one builder — and the
+channel's `revision` is not derivable from `GET /cv-lab`.
+
+`GET /cv-lab` exists for the operator with a terminal; the Tower is
+normally driven over Tailscale where a server-side log line is invisible.
 
 There is **no HTTP surface for start, pause or stop**. A command needs the
 connection it was issued on to still be there when the outcome arrives — a
@@ -142,17 +150,24 @@ snapshot**; there are no deltas to merge.
 | `idle` | nothing armed; a start would be accepted | `.idle(available:)` |
 | `starting` | a start was accepted, the experiment is loading | `.starting(experiment)` |
 | `running` | processing frames | `.running(run)` |
-| `paused` | armed and deliberately not processing | **`.paused(run)` — a new case, see §8** |
+| `paused` | armed and deliberately not processing | **`.paused(run)` — a new case; see `CV-LAB-IOS-HANDOFF.md` §4** |
 | `stopped` | the last run ended; its figures are final | `.completed(run)` |
-| `failed` | the last start failed; another may be sent | `.failed(CartridgeFailure)` |
+| `failed` | the last **start** failed; another may be sent | `.failed(CartridgeFailure)` |
 
 `stopped` rather than `completed` on the wire, deliberately. A bench run
 does not complete; it is stopped by a person. The Tower says what happened
 and iOS renders it with the case its state machine has.
 
 `paused` and `stopped` are different states because the difference is
-real: a paused run keeps the experiment **loaded**, so resuming a `depth`
-run costs nothing, while a stopped one pays the model load again.
+real, and it is two differences:
+
+- a paused run keeps the experiment **loaded**, so resuming a `depth` run
+  costs nothing while a stopped one pays the model load again;
+- a paused run is **not over**, so it keeps counting: `frames_processed`
+  and the metrics stop moving, but `frames_refused` climbs with every
+  frame that arrives. A stopped run freezes everything. If you want to
+  see whether the phone is still sending while paused, that counter is
+  where it shows.
 
 `lifecycle.reason` is prose for a person, present only when the state
 needs explaining. `null` is not "no reason" — it is "the state speaks for
@@ -202,9 +217,14 @@ additive; a client that ignores all of it still has a working picker.
 - `backend` — `opencv` or `torch`.
 - `annotation_metric` — the metric that is a count of things found in a
   frame, or `null`. Only `object_detection` has one.
-- `available` / `unavailable_reason` — false when `requires_model` and
-  torch is not installed on this Tower. Starting it is refused, in
-  advance, with a reason.
+- `available` / `unavailable_reason` — false when this Tower is missing
+  a module the experiment needs, checked **per experiment**: `depth` needs
+  `torch` and `timm`, `object_detection` needs `torch` and `torchvision`.
+  Starting such an experiment is refused in advance, with a reason.
+  **What this cannot check is the network**: `depth` fetches MiDaS weights
+  through `torch.hub` on first use, so an offline Tower reports it
+  `available: true`, accepts the start, and then goes `failed` with the
+  reason. That is why `failed` is recoverable.
 
 The eight registered today: `baseline`, `depth`, `edge_detection`,
 `feature_detection`, `frame_quality`, `object_detection`, `optical_flow`,
@@ -236,6 +256,31 @@ The eight registered today: `baseline`, `depth`, `edge_detection`,
 means nobody asked for this run** — the Tower armed it at boot. Reported
 so that "the Lab is running" never reads as "somebody chose this".
 
+**On a run that has processed no frame — which is every Release build,
+and every Tower nobody has streamed to yet — these are `null`, not zero:**
+
+```json
+"metrics": [], "annotation": {"count": null, ...},
+"timings":    {"processing_ms": null, "processing_ms_max": null,
+               "stage_ms": {}, "observed_at": null,
+               "time_basis": "tower-receipt"},
+"throughput": {"processed_fps": null, "offered_fps": null,
+               "capacity_fps": null}
+```
+
+**Every number under `timings` and `throughput` is nullable, and the
+reply to your very first `cv_lab_start` will exercise it.** `null` is
+"nothing has been measured"; it is never a zero you can render as one.
+
+The two `fps` figures are `null` specifically while `elapsed_s` is `0.0`,
+because a rate over a zero-length window is undefined rather than zero.
+That is not a rare edge: `time.time()` on Windows has ~15.6 ms
+granularity, so a run started and read in the same tick reports
+`elapsed_s: 0.0` — measured at 11 of 12 `cv_lab_start` replies. They
+become numbers a few milliseconds later. `capacity_fps` is `null` until
+one frame has been processed, because it is derived from measured
+per-frame cost.
+
 `runtime` is what the experiment says it actually loaded, and is empty for
 an experiment that holds nothing. Its keys are the experiment's own; do
 not switch on them. It exists because `TOWER_CV_DEVICE=auto` is a
@@ -243,18 +288,23 @@ not switch on them. It exists because `TOWER_CV_DEVICE=auto` is a
 not said whether it used the GPU, and a CPU figure with a GPU label on it
 is a real failure this closes.
 
-**The four frame counters are disjoint and sum to `frames_offered`.** That
-is what makes a dead start diagnosable:
+**`frames_offered` is derived**: it is exactly
+`frames_processed + frames_refused + frames_failed`, so the sum holds at
+every read rather than only between them. (A frame currently being
+processed is in none of them yet, because its outcome is not known.) That
+invariant is what makes a dead start diagnosable:
 
 | Reading | Means |
 |---|---|
-| `frames_offered == 0` | nothing is reaching the Lab. The stream is not running, or this Tower is not receiving it |
+| `frames_offered == 0`, `source.frames_rejected_before_lab == 0` | nothing is reaching the Tower at all. The stream is not running |
+| `frames_offered == 0`, `source.frames_rejected_before_lab > 0` | frames ARE arriving and the transport cannot decode them. A sender problem, not a Lab one |
 | `frames_offered > 0`, `frames_processed == 0` | frames are arriving and the Lab is refusing them. Check `lifecycle.state` |
 | `frames_failed > 0` | the experiment raised on a frame. It stays armed; those frames produced nothing |
 
 Frames rejected by wire validation before they ever reach the Lab are
-**not** counted here — they never reached it. They appear in the Tower's
-own session summary as `frames_rejected`.
+**not** counted here — they never reached it. They appear in
+`source.frames_rejected_before_lab` (§3.5) and in the Tower's own session
+summary as `frames_rejected`.
 
 `metrics_omitted` is how many aggregate metrics did not fit the 16-row
 bound. Reported rather than silently truncated.
@@ -264,7 +314,7 @@ declaring how it combines across frames. Empty is the only correct value
 and a test enforces it for every registered experiment; this is what the
 wire says if one ever reaches production anyway.
 
-### 3.4 Switching discards the previous run
+### 3.4 Switching discards the previous run; stopping freezes it
 
 Starting a different experiment mints a **new** run and the previous run's
 figures leave the document. That is the point: a run is the unit of
@@ -272,13 +322,28 @@ provenance, and keeping an old summary beside a new one is how a number
 from the wrong experiment ends up on a screen. Press **Stop** to keep a
 run's figures readable; they stay until the next start.
 
+**A stopped run stops counting.** Every field under `run` is frozen at the
+moment of the stop, including the frame counters — frames that keep
+arriving afterwards are refused and counted by `source`, which is a
+property of the Tower rather than of a run that ended. An earlier build
+kept adding refused frames to the stopped run's `frames_offered` while
+`elapsed_s` stayed frozen, so `offered_fps` climbed without bound: 8
+frames over 9 s read 0.89, and 400 refused frames later the same nine
+seconds read 45.3.
+
 ### 3.5 `source` — is anything feeding this Lab
 
 ```json
 {"clients_connected": 1, "receiving_frames": true,
  "last_frame_at": 1787810180.83, "frames_offered_total": 7,
- "idle_after_s": 5.0}
+ "frames_rejected_before_lab": 0, "idle_after_s": 5.0}
 ```
+
+`frames_rejected_before_lab` counts frames that arrived and the transport
+could not decode — a truncated JPEG, a bad base64, a missing field. They
+never reach the Lab, so `frames_offered_total` does not count them, and
+without this field a phone sending garbage reads exactly like a phone
+sending nothing. Those need opposite fixes.
 
 `receiving_frames` is `last_frame_at` within `idle_after_s`. Five seconds,
 because the current iOS sender forwards roughly one frame in thirty of a
@@ -288,7 +353,16 @@ streaming, short enough to show up while a person is still standing there.
 
 `clients_connected` is `null` when this Tower cannot report it.
 
-**This is the field that keeps a Release build honest.** See §7.
+**Every figure in this block is TOWER-WIDE, not per connection.** One
+Tower has one Lab and one run, so `receiving_frames: true` means *somebody*
+is feeding it — possibly the other phone. There is no per-connection frame
+counter anywhere in this contract, because the Lab is handed bytes and not
+a connection identity.
+
+That matters for §7: `receiving_frames` alone cannot tell a client that
+**its own** frames are arriving. Combine it with what the client already
+knows — whether this build is streaming at all — and read
+`clients_connected > 1` as "somebody else is on this Tower too".
 
 ---
 
@@ -390,7 +464,9 @@ worst frame — the Tower measuring itself, the same quantity
 
 `stage_ms` is an **open map**: its keys are the experiment's own stage
 names (`decode`, `blur`, `canny`, `summarize`, …) and a client must not
-switch on them. Same for `runtime` in §3.3.
+switch on them. Same for `runtime` in §3.3. Both are bounded — 16 stage
+names and 8 runtime facts per run — because "open" must not mean
+"unbounded" in a run that stays open for the life of the Tower.
 
 `observed_at` is when the Tower last produced a result for this run.
 **There is no capture timestamp anywhere on the wire** — `tower/frames.py`
@@ -433,11 +509,14 @@ What this contract does about it:
    and processing whatever arrives*, not *frames are arriving*. Those are
    two facts and the document keeps them apart.
 
-The rule for iOS: **`.running` may only be shown as live when
-`source.receiving_frames` is true.** Otherwise show the run as armed and
-waiting for a stream, and in Release say the build has no camera. Never
-render a Start control in a configuration that has no `startCameraSession`
-to call.
+The rule for iOS: **`.running` may be shown as LIVE only when this build
+is itself streaming AND `source.receiving_frames` is true.** Both halves
+are needed. `receiving_frames` is Tower-wide (§3.5), so on a Tower with a
+second phone attached it is `true` for a Release build that has no camera
+at all — and the client's own streaming state is the half that catches
+that. Otherwise show the run as armed and waiting for a stream, and in
+Release say the build has no camera. Never render a Start control in a
+configuration that has no `startCameraSession` to call.
 
 ---
 
@@ -491,15 +570,30 @@ not take effect.** There is no partial application.
 |---|---|---|
 | `malformed_request` | `experiment_id` or `run_id` missing or wrong-typed | `command` |
 | `unknown_experiment` | no experiment with that id on this Tower | `available` (array of ids) |
-| `experiment_unavailable` | the experiment exists but this Tower cannot run it (the `[ml]` extra is absent) | `experiment_id` |
-| `lab_busy` | a start or stop is already in flight | — |
+| `experiment_unavailable` | the experiment exists but a module it needs is not installed on this Tower — `depth` needs `torch` and `timm`, `object_detection` needs `torch` and `torchvision`. `message` names the missing one | `experiment_id` |
+| `lab_busy` | a start is already in flight (only a start can be; stop, pause and resume are immediate) | — |
 | `invalid_state` | the command does not apply from the current state (resume when idle, pause when stopped) | — |
 | `stale_run` | the `run_id` named is not the current one | `current_run_id` |
-| `lab_unavailable` | this Tower runs no CV Lab, or its module failed | — |
-| `start_failed` | accepted, then the experiment failed to load | — |
+| `lab_unavailable` | this Tower runs no CV Lab, or its module failed. **Terminal** — treat as `.unsupported` | — |
+| `internal_error` | the Tower failed while answering, and the request did not take effect. **Transient and retryable** — deliberately not `lab_unavailable`, because telling a person to give up on a working Tower is worse than telling them to try again | — |
 
 Every `cv_lab_error` also carries `control_contract`, `message` (prose for
-a person), and `status` (the document, unchanged).
+a person), and `status` (the document, unchanged) — including the
+`lab_unavailable` refusal from a Tower with no Lab at all, which carries a
+hollow document with the real contract identifiers in it.
+
+**There is no `start_failed` refusal, and that is not an omission.** An arm
+is asynchronous — the whole reason a start returns immediately — so by the
+time a load fails, the command has already been answered `accepted`. A
+second reply to a reply is not a thing this wire has. The outcome arrives
+as **state**: `lifecycle.state` becomes `failed` with a `reason`, pushed on
+the result channel or read with `cv_lab_status`. That is the shape iOS's
+own `run(_:)` already has. **A client that sends commands and does not
+also read status will never learn that a start failed.**
+
+A `request_id` longer than 64 characters is **dropped, not refused**: the
+command still applies and the reply simply carries no `request_id`. Keep
+them short — matching a reply to a pressed button is the entire purpose.
 
 **Refused, never queued.** `lab_busy` exists because the Lab holds one
 experiment: queueing a second request behind the first would let two
@@ -523,6 +617,17 @@ These sit alongside the transport's existing `invalid_frame`,
 `frame_skipped` and `module_unavailable`. They are refusals, not failures:
 the module stays ACTIVE and the next frame is accepted the moment the Lab
 is running again. The `message` beside each one says what to send.
+
+`cv_lab_unavailable` is a **defensive default** rather than a state you
+will normally see — when the Lab is `unavailable` the module behind it is
+FAILED or UNLOADED, so the transport answers `module_unavailable` before
+the Lab is reached.
+
+**A refusal is not counted as a frame processing error.** The Tower's own
+session summary counts these under `frames_rejected` (they are missing
+from the measured numbers, which is what that field means) but **not**
+under `frame_processing_errors` — a Lab paused for five minutes has not
+failed hundreds of times.
 
 ---
 
@@ -576,11 +681,13 @@ for that reason, so comparing `run_id` alone is sufficient.
 
 | Bound | Value | Why |
 |---|---|---|
-| Metrics reported per run | **16** | the largest registered experiment emits 14; this bounds a future one, and says how many it dropped |
-| Metric names tracked per run | the experiment's own declared set — **12** at its largest | a name is filed only if the experiment declared it. There is no separate cap, because one would never fire |
+| Metrics reported per run | **16** | the largest registered experiment (`optical_flow`) emits **14**, so the real headroom is two; this bounds a future one, and says how many it dropped |
+| Metric names tracked per run | the experiment's own declared set — **14** at its largest | a name is filed only if the experiment declared it. There is no separate cap, because one would never fire |
+| Stage names tracked per run | **16** | unlike a metric, a stage name is whatever the experiment passed to `StageTimer` with nothing declaring it in advance. The most any registered experiment uses is four |
 | Unclassified metric names reported | **8** | a name list a producer controls must not grow without limit |
-| `request_id` length | **64** characters | it is echoed onto the wire |
-| Status document size | measured **< 9 KB** worst case (`optical_flow`, 14 metrics + the 8-experiment catalog) | a fixed arity with no unbounded list |
+| `request_id` length | **64** characters | it is echoed onto the wire; longer is dropped, not refused |
+| Echoed `experiment_id` / `run_id` / failure reason | **120** characters in a message | a remote party must not choose the size of a message this Tower sends |
+| Status document size | bounded at **16 KB**; measured worst case **8 852 B** (`optical_flow`, 14 metrics + the 8-experiment catalog) | a fixed arity with no unbounded list. The bound is deliberately looser than the measurement, so that adding one honest field does not fail a test |
 | Stream-idle threshold | **5.0 s** | ~4 missed frames at the sender's observed 0.8 fps |
 | Arm timeout | **120 s** | the same bound and the same reason as the module container's load timeout: 119 MB of MiDaS weights does not fit a 10 s bound on any ordinary link |
 
@@ -590,11 +697,17 @@ metric history and no sample buffer — `handoff.md` 9.3 says a
 `stream_stop` may never arrive, so "for the length of a run" means "for as
 long as the Tower is up".
 
-**Cost on the wire.** While running, the status document is re-sent when
-its revision changes (a frame was processed) or every 2 s otherwise, so at
-the sender's observed ~0.8 fps a subscriber sees roughly 1.3 documents per
-second — about 11 KB/s, against ~16 KB/s for the frame stream itself.
-Unsubscribe when the CV Lab screen is not visible.
+**Cost on the wire.** The document is re-sent when its **revision**
+changes or every 2 s otherwise. The revision deliberately excludes
+`run.elapsed_s` and the two throughput rates derived from it — they
+advance with the clock and with nothing else, and hashing them made
+`revision_changed` fire on every poll for a Lab that had seen no frame at
+all. So a subscriber sees a document per processed frame, plus a 2 s
+heartbeat: at the sender's observed ~0.8 fps that is roughly **1.3
+documents per second, about 11 KB/s**, against ~16 KB/s for the frame
+stream itself. A Lab that is idle, paused or stopped costs the 2 s
+heartbeat and nothing more. Unsubscribe when the CV Lab screen is not
+visible.
 
 ---
 
@@ -612,11 +725,22 @@ Unsubscribe when the CV Lab screen is not visible.
    sequence both succeed; the second replaces the first, and both see it
    in the pushed status. There is no ownership model, because a bench with
    one slot and two operators has a social problem, not a protocol one.
-3. **A failed STARTUP experiment is terminal.** If `TOWER_CV_EXPERIMENT`
-   names something unknown, or its load fails at boot, the module is
-   marked FAILED — which is terminal by design — and the Lab reports
-   `unavailable` until the Tower restarts. A failed *interactive* start is
-   recoverable: the Lab goes `failed` and another start may be sent.
+3. **Two failures are terminal and one is not.** A failed *interactive*
+   start is recoverable: the Lab goes `failed` and another start may be
+   sent. Two others are not, and both report `unavailable` until the Tower
+   restarts:
+   - a failed **startup** experiment (`TOWER_CV_EXPERIMENT` names
+     something unknown, or its load fails at boot) — the module is marked
+     FAILED, which is terminal by design, and a typo in configuration
+     should be loud;
+   - an experiment that raises something other than a
+     `FrameProcessingError` **while processing a frame**. `ModuleContainer`
+     treats that as a module failure, `mark_failed()` is terminal, and the
+     Lab goes with it. This is a property of the shared module lifecycle
+     rather than of the Lab, and closing it means giving the container a
+     way back from FAILED — V1.0/V1.1 work that is out of scope here.
+     Every registered experiment routes its recoverable failures through
+     `FrameProcessingError` precisely to stay out of this case.
 4. **No artifact, no baseline, no direction.** See §4 and §5. All three
    are `null` with a stated reason rather than omitted.
 5. **No cancellation of an in-flight arm from the client's point of

@@ -112,6 +112,27 @@ def test_only_the_model_backed_experiments_claim_to_need_a_model():
         assert experiment_metadata(experiment_id).backend == "torch"
 
 
+def test_every_model_backed_experiment_declares_what_it_needs():
+    """Otherwise `available: true` is a claim nothing checked.
+
+    `_missing_extra` returns None for an experiment with no entry in
+    `_REQUIRED_MODULES`, so an experiment declaring `requires_model=True`
+    and forgetting the map would be advertised as runnable on a Tower
+    that cannot run it -- and then fail asynchronously, which is the
+    outcome "refused in advance" exists to avoid. Nothing else ties the
+    two together, so this does.
+    """
+    from tower.cv_lab.lab import _REQUIRED_MODULES
+
+    needs_model = {i for i in EXPERIMENTS if experiment_metadata(i).requires_model}
+    assert needs_model == set(_REQUIRED_MODULES), (
+        "every requires_model experiment needs a _REQUIRED_MODULES entry, "
+        "and nothing else may have one"
+    )
+    for experiment_id, modules in _REQUIRED_MODULES.items():
+        assert modules, experiment_id
+
+
 def test_only_the_model_backed_experiments_report_inference():
     """Rule 16 / Core Principle 2: model output is not measured fact, and
     the two must be distinguishable on the wire rather than in a docstring."""

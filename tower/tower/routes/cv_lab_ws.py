@@ -28,12 +28,15 @@ the document.
 
 import logging
 
+from fastapi import WebSocketDisconnect
+
 from tower.cv_lab.contracts import (
     CONTROL_CONTRACT,
+    ERR_INTERNAL,
     ERR_LAB_UNAVAILABLE,
-    ERR_MALFORMED,
     STATUS_CONTRACT,
 )
+from tower.results.experimental_cv import unavailable_payload
 
 logger = logging.getLogger(__name__)
 
@@ -64,12 +67,20 @@ async def handle(message: dict, *, websocket, sender) -> None:
             # that constructs one by hand is such an app, and the honest
             # answer is a refusal rather than an AttributeError that ends
             # a connection which is otherwise answering frames.
+            #
+            # It carries a `status` like every other refusal, and that is
+            # not decoration: the contract says every `cv_lab_error`
+            # carries one, so a client is entitled to require the field.
+            # This branch omitted it, which would have made a hand-written
+            # decoder drop the whole refusal -- on exactly the Tower
+            # configuration the refusal exists to describe.
             await _error(
                 sender,
                 ERR_LAB_UNAVAILABLE,
                 "this Tower runs no CV Lab",
                 command=message_type,
                 request_id=_request_id(message),
+                status=unavailable_payload("this Tower runs no CV Lab"),
             )
             return
 
@@ -107,15 +118,66 @@ async def handle(message: dict, *, websocket, sender) -> None:
             status=outcome.status,
             **outcome.extra,
         )
+    except WebSocketDisconnect:
+        # NOT swallowed. The socket is gone; the receive loop must learn
+        # that and stop, rather than keep polling a dead connection
+        # because a control message happened to be the thing that
+        # noticed. `_handle_frame_message` re-raises for the same reason.
+        raise
     except Exception:
-        # Deliberately broad, and deliberately swallowed after logging.
-        # This handler is called from the frame-serving receive loop; an
-        # escape here would end a connection that is successfully
-        # answering frames because somebody sent a bad start request.
+        # Deliberately broad. This handler is called from the
+        # frame-serving receive loop; an escape here would end a
+        # connection that is successfully answering frames because
+        # somebody sent a bad start request.
+        #
+        # Logged AND answered. Swallowing it silently left a client that
+        # sent a `request_id` waiting forever for a reply that was never
+        # coming, which is the one outcome this module's own header calls
+        # out as worse than a failure. Best-effort: if this send fails too
+        # the connection is already going.
         logger.exception(
             "[Tower][CVLab] handler failed for %r; the connection continues",
             message_type,
         )
+        try:
+            # `internal_error`, not `lab_unavailable`. The second is
+            # terminal -- iOS renders it as "this Tower cannot do this" --
+            # and a handler bug is not that. And it carries a `status`
+            # like every other refusal: omitting it here would be the
+            # same defect this branch was added to fix, two lines down
+            # from the fix.
+            await _error(
+                sender,
+                ERR_INTERNAL,
+                "the CV Lab could not answer that request",
+                command=message_type,
+                request_id=_request_id(message),
+                status=_best_effort_status(websocket),
+            )
+        except Exception:
+            logger.debug(
+                "[Tower][CVLab] could not report the handler failure",
+                exc_info=True,
+            )
+
+
+def _best_effort_status(websocket) -> dict:
+    """A document to attach to an internal-failure refusal.
+
+    The Lab's own if it can still produce one, and a hollow one if it
+    cannot -- because the thing that just failed may well be `status()`.
+    Never raises: this runs inside the handler for something that already
+    went wrong.
+    """
+    lab = getattr(websocket.app.state, "cv_lab", None)
+    if lab is not None:
+        try:
+            return lab.status()
+        except Exception:
+            logger.debug("[Tower][CVLab] status() failed too", exc_info=True)
+    return unavailable_payload(
+        "the CV Lab could not report its state while answering a request"
+    )
 
 
 def _status_payload(status: dict, request_id) -> dict:
@@ -165,19 +227,3 @@ def _request_id(message: dict):
     if isinstance(request_id, str) and 0 < len(request_id) <= 64:
         return request_id
     return None
-
-
-def malformed_message(message_type: str) -> dict:
-    """The refusal for a control message that is not a JSON object.
-
-    Exposed for `ws.py`, which validates the envelope before this module
-    sees it and must be able to answer with this module's vocabulary
-    rather than inventing a second one.
-    """
-    return {
-        "type": MSG_ERROR,
-        "control_contract": CONTROL_CONTRACT,
-        "reason": ERR_MALFORMED,
-        "message": "a CV Lab message must be a JSON object",
-        "command": message_type,
-    }

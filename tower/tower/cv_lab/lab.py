@@ -57,7 +57,9 @@ a restart cannot show a previous Tower's numbers.
 """
 
 import asyncio
+import functools
 import importlib.util
+import math
 import logging
 import threading
 import time
@@ -72,7 +74,6 @@ from tower.cv_lab.contracts import (
     ERR_LAB_UNAVAILABLE,
     ERR_MALFORMED,
     ERR_STALE_RUN,
-    ERR_START_FAILED,
     ERR_UNKNOWN_EXPERIMENT,
     FRAME_REFUSAL_REASONS,
     FRAME_RESULT_CONTRACT,
@@ -93,6 +94,16 @@ from tower.cv_lab.run import LabRun
 from tower.experiments import EXPERIMENTS, ExperimentSettings, experiment_metadata
 from tower.loading import run_abandonable
 from tower.modules.base import FrameProcessingError
+
+# Imported for `json_safe` alone, and the direction is deliberate.
+# `NaN` and `Infinity` are not JSON: Python emits them bare because
+# `allow_nan` defaults True, and a strict decoder -- Swift's, for one --
+# then rejects the WHOLE message rather than one field. The result
+# channel already sanitises at its envelope boundary, but this document
+# has three surfaces and only one of them is that envelope. Sanitising
+# where the document is BUILT covers all three at once, and means no
+# future surface has to remember.
+from tower.results.envelope import json_safe
 
 logger = logging.getLogger(__name__)
 
@@ -131,8 +142,33 @@ class CommandOutcome:
         self.extra = extra or {}
 
 
-def _torch_is_installed() -> bool:
-    """Whether the optional [ml] extra is present, WITHOUT importing it.
+# What each model-backed experiment needs on the import path. Per
+# experiment, not one global "is torch there": `depth` needs torch and
+# timm (MiDaS's hubconf imports a DPT backbone chain unconditionally),
+# and `object_detection` needs torchvision. A single torch probe reported
+# `object_detection` available on a Tower that could not run it.
+#
+# What this canNOT check is the network. `depth` fetches MiDaS weights
+# through `torch.hub` on first use, so an offline Tower still accepts the
+# start and reports `failed` afterwards with the reason. That is why
+# `failed` is recoverable, and why the contract says so.
+_REQUIRED_MODULES: dict[str, tuple[str, ...]] = {
+    "depth": ("torch", "timm"),
+    "object_detection": ("torch", "torchvision"),
+}
+
+
+@functools.lru_cache(maxsize=None)
+def _module_is_installed(name: str) -> bool:
+    """Whether an import would succeed, WITHOUT performing it.
+
+    CACHED, because this runs on every status build -- once per required
+    module of every model-backed experiment -- and `find_spec` walks the
+    filesystem. Uncached it cost 0.65 ms of a 1.25 ms status build,
+    measured; the whole document costs 0.35 ms without it. A module does
+    not appear or disappear while a process runs, and installing the [ml]
+    extra into a live Tower needs a restart anyway: the module system
+    loads its experiment once.
 
     `find_spec` locates a module and does not execute it, which is the
     whole point: `test_importing_the_lab_does_not_import_torch` asserts
@@ -141,9 +177,36 @@ def _torch_is_installed() -> bool:
     would be a 2 GB answer to a yes/no question.
     """
     try:
-        return importlib.util.find_spec("torch") is not None
+        return importlib.util.find_spec(name) is not None
     except (ImportError, ValueError):
         return False
+
+
+def _missing_extra(experiment_id) -> str | None:
+    """The first module this experiment needs and this Tower lacks."""
+    for name in _REQUIRED_MODULES.get(experiment_id, ()):
+        if not _module_is_installed(name):
+            return name
+    return None
+
+
+def _clip(value, limit: int = 120) -> str:
+    """Bound a string that came from a client before it goes back out.
+
+    `request_id` is capped because it is echoed onto the wire; an
+    `experiment_id` embedded in a refusal message is echoed onto the wire
+    too, and so is the `str(exc)` of a failed load. A remote party must
+    not be able to choose the size of a message this Tower sends.
+    """
+    text = str(value)
+    return text if len(text) <= limit else text[: limit - 1] + "\u2026"
+
+
+def _wire_safe(value):
+    """A runtime fact, reduced to something JSON can carry."""
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    return _clip(value, 120)
 
 
 class CVLab:
@@ -199,6 +262,15 @@ class CVLab:
         # know when nothing is happening, and a run-scoped counter cannot
         # say it because there is no run.
         self._frames_offered_total = 0
+        # Frames that arrived and never reached the Lab, because the
+        # transport could not decode them. Counted here rather than only
+        # in the session summary because they are the difference between
+        # two situations a person diagnoses differently: "nothing is
+        # arriving" and "things are arriving and they are broken". Without
+        # it those look identical from the status document, and the answer
+        # was a server-side log line -- which is exactly what `GET /cv-lab`
+        # exists because nobody can see over Tailscale.
+        self._frames_rejected_before_lab = 0
         self._last_frame_at: float | None = None
 
         self._last_frame_provenance: dict | None = None
@@ -216,6 +288,12 @@ class CVLab:
 
         The interactive path is the one that recovers. See `start()`.
         """
+        # A fresh load is not a released Lab. Nothing reaches this
+        # today -- `ModuleContainer` has no reload path and `unload()`
+        # runs only from `shutdown()` -- but `_released` gates every
+        # command, and a sticky flag on a Lab whose `process()` works
+        # would refuse every request while answering every frame.
+        self._released = False
         experiment_id = self._initial_experiment_id
         if self._injected_experiment is None:
             factory = EXPERIMENTS.get(experiment_id)
@@ -313,7 +391,19 @@ class CVLab:
             task.cancel()
         with self._guard:
             self._released = True
+            # Cleared here as well as on every completion path. Leaving it
+            # set after a release mid-arm made `_switching` stop being an
+            # invariant: nothing could reach `start()` past the
+            # `_released` check today, but the next person to reorder
+            # those checks would get a permanently busy Lab.
+            self._switching = False
             self._set_state_locked(STATE_UNAVAILABLE, reason=reason)
+            # A run that will never process another frame has ended.
+            # Without this the document keeps publishing `ended_at: null`
+            # with `elapsed_s` growing and `processed_fps` decaying
+            # towards zero, for a Lab that is gone.
+            if self._run is not None and self._run.ended_at is None:
+                self._run.ended_at = self._clock()
             experiment, self._experiment = self._experiment, None
             self._last_frame_provenance = None
         if experiment is not None:
@@ -334,8 +424,6 @@ class CVLab:
         run = self._run
         state = self._state
         experiment = self._experiment
-        if run is not None:
-            run.record_offered()
 
         if state != STATE_RUNNING or experiment is None:
             self._last_frame_provenance = None
@@ -372,6 +460,19 @@ class CVLab:
                 self._selected_id,
             )
         return result
+
+    def note_frame_rejected_before_processing(self, now: float | None = None) -> None:
+        """A frame arrived and the transport refused it. Never raises.
+
+        Called from `ws.py` when `parse_and_decode_frame` fails, which is
+        the one thing that happens to a frame before the Lab can see it.
+        It updates `last_frame_at` too: a malformed frame is still
+        evidence that something is streaming, and `receiving_frames`
+        would otherwise say no while a phone was sending as fast as it
+        could.
+        """
+        self._frames_rejected_before_lab += 1
+        self._last_frame_at = self._clock() if now is None else now
 
     def frame_provenance(self) -> dict | None:
         """Who produced the frame result `process()` just returned.
@@ -459,12 +560,9 @@ class CVLab:
         iOS's `run(_:)` already returns nothing and reports through state,
         so there is nothing here for it to wait on.
         """
-        if self._released or self._state == STATE_UNAVAILABLE:
-            return self._refuse(
-                ERR_LAB_UNAVAILABLE,
-                "this Tower cannot run experiments: "
-                f"{self._state_reason or 'the Lab module is not available'}",
-            )
+        refusal = self._unavailable_refusal()
+        if refusal is not None:
+            return refusal
         if not isinstance(experiment_id, str) or not experiment_id:
             return self._refuse(
                 ERR_MALFORMED, "cv_lab_start requires a string 'experiment_id'"
@@ -472,22 +570,22 @@ class CVLab:
         if not catalog.is_registered(experiment_id):
             return self._refuse(
                 ERR_UNKNOWN_EXPERIMENT,
-                f"this Tower has no experiment {experiment_id!r}",
+                f"this Tower has no experiment {_clip(experiment_id)!r}",
                 extra={"available": sorted(EXPERIMENTS)},
             )
-        metadata = experiment_metadata(experiment_id)
-        if metadata.requires_model and not _torch_is_installed():
+        missing = _missing_extra(experiment_id)
+        if experiment_metadata(experiment_id).requires_model and missing:
             return self._refuse(
                 ERR_EXPERIMENT_UNAVAILABLE,
-                f"{experiment_id!r} needs the optional [ml] extra (torch), "
-                "which is not installed on this Tower",
+                f"{experiment_id!r} needs the optional [ml] extra "
+                f"({missing}), which is not installed on this Tower",
                 extra={"experiment_id": experiment_id},
             )
         if self._switching:
             return self._refuse(
                 ERR_LAB_BUSY,
-                "another start or stop is already in flight; the Lab holds "
-                "one experiment and will not queue a second request behind it",
+                "another start is already in flight; the Lab holds one "
+                "experiment and will not queue a second request behind it",
             )
 
         # Set with no await in between, so no second command can pass this
@@ -526,6 +624,13 @@ class CVLab:
             raise
         except BaseException as exc:
             self._release_quietly(experiment)
+            # Reported as STATE, never as a refusal. The command was
+            # already answered `accepted` -- an arm is asynchronous and
+            # that is the whole reason it is -- so the outcome arrives
+            # the way iOS's own `run(_:)` expects it to: through the
+            # status document, pushed on the result channel or read with
+            # `cv_lab_status`. There is no `start_failed` refusal code
+            # for the same reason there is no reply to a reply.
             self._fail_arm(
                 run_id,
                 f"{experiment_id} could not be armed: {type(exc).__name__}: {exc}",
@@ -537,6 +642,16 @@ class CVLab:
             )
             return
 
+        # Whether THIS task is still the arm the Lab is waiting on. A
+        # cancelled task does not always raise: `stop()` cancels and then
+        # a `start()` may arm again, and if this task had already passed
+        # its last await it runs to completion regardless. Clearing
+        # `_switching` unconditionally then cleared the NEW start's flag
+        # and let a third start race the second. The wrong experiment
+        # still could not be installed -- the run-id check below sees to
+        # that -- but `lab_busy` stopped meaning what it says, and a
+        # guarantee that holds only most of the time is not one.
+        mine = self._arm_task is asyncio.current_task()
         with self._guard:
             if (
                 self._released
@@ -553,7 +668,8 @@ class CVLab:
                 self._experiment = experiment
                 self._set_state_locked(STATE_RUNNING)
                 self._record_runtime_locked(experiment)
-            self._switching = False
+            if mine:
+                self._switching = False
         if stale is not None:
             self._release_quietly(stale)
             logger.info(
@@ -564,12 +680,13 @@ class CVLab:
             )
 
     async def wait_until_armed(self) -> None:
-        """Await the in-flight arm, if there is one. For tests and shutdown.
+        """Await the in-flight arm, if there is one.
 
         Not part of the wire surface: a client learns that arming finished
-        from the status document, which is pushed. This exists so a test
-        does not have to sleep, and so a shutdown does not leave a load
-        running into a torn-down app.
+        from the status document. This exists so a test does not have to
+        sleep. `shutdown()` is what a teardown calls -- it releases FIRST
+        and then joins, which is the order that makes the arm task free
+        what it built rather than install it.
         """
         task = self._arm_task
         if task is None:
@@ -584,13 +701,25 @@ class CVLab:
             logger.debug("[Tower][CVLab] arm task ended badly", exc_info=True)
 
     def _fail_arm(self, run_id: str, reason: str) -> None:
+        # Same ownership check as the success path, for the same reason:
+        # a superseded task must not clear the flag its successor set.
+        try:
+            mine = self._arm_task is asyncio.current_task()
+        except RuntimeError:
+            # Called from outside a task (a test drives it directly).
+            mine = True
         with self._guard:
-            self._switching = False
+            if mine:
+                self._switching = False
             if self._run is not None and self._run.run_id == run_id:
-                self._set_state_locked(STATE_FAILED, reason=reason)
+                self._set_state_locked(STATE_FAILED, reason=_clip(reason))
+                # The run never started and never will. Ending it keeps
+                # `elapsed_s` from growing for a run that processed
+                # nothing and is not going to.
+                self._run.ended_at = self._clock()
 
     def pause(self, run_id=None):
-        refusal = self._check_run_id(run_id)
+        refusal = self._unavailable_refusal() or self._check_run_id(run_id)
         if refusal is not None:
             return refusal
         if self._state != STATE_RUNNING:
@@ -605,7 +734,7 @@ class CVLab:
         return CommandOutcome(accepted=True, status=self.status())
 
     def resume(self, run_id=None):
-        refusal = self._check_run_id(run_id)
+        refusal = self._unavailable_refusal() or self._check_run_id(run_id)
         if refusal is not None:
             return refusal
         if self._state != STATE_PAUSED:
@@ -622,7 +751,7 @@ class CVLab:
         return CommandOutcome(accepted=True, status=self.status())
 
     def stop(self, run_id=None):
-        refusal = self._check_run_id(run_id)
+        refusal = self._unavailable_refusal() or self._check_run_id(run_id)
         if refusal is not None:
             return refusal
         if self._state not in (STATE_RUNNING, STATE_PAUSED, STATE_STARTING):
@@ -644,6 +773,22 @@ class CVLab:
             self._set_state_locked(STATE_STOPPED)
         return CommandOutcome(accepted=True, status=self.status())
 
+    def _unavailable_refusal(self):
+        """`lab_unavailable`, or None. Checked before anything else.
+
+        Without it a dead Lab answered `invalid_state` -- which tells a
+        client "try again from another state", of a condition no state
+        change can fix. Two codes on a closed set mean two different
+        things and only one of them is true here.
+        """
+        if self._released or self._state == STATE_UNAVAILABLE:
+            return self._refuse(
+                ERR_LAB_UNAVAILABLE,
+                "this Tower cannot run experiments: "
+                f"{self._state_reason or 'the Lab module is not available'}",
+            )
+        return None
+
     def _check_run_id(self, run_id):
         if run_id is None:
             return None
@@ -655,8 +800,8 @@ class CVLab:
         if run_id != current:
             return self._refuse(
                 ERR_STALE_RUN,
-                f"run {run_id!r} is not the current run; the Lab is now on "
-                f"{current!r}",
+                f"run {_clip(run_id)!r} is not the current run; the Lab is "
+                f"now on {current!r}",
                 extra={"current_run_id": current},
             )
         return None
@@ -740,9 +885,11 @@ class CVLab:
         if isinstance(described, dict):
             # Bounded and stringified: this is a diagnostic block, not a
             # channel for an experiment to put arbitrary objects on the
-            # wire.
+            # wire. `None` survives as `null` rather than becoming the
+            # string "None" -- "we do not know which device" and "the
+            # device is called None" are different claims.
             self._run.runtime = {
-                str(key): (value if isinstance(value, (int, float, bool)) else str(value))
+                str(key)[:64]: _wire_safe(value)
                 for key, value in list(described.items())[:8]
             }
 
@@ -779,10 +926,18 @@ class CVLab:
             selected = self._selected_id
             run = self._run
             frames_offered_total = self._frames_offered_total
+            rejected_before_lab = self._frames_rejected_before_lab
             last_frame_at = self._last_frame_at
 
         now = self._clock()
-        return {
+        # Sanitised HERE, once, so that all three surfaces are covered.
+        # The result channel sanitises at its envelope boundary; `GET
+        # /cv-lab` goes through Starlette with `allow_nan=False` and would
+        # answer 500; `cv_lab_status` goes through `send_json`, whose
+        # `allow_nan` defaults True and would put a bare `NaN` on the wire
+        # for a strict decoder to reject the whole message over. Three
+        # different failures from one non-finite float.
+        return json_safe({
             "contract": STATUS_CONTRACT,
             "control_contract": CONTROL_CONTRACT,
             "frame_result_contract": FRAME_RESULT_CONTRACT,
@@ -819,9 +974,14 @@ class CVLab:
                 ),
                 "last_frame_at": last_frame_at,
                 "frames_offered_total": frames_offered_total,
+                # Arriving, and refused before the Lab could look. Non-zero
+                # with `frames_offered_total` at zero means the stream is
+                # alive and its frames are undecodable, which is a
+                # different fix from "nothing is streaming".
+                "frames_rejected_before_lab": rejected_before_lab,
                 "idle_after_s": STREAM_IDLE_AFTER_S,
             },
-        }
+        })
 
     def _clients_connected(self) -> int | None:
         if self._connection_count is None:
@@ -833,21 +993,28 @@ class CVLab:
             return None
 
     def _available_experiments(self) -> list[dict]:
-        torch_present = _torch_is_installed()
-        rows = []
-        for entry in catalog.catalog():
-            row = dict(entry)
-            if entry["requires_model"] and not torch_present:
-                row["available"] = False
-                row["unavailable_reason"] = (
-                    "needs the optional [ml] extra (torch), which is not "
-                    "installed on this Tower"
-                )
-            else:
-                row["available"] = True
-                row["unavailable_reason"] = None
-            rows.append(row)
-        return rows
+        return [self._with_availability(entry) for entry in catalog.catalog()]
+
+    def _with_availability(self, entry: dict) -> dict:
+        """One catalog entry plus whether this Tower can run it.
+
+        Applied to the entry inside `run.experiment` as well as to the
+        catalog, so a client has ONE shape to decode. They differed by two
+        keys before, which is exactly the kind of difference a hand-written
+        decoder discovers by dropping a message.
+        """
+        row = dict(entry)
+        missing = _missing_extra(entry.get("id"))
+        if entry.get("requires_model") and missing is not None:
+            row["available"] = False
+            row["unavailable_reason"] = (
+                f"needs the optional [ml] extra ({missing}), which is not "
+                "installed on this Tower"
+            )
+        else:
+            row["available"] = True
+            row["unavailable_reason"] = None
+        return row
 
     def _run_document(self, run: LabRun | None, now: float) -> dict | None:
         if run is None:
@@ -862,9 +1029,19 @@ class CVLab:
         else:
             metrics, omitted = run.metric_rows(metadata)
         elapsed = max((run.ended_at or now) - run.started_at, 0.0)
+        # The three counters read ONCE, into locals, and
+        # `frames_offered` derived from those. Reading `run.frames_offered`
+        # and then the three attributes separately was atomic only because
+        # CPython happens to schedule no eval-breaker check between a
+        # property's return and the loads that follow it -- which is not a
+        # guarantee, and is certainly not the "true by construction" this
+        # design claims. Four reads of one consistent triple are.
+        processed = run.frames_processed
+        refused = run.frames_refused
+        failed = run.frames_failed
         return {
             "run_id": run.run_id,
-            "experiment": run.descriptor,
+            "experiment": self._with_availability(run.descriptor),
             # Who asked for this run. `startup_default` means nobody did.
             "origin": run.origin,
             "started_at": run.started_at,
@@ -873,10 +1050,10 @@ class CVLab:
             # What the experiment says it actually loaded -- device,
             # weights, versions. Empty for an experiment that holds none.
             "runtime": dict(run.runtime),
-            "frames_offered": run.frames_offered,
-            "frames_processed": run.frames_processed,
-            "frames_refused": run.frames_refused,
-            "frames_failed": run.frames_failed,
+            "frames_offered": processed + refused + failed,
+            "frames_processed": processed,
+            "frames_refused": refused,
+            "frames_failed": failed,
             "metrics": metrics,
             "metrics_omitted": omitted,
             # An experiment emitting a metric it never classified. Empty
@@ -914,11 +1091,20 @@ class CVLab:
                 # figure is bounded by what arrives, not by what the Lab
                 # could do. `frames_offered` beside it is what makes the
                 # difference visible.
+                # `null`, not `0.0`, when there is no window yet. A
+                # rate over a zero-length interval is undefined, not zero
+                # -- and on Windows `time.time()` has ~15.6 ms
+                # granularity, so the reply to `cv_lab_start` almost
+                # always lands inside the same tick as the run's own
+                # start. A client sees `null` for the first few
+                # milliseconds and a number thereafter.
                 "processed_fps": (
-                    round(run.frames_processed / elapsed, 3) if elapsed > 0 else None
+                    round(processed / elapsed, 3) if elapsed > 0 else None
                 ),
                 "offered_fps": (
-                    round(run.frames_offered / elapsed, 3) if elapsed > 0 else None
+                    round((processed + refused + failed) / elapsed, 3)
+                    if elapsed > 0
+                    else None
                 ),
                 # The other direction: how fast the Lab could go if frames
                 # never stopped arriving. Derived from measured
@@ -951,7 +1137,15 @@ class CVLab:
         count = None
         if metadata is not None and metadata.annotation_metric:
             total = run.metric_total(metadata.annotation_metric)
-            if total is not None:
+            # `isfinite` before `int(round(...))`, because `int(round(nan))`
+            # RAISES. `json_safe` wraps the finished document and cannot
+            # protect a computation that happens while the document is
+            # being built: one non-finite detection count made `status()`
+            # raise, which answered `GET /cv-lab` with a 500, the socket
+            # with an error, and the result channel with `snapshot_failed`
+            # -- permanently for that run, because the accumulator never
+            # resets.
+            if total is not None and math.isfinite(total):
                 count = int(round(total))
         return {
             "count": count,

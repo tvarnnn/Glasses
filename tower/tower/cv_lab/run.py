@@ -26,6 +26,7 @@ import logging
 
 from tower.cv_lab.contracts import (
     MAX_REPORTED_METRICS,
+    MAX_TRACKED_STAGES,
     MAX_UNCLASSIFIED_REPORTED,
 )
 from tower.experiments import (
@@ -133,11 +134,17 @@ class LabRun:
     """The measurements and the identity of one experiment run.
 
     Mutated only from the event loop (the frame path and the command
-    handlers both run there). Read from a worker thread by the result
-    channel's poller, which is why `CVLab` holds a lock around building a
-    snapshot of it -- see `lab.py`. Nothing in here takes a lock itself:
-    a lock per counter would be four locks on the frame path buying
-    nothing, because the writer is single-threaded either way.
+    handlers both run there) and read from a worker thread by the result
+    channel's poller. Nothing in here takes a lock, and `CVLab` does not
+    hold one while reading these counters either -- an earlier version of
+    this comment claimed it did, and it does not.
+
+    What makes that safe is not a lock. It is that the reader reads each
+    counter ONCE into a local and derives `frames_offered` from those
+    locals (see `CVLab._run_document`), so the three it publishes are one
+    consistent triple whatever the writer does next. Reading the derived
+    property and then the three attributes separately would be atomic
+    only by accident of CPython's scheduling.
     """
 
     def __init__(
@@ -160,12 +167,25 @@ class LabRun:
         # and empty forever for an experiment that does not implement it.
         self.runtime: dict = {}
 
-        # Every frame this run was offered, and what became of it. The
-        # four are disjoint and they sum to `frames_offered`, which is
-        # what makes "Start was pressed and nothing happened" diagnosable:
-        # offered 0 means the stream is not reaching the Lab at all,
-        # offered>0 with processed 0 means it is and the Lab is refusing.
-        self.frames_offered = 0
+        # What became of every frame this run was offered. Three counters,
+        # and `frames_offered` DERIVED from them rather than stored --
+        # which is the only way the sum can be trusted.
+        #
+        # It used to be a fourth counter, incremented on arrival and the
+        # others on the outcome. The status document is built on a worker
+        # thread while the frame path runs on the loop, so a snapshot
+        # taken between those two increments published four numbers that
+        # did not add up: measured at 2,741 such snapshots over a run
+        # with a 2 ms experiment. The invariant below is the whole
+        # diagnostic -- offered 0 means the stream is not reaching the Lab
+        # at all, offered>0 with processed 0 means it is and the Lab is
+        # refusing -- and an invariant that is false 2,741 times is not
+        # one. Locking the frame path to fix a diagnostic would have been
+        # paying in the wrong currency; deriving it costs nothing and is
+        # true by construction.
+        #
+        # A frame currently being processed is therefore not yet counted
+        # anywhere, which is correct: its outcome is not known.
         self.frames_processed = 0
         self.frames_refused = 0
         self.frames_failed = 0
@@ -182,19 +202,43 @@ class LabRun:
         self.headline_label: str | None = None
         self._metrics: dict[str, _MetricAccumulator] = {}
         self._unclassified: list[str] = []
+        self._stages_rejected = 0
         self.last_frame_at: float | None = None
         self.last_result_at: float | None = None
 
-    # -- recording ------------------------------------------------------
+    @property
+    def frames_offered(self) -> int:
+        """Every frame whose outcome this run knows. Derived, see above."""
+        return self.frames_processed + self.frames_refused + self.frames_failed
 
-    def record_offered(self) -> None:
-        self.frames_offered += 1
+    @property
+    def is_over(self) -> bool:
+        return self.ended_at is not None
+
+    # -- recording ------------------------------------------------------
+    #
+    # Every one of these is a no-op once the run has ended. A stopped run
+    # publishes `ended_at`, which freezes `elapsed_s`, and the Tower tells
+    # a client in as many words that "the last run's figures are final" --
+    # so a run that kept counting refused frames against a frozen window
+    # reported a throughput that climbed forever with nothing happening.
+    # Measured: 8 frames over 9 s read 0.89 offered_fps; 400 more refused
+    # frames on the same stopped run read 45.3, from the same 9 seconds.
+    #
+    # The question those counters were there to answer -- "I pressed Stop,
+    # is the phone still streaming?" -- is answered by the Lab-scoped
+    # `source` block, which never stops counting. It is a property of the
+    # Tower, not of a run that is over.
 
     def record_refused(self, now: float) -> None:
+        if self.is_over:
+            return
         self.frames_refused += 1
         self.last_frame_at = now
 
     def record_failed(self, now: float) -> None:
+        if self.is_over:
+            return
         self.frames_failed += 1
         self.last_frame_at = now
 
@@ -205,6 +249,8 @@ class LabRun:
         answering a client must not end because a measurement could not be
         filed.
         """
+        if self.is_over:
+            return self.result_seq
         self.frames_processed += 1
         self.result_seq += 1
         self.last_frame_at = now
@@ -212,7 +258,17 @@ class LabRun:
         try:
             self.processing_ms.add(float(result.processing_ms))
             for stage, ms in (result.stage_ms or {}).items():
-                self.stage_ms.setdefault(str(stage), Running()).add(float(ms))
+                name = str(stage)[:64]
+                running = self.stage_ms.get(name)
+                if running is None:
+                    if len(self.stage_ms) >= MAX_TRACKED_STAGES:
+                        # An experiment naming a stage per frame is a bug,
+                        # but it must not become an unbounded dict in a run
+                        # that stays open for the life of the Tower.
+                        self._stages_rejected += 1
+                        continue
+                    running = self.stage_ms[name] = Running()
+                running.add(float(ms))
             self.headline_label = result.result_label
             self.headline.add(float(result.result_value))
             for name, value in (getattr(result, "metrics", None) or {}).items():
@@ -379,6 +435,11 @@ class LabRun:
     @property
     def unclassified_metrics(self) -> list[str]:
         return list(self._unclassified)
+
+    @property
+    def stages_rejected(self) -> int:
+        """Stage names dropped because the run already held the maximum."""
+        return self._stages_rejected
 
     @property
     def tracked_metric_count(self) -> int:

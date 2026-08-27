@@ -155,6 +155,7 @@ installed" is a useful thing for a person to know.
 | `experiment` | `run.experiment` (same shape as a catalog entry) |
 | `metrics` | `run.metrics[]`, §3 |
 | `annotation.count` | `run.annotation.count` — **`nil` and `0` are different**, see §3 |
+| — | `run.experiment` has **exactly the same keys** as an `available[]` entry, including `available` and `unavailable_reason`. One `CVExperiment` decoder for both |
 | `annotation.artifact` | always `.absent`. `run.annotation.artifact` is always `null` and `artifact_unavailable_reason` says why |
 | `timings.processingMs` | `run.timings.processing_ms` |
 | `timings.time.observedAt` | `run.timings.observed_at` — **only this**. Never `Date()` at decode |
@@ -163,6 +164,22 @@ installed" is a useful thing for a person to know.
 `run.timings.observed_at` may be `null` (a run that has processed no
 frames). `ObservationTime` already renders that as "time unknown"; do not
 substitute `receivedAt`.
+
+**On a run that has processed no frame — which is every Release build —
+`metrics` is empty and every number under `timings` and `throughput` is
+`null`**: `processing_ms`, `processing_ms_max`, `observed_at`,
+`capacity_fps`, `processed_fps` and `offered_fps`. Not zero — `null`. A
+rate over a zero-length window is undefined, and `time.time()` on Windows
+has ~15.6 ms granularity, so **the reply to your very first
+`cv_lab_start` will almost always carry `processed_fps: null`** (measured
+at 11 of 12). Type them all optional; the Tower exercises every one of
+them on the first message you receive.
+
+**A STOPPED run is frozen.** Every field under `run` stops moving at the
+stop, including the frame counters. Frames that keep arriving afterwards
+are refused and counted by `source`, which belongs to the Tower rather
+than to a run that ended. So `.completed(run)` renders numbers that will
+never change again — which is what makes it worth rendering.
 
 ---
 
@@ -269,10 +286,12 @@ whatever run is current, and if somebody else switched experiments in the
 meantime you stopped the wrong run. With it you get `cv_lab_error` /
 `stale_run` carrying `current_run_id`.
 
-**Always send `request_id`.** It is echoed back, at most 64 characters,
-and it is how you match a reply to the button when two commands are in
-flight and one is refused. Without it, `lastRequestFailure` cannot be
-attributed to a specific action.
+**Always send `request_id`.** It is echoed back and it is how you match a
+reply to the button when two commands are in flight and one is refused.
+Without it, `lastRequestFailure` cannot be attributed to a specific
+action. **Keep it to 64 characters**: a longer one is silently dropped —
+the command still applies, the reply simply carries no `request_id`, and
+you have lost the only thing that field was for.
 
 ### The two replies
 
@@ -293,8 +312,21 @@ from `state`, so a refusal does not erase what is on screen) and update
 | `invalid_state` | A UI bug: you offered a button the state does not allow. Log it |
 | `stale_run` | "Somebody else changed the experiment." Redraw from the `status` in the error |
 | `lab_unavailable` | The Tower cannot run experiments; treat as `.unsupported` |
-| `start_failed` | Use `message` verbatim. Another start may be sent |
 | `malformed_request` | A client bug. Log it |
+| `internal_error` | The Tower failed while answering. **Transient — retrying is reasonable**, unlike `lab_unavailable`, which is terminal |
+
+**There is no `start_failed`, and you must not wait for one.** An arm is
+asynchronous, so by the time a load fails the Tower has already answered
+your `cv_lab_start` with `accepted`. The failure arrives as **state** —
+`lifecycle.state: "failed"` with a `reason` — through the result-channel
+subscription or a `cv_lab_status` poll. **A client that sends commands and
+does not also read status will sit on `.starting` forever when a start
+fails.** Subscribe first, then send commands.
+
+Every `cv_lab_error` carries `status`, including the `lab_unavailable`
+refusal from a Tower with no Lab at all — that one carries a hollow
+document with the real contract identifiers in it, so one decoder handles
+every case.
 
 ### Stale-result invalidation — the rule
 
@@ -359,12 +391,16 @@ Rules for the iOS lane:
    A Release build is entitled to a truthful answer about what the Tower
    can do — the same reasoning already written on
    `requestCartridgeDeclaration()`.
-2. **`.running` may only be shown as LIVE when
-   `status.source.receiving_frames` is `true`.** Otherwise render the run
-   as armed and waiting for a stream. `source.frames_offered_total` and
-   `source.last_frame_at` are there to make that decision, and
-   `source.clients_connected` tells you whether another device is feeding
-   it.
+2. **`.running` may be shown as LIVE only when this build is itself
+   streaming AND `status.source.receiving_frames` is `true`.** Both halves.
+   `source` is **Tower-wide, not per connection** — one Tower has one Lab
+   and one run, and the Lab is handed bytes rather than a connection
+   identity — so on a Tower with a second phone attached,
+   `receiving_frames` is `true` for a Release build that has no camera at
+   all. Your own streaming state is the half that catches that.
+   `source.frames_offered_total` and `source.last_frame_at` inform the
+   decision; `source.clients_connected > 1` says somebody else is on this
+   Tower too, and is worth showing.
 3. **The Start control is `#if DEBUG`**, because `startCameraSession()`
    does not exist in Release. In Release, say the build has no camera —
    the Home workspace already has the sentence for it ("Capture is not
@@ -424,6 +460,8 @@ Negative fixtures worth having, all of which the Tower can produce:
 | a frame refused while arming | start `depth` and send a frame |
 | a metric with `value: null` | run `optical_flow`; `dominant_direction_deg` is `unaggregated` |
 | a `constant` that varied | run `frame_quality` at two resolutions in one run |
+| a refusal with a hollow status | any command against a Tower whose Lab failed to load |
+| a run with every timing `null` | read the status of a fresh Tower before sending a frame |
 | an unavailable experiment | run a Tower without the `[ml]` extra; `depth` gets `available: false` |
 | `receiving_frames: false` | read the status more than 5 s after the last frame |
 | the Lab unavailable | `GET /cv-lab` on a Tower with no Lab returns **503**, not 404 |
@@ -452,11 +490,18 @@ Negative fixtures worth having, all of which the Tower can produce:
 2. **No baseline and no direction**, so no better/worse verdict. §3.
 3. **No end-to-end latency.** It would span two clocks whose relationship
    is an open question, and iOS asked for none.
-4. **No per-connection Lab.** One Tower, one Lab, one experiment. Two
-   phones share a run — and for `optical_flow` that means frames from two
-   sources diffed against each other. `source.clients_connected` makes it
-   visible; closing it needs a session-boundary hook the module contract
-   does not have.
+4. **No per-connection Lab, and no per-connection `source`.** One Tower,
+   one Lab, one experiment. Two phones share a run — and for
+   `optical_flow` that means frames from two sources diffed against each
+   other. `source.clients_connected` makes it visible; closing it needs a
+   session-boundary hook the module contract does not have.
+7. **An experiment that raises the wrong exception type mid-frame takes
+   the Lab down until the Tower restarts.** `ModuleContainer` treats
+   anything that is not a `FrameProcessingError` as a module failure, and
+   that is terminal by design. The Lab then reports `unavailable`, which
+   iOS renders as `.unsupported` — correct, and not something a retry
+   fixes. Every registered experiment routes its recoverable failures
+   through `FrameProcessingError` to stay out of this case.
 5. **No progress during an arm.** `torch.hub` does not report download
    progress. `starting` is all there is, bounded at 120 s.
 6. **No HTTP start/pause/stop.** Only the socket. §2.2 of the contract
