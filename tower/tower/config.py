@@ -145,6 +145,19 @@ class Settings:
     # the producer's argv AND used by the read routes to say which
     # classes this Tower records, so the two cannot disagree about it.
     observation_verifier: str = "none"
+    # Where the verifier runs, when there is one.
+    #
+    # CUDA by default even though the DETECTOR defaults to CPU, and the
+    # asymmetry is the measurement: the detector costs about the same on
+    # either device (within noise, see above), while the verifier
+    # measured 126 ms a crop on this GPU against 2,473 ms on this CPU --
+    # a factor of nineteen. Splitting the two stages across devices is
+    # what keeps a 2.5-second burst off the cores the detector is using,
+    # and it costs 620 MB of VRAM on a card that has twelve.
+    #
+    # A host with no CUDA does not need this set: the verifier reports
+    # the downgrade and runs on CPU rather than failing.
+    observation_verifier_device: str = "cuda"
     # Keyframes between mid-walk rebuilds in the attached builder.
     #
     # NOT the script's own default, which is 0 -- "build once, at the
@@ -167,12 +180,17 @@ def get_settings() -> Settings:
         world_root=_optional_path(os.environ.get("TOWER_WORLD_ROOT")),
         observation_root=_observation_root(observation_enabled),
         observation_enabled=observation_enabled,
-        observation_device=_device(os.environ.get("TOWER_OBSERVATION_DEVICE")),
+        observation_device=_device(
+            os.environ.get("TOWER_OBSERVATION_DEVICE"), default="cpu"
+        ),
         observation_retention_days=_non_negative_float(
             os.environ.get("TOWER_OBSERVATION_RETENTION_DAYS"), default=30.0
         ),
         observation_verifier=_verifier(
             os.environ.get("TOWER_OBSERVATION_VERIFIER")
+        ),
+        observation_verifier_device=_device(
+            os.environ.get("TOWER_OBSERVATION_VERIFIER_DEVICE"), default="cuda"
         ),
         world_autobuild=os.environ.get("TOWER_WORLD_AUTOBUILD", "true").lower()
         in ("1", "true", "yes"),
@@ -235,7 +253,7 @@ def _verifier(value: str | None) -> str:
     return name if name in KNOWN_VERIFIERS else "none"
 
 
-def _device(value: str | None) -> str:
+def _device(value: str | None, *, default: str = "cpu") -> str:
     """"cpu" or "cuda". Anything else falls back rather than failing late.
 
     A typo here would otherwise reach a child process as an argv, be
@@ -244,11 +262,11 @@ def _device(value: str | None) -> str:
     a walk that remembered nothing. The fallback is the measured default.
     """
     if value is None:
-        return "cpu"
+        return default
     normalised = value.strip().lower()
     if normalised in ("cpu", "cuda"):
         return normalised
-    return "cpu"
+    return default
 
 
 def _non_negative_float(value: str | None, *, default: float) -> float:

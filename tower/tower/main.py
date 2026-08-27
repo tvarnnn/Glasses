@@ -147,6 +147,8 @@ def _observation_spec(settings: Settings, gate) -> WorkerSpec | None:
             str(settings.observation_retention_days),
             "--verifier",
             settings.observation_verifier,
+            "--verifier-device",
+            settings.observation_verifier_device,
         ),
         cwd=str(TOWER_ROOT),
         name=OBJECT_MEMORY_WORKER,
@@ -263,11 +265,12 @@ def _log_effective_configuration(
             "[Tower][Config] observation root %s (one path for the producer "
             "AND the read routes; the web process never writes or deletes "
             "observations). Producer device %s, retention %s days, verifier "
-            "%s -- recording %s.",
+            "%s on %s -- recording %s.",
             settings.observation_root,
             settings.observation_device,
             settings.observation_retention_days,
             settings.observation_verifier,
+            settings.observation_verifier_device,
             ", ".join(_recorded_classes(settings)),
         )
         raw_verifier = os.environ.get("TOWER_OBSERVATION_VERIFIER", "")

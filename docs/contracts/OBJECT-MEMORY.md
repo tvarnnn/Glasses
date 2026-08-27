@@ -654,7 +654,8 @@ offers it.
 | `TOWER_OBSERVATION_ENABLED` | `true` | `false` switches the cartridge off entirely: nothing is produced, and both `GET`s answer **404**. |
 | `TOWER_OBSERVATION_ROOT` | `<tower>/data/object_memory` | Where the producer writes **and** where the routes read. One value, handed to both. |
 | `TOWER_OBSERVATION_DEVICE` | `cpu` | Where the detector runs. CPU measured 69.3 ms/frame against CUDA's 100.4 on this host. |
-| `TOWER_OBSERVATION_VERIFIER` | `none` | `owlv2` loads `google/owlv2-base-patch16-ensemble` (Apache-2.0, ~600 MB, downloaded once) and unlocks the `verify` tier. |
+| `TOWER_OBSERVATION_VERIFIER` | `none` | `owlv2` loads `google/owlv2-base-patch16-ensemble` (Apache-2.0, ~600 MB, downloaded once) and unlocks the `verify` tier. An unrecognised name falls back to `none` — the **narrowing** direction — and is logged loudly. |
+| `TOWER_OBSERVATION_VERIFIER_DEVICE` | `cuda` | Where the verifier runs. CUDA even though the detector defaults to CPU: the detector costs about the same either way, the verifier measured 126 ms a crop on the GPU against 2,473 on the CPU. Costs 620 MB of VRAM. A host with no CUDA needs no setting — the verifier reports the downgrade and runs on CPU. |
 | `TOWER_OBSERVATION_RETENTION_DAYS` | `30` | The window the producer writes under, recorded in the store manifest. |
 | `TOWER_CAPTURE_ROOT` | *(unset)* | Required for §10. Without it the imagery routes answer 503. |
 | `TOWER_FACE_REDACTION_MODEL` | *(vendored)* | The YuNet weights. Without them **no picture is served**. |

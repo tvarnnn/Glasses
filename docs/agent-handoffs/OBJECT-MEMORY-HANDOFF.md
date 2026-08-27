@@ -379,6 +379,8 @@ cd tower
 # and only because the imagery routes need somewhere to look.
 $env:TOWER_CAPTURE_ROOT = "data"
 # Optional: unlock the verify tier (~600 MB downloaded once).
+# The verifier runs on CUDA by default and takes ~620 MB of VRAM;
+# TOWER_OBSERVATION_VERIFIER_DEVICE=cpu moves it, at 19x the latency.
 $env:TOWER_OBSERVATION_VERIFIER = "owlv2"
 powershell -NoProfile -File scripts\start_tower.ps1
 ```
