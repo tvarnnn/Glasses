@@ -42,6 +42,19 @@ from tower.results.object_memory import (
 router = APIRouter()
 
 
+def _recorded_classes(request: Request):
+    """What this Tower will actually record, or None to mean the safe default.
+
+    Read from `app.state` rather than imported, because it depends on
+    whether a semantic verifier is configured -- and the route is not
+    allowed to know what a verifier is. `main.py` puts the answer here
+    from the same `Settings` object the producer's argv is built from, so
+    the read surface and the producer cannot disagree about it any more
+    than they can disagree about where the store lives.
+    """
+    return getattr(request.app.state, "object_memory_recorded_classes", None)
+
+
 def _store(request: Request, retention_days: float | None):
     root = getattr(request.app.state, "object_memory_root", None)
     if root is None:
@@ -79,6 +92,7 @@ def observations(
         _store(request, retention_days),
         object_class=object_class,
         requested_retention_days=retention_days,
+        recorded_classes=_recorded_classes(request),
     )
 
 
@@ -92,4 +106,5 @@ def last_seen(
         _store(request, retention_days),
         object_class,
         requested_retention_days=retention_days,
+        recorded_classes=_recorded_classes(request),
     )

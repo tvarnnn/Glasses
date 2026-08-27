@@ -41,8 +41,21 @@ like a version skew; a null is an answer.
 
 import time
 
-from tower.object_memory.relevance import PERSISTED_CLASSES
+from tower.object_memory.relevance import recordable_classes
 from tower.object_memory.store import ObservationStore
+
+
+def recorded_classes_for(verifier: str) -> tuple[str, ...]:
+    """Which classes a Tower with this verifier will actually write.
+
+    Lives in the ADAPTER, not in `main.py`, and that placement is the
+    point. `main.py` is the wiring point and must not import a cartridge:
+    it knows the world builder as an argv and it knows object memory the
+    same way. This file is the one door -- it is already the only module
+    outside `tower/object_memory/` that imports the cartridge's policy --
+    so the answer travels through it as a tuple of strings.
+    """
+    return recordable_classes(verifier != "none")
 
 # Opaque and dated, in the style of `world_builder.geometry/2026-08-25`.
 # Compared for equality only: never parsed, never ordered, never used to
@@ -172,7 +185,27 @@ def _observation_view(observation) -> dict:
     }
 
 
-def _envelope(store: ObservationStore, requested_days: float | None) -> dict:
+def _recorded_classes(recorded_classes) -> list[str]:
+    """What this Tower will actually write, as the wire says it.
+
+    Passed IN rather than imported from the cartridge's default, because
+    the answer depends on configuration the adapter cannot see: a Tower
+    with a semantic verifier records a wider set than one without, and
+    naming a class here that nothing will ever write would turn "never
+    looked for" -- the weaker silence, which a client words differently
+    on purpose -- into "looked for and not seen".
+
+    `None` falls back to the no-verifier set, which is the smaller and
+    therefore the safer claim.
+    """
+    if recorded_classes is None:
+        return list(recordable_classes(False))
+    return list(recorded_classes)
+
+
+def _envelope(
+    store: ObservationStore, requested_days: float | None, recorded_classes=None
+) -> dict:
     return {
         "contract": OBSERVATIONS_CONTRACT,
         "claim": CATEGORY_CLAIM,
@@ -184,7 +217,7 @@ def _envelope(store: ObservationStore, requested_days: float | None) -> dict:
         # The universe of what could ever appear below. A class outside
         # this list has never been looked for, which is a different and
         # weaker kind of silence than "looked for and not seen".
-        "recorded_classes": list(PERSISTED_CLASSES),
+        "recorded_classes": _recorded_classes(recorded_classes),
         "retention": _retention_view(store, requested_days),
     }
 
@@ -194,6 +227,7 @@ def build_observations(
     *,
     object_class: str | None = None,
     requested_retention_days: float | None = None,
+    recorded_classes=None,
 ) -> dict:
     """Every observation the store will still serve, newest first.
 
@@ -211,7 +245,7 @@ def build_observations(
     # bottom of a scroll.
     observations.sort(key=lambda o: o.observed_at, reverse=True)
 
-    payload = _envelope(store, requested_retention_days)
+    payload = _envelope(store, requested_retention_days, recorded_classes)
     payload["object_class"] = object_class
     payload["observation_count"] = len(observations)
     payload["observations"] = [_observation_view(o) for o in observations]
@@ -223,6 +257,7 @@ def build_last_seen(
     object_class: str,
     *,
     requested_retention_days: float | None = None,
+    recorded_classes=None,
 ) -> dict:
     """When a category was last in view, or an honest silence.
 
@@ -238,13 +273,14 @@ def build_last_seen(
     """
     observation = store.last_seen(object_class)
 
-    payload = _envelope(store, requested_retention_days)
+    payload = _envelope(store, requested_retention_days, recorded_classes)
     payload["object_class"] = object_class
-    # A class outside PERSISTED_CLASSES is never written by anything, so
-    # its absence carries no information at all. Widening that list is a
-    # decision about what the system is allowed to remember; reporting it
-    # is how a client can tell the two silences apart.
-    payload["recordable"] = bool(object_class in PERSISTED_CLASSES)
+    # A class this Tower never writes carries no information in its
+    # absence at all. Widening that list is a decision about what the
+    # system is allowed to remember AND about what it is able to read
+    # correctly; reporting it is how a client tells the two silences
+    # apart.
+    payload["recordable"] = bool(object_class in payload["recorded_classes"])
     payload["observed"] = bool(observation is not None)
     payload["observation"] = (
         _observation_view(observation) if observation is not None else None

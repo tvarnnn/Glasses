@@ -110,6 +110,21 @@ class Settings:
     # min(persisted, requested), so this is the promise and a reader can
     # only ever narrow it.
     observation_retention_days: float = 30.0
+    # What, if anything, may second-guess a detector label before a class
+    # the detector cannot be trusted to name is written.
+    #
+    # "none" is the default and is a measurement rather than caution.
+    # Reading the crops the shipped detector produced over the real
+    # corpus found a ceiling fan detected as `airplane` at 0.99 and a
+    # laptop keyboard as `remote` at 0.87, so a Tower with nothing to
+    # check those labels records neither -- which is exactly the
+    # behaviour that was physically validated.
+    #
+    # A NAME rather than a boolean, because the answer will eventually be
+    # a model identifier and a boolean cannot become one. It is handed to
+    # the producer's argv AND used by the read routes to say which
+    # classes this Tower records, so the two cannot disagree about it.
+    observation_verifier: str = "none"
     # Keyframes between mid-walk rebuilds in the attached builder.
     #
     # NOT the script's own default, which is 0 -- "build once, at the
@@ -135,6 +150,9 @@ def get_settings() -> Settings:
         observation_device=_device(os.environ.get("TOWER_OBSERVATION_DEVICE")),
         observation_retention_days=_non_negative_float(
             os.environ.get("TOWER_OBSERVATION_RETENTION_DAYS"), default=30.0
+        ),
+        observation_verifier=(
+            _optional_path(os.environ.get("TOWER_OBSERVATION_VERIFIER")) or "none"
         ),
         world_autobuild=os.environ.get("TOWER_WORLD_AUTOBUILD", "true").lower()
         in ("1", "true", "yes"),

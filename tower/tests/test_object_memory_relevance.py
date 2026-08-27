@@ -1,122 +1,238 @@
+"""Which detections may be remembered, and which may not, and why.
+
+The policy these test used to describe was a two-name whitelist and a
+30-second resample window. Both were replaced by measurement over all
+18,821 real frames -- see `tower/object_memory/classes.py` for the
+per-class evidence and `sightings.py` for what replaced the window.
+
+The tests that mattered most in the old file survive here unchanged in
+substance, because the properties they protect did not change: `person`
+is never written, a class outside the policy is never written, and the
+class check runs before the score check.
+"""
+
+import pytest
+
+from tower.object_memory.classes import (
+    CLASS_EVIDENCE,
+    CONTEXT,
+    EXCLUDED_CLASSES,
+    IGNORED,
+    PERSISTABLE_CLASSES,
+    REMEMBERED,
+    VERIFY,
+    classes_in,
+    tier_of,
+)
 from tower.object_memory.relevance import (
-    PERSISTED_CLASSES,
+    ALREADY_RECORDED,
+    BELOW_MIN_SCORE,
+    CONTEXT_ONLY,
+    EXCLUDED,
+    NOT_WHITELISTED,
+    RECORD,
+    TOO_BRIEF,
+    UNVERIFIED,
     RelevanceFilter,
     RelevancePolicy,
+    recordable_classes,
 )
-from tower.object_memory.records import Confidence
+from tower.object_memory.sightings import Look, Sighting
 
 
-def _filter(**overrides) -> RelevanceFilter:
-    # These cases predate the class policy and are about the SCORE and
-    # RESAMPLE rules, so they name their own allowed classes rather than
-    # being rewritten around the whitelist. They must not be the reason
-    # the default whitelist stays wide.
-    defaults = {"allowed_classes": ("keys", "backpack", "item")}
-    defaults.update(overrides)
-    return RelevanceFilter(RelevancePolicy(**defaults))
+def _filter(**kwargs):
+    return RelevanceFilter(RelevancePolicy(**kwargs))
 
 
-def test_detection_below_min_score_is_not_recorded():
-    relevance = _filter(min_score=0.5)
-
-    assert relevance.should_record("keys", score=0.49, now=100.0) is False
+def _look(score=0.9, at=100.0):
+    return Look(score=score, box=(0.1, 0.1, 0.4, 0.4), at=at, frame_seq=1)
 
 
-def test_first_confident_sighting_of_a_class_is_recorded():
-    relevance = _filter(min_score=0.5)
-
-    assert relevance.should_record("keys", score=0.80, now=100.0) is True
-
-
-def test_repeat_sighting_within_resample_window_is_suppressed():
-    relevance = _filter(min_score=0.5, resample_seconds=30.0)
-    relevance.note_recorded("keys", now=100.0)
-
-    assert relevance.should_record("keys", score=0.99, now=120.0) is False
+def _sighting(object_class="laptop", *, score=0.9, frames=5, verdict=None):
+    look = _look(score)
+    sighting = Sighting(
+        object_class=object_class, first=look, best=look, last=look
+    )
+    sighting.frame_count = frames
+    sighting.verdict = verdict
+    return sighting
 
 
-def test_repeat_sighting_after_resample_window_is_recorded_again():
-    relevance = _filter(min_score=0.5, resample_seconds=30.0)
-    relevance.note_recorded("keys", now=100.0)
-
-    assert relevance.should_record("keys", score=0.80, now=131.0) is True
+# -- the privacy gate, which is the one that may never move ------------
 
 
-def test_suppression_is_per_class_not_global():
-    relevance = _filter(min_score=0.5, resample_seconds=30.0)
-    relevance.note_recorded("keys", now=100.0)
+class TestExclusion:
+    def test_person_is_refused_however_confident_the_detector_is(self):
+        assert _filter().decide("person", 0.999) == EXCLUDED
 
-    assert relevance.should_record("backpack", score=0.80, now=101.0) is True
+    def test_the_exclusion_is_checked_before_everything_else(self):
+        """Order, not just outcome.
 
+        An excluded class refused for being off the whitelist would be
+        counted under the wrong reason, and a reader of the report would
+        see a policy decision where a privacy decision was made.
+        """
+        verdict = _filter(min_score=0.99, allowed_classes=()).decide("person", 0.1)
 
-def test_repeat_sighting_exactly_at_resample_boundary_is_recorded():
-    # elapsed == resample_seconds is treated as due, not suppressed --
-    # pins the >= in should_record against an off-by-boundary flip.
-    relevance = _filter(min_score=0.5, resample_seconds=30.0)
-    relevance.note_recorded("keys", now=100.0)
+        assert verdict == EXCLUDED
 
-    assert relevance.should_record("keys", score=0.80, now=130.0) is True
+    def test_person_is_not_in_any_tier(self):
+        for tier in (REMEMBERED, VERIFY, CONTEXT):
+            assert "person" not in classes_in(tier)
 
+    def test_person_can_never_be_persisted_by_any_configuration(self):
+        assert "person" not in PERSISTABLE_CLASSES
+        assert "person" not in recordable_classes(True)
+        assert "person" not in recordable_classes(False)
 
-def test_default_min_score_means_persisted_confidence_is_never_low():
-    # The default min_score (0.5) is exactly equal to LOW_CONFIDENCE_MAX (0.5).
-    # This means every detection that passes this filter buckets to MEDIUM or HIGH.
-    # Confidence.LOW can never appear on a persisted record using the default policy.
-    # This coupling test pins both halves: the filter comparison is score < min_score,
-    # so 0.5 is accepted; and Confidence.from_score(0.5) is MEDIUM, not LOW.
-    relevance = _filter()  # default min_score=0.5
+    def test_a_verifier_cannot_widen_the_policy(self):
+        """The tripwire the whole tier design exists to arm.
 
-    assert relevance.should_record("item", score=0.5, now=100.0) is True
-    assert Confidence.from_score(0.5) is Confidence.MEDIUM
-
-
-# --- The class whitelist: what this slice will persist, and why ---
-
-
-def test_person_is_never_recorded_however_confident_the_detector_is():
-    # The unresolved ruling about persisting a record per detected
-    # bystander is not settled by anything here, and this slice must not
-    # depend on it being settled. Excluding `person` is what makes that
-    # true. See PERSISTED_CLASSES for the reasoning.
-    relevance = RelevanceFilter(RelevancePolicy())
-
-    assert relevance.should_record("person", score=0.99, now=100.0) is False
+        A verifier is consulted at gate 4, for classes gates 1-3 have
+        already admitted. A verdict agreeing enthusiastically about
+        `person` -- or about any class the tables never allowed -- must
+        change nothing.
+        """
+        agreed = {"agrees": True, "label": "person", "model": "hostile"}
+        for object_class in ("person", "car", "banana"):
+            sighting = _sighting(object_class, verdict=agreed)
+            assert _filter().decide_sighting(sighting) != RECORD
 
 
-def test_the_default_whitelist_is_the_two_measured_reliable_classes():
-    assert PERSISTED_CLASSES == ("laptop", "cell phone")
+# -- the tier gate -----------------------------------------------------
 
 
-def test_the_whitelisted_classes_are_recorded():
-    relevance = RelevanceFilter(RelevancePolicy())
+class TestTiers:
+    def test_the_measured_reliable_classes_are_remembered_outright(self):
+        assert classes_in(REMEMBERED) == ("laptop", "cell phone")
 
-    assert relevance.should_record("laptop", score=0.81, now=100.0) is True
-    assert relevance.should_record("cell phone", score=0.84, now=100.0) is True
+    def test_a_context_class_is_refused_with_its_own_reason(self):
+        """"Detected reliably and not worth a memory" is not "unknown".
+
+        `bed` was correct in 20 of 24 inspected crops. Reporting it as
+        off-the-whitelist would hide that this is a product decision --
+        nobody looks for their bed -- rather than a detector limitation.
+        """
+        assert _filter().decide("bed", 0.95) == CONTEXT_ONLY
+
+    def test_a_class_with_no_evidence_is_refused(self):
+        assert _filter().decide("giraffe", 0.99) == NOT_WHITELISTED
+
+    def test_the_ceiling_fan_classes_are_ignored(self):
+        """`airplane` at 0.99 and `scissors` at 0.93 were the same fan.
+
+        `scissors` stays in the verify tier because scissors are a real
+        thing to look for; `airplane` does not, because an aeroplane
+        indoors is only ever a mistake.
+        """
+        assert tier_of("airplane") == IGNORED
+        assert _filter().decide("airplane", 0.99) == NOT_WHITELISTED
+
+    def test_the_class_check_runs_before_the_score_check(self):
+        assert _filter(min_score=0.99).decide("giraffe", 0.1) == NOT_WHITELISTED
+
+    def test_a_weak_detection_of_an_allowed_class_is_refused_for_its_score(self):
+        assert _filter().decide("laptop", 0.2) == BELOW_MIN_SCORE
+
+    @pytest.mark.parametrize("object_class", classes_in(REMEMBERED))
+    def test_every_remembered_class_passes_the_detection_gates(self, object_class):
+        assert _filter().decide(object_class, 0.9) == RECORD
 
 
-def test_a_class_outside_the_whitelist_is_not_recorded():
-    # `dining table` appears once in 9,199 real frames and `couch` sits
-    # at 0.496 -- near-absent or near-noise, either way not memory.
-    relevance = RelevanceFilter(RelevancePolicy())
-
-    assert relevance.should_record("dining table", score=0.95, now=100.0) is False
-    assert relevance.should_record("couch", score=0.95, now=100.0) is False
+# -- the maturity and verification gates -------------------------------
 
 
-def test_the_class_check_runs_before_the_score_and_resample_checks():
-    # An excluded class must not be able to reach note_recorded and take
-    # up a slot in the resample table.
-    relevance = RelevanceFilter(RelevancePolicy())
+class TestSightingGate:
+    def test_a_sighting_too_short_to_be_real_is_not_written(self):
+        assert _filter().decide_sighting(_sighting(frames=2)) == TOO_BRIEF
 
-    assert relevance.decide("person", score=0.99, now=100.0) == "not-whitelisted"
+    def test_three_frames_is_enough(self):
+        assert _filter().decide_sighting(_sighting(frames=3)) == RECORD
+
+    def test_a_verify_class_with_no_verdict_is_refused(self):
+        assert _filter().decide_sighting(_sighting("remote")) == UNVERIFIED
+
+    def test_a_verify_class_a_verifier_disagreed_with_is_refused(self):
+        sighting = _sighting("remote", verdict={"agrees": False, "model": "x"})
+
+        assert _filter().decide_sighting(sighting) == UNVERIFIED
+
+    def test_a_verify_class_a_verifier_agreed_with_is_written(self):
+        sighting = _sighting("remote", verdict={"agrees": True, "model": "x"})
+
+        assert _filter().decide_sighting(sighting) == RECORD
+
+    def test_a_remembered_class_needs_no_verdict(self):
+        assert _filter().decide_sighting(_sighting("laptop")) == RECORD
+
+    def test_a_sighting_already_on_disk_says_so_rather_than_being_refused(self):
+        sighting = _sighting()
+        sighting.recorded = True
+
+        assert _filter().decide_sighting(sighting) == ALREADY_RECORDED
+
+    def test_the_gate_reads_the_best_look_not_the_first(self):
+        """A sighting that started weak and got strong is worth writing.
+
+        The first look is provenance; the best look is the evidence for
+        the claim the record makes.
+        """
+        weak = _look(0.2, at=100.0)
+        strong = _look(0.9, at=101.0)
+        sighting = Sighting(object_class="laptop", first=weak, best=strong, last=strong)
+        sighting.frame_count = 5
+
+        assert _filter().decide_sighting(sighting) == RECORD
 
 
-def test_decide_names_the_reason_a_detection_was_dropped():
-    # The producer reports these counts, which is the only way the
-    # filter's real behaviour on real footage becomes measurable.
-    relevance = _filter(min_score=0.5, resample_seconds=30.0)
+# -- what the wire is told ---------------------------------------------
 
-    assert relevance.decide("keys", score=0.80, now=100.0) == "record"
-    assert relevance.decide("keys", score=0.10, now=100.0) == "below-min-score"
-    relevance.note_recorded("keys", now=100.0)
-    assert relevance.decide("keys", score=0.80, now=110.0) == "resampled"
+
+class TestRecordableClasses:
+    def test_without_a_verifier_the_answer_is_what_shipped(self):
+        assert recordable_classes(False) == ("laptop", "cell phone")
+
+    def test_the_order_the_shipped_client_was_written_against_is_preserved(self):
+        """`recorded_classes` reaches an iOS decoder that already exists.
+
+        Sorting this list alphabetically would reorder it for no reason
+        but tidiness.
+        """
+        assert list(recordable_classes(False)) == ["laptop", "cell phone"]
+
+    def test_a_verifier_widens_it_and_only_to_the_verify_tier(self):
+        widened = recordable_classes(True)
+
+        assert set(widened) == set(classes_in(REMEMBERED)) | set(classes_in(VERIFY))
+        assert not set(widened) & set(classes_in(CONTEXT))
+
+    def test_the_store_bound_is_never_narrower_than_what_may_be_written(self):
+        """`PERSISTABLE_CLASSES` is the outer bound the store enforces.
+
+        A class the producer may write that the store would reject is a
+        cartridge that fails at the last step, loudly, in the field.
+        """
+        assert set(recordable_classes(True)) <= set(PERSISTABLE_CLASSES)
+
+
+# -- the evidence table itself -----------------------------------------
+
+
+class TestClassEvidence:
+    def test_every_entry_carries_the_count_behind_its_tier(self):
+        for name, evidence in CLASS_EVIDENCE.items():
+            assert evidence.correct <= evidence.inspected, name
+            assert evidence.note.strip(), name
+
+    def test_an_uninspected_class_reports_unknown_precision_not_zero(self):
+        """0.0 would read as "always wrong", which is a much stronger claim."""
+        assert CLASS_EVIDENCE["tv"].precision is None
+
+    def test_the_classes_that_were_all_wrong_are_not_remembered_outright(self):
+        for name, evidence in CLASS_EVIDENCE.items():
+            if evidence.inspected and evidence.correct == 0:
+                assert evidence.tier != REMEMBERED, name
+
+    def test_the_excluded_set_is_not_silently_empty(self):
+        """A guard that guards nothing passes for the wrong reason."""
+        assert EXCLUDED_CLASSES

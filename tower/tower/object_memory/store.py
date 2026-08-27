@@ -117,37 +117,56 @@ class ObservationStore:
             with self._path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(observation.to_json_dict()) + "\n")
 
-    def update_best_score(
-        self, object_class: str, observed_at: float, best_score: float
+    def update_sighting(
+        self,
+        object_class: str,
+        observed_at: float,
+        *,
+        best_score: float | None = None,
+        last_seen_at: float | None = None,
+        frame_count: int | None = None,
+        best_frame_seq: int | None = None,
+        best_relpath: str | None = None,
+        best_bounding_box=None,
+        verification: dict | None = None,
     ) -> bool:
-        """Raise the best score recorded against an existing sighting.
+        """Fold what the sighting has since become into the record on disk.
 
-        The producer writes a record the moment a class comes into view,
-        so a killed session loses nothing and observed_at keeps meaning
-        "when it came into view". A stronger look at the SAME sighting,
-        seconds later inside the resample window, is folded back into
-        that record here rather than becoming a second one.
+        The producer writes a record the moment a sighting matures, so a
+        killed session loses nothing and `observed_at` keeps meaning "when
+        it came into view". Everything a sighting only learns LATER --
+        that it lasted 4.4 seconds, that the strongest look was frame
+        3,410 rather than frame 3,398, that something agreed with the
+        label -- is folded back into that record here rather than
+        becoming a second one.
 
-        `confidence` moves with it, in the same rewrite. That field is
-        the INTERPRETATION a consumer reads, and the claim a record makes
-        is "this category was in view" -- the strength of the evidence for
-        that claim is the best look during the sighting, not the first
-        one. A record left saying "medium" about a laptop the detector
-        went on to see at 0.97 under-reports what the system knows. Both
-        raw scores stay exactly as written, so the record remains
-        auditable back to the sighting that created it.
+        `confidence` moves with `best_score`, in the same rewrite. That
+        field is the INTERPRETATION a consumer reads, and the claim a
+        record makes is "this category was in view" -- the strength of
+        the evidence for that claim is the best look during the sighting,
+        not the first one. A record left saying "medium" about a laptop
+        the detector went on to see at 0.97 under-reports what the system
+        knows. Both raw scores stay exactly as written, so the record
+        remains auditable back to the sighting that created it.
 
         This is not the tautology the resample review warned about: that
-        was raising min_score to MEDIUM_CONFIDENCE_MAX, which would make
-        every record HIGH by construction. Here the label follows
+        was raising `min_score` to MEDIUM_CONFIDENCE_MAX, which would
+        make every record HIGH by construction. Here the label follows
         evidence actually observed, so a sighting the detector never saw
         clearly keeps its honest label.
 
-        Returns whether anything changed; a score no better than the one
-        already stored is not written. This makes the store no longer
-        purely append-only: an upgrade is an O(n) rewrite, negligible at
-        the size this file is expected to stay and already named in the
-        class docstring as the trigger to move to SQLite.
+        MONOTONIC WHERE MONOTONICITY IS MEANINGFUL. `best_score` is never
+        revised downwards; `frame_count` and `last_seen_at` only grow. A
+        second producer against the same store cannot shrink a sighting
+        somebody else observed more of.
+
+        Returns whether anything changed; an update that would change
+        nothing is not written. This makes the store no longer purely
+        append-only: an update is an O(n) rewrite, negligible at the size
+        this file is expected to stay and already named in the class
+        docstring as the trigger to move to SQLite. The producer keeps
+        the rate down by updating on a better score, on a slow tick, and
+        at the sighting's end -- never per frame.
         """
         with self._lock:
             raw_records, _ = self._read_raw_records()
@@ -157,15 +176,16 @@ class ObservationStore:
                     continue
                 if raw.get("observed_at") != observed_at:
                     continue
-                current = raw.get("best_score")
-                if self._is_number(current) and current >= best_score:
-                    continue
-                raw["best_score"] = best_score
-                # The second of the two places confidence is derived.
-                # The first is the engine's initial write, where the best
-                # look IS the first look; both are pinned by tests.
-                raw["confidence"] = Confidence.from_score(best_score).value
-                changed = True
+                changed |= self._apply_update(
+                    raw,
+                    best_score=best_score,
+                    last_seen_at=last_seen_at,
+                    frame_count=frame_count,
+                    best_frame_seq=best_frame_seq,
+                    best_relpath=best_relpath,
+                    best_bounding_box=best_bounding_box,
+                    verification=verification,
+                )
             if changed:
                 # Raw dicts, like every other rewrite here, so reserved
                 # and future keys survive. Truly corrupt lines do not:
@@ -173,6 +193,67 @@ class ObservationStore:
                 # already dropped them.
                 self._rewrite_locked(raw_records)
             return changed
+
+    def _apply_update(
+        self,
+        raw: dict,
+        *,
+        best_score,
+        last_seen_at,
+        frame_count,
+        best_frame_seq,
+        best_relpath,
+        best_bounding_box,
+        verification,
+    ) -> bool:
+        changed = False
+        if best_score is not None:
+            current = raw.get("best_score")
+            if not (self._is_number(current) and current >= best_score):
+                raw["best_score"] = best_score
+                # The second of the two places confidence is derived.
+                # The first is the engine's initial write, where the best
+                # look IS the first look; both are pinned by tests.
+                raw["confidence"] = Confidence.from_score(best_score).value
+                changed = True
+                # The representative frame belongs to the best look, so
+                # it moves with it and only with it. Passing a new frame
+                # alongside a score that did not improve would leave the
+                # record pointing at a weaker view than the one its
+                # numbers describe.
+                if best_frame_seq is not None:
+                    raw["best_frame_seq"] = best_frame_seq
+                if best_relpath is not None:
+                    raw["best_relpath"] = best_relpath
+                if best_bounding_box is not None:
+                    raw["best_bounding_box"] = list(best_bounding_box)
+        if last_seen_at is not None:
+            current = raw.get("last_seen_at")
+            if not (self._is_number(current) and current >= last_seen_at):
+                raw["last_seen_at"] = last_seen_at
+                changed = True
+        if frame_count is not None:
+            current = raw.get("frame_count")
+            if not (self._is_number(current) and current >= frame_count):
+                raw["frame_count"] = frame_count
+                changed = True
+        if verification is not None and raw.get("verification") != verification:
+            raw["verification"] = verification
+            changed = True
+        return changed
+
+    def update_best_score(
+        self, object_class: str, observed_at: float, best_score: float
+    ) -> bool:
+        """The narrow form of `update_sighting`, kept because it is used.
+
+        Not a deprecation shim: "a stronger look at the same sighting"
+        is a real thing to say on its own, and every caller that only has
+        that to say should not have to pass six Nones to say it.
+        """
+        return self.update_sighting(
+            object_class, observed_at, best_score=best_score
+        )
 
     @staticmethod
     def _is_number(value) -> bool:

@@ -17,6 +17,7 @@ from tower.modules.container import ModuleContainer
 from tower.modules.experimental_cv import ExperimentalCVModule
 from tower.results import build_hub
 from tower.results.contracts import CARTRIDGE_OBJECT_MEMORY
+from tower.results.object_memory import recorded_classes_for
 from tower.routes import cartridges, geometry, health, observations, sessions, ws
 from tower.session import ConnectionTracker
 
@@ -143,6 +144,8 @@ def _observation_spec(settings: Settings, gate) -> WorkerSpec | None:
             settings.observation_device,
             "--retention-days",
             str(settings.observation_retention_days),
+            "--verifier",
+            settings.observation_verifier,
         ),
         cwd=str(TOWER_ROOT),
         name=OBJECT_MEMORY_WORKER,
@@ -169,6 +172,21 @@ def _build_capture_worker_supervisor(settings: Settings, gates: dict):
         if spec is not None
     ]
     return CaptureWorkerSupervisor(specs)
+
+
+def _recorded_classes(settings: Settings) -> tuple[str, ...]:
+    """The classes this Tower will actually write, as a tuple of strings.
+
+    Resolved through the result-channel ADAPTER, which is the one module
+    outside the cartridge allowed to import its policy. This file knows
+    the world builder as an argv and knows object memory the same way;
+    the only thing it takes from either is a tuple of strings.
+
+    The route reads the answer off `app.state`. Neither the route nor the
+    wiring point holds a policy, and neither can drift from what the
+    producer was told, because both come from one `Settings`.
+    """
+    return recorded_classes_for(settings.observation_verifier)
 
 
 def _open_capture_lookup(frame_observers):
@@ -311,6 +329,15 @@ def create_app() -> FastAPI:
     # observes and never deletes: the producer is its own script, and
     # deletion is a CLI a human types. Unset means that route answers 404.
     app.state.object_memory_root = settings.observation_root
+    # Which classes the READ routes may claim this Tower records. It
+    # depends on whether a verifier is configured, and it is derived from
+    # the same `Settings` object that builds the producer's argv -- so
+    # the surface that answers "have you ever looked for a remote?"
+    # cannot disagree with the process that would have written one.
+    #
+    # A tuple of strings, not an import: `tower/routes/observations.py`
+    # is not allowed to know what a verifier is.
+    app.state.object_memory_recorded_classes = _recorded_classes(settings)
     # Mutually referential, resolved by a lookup rather than by an
     # ordering trick: the worker spec's gate asks a session whether it is
     # active, and the session needs the supervisor the spec is registered

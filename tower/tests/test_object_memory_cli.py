@@ -145,9 +145,14 @@ class TestSessionDriver:
         assert report["observations_recorded"] == 0
         assert report["stored_observations"] == 0
 
-    def test_the_report_names_the_classes_it_is_willing_to_persist(
+    def test_the_report_names_the_classes_this_run_could_record(
         self, tmp_path, capture
     ):
+        """Renamed from `persisted_classes` because the answer became
+        configuration-dependent: a run with a verifier can record the
+        `verify` tier and a run without it cannot, and one key that meant
+        both would be a key that meant neither.
+        """
         result = _run(
             "object_memory_session.py",
             "--frames",
@@ -161,7 +166,7 @@ class TestSessionDriver:
         )
 
         report = json.loads(result.stdout)
-        assert report["persisted_classes"] == ["laptop", "cell phone"]
+        assert report["recordable_classes"] == ["laptop", "cell phone"]
 
     def test_there_is_no_flag_that_widens_the_whitelist(self):
         # Re-admitting `person` must be an edit that meets the comment on
