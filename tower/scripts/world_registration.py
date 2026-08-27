@@ -843,7 +843,139 @@ def _ratio(value: float) -> float:
 # -- composition -----------------------------------------------------------
 
 
+# How far a loop may fail to close before the cluster containing it is
+# refused.
+#
+# Every clause in `admit()` judges ONE pair from that pair's own evidence.
+# None can see an error that only appears going round a loop, which is
+# the failure the research note calls the dangerous one: a wrong Sim3
+# fits well and reads as a slightly odd floor plan rather than as an
+# error.
+#
+# Set from evidence, like the other thresholds here. The only real cycle
+# in the corpus -- (12,16), (12,19), (16,19) on capture 2e6cffa2 --
+# closes to 5.899 degrees and a 1.06x scale ratio, and every one of those
+# three edges passed reciprocity individually. The documented broken
+# cases are wrong rotations of 31.9 to 166.0 degrees and a scale 3.2x
+# out. These bars sit between: roughly 3x the measured honest residual
+# and comfortably below every documented failure.
+#
+# Deliberately looser than the single-edge bars (15 deg, 10% scale),
+# because a residual accumulates over a whole path while those judge one
+# hop.
+MAX_CYCLE_ROTATION_DEG = 20.0
+MAX_CYCLE_SCALE_RATIO = 2.0
+
+
+def cycle_refusal_for(residuals, thresholds=None) -> str | None:
+    """The reason a cluster's loops disqualify it, or None.
+
+    Refuses on the WHOLE cluster rather than on the closing edge. The
+    closure is not in the spanning tree, so dropping it would change no
+    placement and leave the bad edge in place. A cycle proves an
+    inconsistency exists without saying which edge carries it, and a
+    cluster known to contain a false merge must not be presented as one
+    space -- that is the failure mode the registration research calls the
+    dangerous one, because it reads as a slightly odd floor plan.
+    """
+    rotation_bar = MAX_CYCLE_ROTATION_DEG
+    scale_bar = MAX_CYCLE_SCALE_RATIO
+    if thresholds is not None:
+        rotation_bar = getattr(thresholds, "max_cycle_rotation_deg", rotation_bar)
+        scale_bar = getattr(thresholds, "max_cycle_scale_ratio", scale_bar)
+    for residual in residuals:
+        if (
+            residual["rotation_deg"] > rotation_bar
+            or residual["scale_ratio"] > scale_bar
+        ):
+            return (
+                f"the loop through {tuple(residual['edge'])} does not "
+                f"close: composing round it disagrees with the direct "
+                f"estimate by {residual['rotation_deg']:.1f} degrees and "
+                f"{residual['scale_ratio']:.2f}x in scale. One of this "
+                "cluster's edges is wrong and the cycle cannot say which, "
+                "so the whole cluster is refused rather than drawn with a "
+                "fold in it"
+            )
+    return None
+
+
+def cycle_residuals(edges, placements, tree_edges=()) -> list:
+    """How badly each closing edge disagrees with the path around the loop.
+
+    `compose_tree` places segments along a SPANNING TREE, so every
+    admitted edge it did not need is a cycle closure -- an independent
+    second opinion about a relationship the tree already asserts.
+
+    For a closure a->b, the placements say where both segments sit, so
+    `placement[b] . placement[a]^-1` is the relationship the tree claims.
+    The edge's own fit says something too. The difference between them is
+    evidence no single pair could produce.
+
+    Tree edges are named explicitly rather than inferred from a
+    near-zero residual: a PERFECTLY consistent closure is the best
+    possible outcome and would be indistinguishable from a tree edge,
+    so inferring would silently discard exactly the evidence worth
+    having. Edges touching an unplaced segment are skipped because there
+    is nothing to compose against, and inventing a residual would be
+    fiction.
+
+    Scale is reported as a ratio >= 1 whichever way it is wrong: 0.31x and
+    3.2x are the same disagreement, and a bar on the raw ratio would catch
+    one and miss the other.
+    """
+    tree = {tuple(edge) for edge in tree_edges}
+    residuals = []
+    for source, target, scale, rotation, translation in edges:
+        if (source, target) in tree:
+            # The tree was BUILT from this edge. Comparing it against
+            # placements derived from it agrees trivially, and counting
+            # that as a passing check would overstate the evidence.
+            continue
+        if source not in placements or target not in placements:
+            continue
+        edge = Sim3(
+            float(scale),
+            np.asarray(rotation, dtype=np.float64),
+            np.asarray(translation, dtype=np.float64),
+        )
+        claimed = placements[target].compose(_invert_sim3(placements[source]))
+        difference = edge.compose(_invert_sim3(claimed))
+
+        ratio = float(difference.scale)
+        if ratio <= 0:
+            ratio = float("inf")
+        elif ratio < 1.0:
+            ratio = 1.0 / ratio
+        cosine = (float(np.trace(difference.rotation)) - 1.0) / 2.0
+        degrees = math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+        offset = float(np.linalg.norm(difference.translation))
+
+        residuals.append({
+            "edge": (source, target),
+            "scale_ratio": ratio,
+            "rotation_deg": degrees,
+            "translation": offset,
+        })
+    return residuals
+
+
+def _invert_sim3(transform):
+    rotation = np.asarray(transform.rotation, dtype=np.float64).T
+    scale = 1.0 / float(transform.scale)
+    return Sim3(
+        scale,
+        rotation,
+        -scale * (rotation @ np.asarray(transform.translation, dtype=np.float64)),
+    )
+
+
 def compose_tree(edges, reference: int) -> dict:
+    """Placements only. See compose_tree_with_edges for the edges used."""
+    return compose_tree_with_edges(edges, reference)[0]
+
+
+def compose_tree_with_edges(edges, reference: int):
     """Place every segment reachable from `reference`, by composing edges.
 
     Breadth-first, so each segment is placed along the shortest path of
@@ -865,25 +997,32 @@ def compose_tree(edges, reference: int) -> dict:
     for source, target, scale, rotation, translation in edges:
         transform = Sim3(float(scale), np.asarray(rotation, dtype=np.float64),
                          np.asarray(translation, dtype=np.float64))
-        adjacency.setdefault(source, []).append((target, transform))
+        adjacency.setdefault(source, []).append(
+            (target, transform, (source, target))
+        )
         inverse_rotation = transform.rotation.T
         inverse_scale = 1.0 / transform.scale
         adjacency.setdefault(target, []).append((
             source,
             Sim3(inverse_scale, inverse_rotation,
                  -inverse_scale * (inverse_rotation @ transform.translation)),
+            # The edge is named by its ORIGINAL orientation, so the tree
+            # reports the same identity whichever way it traversed it.
+            (source, target),
         ))
 
     placements = {reference: IDENTITY}
+    used_edges = set()
     queue = [reference]
     while queue:
         current = queue.pop(0)
-        for neighbour, transform in adjacency.get(current, ()):
+        for neighbour, transform, edge in adjacency.get(current, ()):
             if neighbour in placements:
                 continue
             placements[neighbour] = placements[current].compose(transform)
+            used_edges.add(edge)
             queue.append(neighbour)
-    return placements
+    return placements, used_edges
 
 
 # -- reading a world -------------------------------------------------------
@@ -1185,7 +1324,24 @@ def register(store: WorldStore, world_id: str, session_id: str,
                 )
 
     reference = _pick_reference(admitted, points_by_segment)
-    placements = compose_tree(admitted, reference) if reference is not None else {}
+    if reference is None:
+        placements, tree_edges = {}, set()
+    else:
+        placements, tree_edges = compose_tree_with_edges(admitted, reference)
+
+    # The first independent check this module can run. Every clause in
+    # admit() judges one pair from that pair's own evidence; a loop is the
+    # only thing that can disagree with a relationship the tree already
+    # asserts.
+    residuals = cycle_residuals(admitted, placements, tree_edges)
+    cycle_refusal = cycle_refusal_for(residuals)
+    if cycle_refusal is not None:
+        # Refusing the WHOLE component, not the closing edge. The closure
+        # is not in the tree, so dropping it would change nothing and
+        # leave the bad edge in place. A cycle proves an inconsistency
+        # exists without localising it, and a cluster known to contain a
+        # false merge must not be presented as one space.
+        placements = {}
 
     rows = []
     for index in all_segments:
@@ -1205,6 +1361,20 @@ def register(store: WorldStore, world_id: str, session_id: str,
         ),
         "candidate_pairs": len(verdicts),
         "admitted_pairs": [[a, b] for a, b, *_ in admitted],
+        # Reported whether or not they refuse anything. A cluster whose
+        # loops close tightly is better evidence than one with no loops at
+        # all, and until now there was no way to tell those apart.
+        "cycles_checked": len(residuals),
+        "cycle_residuals": [
+            {
+                "edge": [r["edge"][0], r["edge"][1]],
+                "rotation_deg": r["rotation_deg"],
+                "scale_ratio": r["scale_ratio"],
+                "translation": r["translation"],
+            }
+            for r in residuals
+        ],
+        "cycle_refusal": cycle_refusal,
         "pairs": [_verdict_row(v) for v in verdicts],
         "segments": rows,
     }
