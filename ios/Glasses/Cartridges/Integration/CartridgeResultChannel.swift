@@ -72,6 +72,61 @@ struct TowerCartridgeOffer: Equatable, Sendable {
     }
 }
 
+/// A capability the Tower serves over **HTTP** rather than by subscription.
+///
+/// ## Why this is a separate type from `TowerCartridgeOffer`
+///
+/// They answer different questions and cannot be merged without losing one of
+/// them. A subscription offer says *"you may `result_subscribe` to this and
+/// results will be pushed at you"*; this says *"there is a route, here is where
+/// it starts, and here is the Tower's own reason it is not a subscription"*.
+/// The giveaway is `resultType`, which a fetched contract does not have and
+/// cannot be given a sensible default for — a `TowerCartridgeOffer` with an
+/// invented `resultType` would be subscribable-looking data about something
+/// that cannot be subscribed to.
+///
+/// `whyNotASubscription` is carried rather than dropped because it is the
+/// Tower explaining a design decision in its own words — for Document Memory,
+/// that document text is bulk and the result sender shares its send lock with
+/// the frame path. That is worth showing an operator verbatim rather than
+/// paraphrasing here, where it would rot.
+///
+/// **Not every HTTP contract appears here.** `world_builder.geometry/2026-08-25`
+/// and `object_memory.observations/2026-08-26` are the same shape and are
+/// declared nowhere — declaring them would mean moving their identifiers out of
+/// adapter modules into the Tower's `contracts.py`, and its `registry.py` must
+/// stay cartridge-blind so it cannot import an adapter. Those two lanes own the
+/// move. Until they make it, this app hard-codes those two identifiers, and
+/// **their absence from this list is not evidence they are unavailable.**
+struct TowerHTTPContractOffer: Equatable, Sendable {
+    /// The Tower's name for the cartridge, in the Tower's vocabulary.
+    let cartridge: String
+    /// Opaque. Compared for equality only — never parsed, never ordered.
+    let contract: String
+    /// Where the route set begins (`"/documents"`). A prefix, not a full URL:
+    /// the host comes from the connection, not from the declaration.
+    let entryRoute: String
+    let available: Bool
+    /// Prose, when `available` is false. Shown verbatim.
+    let unavailableReason: String?
+    /// The Tower's own reasoning for the transport choice. Operator-facing.
+    let whyNotASubscription: String?
+
+    init?(json: [String: Any]) {
+        guard
+            let cartridge = json["cartridge"] as? String,
+            let contract = json["contract"] as? String,
+            let entryRoute = json["entry_route"] as? String
+        else { return nil }
+        self.cartridge = cartridge
+        self.contract = contract
+        self.entryRoute = entryRoute
+        self.available = json["available"] as? Bool ?? false
+        self.unavailableReason = json["unavailable_reason"] as? String
+        self.whyNotASubscription = json["why_not_a_subscription"] as? String
+    }
+}
+
 /// The Tower's answer to `{"type":"cartridges"}`.
 ///
 /// `not_offered` is deliberately **not** decoded. The contract states it exists
@@ -80,13 +135,29 @@ struct TowerCartridgeOffer: Equatable, Sendable {
 /// this app: the Tower has declared no contract, so `CartridgeAvailability`
 /// resolves `.noContract`. Decoding it would create a second way to ask a
 /// question that already has one answer.
+///
+/// **That reasoning survived the unification, and is now trivially true:**
+/// `not_offered` is `[]` on the current Tower, and empty is a *claim* — every
+/// cartridge in that build with a wire contract now offers it. A cartridge
+/// belongs in `not_offered` only while it can say nothing at all; one that can
+/// say "I have observed nothing, and here is precisely why" belongs in
+/// `cartridges`, available or not.
 struct TowerCartridgeDeclaration: Equatable, Sendable {
     let envelopeContract: String?
     let offers: [TowerCartridgeOffer]
+    /// Capabilities served over HTTP. Separate from `offers` because the two
+    /// are reached by different code paths and confusing them is how a client
+    /// tries to `result_subscribe` to a document library.
+    let httpContracts: [TowerHTTPContractOffer]
 
-    init(envelopeContract: String?, offers: [TowerCartridgeOffer]) {
+    init(
+        envelopeContract: String?,
+        offers: [TowerCartridgeOffer],
+        httpContracts: [TowerHTTPContractOffer] = []
+    ) {
         self.envelopeContract = envelopeContract
         self.offers = offers
+        self.httpContracts = httpContracts
     }
 
     init(json: [String: Any]) {
@@ -102,10 +173,28 @@ struct TowerCartridgeDeclaration: Equatable, Sendable {
             if let offer = TowerCartridgeOffer(json: entry) { decoded.append(offer) }
         }
         self.offers = decoded
+
+        let rawHTTP = json["http_contracts"] as? [[String: Any]] ?? []
+        var decodedHTTP: [TowerHTTPContractOffer] = []
+        for entry in rawHTTP {
+            if let offer = TowerHTTPContractOffer(json: entry) { decodedHTTP.append(offer) }
+        }
+        self.httpContracts = decodedHTTP
     }
 
     func offer(forTowerCartridge name: String) -> TowerCartridgeOffer? {
         offers.first { $0.cartridge == name }
+    }
+
+    /// The HTTP contract the Tower declared for this cartridge, if any.
+    ///
+    /// Deliberately a **separate lookup** from `offer(forTowerCartridge:)`
+    /// rather than a fallback inside it. A caller wanting a subscription and a
+    /// caller wanting a route are asking different questions, and a single
+    /// method answering both would let a subscription path silently succeed on
+    /// a fetch-only capability.
+    func httpContract(forTowerCartridge name: String) -> TowerHTTPContractOffer? {
+        httpContracts.first { $0.cartridge == name }
     }
 }
 

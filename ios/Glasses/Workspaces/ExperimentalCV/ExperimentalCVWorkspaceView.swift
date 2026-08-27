@@ -11,47 +11,57 @@ import SwiftUI
 ///
 /// ## What this screen may and may not claim
 ///
-/// The Tower runs exactly one experiment, and it chose which one when it
-/// started. This app can read that experiment's answer — it arrives with every
-/// per-frame reply — and can do nothing else with it: there is no message to
-/// list the experiments, pick a different one, or start or stop the one that is
-/// running. The reply names the *number*, not the experiment, so this screen
-/// cannot even say which one produced it.
+/// It used to open by saying the Tower "runs exactly one experiment, and it
+/// chose which one when it started", that there was "no message to list the
+/// experiments, pick a different one, or start or stop the one that is
+/// running", and that "the reply names the *number*, not the experiment, so
+/// this screen cannot even say which one produced it".
 ///
-/// So the workspace shows two things that used to be one, and the split is the
-/// point:
+/// **Every one of those sentences is now false.** `cv_lab_status` lists the
+/// experiments; `cv_lab_start` selects and arms one, replacing whatever ran;
+/// pause, resume and stop are requests with legible refusals; and every
+/// `frame_result` carries a `cv_lab` block naming the experiment, the run and
+/// the provenance. So the copy is gone along with the limitation it described.
+/// What replaced it is not a promise — it is the Tower's own document, drawn
+/// field for field.
 ///
-/// 1. **The latest result**, from the frame channel, which is real and is drawn
-///    exactly as the Tower sent it — see `CVFrameReading`.
-/// 2. **The experiment list**, from the cartridge channel, which is empty and
-///    says why. Not a greyed-out list of plausible experiments: a greyed row
-///    still asserts that the thing exists.
+/// Two things this screen still refuses to do, and both are the Tower's
+/// position as much as this app's:
 ///
-/// Before this, only the second existed here, and the first was on the home
-/// screen — so someone opening the Experimental CV Lab was told the Tower could
-/// not run experiments while its answer sat on the previous screen.
+/// 1. **No better/worse verdict.** `baseline`, `higher_is_better` and
+///    `confidence` are `null` on every metric, always, because the Lab holds no
+///    reference run to compare against. The machinery that would have rendered
+///    a verdict is deleted rather than left dormant — see `CVMetric`.
+/// 2. **No annotated frame.** `artifact` is `null` in this contract with a
+///    stated reason: no redaction-state vocabulary is shared between the two
+///    sides and no artifact fetch contract exists on either. An experiment gets
+///    no privacy exemption for being a debug surface.
 ///
-/// Everything above is a description of a **Debug** build. This screen is not
-/// gated out of Release, and in Release there is no frame channel at all: the
-/// frame path is `#if DEBUG` and no frames are sent, so nothing arrives to
-/// draw. Four strings on this screen therefore exist in two versions — see the
-/// note above `headerSubtitle` — and the refusals are unchanged between them,
-/// because those are facts about the protocol rather than about the build.
+/// ## Debug and Release are genuinely different products here
+///
+/// The frame path is `#if DEBUG` (`ProjectManager`), so **a Release build has
+/// no camera, sends no frame, and receives no `frame_result`.** That predates
+/// this work and is not fixed by it. What this screen does about it:
+///
+/// - the read-only half is drawn in full, because it is fully reachable: the
+///   declaration, the subscription and the status document do not depend on
+///   frames;
+/// - no control that starts an experiment is drawn at all, because there is no
+///   `startCameraSession` in this configuration to feed the experiment it would
+///   arm — see `TowerExperimentalCVClient.canSendCommands`;
+/// - `.running` is never drawn as **live**, because live requires this build to
+///   be streaming and `source.receiving_frames` to be true, and the first half
+///   is permanently false here.
 ///
 /// ## No capture controls here, deliberately
 ///
-/// Home and World Builder carry the app's session controls; this workspace adds
-/// none. Two reasons, and the second is the important one:
-///
-/// 1. There is nothing for a session to feed. An experiment cannot run.
-/// 2. Every additional `startCameraSession()` call site is another place the
-///    "the app never starts the camera on its own" invariant has to be
-///    re-verified. That invariant is currently a *structural* property — one
-///    button per workspace that has one, no `.onAppear` anywhere — and it stays
-///    cheap to check by keeping the number of call sites small.
-///
-/// When the Tower can run an experiment, the control that starts one belongs
-/// here and will be labelled for what the Tower can then actually do.
+/// Home carries the app's session controls; this workspace adds none, and that
+/// is unchanged by gaining experiment controls. Starting an experiment is a
+/// request to the *Tower* about what to compute; it opens no camera, and
+/// `startCameraSession()` is not reachable from this file. The invariant that
+/// the app never starts the camera on its own remains structural — one button
+/// per workspace that has one, no `.onAppear` anywhere — and this workspace
+/// still has none.
 struct ExperimentalCVWorkspaceView: View {
     /// A value, not the connection. Reachability changes almost never, and
     /// `TowerReachabilityReader` — which supplies this — exists so a workspace
@@ -86,24 +96,36 @@ struct ExperimentalCVWorkspaceView: View {
             header
 
             // Above the experiment list, deliberately. This is the answer the
-            // Tower is actually producing; the panel below explains what cannot
-            // be asked of it. Showing the absence first and the substance second
-            // is how the old screen read as empty.
+            // Tower is actually producing; everything below it is about
+            // choosing what produces the next one.
             CVFrameReadingPanel(tower: tower, isTowerReachable: isTowerReachable)
 
             if let forcedPhase = lab.availability(isTowerReachable: isTowerReachable).forcedPhase {
                 CartridgeStatePanel(
                     title: "Experiments",
                     phase: forcedPhase,
-                    explanation: lab.unavailableExplanation(isTowerReachable: isTowerReachable),
-                    futureDescription: Self.futureDescription
+                    explanation: lab.unavailableExplanation(isTowerReachable: isTowerReachable)
                 )
             } else {
-                experimentPanel
+                labPanel
+                // Hidden only for `.unsupported`, which is this Tower saying it
+                // cannot run experiments at all — a catalog under that sentence
+                // would be a list of things that cannot be started.
+                //
+                // Shown for `.failed`, deliberately: **choosing another
+                // experiment is the recovery.** The Lab refuses a stop from
+                // `failed`, so a "try again" control would be refused on step
+                // one, and the list below is the thing that actually works.
+                if !isUnsupported {
+                    experimentPanel
+                }
             }
 
             if let failure = lab.lastRequestFailure {
                 FailureBanner(text: failure.message)
+            }
+            if let refusal = lab.lastRefusal {
+                CVRefusalBanner(refusal: refusal)
             }
         }
     }
@@ -123,73 +145,43 @@ struct ExperimentalCVWorkspaceView: View {
         .accessibilityElement(children: .combine)
     }
 
-    // MARK: The sentences that are only true in one configuration
+    // MARK: The one sentence that is still only true in one configuration
     //
-    // ## Why copy on this screen is compiled twice
+    // The four strings that used to be compiled twice are down to one, and the
+    // reduction is the measure of what changed. Three of them existed to
+    // describe a *protocol* limitation — no list, no request, no provenance —
+    // that turned out to differ between builds only in whether a result could
+    // arrive to be un-labelled. The protocol limitation is gone, so those three
+    // are gone.
     //
-    // The frame path is `#if DEBUG` (`ProjectManager`) and `TowerClient` does
-    // not declare `latestFrameResult` outside DEBUG, so a Release build sends
-    // the Tower nothing and receives no per-frame reply. This screen, however,
-    // is **not** DEBUG-gated — `ContentView`'s `.experimentalCV` arm is
-    // unconditional and `ProjectManager.startAutomaticConnections()` calls
-    // `connectIfIdle()` ungated — so a signed Release build against a reachable
-    // Tower renders it in full.
-    //
-    // In that build `CVFrameReadingPanel.nothingYet` correctly says there is
-    // nothing to show, while three other sentences on the same screen asserted
-    // that the app reads the running experiment's answer. One screen, saying
-    // both. Gating the workspace out of Release would be the wrong repair: the
-    // screen is fine and every refusal on it is still true — it is these
-    // sentences that were wrong. So each is compiled per configuration, exactly
-    // as `nothingYet` already is, and the third
-    // (`UnavailableExperimentalCVClient.reason`, which reaches
-    // `CartridgeStatePanel`) is fixed the same way where it lives.
-    //
-    // None of this is a claim about what a Release build *could* do. It is a
-    // statement about what this one does, which is what Rule 3 asks of a screen.
+    // This one remains because the difference it describes is real and
+    // structural: the frame path is `#if DEBUG`, so a Release build genuinely
+    // cannot feed an experiment. Gating the whole workspace out of Release would
+    // still be the wrong repair — the read-only half is honest and useful there,
+    // and it is exactly what the Tower versions the control vocabulary
+    // separately to support.
 
     #if DEBUG
     private static let headerSubtitle = """
-        A place to run vision experiments on the glasses feed and compare their \
-        measurements. The Tower is running one, chosen when it started, and \
-        this app can read its answer but not change it.
+        Vision experiments the Tower can run on the glasses feed. It lists what \
+        it has, arms the one you choose, and labels every figure with the run \
+        and the experiment that produced it.
         """
     #else
     private static let headerSubtitle = """
-        A place to run vision experiments on the glasses feed and compare their \
-        measurements. The Tower is running one, chosen when it started. This \
-        build sends it no frames, so there is no answer here to read — and \
-        there is no way to change which experiment runs.
+        Vision experiments the Tower can run on the glasses feed. This build has \
+        no camera, so it sends the Tower no frames and can read what the Lab is \
+        doing without asking it to do anything.
         """
     #endif
 
-    #if DEBUG
-    private static let futureDescription = """
-        When the Tower offers an agreement for this module, this workspace will \
-        list the experiments it declares, start one, and show its metrics, \
-        timings and annotated frames — each labelled as a measurement or a \
-        model estimate. What arrives with every frame today, above, is the \
-        running experiment's answer with none of that labelling behind it.
-        """
-    #else
-    private static let futureDescription = """
-        When the Tower offers an agreement for this module, this workspace will \
-        list the experiments it declares, start one, and show its metrics, \
-        timings and annotated frames — each labelled as a measurement or a \
-        model estimate. The running experiment's own answer arrives with every \
-        frame the Tower is sent, and this build sends none, so that is not on \
-        screen above either.
-        """
-    #endif
+    // MARK: The Lab itself
 
-    // MARK: The panel for a Tower that can actually run something
-
-    /// Unreachable today. Written now so the display rules for provenance and
-    /// baselines land with the data rather than after it.
+    /// Lifecycle, liveness, and the controls for the run that is loaded.
     @ViewBuilder
-    private var experimentPanel: some View {
+    private var labPanel: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionLabel("Experiments")
+            SectionLabel("The Lab")
 
             VStack(alignment: .leading, spacing: 12) {
                 switch lab.state {
@@ -197,47 +189,319 @@ struct ExperimentalCVWorkspaceView: View {
                     Text(reason)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
 
-                case .idle(let available):
-                    if available.isEmpty {
-                        // A connected Tower that declares nothing is a real and
-                        // different answer from a Tower that cannot be asked,
-                        // and it gets its own sentence rather than the shared
-                        // unavailable panel.
-                        Text("The Tower is connected and declares no experiments.")
+                case .idle:
+                    if isStillAsking {
+                        // A `cv_lab_status` is genuinely in flight, which is the
+                        // one condition under which a spinner is truthful.
+                        // Without this branch the moment between a socket coming
+                        // up and the first document arriving reads as "the Lab is
+                        // idle and declares nothing", which is a claim about the
+                        // Tower made before it has said anything.
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            Text("Asking the Tower what it can run…")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        Text("Nothing is armed. Choose an experiment below to start one.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(available) { experiment in
-                            experimentRow(experiment)
-                        }
                     }
 
                 case .starting(let experiment):
                     HStack(spacing: 10) {
+                        // The one honest spinner on this screen: something is
+                        // genuinely in flight.
                         ProgressView()
-                        Text("Starting \(experiment.name)…")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Arming \(experiment.name)…")
+                                .font(.subheadline)
+                            // Bounded, and unreportable. Said out loud because a
+                            // model download can take a minute and a half and a
+                            // screen that says nothing about it reads as stuck.
+                            Text(Self.armingCaveat)
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
 
                 case .running(let run):
-                    Label("\(run.experiment.name) · running", systemImage: "dot.radiowaves.left.and.right")
-                        .font(.headline)
+                    runHeader(run, isPaused: false)
                     CVRunSummaryView(run: run, isFinal: false)
+                    controls(for: run, isPaused: false)
+
+                case .paused(let run):
+                    runHeader(run, isPaused: true)
+                    // Not "the run ended". A paused run keeps the experiment
+                    // loaded — resuming a model-backed one costs nothing, while
+                    // a stopped one pays the load again — and it is still
+                    // counting: the metrics stand still while `framesRefused`
+                    // climbs with every frame that arrives.
+                    Text("Paused. The experiment is still loaded, so resuming costs nothing.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    CVRunSummaryView(run: run, isFinal: false)
+                    controls(for: run, isPaused: true)
 
                 case .completed(let run):
                     Label(run.experiment.name, systemImage: "checkmark.circle")
                         .font(.headline)
+                    // The Tower's word is `stopped`, and the distinction it is
+                    // making is worth keeping: a bench run does not complete, a
+                    // person ends it.
+                    Text("Stopped. These figures are final and stay until the next start.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     CVRunSummaryView(run: run, isFinal: true)
 
                 case .failed(let failure):
-                    Label("Experiment failed", systemImage: "exclamationmark.triangle.fill")
+                    Label("The last start failed", systemImage: "exclamationmark.triangle.fill")
                         .font(.headline)
                     Text(failure.message)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                    // No "Stop, then Start" recovery, and not for tidiness:
+                    // **the Lab refuses `cv_lab_stop` from `failed`**, so that
+                    // path is refused on step one. Another start is the
+                    // recovery, and choosing one below is how it is sent.
+                    Text(Self.failedRecovery)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                sourceRows
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 18))
+        }
+    }
+
+    /// Whether the Tower has said anything about the Lab yet.
+    ///
+    /// Three conditions rather than one, because a client that carries its own
+    /// catalog — the unavailable stand-in, and the fixtures in the test target —
+    /// has genuinely answered without ever holding a document. Only a state that
+    /// is idle, a catalog that is empty and a document that is absent together
+    /// mean "nothing has come back yet".
+    private var isStillAsking: Bool {
+        lab.status == nil && lab.availableExperiments.isEmpty
+    }
+
+    /// Whether this Tower says it cannot run experiments at all.
+    private var isUnsupported: Bool {
+        if case .unsupported = lab.state { return true }
+        return false
+    }
+
+    /// The run's name, and whether this build may call it live.
+    ///
+    /// > `.running` may be shown as LIVE only when this build is itself
+    /// > streaming **and** `source.receiving_frames` is true.
+    ///
+    /// Both halves, every time. `source` is **Tower-wide**, so it reads `true`
+    /// for a build with no camera whenever a second phone is attached — and
+    /// this phone's own bracket is the half that catches that. The other way
+    /// round, a phone streaming to a Lab that has seen nothing for five seconds
+    /// is not producing results either. Anything short of both is "armed",
+    /// which is a true statement about the Tower and no statement at all about
+    /// where the frames are.
+    @ViewBuilder
+    private func runHeader(_ run: CVExperimentRun, isPaused: Bool) -> some View {
+        let receiving = lab.source?.receivingFrames ?? false
+        let isLive = lab.state.isLive(
+            isStreaming: tower.isStreamingToTower,
+            isReceivingFrames: receiving
+        )
+        VStack(alignment: .leading, spacing: 4) {
+            Label(
+                isLive
+                    ? "\(run.experiment.name) · live"
+                    : (isPaused ? "\(run.experiment.name) · paused" : "\(run.experiment.name) · armed"),
+                systemImage: isLive ? "dot.radiowaves.left.and.right" : "pause.circle"
+            )
+            .font(.headline)
+
+            if !isPaused && !isLive {
+                Text(notLiveExplanation(isReceivingFrames: receiving))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            // Reported so that "the Lab is running" never reads as "somebody
+            // chose this". The Tower arms a startup default at boot, and a run
+            // nobody asked for looks identical to one somebody did without
+            // this line.
+            if run.origin == "startup_default" {
+                Text("The Tower armed this at startup. Nobody chose it from here.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// Which half of "live" is missing, said in the words that fit the build.
+    private func notLiveExplanation(isReceivingFrames: Bool) -> String {
+        #if DEBUG
+        if !tower.isStreamingToTower {
+            return isReceivingFrames
+                ? """
+                    Armed and processing, but the frames are not coming from this \
+                    phone — this session is not streaming, and another client is \
+                    feeding the Tower.
+                    """
+                : "Armed and waiting for a stream. Start a session to feed it."
+        }
+        return """
+            Armed, and the Tower has not seen a frame recently enough to call \
+            itself fed. Check that the glasses are streaming.
+            """
+        #else
+        return """
+            Armed on the Tower. This build has no camera, so none of the frames \
+            it is measuring are from this phone.
+            """
+        #endif
+    }
+
+    /// Pause, resume and stop — drawn only where a command can be sent.
+    ///
+    /// Each carries the run id it was drawn against, one layer down in the
+    /// client. That is what turns "this button was drawn against a run that has
+    /// since been replaced" into a `stale_run` refusal naming the current run,
+    /// instead of stopping somebody else's experiment.
+    @ViewBuilder
+    private func controls(for run: CVExperimentRun, isPaused: Bool) -> some View {
+        if lab.canSendCommands {
+            HStack(spacing: 12) {
+                if isPaused {
+                    Button("Resume") { lab.resume() }
+                } else {
+                    Button("Pause") { lab.pause() }
+                }
+                Button("Stop") { lab.stop() }
+            }
+            .buttonStyle(.bordered)
+            .font(.subheadline)
+            // Stop keeps the figures; switching does not. Said here because it
+            // is the only place the difference is actionable.
+            Text("Stop keeps this run's figures. Starting another experiment replaces them.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// What the Tower says about whether anything is feeding it.
+    ///
+    /// Drawn under every state, because "nothing is arriving" is the answer to
+    /// the question this screen is most often opened to ask, and it is a
+    /// property of the Tower rather than of any run.
+    @ViewBuilder
+    private var sourceRows: some View {
+        if let source = lab.source {
+            Divider()
+            CVFigureRow(
+                caption: "Frames reaching the Tower",
+                value: source.receivingFrames ? "yes" : "no"
+            )
+            // One Lab, shared by every connection. `clients_connected` is
+            // reported so that "somebody else may be driving this" is at least
+            // visible: last start wins, and there is no ownership model.
+            if let clients = source.clientsConnected, clients > 1 {
+                Text("\(clients) clients are connected to this Tower. The Lab has one slot, and the last start wins.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let diagnosis = lab.state.diagnosis(source: source) {
+                Text(Self.explain(diagnosis))
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// The Tower's own diagnosis table, in sentences.
+    private static func explain(_ diagnosis: CVLabDiagnosis) -> String {
+        switch diagnosis {
+        case .nothingArriving:
+            return "No frames have reached the Tower at all, so the stream is not running."
+        case .arrivingButUndecodable(let count):
+            return """
+                \(count) frame\(count == 1 ? "" : "s") reached the Tower and could not be \
+                decoded, so they never reached the Lab. That is a sender problem, not a \
+                Lab one.
+                """
+        case .arrivingButRefused:
+            return "Frames are arriving and the Lab is refusing them. Its state above says why."
+        case .someFramesFailed(let count):
+            return """
+                The experiment raised on \(count) frame\(count == 1 ? "" : "s"). It is still \
+                armed, and those frames produced nothing.
+                """
+        case .measuring:
+            return "Frames are arriving and being measured."
+        }
+    }
+
+    private static let armingCaveat = """
+        Loading a model can take up to two minutes, and the Tower gives up after \
+        that. There is no progress to report — the download does not offer any.
+        """
+
+    private static let failedRecovery = """
+        Another start is the recovery. Do not stop first: the Lab refuses a stop \
+        from this state, so choosing an experiment below is what gets it going.
+        """
+
+    // MARK: The catalog
+
+    /// Every experiment the Tower declared, in the order it declared them.
+    ///
+    /// Read off the status document rather than off `.idle`, so the list does
+    /// not vanish while something is running — `cv_lab_start` replaces whatever
+    /// ran, so switching mid-run is a supported action and not an error.
+    ///
+    /// **iOS holds no list of its own.** A hardcoded subset here would be the
+    /// app asserting that those experiments exist, and this is the file where
+    /// that would be easiest to do and hardest to notice.
+    @ViewBuilder
+    private var experimentPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SectionLabel("Experiments")
+
+            VStack(alignment: .leading, spacing: 12) {
+                let experiments = lab.availableExperiments
+                if experiments.isEmpty {
+                    // "Not asked yet" and "asked, and it declares nothing" are
+                    // different answers about different things, and only the
+                    // second is a statement about the Tower.
+                    Text(
+                        isStillAsking
+                            ? "Waiting for the Tower's catalog."
+                            : "The Tower is connected and declares no experiments."
+                    )
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                } else {
+                    ForEach(experiments) { experiment in
+                        experimentRow(experiment)
+                    }
+                    if !lab.canSendCommands {
+                        Text(Self.cannotStartHere)
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -246,30 +510,125 @@ struct ExperimentalCVWorkspaceView: View {
         }
     }
 
+    /// One catalog entry.
+    ///
+    /// A button where a start would be accepted, and **plain text where it
+    /// would not** — never a greyed-out button, which still invites the press
+    /// that produces the refusal. The Tower's own reason is shown instead,
+    /// verbatim, because only the Tower knows which module is missing.
+    @ViewBuilder
     private func experimentRow(_ experiment: CVExperiment) -> some View {
-        Button {
-            lab.run(experiment)
-        } label: {
-            VStack(alignment: .leading, spacing: 2) {
+        if lab.canSendCommands && experiment.isStartable {
+            Button {
+                lab.run(experiment)
+            } label: {
+                experimentLabel(experiment)
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Starts this experiment on the Tower, replacing whatever is running")
+        } else {
+            experimentLabel(experiment)
+        }
+    }
+
+    private func experimentLabel(_ experiment: CVExperiment) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
                 Text(experiment.name)
                     .font(.body.weight(.medium))
-                if let summary = experiment.summary {
-                    Text(summary)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    .foregroundStyle(experiment.isStartable ? .primary : .secondary)
+                // Declared before it runs, which is the useful moment: this
+                // says whether the numbers it is about to produce will be
+                // measurements or model output.
+                if experiment.provenance.isInference {
+                    CVTag(text: "Estimates")
+                }
+                if experiment.requiresModel {
+                    // Worth saying at the moment of choosing rather than after
+                    // pressing: a model-backed start is the one that takes a
+                    // minute and a half.
+                    CVTag(text: "Loads a model")
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(.rect)
+            if let summary = experiment.summary {
+                Text(summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let reason = experiment.unavailableReason, !experiment.isStartable {
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
-        .buttonStyle(.plain)
-        .accessibilityHint("Runs this experiment on the Tower")
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(.rect)
+    }
+
+    #if DEBUG
+    private static let cannotStartHere = """
+        These are what the Tower can run. Nothing can be started from here until \
+        the Tower is connected and offering the Lab.
+        """
+    #else
+    private static let cannotStartHere = """
+        These are what the Tower can run. This build has no camera, so an \
+        experiment armed from here would measure nothing and no control to start \
+        one is offered.
+        """
+    #endif
+}
+
+/// A refusal the Tower sent, with the one thing this app adds to it: what to do
+/// about it.
+///
+/// The Tower's `message` is shown verbatim — it is the only text that knows
+/// which module is missing or which run is current — and the sentence beneath
+/// it comes from `disposition`, which is the whole reason the eight reasons are
+/// classified rather than concatenated.
+private struct CVRefusalBanner: View {
+    let refusal: CVLabControlRefusal
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(refusal.message)
+                .font(.subheadline)
+                .fixedSize(horizontal: false, vertical: true)
+            if let advice {
+                Text(advice)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(Color(.tertiarySystemFill), in: .rect(cornerRadius: 12))
+    }
+
+    private var advice: String? {
+        switch refusal.disposition {
+        case .terminal:
+            // Rendered as unsupported by the state machine as well; this is the
+            // sentence beside the Tower's own words.
+            return "This Tower cannot run experiments, so there is nothing to try again."
+        case .transient:
+            return "The Tower could not answer this one. Nothing changed, and the same request may work now."
+        case .requestRefused:
+            // Deliberately says "nothing changed" rather than suggesting a
+            // retry: every one of these five is refused identically the second
+            // time.
+            return "Nothing changed on the Tower."
+        case .unrecognised:
+            return nil
+        }
     }
 }
 
 /// The running experiment's answer for the most recent frame the Tower replied
-/// to — the one thing on this screen that is real today.
+/// to.
 ///
 /// ## Why this observes `TowerClient` when the workspace above it does not
 ///
@@ -282,6 +641,14 @@ struct ExperimentalCVWorkspaceView: View {
 /// changes at reply rate, and a stale rendering of it is the defect rather than
 /// the saving. So it observes — and it is a leaf holding nothing else, so the
 /// invalidation stops here instead of taking the rest of the workspace with it.
+///
+/// ## What it is now allowed to say
+///
+/// The reading it draws has already been **gated on `cv_lab.run_id`** by
+/// `TowerClient`: a result belonging to a run this client is not watching never
+/// reaches `latestFrameResult` at all. So this panel can name the experiment
+/// and the run beside the number without that being a claim it is not in a
+/// position to make.
 ///
 /// ## Runtime ownership
 ///
@@ -308,6 +675,13 @@ private struct CVFrameReadingPanel: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                } else if let refusal = tower.latestFrameRefusal {
+                    // The `frame_error` case that did not exist until now. Every
+                    // one of these used to be logged as an unknown message type
+                    // and discarded, so this panel said "no frame has been
+                    // answered yet" while the Tower was answering every single
+                    // one with a reason.
+                    refusalRows(refusal)
                 } else {
                     // No spinner and no zeroes. Nothing is in flight, so a
                     // progress indicator would be the most convincing untrue
@@ -317,11 +691,6 @@ private struct CVFrameReadingPanel: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-
-                Text(Self.whatCannotBeAsked)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(16)
@@ -332,6 +701,13 @@ private struct CVFrameReadingPanel: View {
     /// Every figure the Tower actually sent, and no other.
     @ViewBuilder
     private func figures(_ reading: CVFrameReading) -> some View {
+        // Which experiment produced this. **The sentence this screen could not
+        // say before**: the reply named the number and not the experiment, so a
+        // figure sat here under a caption with nothing behind it.
+        if let name = reading.experimentName {
+            Text(name)
+                .font(.subheadline.weight(.medium))
+        }
         // The headline pair, drawn under the Tower's own name for it or not at
         // all. `CVFrameReading` will not hand over one half without the other,
         // so there is no way to caption this number with a word this app chose.
@@ -359,24 +735,73 @@ private struct CVFrameReadingPanel: View {
             CVFigureRow(caption: measurement.label, value: measurement.displayValue)
         }
 
-        if let sequence = reading.sequence {
-            // Which frame these figures belong to. "Latest" is otherwise
-            // unanchored, and during a stall the difference between a fresh
-            // answer and an old one is the whole story.
-            Text("From frame \(sequence).")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-        }
+        provenanceRows(reading)
+    }
 
-        // Rule 16. `frame_result` carries no provenance field, and silence must
-        // not be read as "measured" — so the caveat for `.unknown` is stated
-        // once for the card, the way `CVRunSummaryView` states its inference
-        // caveat once for a run.
-        if let caveat = CVFrameReading.provenance.caveat {
-            Text(caveat)
-                .font(.caption)
-                .foregroundStyle(.tertiary)
+    /// Where this reading sits in its run, and where the numbers came from.
+    ///
+    /// ## The line that used to read "From frame 30."
+    ///
+    /// It was drawn from the wire's `seq`, which is the **phone's capture
+    /// index**, and the sender forwards one frame in thirty by design — so
+    /// consecutive replies read 30, 60, 90 and the gaps were not losses. Worse,
+    /// that number is chosen by the sender and cannot order results at all.
+    ///
+    /// `result_seq` is the Tower's own dense counter within the run, from 1,
+    /// and it is what says whether a reading is newer than the last. The
+    /// capture index is still drawn, because it is the only thread back to a
+    /// specific captured frame — under a caption that says what it is.
+    @ViewBuilder
+    private func provenanceRows(_ reading: CVFrameReading) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if let resultSeq = reading.resultSeq {
+                Text("Result \(resultSeq) of this run.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            if let captureIndex = reading.captureIndex {
+                Text("From capture \(captureIndex). The sender forwards one frame in thirty, so this number skips.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            // Rule 16, discharged once for the card. `frame_result` now carries
+            // provenance on every reply, so this is the Tower's own answer
+            // rather than the blanket "the Tower did not say" this panel used
+            // to show — and `.measured` owes no caveat at all, which is why
+            // most replies now draw nothing here.
+            if let caveat = reading.provenance.caveat {
+                Text(caveat)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// Why the Tower answered a frame without measuring it.
+    @ViewBuilder
+    private func refusalRows(_ refusal: TowerFrameRefusal) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            // This app's sentence where it has one — `cv_lab_starting` is
+            // arming rather than an error and has to be said that way — and the
+            // Tower's own words otherwise, because only the Tower knows which
+            // field was malformed or which module is missing.
+            Text(refusal.kind.summary ?? refusal.message)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if refusal.kind.summary != nil {
+                Text(refusal.message)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let sequence = refusal.sequence {
+                Text("Capture \(sequence).")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
         }
     }
 
@@ -417,15 +842,6 @@ private struct CVFrameReadingPanel: View {
             """
         #endif
     }
-
-    /// Said whether or not there is a result, because it is true either way and
-    /// it is the thing a person will otherwise assume they can do.
-    private static let whatCannotBeAsked = """
-        The Tower chose this experiment when it started. This app cannot list \
-        the experiments it has, pick a different one, or start or stop the one \
-        it is running — and the reply names the number, not the experiment, so \
-        this screen cannot say which one produced it.
-        """
 }
 
 /// One caption-and-figure line.
@@ -450,10 +866,37 @@ private struct CVFigureRow: View {
     }
 }
 
-/// Renders one run's results, honouring the two rules
-/// `docs/modules/EXPERIMENTAL-CV.md` imposes on them.
+/// A small capsule label. Two points of layout, three call sites.
+private struct CVTag: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color(.tertiarySystemFill), in: .capsule)
+    }
+}
+
+/// Renders one run's results.
 ///
-/// Unreachable today — no client produces a run.
+/// ## What is deliberately absent
+///
+/// **A better/worse verdict.** There is no code path to one: `CVMetric` carries
+/// no baseline, no stated direction and no `comparison`, because the Tower's
+/// metrics carry `baseline: null` and `higher_is_better: null` on every metric,
+/// always, and a comparison against nothing is the *"declaring an approach
+/// 'better' without a measurement"* that `docs/modules/EXPERIMENTAL-CV.md`
+/// rules out. This view used to render exactly that when both fields arrived;
+/// the fields never will, and the renderer is gone rather than dormant.
+///
+/// **A zero standing in for a null.** Every timing and every rate on this
+/// contract is nullable, and the Tower is emphatic that *"`null` is 'nothing has
+/// been measured'; it is never a zero you can render as one"* — a rate over a
+/// zero-length window is undefined, not slow. Each row below is present only
+/// when there is a number for it, and `notMeasuredNote` says so once for the
+/// group rather than drawing a grid of dashes.
 struct CVRunSummaryView: View {
     let run: CVExperimentRun
     let isFinal: Bool
@@ -463,21 +906,32 @@ struct CVRunSummaryView: View {
             ForEach(run.metrics) { metric in
                 metricRow(metric)
             }
-
-            if let frames = run.framesProcessed {
-                row("Frames processed", "\(frames)")
+            // Reported rather than silently truncated: the Tower bounds a run at
+            // sixteen metric rows and says how many it dropped.
+            if run.metricsOmitted > 0 {
+                Text("\(run.metricsOmitted) more metrics did not fit the Tower's per-run limit.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
             }
-            if let processing = run.timings.processingMs {
-                // The Tower measuring its own work — the only timing here,
-                // because it is the only one with an unambiguous meaning (see
-                // `CVTimings`). And "ms" is not an invented unit, unlike the
-                // metres `ReportedFigure` exists to prevent: the field is named
-                // `processing_ms` on the wire, so milliseconds is the Tower's
-                // own declaration rather than this app's assumption.
-                row("Tower processing", "\(CVMetric.format(processing)) ms")
+            // Empty is the only correct value and a Tower test enforces it for
+            // every registered experiment. Drawn because this is what the wire
+            // says if one ever reaches production anyway, and a silent drop
+            // would make that invisible from here.
+            if !run.unclassifiedMetrics.isEmpty {
+                Text(
+                    "The experiment emitted metrics without saying how they combine across frames: "
+                        + run.unclassifiedMetrics.joined(separator: ", ")
+                        + "."
+                )
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
             }
 
+            frameCounters
+            timingRows
             annotationRows
+            runtimeRows
 
             if !isFinal {
                 Text("Running. These figures may still change.")
@@ -498,23 +952,38 @@ struct CVRunSummaryView: View {
 
     private func metricRow(_ metric: CVMetric) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            row(metric.label, metric.displayValue)
+            if let value = metric.displayValue {
+                row(metric.label, value)
+            } else {
+                // A metric the Tower reported with no value is still a row: it
+                // said this metric exists and has no meaningful aggregate,
+                // which is a different fact from never having mentioned it.
+                Text(metric.label)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
             HStack(spacing: 8) {
+                if metric.isHeadline {
+                    CVTag(text: "Headline")
+                }
                 if metric.provenance.isInference {
-                    Text("Estimate")
-                        .font(.caption2.weight(.semibold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color(.tertiarySystemFill), in: .capsule)
+                    CVTag(text: "Estimate")
                 }
-                // Only rendered when `comparison` produced one, which requires
-                // both a baseline and a stated direction. There is no other
-                // path to a verdict on this screen.
-                if let comparison = metric.comparison {
-                    Text(comparison.label)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                // How the number was arrived at across frames — a mean, a sum,
+                // or a single observed value. Shown because summing a fraction
+                // and averaging a count are different mistakes, and a reader
+                // who cannot tell which this is cannot catch either.
+                if let aggregation = metric.aggregation, let frames = metric.frames, frames > 0 {
+                    Text("\(aggregation) over \(frames) frame\(frames == 1 ? "" : "s")")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
+            }
+            if let reason = metric.unavailableReason {
+                Text(reason)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             // Not gated on `isInference`. `caveat` is already nil for
             // `.measured`, and gating additionally on inference hid the
@@ -531,19 +1000,99 @@ struct CVRunSummaryView: View {
         .accessibilityElement(children: .combine)
     }
 
-    /// The annotated frame, shown only if it was redacted — the same rule every
-    /// other stored image obeys. A debug surface gets no exemption.
+    /// The four counters, which the Tower keeps in an invariant:
+    /// `offered == processed + refused + failed`, holding at every read.
+    ///
+    /// `framesRefused` is drawn even at zero, and that is the point of it: on a
+    /// paused run it is the one figure still moving, and it is how you see
+    /// whether the phone is still sending while the metrics stand still.
+    @ViewBuilder
+    private var frameCounters: some View {
+        if let processed = run.framesProcessed {
+            row("Frames measured", "\(processed)")
+        }
+        if let refused = run.framesRefused, refused > 0 {
+            row("Frames refused", "\(refused)")
+        }
+        if let failed = run.framesFailed, failed > 0 {
+            row("Frames the experiment failed on", "\(failed)")
+        }
+    }
+
+    @ViewBuilder
+    private var timingRows: some View {
+        if let processing = run.timings.processingMs {
+            // The Tower measuring its own work — the only timing here, because
+            // it is the only one with an unambiguous meaning (see `CVTimings`).
+            // And "ms" is not an invented unit, unlike the metres
+            // `ReportedFigure` exists to prevent: the field is named
+            // `processing_ms` on the wire, so milliseconds is the Tower's own
+            // declaration rather than this app's assumption.
+            row("Tower processing, mean", "\(CVMetric.format(processing)) ms")
+        }
+        if let worst = run.timings.processingMsMax {
+            row("Tower processing, worst frame", "\(CVMetric.format(worst)) ms")
+        }
+        if let processed = run.throughput.processedFps {
+            row("Measured", "\(CVMetric.format(processed)) fps")
+        }
+        if let capacity = run.throughput.capacityFps {
+            // Read beside the rate above, this says whether the Lab or the link
+            // is the limit. The sender forwards one frame in thirty, so the
+            // measured rate is normally bounded by what arrives.
+            row("The Lab could manage", "\(CVMetric.format(capacity)) fps")
+        }
+        if !run.hasMeasuredAnything {
+            Text(Self.notMeasuredNote)
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private static let notMeasuredNote = """
+        No frame has been measured on this run, so the Tower reports no timings \
+        and no rate. That is "nothing measured yet", not zero.
+        """
+
+    /// The annotation count, and the Tower's own reason when there is none.
+    ///
+    /// `0` is a real result meaning "found nothing" and must not merge with
+    /// "did not say", which is why the reason is drawn rather than an absence
+    /// being left to speak for itself.
     @ViewBuilder
     private var annotationRows: some View {
-        if run.annotation.hasReport {
-            if let count = run.annotation.count {
-                row("Annotations", "\(count)")
-            }
-            if let withheld = run.annotation.artifact.withheldReason {
-                Text(withheld)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
+        if let count = run.annotation.count {
+            row("Annotations", "\(count)")
+        } else if let reason = run.annotation.countUnavailableReason {
+            Text(reason)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        // Always null on this contract, with a stated reason. Drawn verbatim
+        // rather than paraphrased: it is the Tower explaining a privacy
+        // decision in its own words, and a paraphrase here would rot.
+        if let reason = run.annotation.artifactUnavailableReason {
+            Text(reason)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// What the experiment says it actually loaded.
+    ///
+    /// Sorted by key, because a dictionary has no order and a list that
+    /// reshuffles itself on every update is unreadable. The keys are the
+    /// experiment's own and nothing here switches on them — this exists because
+    /// `device: auto` is a *request* and a CPU figure carrying a GPU label is a
+    /// real failure it closes.
+    @ViewBuilder
+    private var runtimeRows: some View {
+        if !run.runtime.isEmpty {
+            ForEach(run.runtime.sorted(by: { $0.key < $1.key }), id: \.key) { entry in
+                row(entry.key, entry.value)
             }
         }
     }

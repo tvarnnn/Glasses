@@ -1219,7 +1219,15 @@ final class WorldBuilderContract20260825Tests: XCTestCase {
     /// `pose_count` that counts something else.
     func testThisBuildImplementsTheContractTheTowerNowOffers() {
         XCTAssertEqual(WorldBuilderResultContract.identifier, "world_builder.status/2026-08-25")
-        XCTAssertEqual(TowerCapabilities.supported, ["world_builder.status/2026-08-25"])
+        // Membership, not set equality. This test is about *World Builder's*
+        // identifier being the one implemented; it stopped being the only
+        // member on 2026-08-27 when four Tower lanes were unified and three
+        // more cartridges gained clients. Exclusivity — that the set is exactly
+        // the five this build decodes — is pinned once, centrally, in
+        // `ProductShellTests.testTheImplementedContractsAreExactlyTheFiveThisBuildDecodes`.
+        // Re-asserting it here made a World Builder test fail for a Scene
+        // Understanding change, which points a reader at the wrong lane.
+        XCTAssertTrue(TowerCapabilities.supported.contains("world_builder.status/2026-08-25"))
         XCTAssertFalse(
             TowerCapabilities.supported.contains("world_builder.status/2026-08-23"),
             """

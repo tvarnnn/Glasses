@@ -109,8 +109,25 @@ final class ProjectManager: ObservableObject {
         // It owns no socket — it sends three message types over the one
         // `TowerClient` already has — so this adds a subscriber, not a
         // transport.
+        //
+        // Four Tower-backed clients now, not one. The three that joined it in
+        // the 2026-08-27 unification each subscribe to the same result channel
+        // over the same `TowerClient`, so this still adds subscribers rather
+        // than transports — but the outlive-the-switch argument above now has
+        // real weight behind it rather than being a precaution: a CV Lab run in
+        // flight, a paused scene's last-known reading and a document session
+        // are all state a cartridge switch must not destroy.
+        //
+        // Object Memory is deliberately absent from this list because its
+        // client is constructed by `CartridgeClients` itself — it reaches the
+        // Tower over HTTP and needs no socket handed to it.
         self.cartridgeClients = cartridgeClients
-            ?? CartridgeClients(worldBuilder: TowerWorldBuilderClient(tower: tower))
+            ?? CartridgeClients(
+                worldBuilder: TowerWorldBuilderClient(tower: tower),
+                experimentalCV: TowerExperimentalCVClient(tower: tower),
+                documentMemory: TowerDocumentMemoryClient(tower: tower),
+                sceneUnderstanding: TowerSceneUnderstandingClient(tower: tower)
+            )
 
         let health = DeviceHealth()
         self.deviceHealth = health

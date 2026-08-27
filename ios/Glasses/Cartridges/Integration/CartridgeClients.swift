@@ -63,9 +63,23 @@ final class CartridgeClients {
     /// asks a question.
     let objectMemory: any ObjectMemoryClient
 
-    /// Defaults are the unavailable clients, which is the whole truth of the
-    /// current system for four of the five. Injection points exist so a test
-    /// can substitute one without reaching through `ProjectManager`.
+    /// Defaults are the unavailable clients. **That is no longer the whole
+    /// truth of the system for any of the five, and these defaults are now a
+    /// test convenience rather than a description of the product.**
+    ///
+    /// Every cartridge here has a Tower-backed client as of the 2026-08-27
+    /// unification, and `ProjectManager` constructs all of them. The stubs stay
+    /// for two reasons: a test needs to assert what a workspace does when a
+    /// Tower declares nothing, and a stub is the only honest answer at the
+    /// moment before a connection exists. They are kept deliberately dull — a
+    /// stub that says "this Tower has declared no contract" cannot go stale,
+    /// where the strings they used to carry (*"the Tower does not analyse
+    /// scenes yet"*, *"the Tower keeps no document memory"*) became false the
+    /// day the Tower gained those cartridges, and nothing forced anyone to
+    /// notice.
+    ///
+    /// Injection points exist so a test can substitute one without reaching
+    /// through `ProjectManager`.
     init(
         worldBuilder: (any WorldBuilderClient)? = nil,
         experimentalCV: (any ExperimentalCVClient)? = nil,

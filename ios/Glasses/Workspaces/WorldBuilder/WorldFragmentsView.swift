@@ -17,8 +17,14 @@ import SwiftUI
 /// `docs/modules/WORLD-BUILD.md` forbids exactly that.
 ///
 /// So each fragment gets its own frame, its own scale, and its own box. When
-/// the Tower learns to register segments, `registered` flips, they share a
-/// frame, and this model merges them without the view changing.
+/// the Tower registers segments, `registered` flips and a `transform_to_world`
+/// arrives, and this model merges them without the view changing — but only
+/// the ones that name the **same** `reference_segment` under the same
+/// `frame_revision`. `registered: true` is a necessary condition and not a
+/// sufficient one: a Sim3 maps a segment into its reference's frame, and there
+/// is no global world frame, so two registered segments with different
+/// references are as unmergeable as two unregistered ones. See
+/// `hasSharedFrame`.
 struct WorldFragmentsModel: Equatable {
     let segments: [WorldSegmentSummary]
 
@@ -48,9 +54,22 @@ struct WorldFragmentsModel: Equatable {
         segments.filter { $0.resolutionState == .unresolved }.count
     }
 
-    /// True once the Tower registers segments into one frame. False today.
+    /// True only when every segment here is placed **into the same frame**.
+    ///
+    /// `registered` on every row is not enough on its own. A Sim3 maps a
+    /// segment into the frame of its `reference_segment`, and there is no
+    /// global world frame to fall back into — so two registered segments that
+    /// name different references share no space, and drawing them together
+    /// would composite independent reconstructions exactly as drawing two
+    /// unregistered ones would. The same goes for two rows stamped with
+    /// different `frame_revision`s: a coordinate expressed in one gauge may not
+    /// be reinterpreted under another.
+    ///
+    /// `mayBeCompositedWith` is the one place that rule is written; this asks
+    /// it of every row against the first rather than restating it.
     var hasSharedFrame: Bool {
-        !segments.isEmpty && segments.allSatisfy(\.registered)
+        guard let first = segments.first else { return false }
+        return segments.allSatisfy { first.mayBeCompositedWith($0) }
     }
 
     /// Said out loud when the fragments on screen are real but behind. Not a
@@ -231,7 +250,7 @@ struct WorldFragmentsView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             FragmentCanvas(
                                 summary: segment,
-                                chunk: chunks[segment.contentHash]
+                                chunk: chunks[segment.cacheKey]
                             )
                             .frame(height: 120)
                             .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -239,7 +258,7 @@ struct WorldFragmentsView: View {
                             Text("\(segment.pointCount) points")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
-                            if let chunk = chunks[segment.contentHash], chunk.isSampled {
+                            if let chunk = chunks[segment.cacheKey], chunk.isSampled {
                                 Text("showing \(chunk.pointsSent) of \(chunk.pointsTotal)")
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)

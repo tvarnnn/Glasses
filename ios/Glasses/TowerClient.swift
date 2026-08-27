@@ -37,10 +37,14 @@ import UIKit
 /// while the Experimental CV Lab workspace told the wearer the Tower "cannot
 /// run experiments yet".
 ///
-/// The Tower's registry says the same thing from its side: `experimental_cv`
-/// is `not_offered` on the result channel because *"results already reach the
-/// client on `frame_result`"*. They do. This type is now the shape of what
-/// actually arrives.
+/// The Tower's registry used to say the same thing from its side:
+/// `experimental_cv` was `not_offered` on the result channel because *"results
+/// already reach the client on `frame_result`"*. **That has changed.** A Tower
+/// speaking `experimental_cv.status/2026-08-27` offers the cartridge, and every
+/// `frame_result` now carries a `cv_lab` block naming the run, the experiment
+/// and the provenance that produced the numbers beside it — see `cvLab` below.
+/// Everything that was on this message before is still there, unchanged, in the
+/// same place.
 struct TowerFrameResult: Equatable, Sendable {
     /// The frame this result answers, matching the `seq` the app sent.
     let sequence: Int?
@@ -66,6 +70,289 @@ struct TowerFrameResult: Equatable, Sendable {
     /// not the structured result channel", and the structured one is blocked
     /// on module-contract work this app must not pre-empt.
     let metrics: [String: Double]
+    /// Who produced this number, and for which run.
+    ///
+    /// `nil` from a Tower that runs no CV Lab — the block is additive and
+    /// omitted entirely rather than nulled. Every field of it is read in
+    /// `TowerFrameResultProvenance`, and one of them, `runID`, is read by this
+    /// client itself: see `watchedCVLabRunID`.
+    let cvLab: TowerFrameResultProvenance?
+}
+
+/// The `cv_lab` block on a `frame_result` —
+/// `experimental_cv.frame_result/2026-08-27`.
+///
+/// ## What this closes
+///
+/// Before it, the Tower's per-frame reply named the *number* and not the
+/// experiment: `result_value` with `result_label` beside it, and no way to tell
+/// which of eight experiments produced them, on which run, measured or
+/// inferred. A result from a previous experiment could be read as a result from
+/// the current one, and the Experimental CV Lab workspace said so on screen
+/// because it was true.
+///
+/// ## The one rule a client must not get wrong
+///
+/// > **Discard any `frame_result` whose `cv_lab.run_id` is not the run you are
+/// > watching.**
+///
+/// The Tower makes this structural rather than checked: a new experiment is a
+/// new run, and the old experiment is released **before** the new run id is
+/// published, so no result computed by one experiment can carry another's name.
+/// The client-side rule exists for the case the Tower cannot cover — a
+/// reconnect to a **restarted** Tower, which starts counting runs again from 1.
+/// `runID` is `"<tower_instance_id>-<n>"` and `towerInstanceID` is part of it
+/// for exactly that reason, which is why comparing `runID` alone is sufficient
+/// and no separate instance check is needed.
+///
+/// The gate itself is in `handleInboundMessage`, not here: a value type cannot
+/// know which run is being watched.
+struct TowerFrameResultProvenance: Equatable, Sendable {
+    /// Opaque, compared for equality only.
+    let contract: String?
+    /// Which Tower. Already inside `runID`; carried because a client that
+    /// reports a run id to a person should be able to say which machine it
+    /// belongs to.
+    let towerInstanceID: String?
+    /// `"<tower_instance_id>-<n>"`. The run this result belongs to.
+    let runID: String?
+    /// **Dense within the run, from 1.**
+    ///
+    /// This is the field that orders results. The message's own `seq` is the
+    /// phone's capture index and **skips by design** — the sender forwards one
+    /// frame in thirty — so it cannot order anything. That the two are
+    /// different numbers with different meanings on the same message is the
+    /// single easiest thing to get wrong here.
+    let resultSeq: Int?
+    let experimentID: String?
+    /// The Tower's own name for the experiment, for display.
+    let experimentName: String?
+    /// `measured` or `inferred`, as a string. Interpreted by the cartridge that
+    /// owns the contract — this file does not know what an experiment is.
+    let provenance: String?
+    /// `opencv` or `torch`.
+    let backend: String?
+    /// What the experiment actually ran on, or `nil` when it holds nothing.
+    /// Distinct from `deviceRequested`, which is a *request*: `auto` is the
+    /// question, and this is the answer.
+    let device: String?
+    let deviceRequested: String?
+    /// The experiment's own name for the number, repeated here so the block is
+    /// self-contained.
+    let resultLabel: String?
+    let processingMs: Double?
+    /// When the **Tower** received the frame. `timeBasis` says so on every
+    /// block, because there is no capture timestamp anywhere on this wire —
+    /// `tower/frames.py` carries no time field.
+    let towerReceivedAt: Double?
+    let timeBasis: String?
+
+    init?(json: [String: Any]) {
+        // Nothing is required. A block that arrived with only a `run_id` still
+        // gates correctly, and a block with everything but one field still
+        // displays the rest — the alternative, refusing the whole block on a
+        // missing optional, would silently turn a gated result into an ungated
+        // one, which is the failure this type exists to prevent.
+        self.contract = json["contract"] as? String
+        self.towerInstanceID = json["tower_instance_id"] as? String
+        self.runID = json["run_id"] as? String
+        self.resultSeq = json["result_seq"] as? Int
+        self.experimentID = json["experiment_id"] as? String
+        self.experimentName = json["experiment_name"] as? String
+        self.provenance = json["provenance"] as? String
+        self.backend = json["backend"] as? String
+        self.device = json["device"] as? String
+        self.deviceRequested = json["device_requested"] as? String
+        self.resultLabel = json["result_label"] as? String
+        self.processingMs = json["processing_ms"] as? Double
+        self.towerReceivedAt = json["tower_received_at"] as? Double
+        self.timeBasis = json["time_basis"] as? String
+    }
+}
+
+// MARK: - The frame path's refusals
+
+/// One `frame_error`: the Tower answering a frame it did not process.
+///
+/// ## Why this had to be added
+///
+/// `handleInboundMessage` had **no case for it**. Every `frame_error` the Tower
+/// has ever sent fell through to `default:`, was logged as an unknown message
+/// type, and was discarded — so "the Lab is paused", "that frame was
+/// undecodable" and "the socket is wedged" were indistinguishable from this
+/// side, and the answer to *"I pressed Start and nothing happened"* was on the
+/// wire and being thrown away.
+///
+/// ## Refusal, not failure
+///
+/// Six of the nine reasons are the CV Lab declining a frame on purpose. The
+/// Tower is explicit that these are counted under `frames_rejected` and **not**
+/// under `frame_processing_errors` — *"a Lab paused for five minutes has not
+/// failed hundreds of times"* — and this client owes the same discipline:
+/// nothing here touches `status`, the send window, the stream bracket or
+/// `SenderMetrics`' error counters. It decodes, publishes, and returns.
+///
+/// The nine reasons are interpreted by the cartridge that owns the CV Lab
+/// contract, not here. This file decodes three fields and knows what none of
+/// them mean.
+struct TowerFrameRefusal: Equatable, Sendable {
+    /// The frame this answers — the phone's **capture index**, and `nil` when
+    /// the frame failed validation before its `seq` was even readable. The
+    /// Tower reports null rather than inventing one.
+    let sequence: Int?
+    /// The Tower's code: `cv_lab_idle`, `cv_lab_starting`, `cv_lab_paused`,
+    /// `cv_lab_stopped`, `cv_lab_failed`, `cv_lab_unavailable`,
+    /// `invalid_frame`, `frame_skipped` or `module_unavailable`.
+    ///
+    /// Kept as a **string**, like every other refusal vocabulary this client
+    /// carries: a code this build does not recognise must still reach a person
+    /// rather than being collapsed into "unknown".
+    let reason: String
+    /// Prose for a person. The Tower's message says what to send next.
+    let message: String
+
+    init?(json: [String: Any]) {
+        guard let reason = json["reason"] as? String else { return nil }
+        self.sequence = json["seq"] as? Int
+        self.reason = reason
+        self.message = json["message"] as? String ?? reason
+    }
+}
+
+// MARK: - The CV Lab control plane
+
+/// A `cv_lab_status` message: the Lab's whole state, in one snapshot.
+///
+/// ## `acceptedCommand` is the field that makes this two messages
+///
+/// The Tower uses one name for one document, whichever direction it is
+/// travelling and whatever prompted it — a read, an accepted command, or a push
+/// on the result channel. `acceptedCommand` is present **only** on a reply to a
+/// command, and it is therefore the only way to tell an answer from a pushed
+/// state. A client that treated every arriving document as an answer would
+/// report "started" every two seconds for as long as the Lab was running.
+///
+/// Verified against a live Tower: a plain `cv_lab_status` read comes back with
+/// no `accepted_command` at all, while `cv_lab_start`/`pause`/`resume`/`stop`
+/// each echo their own name.
+///
+/// The `status` document itself is passed through **undecoded**, for the same
+/// reason `CartridgeResultEnvelope.payload` is: this file owns the transport
+/// and the cartridge owns the contract. Nothing here knows what an experiment
+/// is. The one exception is `runID`, which the frame path needs — see
+/// `watchedCVLabRunID`.
+struct CVLabControlReply {
+    /// The status document's contract identifier. Opaque.
+    let contract: String?
+    /// The **control vocabulary's** identifier, which versions separately from
+    /// the document's precisely so a client can implement the read-only half
+    /// and never send a command.
+    let controlContract: String?
+    /// Echoed from the request, when one was sent and was at most 64
+    /// characters. **A longer one is dropped, not refused** — the command still
+    /// applies and the reply simply carries none — which is why this client
+    /// bounds its own ids rather than relying on noticing the absence.
+    let requestID: String?
+    /// The command this answers, or `nil` when the document was pushed or read.
+    let acceptedCommand: String?
+    /// The whole document, undecoded.
+    let status: [String: Any]
+
+    init?(json: [String: Any]) {
+        guard let status = json["status"] as? [String: Any] else { return nil }
+        self.contract = json["contract"] as? String
+        self.controlContract = json["control_contract"] as? String
+        self.requestID = json["request_id"] as? String
+        self.acceptedCommand = json["accepted_command"] as? String
+        self.status = status
+    }
+
+    /// `lifecycle.run_id`, the one field this file reads out of the document.
+    ///
+    /// Read here rather than in the cartridge because the **frame path** needs
+    /// it, and the frame path is this file's. It is a single traversal of two
+    /// keys; it does not make this client cartridge-aware in any other respect.
+    var runID: String? {
+        (status["lifecycle"] as? [String: Any])?["run_id"] as? String
+    }
+
+    /// `lifecycle.state`, read only so a log line says something useful.
+    var lifecycleState: String? {
+        (status["lifecycle"] as? [String: Any])?["state"] as? String
+    }
+}
+
+/// A `cv_lab_error`: a refusal.
+///
+/// > **Every one of the eight reasons means the request did not take effect.
+/// > There is no partial application.**
+///
+/// Which is why this carries the unchanged `status`: a refused client never has
+/// to guess what state it is now in, and nothing in this app has to model a
+/// half-applied command. Even the `lab_unavailable` refusal from a Tower with
+/// no Lab at all carries a document — a hollow one, with the real contract
+/// identifiers in it — so a decoder is entitled to require the field. It is
+/// still optional here, because a refusal that arrived without one is worth
+/// showing rather than dropping.
+struct CVLabControlRefusal {
+    /// `malformed_request`, `unknown_experiment`, `experiment_unavailable`,
+    /// `lab_busy`, `invalid_state`, `stale_run`, `lab_unavailable` or
+    /// `internal_error`. A string, so a ninth reaches a person as itself.
+    let reason: String
+    /// Prose for a person, from the Tower. The only text that knows *which*
+    /// module was missing or *which* run is current.
+    let message: String
+    /// Which command was refused. Lets a refusal be attributed to a button even
+    /// when no `request_id` was sent.
+    let command: String?
+    let requestID: String?
+    let controlContract: String?
+    /// `unknown_experiment` only: the ids this Tower does have.
+    let available: [String]
+    /// `experiment_unavailable` only.
+    let experimentID: String?
+    /// `stale_run` only: the run the Lab is actually on now. A stale `run_id`
+    /// is refused rather than applied to whichever run is current, so a Stop
+    /// drawn against a run that has already been replaced cannot end the one
+    /// that replaced it.
+    let currentRunID: String?
+    /// The document, unchanged. Undecoded, for the reason `CVLabControlReply`
+    /// gives.
+    let status: [String: Any]?
+
+    init?(json: [String: Any]) {
+        guard let reason = json["reason"] as? String else { return nil }
+        self.reason = reason
+        self.message = json["message"] as? String ?? reason
+        self.command = json["command"] as? String
+        self.requestID = json["request_id"] as? String
+        self.controlContract = json["control_contract"] as? String
+        self.available = json["available"] as? [String] ?? []
+        self.experimentID = json["experiment_id"] as? String
+        self.currentRunID = json["current_run_id"] as? String
+        self.status = json["status"] as? [String: Any]
+    }
+}
+
+/// Everything the CV Lab's control plane delivers, as one stream.
+///
+/// One subject rather than three published properties, for the reason
+/// `CartridgeResultEvent` gives: ordering between them is load-bearing. A
+/// `cv_lab_error` and the pushed status that follows it must not be observed
+/// out of order, or a client would file the refusal against the wrong state.
+///
+/// `frameRefused` rides this stream too. A `frame_error` is a frame-path
+/// message and six of its nine reasons are the Lab's own — *"the Lab is
+/// paused"* is the answer to *"why is there no result"*, which is a CV Lab
+/// question wherever it arrives from.
+enum CVLabEvent {
+    /// A status document: an answer to a command when `acceptedCommand` is
+    /// non-nil, a read or a push otherwise.
+    case status(CVLabControlReply)
+    /// A refused command. The request did not take effect.
+    case refused(CVLabControlRefusal)
+    /// A frame the Tower did not process.
+    case frameRefused(TowerFrameRefusal)
 }
 
 /// Connection status to the Tower (the project's base-station/hub service).
@@ -423,9 +710,62 @@ final class TowerClient: NSObject, ObservableObject {
     /// inventing a capability it does not have.
     ///
     /// Republished at the reply rate, like `frameResultCount` beside it.
+    ///
+    /// **Gated on `cv_lab.run_id`.** A reply belonging to a run this client is
+    /// not watching never reaches here — see `watchedCVLabRunID`.
     @Published private(set) var latestFrameResult: TowerFrameResult?
 
     #endif
+
+    /// The most recent `frame_error` the Tower returned.
+    ///
+    /// **Deliberately not `#if DEBUG`, unlike `latestFrameResult` beside it.**
+    /// That one is gated because it is a *figure a screen renders*, and a
+    /// Release build has no camera, sends no frame, and would render a stale
+    /// number from a bracket it cannot open. This is a refusal, and the honest
+    /// Release rendering of a refusal is the same as the honest Release
+    /// rendering of everything else on the frame path: nothing arrives, because
+    /// nothing was sent. Publishing it unconditionally costs one optional and
+    /// keeps the CV Lab client free of a second conditional-compilation branch
+    /// in the middle of its state machine.
+    ///
+    /// Cleared alongside `latestFrameResult` at all three points, for the same
+    /// reason: a refusal from a bracket that has closed is not the current
+    /// answer to anything.
+    @Published private(set) var latestFrameRefusal: TowerFrameRefusal?
+
+    /// The CV Lab run this client is watching, or `nil`.
+    ///
+    /// ## The whole staleness rule, in one property
+    ///
+    /// > **Discard any `frame_result` whose `cv_lab.run_id` is not the run you
+    /// > are watching.**
+    ///
+    /// Learned from the **status document**, never from a `frame_result`, and
+    /// that direction is the point: the status document is what says which run
+    /// is current, and adopting a run id from a result would make the result
+    /// its own authority — the stale reply would nominate itself as the run to
+    /// watch and then match.
+    ///
+    /// While this is `nil` nothing is discarded. That is not a hole: it is the
+    /// state of a client that has never read a status, so there is no run it
+    /// could be said to be watching and no claim to contradict. The moment a
+    /// document arrives, gating begins.
+    ///
+    /// Because `run_id` is `"<tower_instance_id>-<n>"`, comparing it alone also
+    /// covers a reconnect to a **restarted** Tower, whose run numbering starts
+    /// again at 1. No separate instance-id check is needed and none is done.
+    ///
+    /// Cleared at exactly the three points `latestFrameResult` is cleared —
+    /// `sendStreamStart()`, `sendStreamStop()` and `teardownConnection` — and
+    /// for the same reason each time: a run id held across a boundary the
+    /// results did not survive would gate the next bracket's replies against
+    /// the previous one's run.
+    private(set) var watchedCVLabRunID: String?
+
+    /// How many `frame_result` replies were discarded as belonging to another
+    /// run. Non-zero is worth knowing about; it is not an error.
+    private(set) var staleFrameResultCount = 0
 
     /// True between a sent `stream_start` and the matching `stream_stop`.
     /// `sendFrame` will not forward anything while this is false, so a frame
@@ -558,6 +898,29 @@ final class TowerClient: NSObject, ObservableObject {
     /// all three. That split is what keeps this file cartridge-blind.
     var cartridgeResults: AnyPublisher<CartridgeResultEvent, Never> {
         resultEvents.eraseToAnyPublisher()
+    }
+
+    // MARK: CV Lab control plane
+
+    private let cvLabControlEvents = PassthroughSubject<CVLabEvent, Never>()
+
+    /// The CV Lab's control plane, for whoever owns its contract.
+    ///
+    /// The same split as `cartridgeResults`: this file decodes the message
+    /// envelope and passes the status document through undecoded. It does not
+    /// know what an experiment is, holds no lifecycle state, and sends no
+    /// command on anyone's behalf.
+    ///
+    /// **The CV Lab's commands travel here rather than on the result channel,
+    /// and that is the contract's own exception.** `tower/results/` is a
+    /// read-only reporting surface — a Tower test forbids a call named
+    /// `observe` or `build` anywhere inside it — so a mutation must not travel
+    /// on it. The CV Lab's start, pause and stop are plain socket messages on
+    /// `/ws` instead, and there is **no HTTP surface for any of them**: a
+    /// command needs the connection it was issued on to still be there when the
+    /// outcome arrives, and an arm may take two minutes.
+    var cvLabEvents: AnyPublisher<CVLabEvent, Never> {
+        cvLabControlEvents.eraseToAnyPublisher()
     }
 
     private var session: URLSession?
@@ -1091,6 +1454,7 @@ final class TowerClient: NSObject, ObservableObject {
         // from the previous bracket displayed against a fresh one is a stale
         // claim about the current session.
         latestFrameResult = nil
+        clearCVLabRunWatch()
     }
 
     /// Marks the stream as inactive and sends `{"type":"stream_stop"}` once.
@@ -1106,8 +1470,68 @@ final class TowerClient: NSObject, ObservableObject {
         // captioned "latest Tower reply", and after a stop there is no current
         // reply - leaving the last one on screen would date it silently.
         latestFrameResult = nil
+        clearCVLabRunWatch()
         _ = sendLifecycleMarker(type: "stream_stop")
     }
+
+    #endif
+
+    /// Forget which CV Lab run this client is watching, and the last refusal.
+    ///
+    /// ## Why this is called from exactly three places
+    ///
+    /// The same three that clear `latestFrameResult`: `sendStreamStart()`,
+    /// `sendStreamStop()` and `teardownConnection`. The held run id and the
+    /// held reply have identical lifetimes because they answer the same
+    /// question — *what is the Tower currently telling us about frames* — and a
+    /// run id that outlived a bracket would silently change what the gate
+    /// means: replies from the next bracket would be measured against a run
+    /// that ended, and every one of them discarded.
+    ///
+    /// It is **not** called when the run merely changes. That case is handled
+    /// where the new run id arrives, by adopting it and dropping the reading
+    /// that belonged to the old one — see `watchCVLabRun(_:)`.
+    ///
+    /// Outside `#if DEBUG` although two of its three callers are inside it, so
+    /// that `teardownConnection`'s Release path can call it: the run watch is
+    /// fed by the status document, which is a read-only surface a Release build
+    /// reaches perfectly well.
+    private func clearCVLabRunWatch() {
+        watchedCVLabRunID = nil
+        latestFrameRefusal = nil
+    }
+
+    /// Adopt the run the Tower's status document says is current.
+    ///
+    /// The **only** writer of `watchedCVLabRunID` other than the three clears,
+    /// and it is fed exclusively from status documents — a `cv_lab_status`
+    /// reply, a pushed one, or the unchanged document a `cv_lab_error` carries.
+    /// Never from a `frame_result`: a result that nominated its own run as the
+    /// one to watch would always match, which is the gate deleting itself.
+    ///
+    /// When the run **changes**, the held reading is dropped with it. A run is
+    /// the unit of provenance, and the Tower makes the same move on its side —
+    /// starting a different experiment mints a new run and takes the previous
+    /// one's figures out of the document entirely, *"because keeping an old
+    /// summary beside a new one is how a number from the wrong experiment ends
+    /// up on a screen"*. Leaving the last reading on screen across a switch
+    /// would put the old experiment's number under the new experiment's name.
+    ///
+    /// A `nil` run id — the Lab is idle, or unavailable — clears the watch
+    /// rather than being ignored: there is no current run, so there is nothing
+    /// to gate against, and holding the previous one would discard the results
+    /// of whatever starts next.
+    private func watchCVLabRun(_ runID: String?) {
+        guard runID != watchedCVLabRunID else { return }
+        log("cv_lab run watch: \(watchedCVLabRunID ?? "none") -> \(runID ?? "none")")
+        watchedCVLabRunID = runID
+        #if DEBUG
+        latestFrameResult = nil
+        #endif
+        latestFrameRefusal = nil
+    }
+
+    #if DEBUG
 
     /// Shared send path for the two stream lifecycle markers — same
     /// WebSocket, same fire-and-forget `send` used by `sendFrame`, no new
@@ -1188,17 +1612,143 @@ final class TowerClient: NSObject, ObservableObject {
         )
     }
 
+    // MARK: - CV Lab control: outbound
+
+    /// Asks the Lab for its whole state.
+    ///
+    /// **Not `#if DEBUG`, and this is the message that proves the rule.** The
+    /// CV Lab's read-only half is reachable from a build with no camera: a
+    /// Release build can enumerate the experiments and read the Lab's state
+    /// truthfully, and the contract versions the control vocabulary separately
+    /// from the status document precisely so that *"a client may implement the
+    /// read-only half and never send a command"*.
+    ///
+    /// - Parameter requestID: echoed back on the reply, so an answer can be
+    ///   matched to the button that was pressed. Bounded by
+    ///   `boundedRequestID(_:)` before it goes out.
+    func sendCVLabStatusRequest(requestID: String? = nil) {
+        sendCVLabCommand(.status, requestID: requestID)
+    }
+
+    /// Selects **and arms** an experiment, replacing whatever was running.
+    ///
+    /// There is deliberately no separate select message: selection without
+    /// arming is a state nobody needs on the wire.
+    ///
+    /// The reply is immediate and says `starting`, not `running` — an arm is
+    /// asynchronous, and a start that later fails to load has **already been
+    /// answered `accepted`** by then. The outcome arrives as state on a later
+    /// status document, which is why a client that sends this must also read
+    /// status.
+    func sendCVLabStart(experimentID: String, requestID: String? = nil) {
+        sendCVLabCommand(
+            .start,
+            extra: ["experiment_id": experimentID],
+            requestID: requestID
+        )
+    }
+
+    /// Stops processing and keeps the experiment loaded.
+    ///
+    /// - Parameter runID: the run the button was drawn against. **Send it
+    ///   whenever there is one.** A command naming a run that is no longer
+    ///   current is refused `stale_run` rather than applied to whichever run
+    ///   is — which is the difference between a refusal and the wrong run being
+    ///   paused by the wrong person.
+    func sendCVLabPause(runID: String? = nil, requestID: String? = nil) {
+        sendCVLabCommand(.pause, runID: runID, requestID: requestID)
+    }
+
+    /// Resumes a paused run. Costs nothing: the experiment never left memory.
+    func sendCVLabResume(runID: String? = nil, requestID: String? = nil) {
+        sendCVLabCommand(.resume, runID: runID, requestID: requestID)
+    }
+
+    /// Ends the run, releases the experiment, and **keeps the figures**.
+    ///
+    /// The only way to keep a run readable: starting a different experiment
+    /// mints a new run and takes the previous one's figures out of the document
+    /// entirely.
+    func sendCVLabStop(runID: String? = nil, requestID: String? = nil) {
+        sendCVLabCommand(.stop, runID: runID, requestID: requestID)
+    }
+
+    /// Shared shape for the five control messages.
+    ///
+    /// Sent down `sendUnescalatedMessage` rather than `sendLifecycleMarker`,
+    /// and that choice is the important one: **a refused or undeliverable
+    /// command must not tear down the frame socket.** A start is a request
+    /// about what the Tower should compute; the frames are the session. Failing
+    /// the connection because a control message did not land would let the
+    /// control plane do the one thing the contract promises it cannot — affect
+    /// the frame path.
+    private func sendCVLabCommand(
+        _ command: CVLabCommand,
+        extra: [String: Any] = [:],
+        runID: String? = nil,
+        requestID: String? = nil
+    ) {
+        var object: [String: Any] = ["type": command.rawValue]
+        for (key, value) in extra { object[key] = value }
+        if let runID { object["run_id"] = runID }
+        if let requestID = boundedRequestID(requestID) { object["request_id"] = requestID }
+        sendUnescalatedMessage(object, label: command.rawValue)
+    }
+
+    /// Bounds a `request_id` to the 64 characters the Tower echoes.
+    ///
+    /// **A longer one is dropped, not refused**: the command applies and the
+    /// reply simply comes back carrying no `request_id`. That is the worst
+    /// possible failure for a client that matches replies to buttons — the
+    /// command takes effect and the answer cannot be attributed to it — so this
+    /// client refuses to send one it knows will be dropped rather than
+    /// discovering the loss on the reply.
+    ///
+    /// Dropped locally rather than truncated: a truncated id is a *different*
+    /// id, and one that could collide with another button's.
+    private func boundedRequestID(_ requestID: String?) -> String? {
+        guard let requestID, !requestID.isEmpty else { return nil }
+        guard requestID.count <= ExperimentalCVContract.requestIDMaxLength else {
+            log(
+                "cv_lab request_id dropped locally: \(requestID.count) characters, "
+                    + "the Tower echoes at most \(ExperimentalCVContract.requestIDMaxLength) "
+                    + "and drops longer ones without refusing the command"
+            )
+            return nil
+        }
+        return requestID
+    }
+
     /// Shared send path for the three result-channel messages.
+    ///
+    /// Kept as a named wrapper rather than folded into
+    /// `sendUnescalatedMessage`: "these three are the result channel" is a fact
+    /// worth keeping visible now that a fourth kind of message — the CV Lab's
+    /// commands, which are **not** on the result channel — shares the same send
+    /// discipline.
+    private func sendResultMessage(_ object: [String: Any], label: String) {
+        sendUnescalatedMessage(object, label: label)
+    }
+
+    /// Sends a message whose failure must not cost the frame path.
     ///
     /// **A send failure here is logged and not escalated**, which is the one
     /// way this differs from `sendLifecycleMarker`. A lifecycle marker defines
     /// a frame bracket and losing one corrupts the counts on both sides, so
-    /// that path fails the connection; a subscribe is a request for a report,
-    /// and tearing down the socket the camera is streaming over because a
-    /// capability query did not land would let the result channel do the one
-    /// thing the contract promises it cannot — affect the frame path. If the
-    /// socket really is gone, the receive loop notices it on its own terms.
-    private func sendResultMessage(_ object: [String: Any], label: String) {
+    /// that path fails the connection; a subscribe is a request for a report
+    /// and a CV Lab command is a request about what to compute, and tearing
+    /// down the socket the camera is streaming over because either did not land
+    /// would let a control surface do the one thing the contract promises it
+    /// cannot — affect the frame path. If the socket really is gone, the
+    /// receive loop notices it on its own terms.
+    ///
+    /// Note that this sits **outside** the `#if DEBUG` block that covers the
+    /// frame path, so commands can be sent from a Release build. That is not an
+    /// oversight: a Release build has no camera and will get no `frame_result`,
+    /// but nothing about the control plane depends on frames, and a Tower
+    /// driven from a phone that is not the one streaming is a real bench
+    /// configuration.
+    private func sendUnescalatedMessage(_ object: [String: Any], label: String) {
         guard status == .online, let task = webSocketTask else {
             log("\(label) not sent — Tower not online (status=\(status))")
             return
@@ -1386,6 +1936,38 @@ final class TowerClient: NSObject, ObservableObject {
             // Not `metrics`: that name is this client's `SenderMetrics`, and
             // shadowing it here silently rebinds every use below.
             let extraMetrics = json["metrics"] as? [String: Double] ?? [:]
+            // Additive, and omitted entirely by a Tower that runs no Lab. An
+            // `if let` rather than `flatMap(TowerFrameResultProvenance.init)`
+            // for the isolation reason `TowerCartridgeDeclaration.init` gives.
+            var cvLab: TowerFrameResultProvenance?
+            if let rawCVLab = json["cv_lab"] as? [String: Any] {
+                cvLab = TowerFrameResultProvenance(json: rawCVLab)
+            }
+
+            // >>> The staleness gate. <<<
+            //
+            // A result belonging to a run this client is not watching is
+            // discarded here and reaches nothing below — not the published
+            // reading, not the reply counter, not the metrics. It is the whole
+            // of the rule the contract states in one line, and the reason it
+            // sits at the top of this case rather than at the point of display
+            // is that there is more than one consumer downstream and a gate per
+            // consumer is a gate somebody forgets.
+            //
+            // `watchedCVLabRunID == nil` means no status has ever been read, so
+            // there is no run being watched and nothing to contradict — every
+            // result is passed through. A reply with no `cv_lab` block at all
+            // is passed through for the same reason: a Tower that attaches no
+            // provenance has made no claim about which run this belongs to, and
+            // discarding it would drop every result from a Tower running no Lab.
+            if let watched = watchedCVLabRunID, let runID = cvLab?.runID, runID != watched {
+                staleFrameResultCount += 1
+                log(
+                    "frame_result discarded: run \(runID) is not the watched run "
+                        + "\(watched) (stale results so far: \(staleFrameResultCount))"
+                )
+                return
+            }
 
             resultLogCounter += 1
             if resultLogCounter % Self.frameLogStride == 1 {
@@ -1410,10 +1992,89 @@ final class TowerClient: NSObject, ObservableObject {
                 resultValue: resultValue,
                 resultLabel: resultLabel,
                 stageMs: stageMs,
-                metrics: extraMetrics
+                metrics: extraMetrics,
+                cvLab: cvLab
             )
             #endif
+            // A result cleared the gate, so whatever refusal was last on screen
+            // has been answered. Cleared here rather than left to age: "the Lab
+            // is paused" beside a fresh reading is two claims that cannot both
+            // be current.
+            latestFrameRefusal = nil
             metrics.recordFrameResult()
+
+        case "frame_error":
+            // The case that did not exist. Every `frame_error` the Tower has
+            // ever sent fell through to `default:` below and was logged as an
+            // unknown message type — so the Lab's six refusal codes, which are
+            // the answer to "I pressed Start and nothing happened", were
+            // arriving and being discarded.
+            //
+            // **Refusals are not failures**, and nothing here treats them as
+            // such: no `fail()`, no send-window change, no stream-bracket
+            // change, and `metrics` is not told a frame failed. The Tower
+            // counts these under `frames_rejected` and deliberately not under
+            // `frame_processing_errors`, for the reason it gives in one line —
+            // a Lab paused for five minutes has not failed hundreds of times —
+            // and a client that counted them as errors would reproduce exactly
+            // the number the Tower fixed.
+            guard let refusal = TowerFrameRefusal(json: json) else {
+                log("frame_error could not be decoded")
+                return
+            }
+            // Not decimated. These arrive at the refusal rate, which is the
+            // sender's ~0.8 frames per second and not the 12 Hz reply rate, and
+            // each one is a state change worth seeing in full.
+            log(
+                "frame_error: seq=\(refusal.sequence.map(String.init) ?? "?")"
+                    + " reason=\(refusal.reason) — \(refusal.message)"
+            )
+            latestFrameRefusal = refusal
+            cvLabControlEvents.send(.frameRefused(refusal))
+
+        // MARK: CV Lab control plane
+        //
+        // Two more cases that did not exist. Both are additive, neither can
+        // affect the frame path, and both pass the status document through
+        // undecoded — this file owns the transport, the cartridge owns the
+        // contract.
+
+        case "cv_lab_status":
+            guard let reply = CVLabControlReply(json: json) else {
+                log("cv_lab_status could not be decoded")
+                return
+            }
+            log(
+                "cv_lab_status: state=\(reply.lifecycleState ?? "?")"
+                    + " run=\(reply.runID ?? "none")"
+                    // The field that separates an answer from a push. Logged
+                    // because reading a pushed heartbeat as the answer to a
+                    // command is the mistake this field exists to prevent, and
+                    // a log that does not distinguish them cannot show it.
+                    + " accepted_command=\(reply.acceptedCommand ?? "—")"
+                    + " request_id=\(reply.requestID ?? "—")"
+            )
+            watchCVLabRun(reply.runID)
+            cvLabControlEvents.send(.status(reply))
+
+        case "cv_lab_error":
+            guard let refusal = CVLabControlRefusal(json: json) else {
+                log("cv_lab_error could not be decoded")
+                return
+            }
+            // Every one of the eight reasons means the request did not take
+            // effect, so nothing is applied here — not even optimistically. The
+            // refusal carries the unchanged document and the run watch is
+            // updated from it, which is the same path an accepted command
+            // takes: state comes from the document, never from the command.
+            log(
+                "cv_lab_error: \(refusal.reason) for \(refusal.command ?? "?")"
+                    + " — \(refusal.message)"
+            )
+            if let status = refusal.status {
+                watchCVLabRun((status["lifecycle"] as? [String: Any])?["run_id"] as? String)
+            }
+            cvLabControlEvents.send(.refused(refusal))
 
         // MARK: Result channel
         //
@@ -1575,6 +2236,15 @@ final class TowerClient: NSObject, ObservableObject {
         // ever sent for a socket that is not there.
         latestFrameResult = nil
         #endif
+        // The third of the three clears, and the only one that runs in a
+        // Release build. A run id is a fact about the Tower on the other end of
+        // *this* socket, and the socket is what just went away: the next one
+        // may reach a different Tower, or the same one restarted, and either
+        // way the run it names has to be learned again from a document rather
+        // than assumed to have survived. Holding a run id across a teardown
+        // would gate the next connection's replies against the last one's run
+        // and discard every one of them until a status arrived.
+        clearCVLabRunWatch()
     }
 
     // MARK: - What the Tower says about itself

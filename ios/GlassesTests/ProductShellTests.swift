@@ -597,30 +597,74 @@ final class CartridgeIntegrationTests: XCTestCase {
     /// was reviewed. What it pins now is the same property in its new form —
     /// **exactly one contract is implemented, and it is that one** — so a
     /// second one appearing is still a review and not a silent widening.
-    func testTheTowerDeclaresOnlyTheWorldBuilderContract() {
+    func testTheImplementedContractsAreExactlyTheFiveThisBuildDecodes() {
         XCTAssertEqual(
             TowerCapabilities.supported,
-            [WorldBuilderResultContract.identifier],
+            [
+                WorldBuilderResultContract.identifier,
+                ExperimentalCVContract.status,
+                SceneUnderstandingContract.identifier,
+                DocumentMemoryContract.statusIdentifier,
+                DocumentMemoryContract.libraryIdentifier
+            ],
             "this build's implemented contracts changed; every cartridge's client must be reviewed"
         )
         XCTAssertTrue(
             TowerCapabilities.declared.isEmpty,
             """
-            a contract was hardcoded into the local table. World Builder's arrives \
-            over the socket, and a compile-time copy is a second answer that can \
-            disagree with the Tower's.
+            a contract was hardcoded into the local table. Every one this app \
+            implements arrives over the wire, and a compile-time copy is a second \
+            answer that can disagree with the Tower's.
             """
         )
     }
 
-    /// The Tower's name for a cartridge is not this app's, and exactly one
-    /// cartridge has both.
-    func testTheCartridgeNameMappingCoversOnlyWorldBuilder() {
+    /// Object Memory has a complete client and no declaration, deliberately.
+    ///
+    /// This is the one asymmetry in the system that looks like a bug from every
+    /// angle, so it is pinned from the iOS side rather than left to be
+    /// rediscovered. The Tower's own contract §9 says: *"Object Memory is NOT
+    /// in `GET /cartridges`, and that is deliberate… Reach Object Memory over
+    /// HTTP. Learn nothing about it from the declaration."* A
+    /// `result_subscribe` for it is refused `unknown_cartridge`, and the Tower
+    /// pins that refusal on its side too.
+    ///
+    /// So the absence below is the assertion, not an omission in it. If Object
+    /// Memory ever gains a socket declaration, this test fails and **that is
+    /// the review** — the two halves must land together, and the Tower lane
+    /// recorded the decision as a human's to make.
+    func testObjectMemoryIsReachedWithoutADeclaration() {
+        XCTAssertNil(
+            TowerCapabilities.towerCartridgeNames["object-memory"],
+            """
+            Object Memory gained a Tower name. It is undeclared by design and \
+            reached over HTTP; a name here would make it look subscribable.
+            """
+        )
+        XCTAssertFalse(
+            TowerCapabilities.supported.contains(where: { $0.hasPrefix("object_memory.") }),
+            "an object_memory contract entered the subscription set; it has none on the socket"
+        )
+    }
+
+    /// The Tower's name for a cartridge is not this app's, and only cartridges
+    /// with a client that decodes a declared contract have both.
+    ///
+    /// The hyphen/underscore split is not cosmetic: `experimental-cv` against
+    /// `experimental_cv` is the mapping without which a complete client, a
+    /// correct decoder and a live offer still resolve to "nothing here".
+    func testTheCartridgeNameMappingCoversTheDeclaredCartridges() {
         XCTAssertEqual(
             TowerCapabilities.towerCartridgeNames,
-            ["world-build": "world_builder"]
+            [
+                "world-build": "world_builder",
+                "experimental-cv": "experimental_cv",
+                "scene-understanding": "scene_understanding",
+                "document-memory": "document_memory"
+            ]
         )
-        for cartridge in Cartridge.catalog where cartridge.id != "world-build" {
+        let mapped = Set(TowerCapabilities.towerCartridgeNames.keys)
+        for cartridge in Cartridge.catalog where !mapped.contains(cartridge.id) {
             XCTAssertNil(
                 TowerCapabilities.towerCartridgeNames[cartridge.id],
                 "\(cartridge.name) gained a Tower name without a client to use it"
@@ -734,10 +778,16 @@ final class CartridgeIntegrationTests: XCTestCase {
     }
 
     /// A declaration naming some other cartridge must not make World Builder
-    /// available, and must not make that other cartridge available either —
-    /// this build has no client for it.
+    /// available, and a cartridge this build has no name for stays absent.
+    ///
+    /// This test used to use `scene_understanding` as its "other cartridge",
+    /// and that stopped being a valid choice on 2026-08-27: Scene Understanding
+    /// now has a name mapping and a client, so a declaration for it resolves to
+    /// something. `visual-qa` is the replacement because it is the case the
+    /// test is actually about — a cartridge with **no Tower code anywhere**,
+    /// which no amount of declaring can change.
     func testADeclarationForAnotherCartridgeChangesNothing() {
-        let other = declaration(cartridge: "scene_understanding", contract: "scene.v1")
+        let other = declaration(cartridge: "visual_qa", contract: "visual_qa.v1")
         XCTAssertEqual(
             TowerCapabilities.availability(
                 for: "world-build",
@@ -748,12 +798,54 @@ final class CartridgeIntegrationTests: XCTestCase {
         )
         XCTAssertEqual(
             TowerCapabilities.availability(
-                for: "scene-understanding",
+                for: "visual-qa",
                 declaredBy: other,
                 isTowerReachable: true
             ),
             .noContract,
             "a cartridge with no name mapping and no client became available"
+        )
+    }
+
+    /// The contract's **third state**, which this app could not previously
+    /// express and which is the whole reason `GET /cartridges` exists over HTTP
+    /// as well as the socket.
+    ///
+    /// The Tower's §2 puts three outcomes side by side and says they call for
+    /// *opposite* instructions to a person:
+    ///
+    /// | the declaration says | show |
+    /// |---|---|
+    /// | absent from every list | "not built yet" |
+    /// | present, contract this build cannot read | **"update the app"** |
+    /// | present, `available: false` | "connect" / the reason |
+    ///
+    /// The middle row is the one worth a test, because collapsing it into the
+    /// first tells someone a feature does not exist when they are one update
+    /// away from it. Before the name mapping existed, every unmapped cartridge
+    /// fell into the first row regardless of what the Tower said — which is why
+    /// this could not be asserted until now.
+    func testADeclaredContractThisBuildCannotReadAsksForAnUpdateNotForPatience() {
+        let futureTower = declaration(
+            cartridge: "scene_understanding",
+            contract: "scene_understanding.live/2027-01-01"
+        )
+        XCTAssertEqual(
+            TowerCapabilities.availability(
+                for: "scene-understanding",
+                declaredBy: futureTower,
+                isTowerReachable: true
+            ),
+            .unsupportedContract(
+                declared: CartridgeContract(
+                    cartridgeID: "scene-understanding",
+                    identifier: "scene_understanding.live/2027-01-01"
+                )
+            ),
+            """
+            a Tower speaking a newer contract resolved to "not built" rather than \
+            "update the app". Those are opposite instructions to a person.
+            """
         )
     }
 
@@ -1093,7 +1185,11 @@ final class CartridgeClientTests: XCTestCase {
                 cartridgeID: scene.cartridgeID,
                 phase: scene.state.phase,
                 reason: UnavailableSceneUnderstandingClient.reason,
-                hasData: scene.state.snapshot != nil
+                // `observation`, not the old `snapshot`. `SceneSnapshot` was
+                // removed with the entity/relationship types it held: the wire
+                // has no key that could carry an entity, so a type shaped like
+                // a list of them could never be filled from a real payload.
+                hasData: scene.state.observation != nil
             ),
         ]
     }
@@ -1841,60 +1937,18 @@ final class WorldModelIntegrationTests: XCTestCase {
 
 // MARK: - Experimental CV Lab
 
-/// Guards the two rules `docs/modules/EXPERIMENTAL-CV.md` puts on results:
-/// inference must be distinguishable from measurement, and nothing may be called
-/// "better" without a baseline to be better than.
+/// Guards the rule `docs/modules/EXPERIMENTAL-CV.md` puts on results:
+/// inference must be distinguishable from measurement.
+///
+/// The other rule it used to guard — nothing may be called "better" without a
+/// baseline to be better than — is no longer testable here, because there is
+/// no longer any code that could break it. `CVMetric` carries no `baseline`,
+/// no `higherIsBetter` and no `comparison`: the Tower sends those fields as
+/// `null` on every metric, always, and the machinery was deleted rather than
+/// left dormant behind them. The four tests that lived here asserted the
+/// behaviour of a verdict renderer that no longer exists.
 @MainActor
 final class ExperimentalCVModelTests: XCTestCase {
-
-    private func metric(
-        _ value: Double,
-        baseline: Double? = nil,
-        higherIsBetter: Bool? = nil
-    ) -> CVMetric {
-        CVMetric(
-            label: "accuracy",
-            value: value,
-            provenance: .inferred(confidence: nil),
-            baseline: baseline,
-            higherIsBetter: higherIsBetter
-        )
-    }
-
-    /// "Avoid declaring an approach 'better' without a measurement", enforced.
-    func testNoVerdictWithoutABaseline() {
-        XCTAssertNil(metric(0.9, higherIsBetter: true).comparison)
-    }
-
-    /// A metric with no stated direction cannot be judged either: latency and
-    /// error improve downward, and guessing gets it backwards half the time.
-    func testNoVerdictWithoutAStatedDirection() {
-        XCTAssertNil(metric(0.9, baseline: 0.5).comparison)
-    }
-
-    /// Integral values on purpose: this asserts the *direction* logic, and a
-    /// binary-float delta would make the test about `Double` equality instead.
-    func testAVerdictRespectsTheStatedDirection() {
-        XCTAssertEqual(
-            metric(90, baseline: 50, higherIsBetter: true).comparison,
-            .better(delta: 40)
-        )
-        // The same movement, on a metric where lower is better.
-        XCTAssertEqual(
-            metric(90, baseline: 50, higherIsBetter: false).comparison,
-            .worse(delta: 40)
-        )
-        XCTAssertEqual(
-            metric(20, baseline: 50, higherIsBetter: false).comparison,
-            .better(delta: -30)
-        )
-    }
-
-    /// A tie is a real result and must not round into a win.
-    func testMatchingTheBaselineIsUnchanged() {
-        XCTAssertEqual(metric(0.5, baseline: 0.5, higherIsBetter: true).comparison, .unchanged)
-        XCTAssertEqual(CVMetric.Comparison.unchanged.label, "Unchanged")
-    }
 
     /// A unit the Tower did not send is omitted, not substituted.
     func testAMissingUnitIsOmittedRatherThanInvented() {
@@ -1977,7 +2031,11 @@ final class ExperimentalCVModelTests: XCTestCase {
             resultValue: resultValue,
             resultLabel: resultLabel,
             stageMs: [:],
-            metrics: metrics
+            metrics: metrics,
+            // A Tower running no CV Lab attaches no `cv_lab` block, which is
+            // the case these fixtures describe: they exercise the pair rule on
+            // the message's own fields.
+            cvLab: nil
         )
     }
 
@@ -2134,10 +2192,10 @@ final class ExperimentalCVModelTests: XCTestCase {
                 state.phase.mayCarryData,
                 "\(state) claims a phase that permits data it does not have"
             )
-        case .running(let run), .completed(let run):
-            // The only two cases that carry results, and what they carry is a
-            // `CVExperimentRun` — metrics with `provenance` and `baseline`
-            // required by the type, which is exactly what the frame channel
+        case .running(let run), .paused(let run), .completed(let run):
+            // The only three cases that carry results, and what they carry is
+            // a `CVExperimentRun` — metrics with `provenance` required by the
+            // type, which is exactly what the frame channel
             // cannot supply.
             XCTAssertEqual(state.run, run)
             XCTAssertTrue(state.phase.mayCarryData)
@@ -2334,255 +2392,6 @@ final class DocumentMemoryModelTests: XCTestCase {
         ]
         for (state, phase) in expected {
             XCTAssertEqual(state.phase, phase, "\(state) mapped to the wrong phase")
-        }
-    }
-}
-
-// MARK: - Scene Understanding
-
-/// The anonymity and no-gaze rules, as tests. These are the assertions most
-/// likely to be tripped by a future well-meaning copy edit, which is exactly why
-/// they are here rather than in a comment.
-@MainActor
-final class SceneUnderstandingModelTests: XCTestCase {
-
-    private func person(_ id: String, facing: SceneFacing = .unknown) -> SceneEntity {
-        SceneEntity(
-            trackID: SceneTrackID(id),
-            kind: .person,
-            facing: facing,
-            provenance: .inferred(confidence: 0.7)
-        )
-    }
-
-    // MARK: Anonymity
-
-    /// A person on screen is a positional label and nothing else. The Tower's
-    /// track handle never reaches the display, because a stable-looking string
-    /// beside a person's outline invites a reader to treat it as an identity.
-    func testAPersonIsNamedPositionallyAndNeverByTheirTrackHandle() {
-        let handle = SceneTrackID("track-7f3a-9b21")
-        let name = handle.displayName(index: 0, kind: .person)
-        XCTAssertEqual(name, "Person 1")
-        XCTAssertFalse(name.contains(handle.rawValue), "a track handle reached the display")
-    }
-
-    /// An object may carry a class label — "chair" — which is a category, not an
-    /// identity. Limitation 6's distinction, preserved.
-    func testAnObjectMayCarryAClassLabelButNeverAnIdentity() {
-        let handle = SceneTrackID("track-2")
-        XCTAssertEqual(handle.displayName(index: 1, kind: .object(label: "chair")), "chair")
-        XCTAssertEqual(handle.displayName(index: 1, kind: .object(label: nil)), "Object 2")
-    }
-
-    /// Two tracked people differ only by their handle — never by anything the
-    /// system claims to know *about* them.
-    ///
-    /// The anonymity guarantee itself is structural: `SceneEntityKind.person`
-    /// has no associated value, so there is nowhere to put a name, and no
-    /// runtime test can assert the absence of a field. What is testable is the
-    /// consequence, which is what this checks. An earlier version asserted
-    /// `SceneEntityKind.person == SceneEntityKind.person`, a tautology that
-    /// would keep passing if someone added `case identifiedPerson(name:)`
-    /// beside it.
-    func testTwoTrackedPeopleDifferOnlyByTheirHandle() {
-        let a = person("track-a")
-        let b = person("track-b")
-        XCTAssertNotEqual(a.trackID, b.trackID)
-        XCTAssertEqual(a.kind, b.kind, "the system distinguished two people by something about them")
-        XCTAssertFalse(SceneEntityKind.object(label: "person").isPerson)
-
-        // And the display of each is positional, so even the handle that does
-        // distinguish them never reaches the screen.
-        XCTAssertEqual(a.trackID.displayName(index: 0, kind: a.kind), "Person 1")
-        XCTAssertEqual(b.trackID.displayName(index: 1, kind: b.kind), "Person 2")
-    }
-
-    // MARK: Gaze
-
-    /// The wording rule from Limitation 8. `.towardCamera` is body orientation
-    /// and reads as such; every phrasing that would claim attention is absent.
-    func testOrientationLabelsNeverClaimGaze() {
-        XCTAssertEqual(SceneFacing.towardCamera.displayName, "Facing your direction")
-        let forbidden = ["look", "watch", "eye", "gaze", "stare", "notice", "see you"]
-        for facing in SceneFacing.allCases {
-            let lowered = facing.displayName.lowercased()
-            for word in forbidden {
-                XCTAssertFalse(
-                    lowered.contains(word),
-                    "\(facing.displayName) claims attention the glasses cannot observe"
-                )
-            }
-            XCTAssertFalse(facing.displayName.isEmpty)
-        }
-    }
-
-    /// The caveat must name the missing hardware, not merely hedge. A softened
-    /// version invites the reading it exists to prevent.
-    func testTheGazeCaveatNamesTheMissingCapability() {
-        let caveat = SceneFacing.gazeCaveat.lowercased()
-        XCTAssertTrue(caveat.contains("no eye tracking"), "got: \(SceneFacing.gazeCaveat)")
-        XCTAssertTrue(caveat.contains("cannot"))
-    }
-
-    /// "Not reported" is its own answer and must not collapse into a direction.
-    func testUnknownOrientationIsItsOwnAnswer() {
-        XCTAssertEqual(SceneFacing.unknown.displayName, "Orientation unknown")
-        XCTAssertNotEqual(SceneFacing.unknown.displayName, SceneFacing.acrossView.displayName)
-    }
-
-    // MARK: Counts
-
-    /// Derived from the list, so a header can never disagree with the rows
-    /// beneath it.
-    func testCountsAreDerivedFromTheEntityListItself() {
-        let snapshot = SceneSnapshot(entities: [
-            person("a"),
-            person("b"),
-            SceneEntity(trackID: SceneTrackID("c"), kind: .object(label: "chair"), provenance: .measured),
-        ])
-        XCTAssertEqual(snapshot.personCount, 2)
-        XCTAssertEqual(snapshot.objectCount, 1)
-        XCTAssertEqual(snapshot.personCount + snapshot.objectCount, snapshot.entities.count)
-    }
-
-    func testAnEmptySceneCountsZeroOfEach() {
-        let snapshot = SceneSnapshot()
-        XCTAssertEqual(snapshot.personCount, 0)
-        XCTAssertEqual(snapshot.objectCount, 0)
-        XCTAssertTrue(snapshot.isEmpty)
-    }
-
-    /// Core Principle 3. A bare "0 people" invites the reading that nobody is
-    /// there; the caveat is what prevents it, so it must actually disclaim
-    /// absence rather than merely describe the camera.
-    func testTheCountCaveatDisclaimsAbsenceRatherThanJustDescribingTheCamera() {
-        let caveat = SceneSnapshot.countCaveat.lowercased()
-        XCTAssertTrue(caveat.contains("not ruled out"), "got: \(SceneSnapshot.countCaveat)")
-        XCTAssertTrue(caveat.contains("camera"))
-    }
-
-    // MARK: Positions
-
-    /// The same monocular-depth rule World Builder obeys, applied to a distance
-    /// to a person.
-    func testADistanceToAnEntityIsWithheldWithoutMetricScale() {
-        let relative = ScenePosition(frame: .cameraRelative, distance: 2.5, scale: .relative)
-        XCTAssertFalse(relative.distanceDisplayable)
-
-        let inferred = ScenePosition(frame: .cameraRelative, distance: 2.5, scale: .inferredMetric)
-        XCTAssertTrue(inferred.distanceDisplayable)
-        XCTAssertTrue(inferred.scale.isEstimate, "an inferred distance must be labelled an estimate")
-
-        let unknown = ScenePosition(frame: .cameraRelative, distance: 2.5, scale: .unknown)
-        XCTAssertFalse(unknown.distanceDisplayable)
-    }
-
-    /// A bearing is an angle and needs no depth, so it is not subject to the
-    /// scale rule — treating it as if it were would discard information the
-    /// system genuinely has.
-    func testABearingIsAvailableWithoutAnyScale() {
-        let position = ScenePosition(frame: .cameraRelative, bearingDegrees: -30, scale: .unknown)
-        XCTAssertEqual(position.bearingDescription, "To your left")
-        XCTAssertFalse(position.distanceDisplayable)
-    }
-
-    /// Coarse on purpose: a bounding-box centre does not support "37.4° right".
-    func testBearingsAreDescribedCoarsely() {
-        XCTAssertEqual(ScenePosition(frame: .cameraRelative, bearingDegrees: 5).bearingDescription, "Ahead")
-        XCTAssertEqual(ScenePosition(frame: .cameraRelative, bearingDegrees: 30).bearingDescription, "To your right")
-        XCTAssertEqual(ScenePosition(frame: .cameraRelative, bearingDegrees: -30).bearingDescription, "To your left")
-        XCTAssertNil(ScenePosition(frame: .cameraRelative).bearingDescription)
-    }
-
-    /// **The camera sees a forward cone.**
-    ///
-    /// An earlier version said "Beside you, left" past 60° and "Behind you,
-    /// right" past 120° — telling the wearer the system had detected someone
-    /// behind them, which no forward-facing camera can do.
-    /// `docs/modules/SCENE-UNDERSTANDING.md` says so itself: a wearer looking
-    /// at a desk has most of the room behind the camera.
-    ///
-    /// The previous test enshrined the 150° case rather than catching it, which
-    /// is what a test asserting the implementation back to itself does.
-    func testNoBearingClaimsAnObservationBehindTheWearer() {
-        for degrees in stride(from: -180.0, through: 180.0, by: 5.0) {
-            let description = ScenePosition(
-                frame: .cameraRelative,
-                bearingDegrees: degrees
-            ).bearingDescription ?? ""
-            let lowered = description.lowercased()
-            XCTAssertFalse(
-                lowered.contains("behind"),
-                "a bearing of \(degrees)° claimed an observation behind the wearer"
-            )
-            XCTAssertFalse(
-                lowered.contains("beside"),
-                "a bearing of \(degrees)° claimed an observation outside the camera cone"
-            )
-            XCTAssertFalse(description.isEmpty, "a bearing of \(degrees)° could not be described")
-        }
-        // Past the plausible field of view it says so, rather than picking a
-        // direction the sensor cannot justify.
-        XCTAssertEqual(
-            ScenePosition(frame: .cameraRelative, bearingDegrees: 150).bearingDescription,
-            "At the edge of view, right"
-        )
-    }
-
-    /// Camera-relative and world-relative are different claims: one changes when
-    /// the wearer turns their head and the other does not.
-    func testFramesOfReferenceAreDistinguishable() {
-        XCTAssertNotEqual(
-            SceneFrameOfReference.cameraRelative,
-            SceneFrameOfReference.worldRelative(worldID: nil)
-        )
-        XCTAssertNotEqual(
-            SceneFrameOfReference.worldRelative(worldID: "a"),
-            SceneFrameOfReference.worldRelative(worldID: "b")
-        )
-    }
-
-    // MARK: Relationships and staleness
-
-    /// A relation is an inference about two inferences and carries its own
-    /// confidence; the predicate is the Tower's word, kept verbatim.
-    func testARelationshipKeepsItsPredicateAndItsConfidence() {
-        let relationship = SceneRelationship(
-            subject: SceneTrackID("a"),
-            predicate: "seated at",
-            object: SceneTrackID("b"),
-            provenance: .inferred(confidence: 0.3)
-        )
-        XCTAssertEqual(relationship.predicate, "seated at")
-        XCTAssertEqual(relationship.provenance.confidence, 0.3)
-        XCTAssertTrue(relationship.id.contains("seated at"))
-    }
-
-    /// Limitation 7: a last-known scene is not a current one, and the states
-    /// must be distinguishable so the view can say which it is drawing.
-    func testALastKnownSceneIsNotCurrent() {
-        let snapshot = SceneSnapshot(entities: [person("a")])
-        XCTAssertTrue(SceneUnderstandingState.observing(snapshot).isCurrent)
-        XCTAssertFalse(SceneUnderstandingState.lastKnown(snapshot).isCurrent)
-        XCTAssertEqual(SceneUnderstandingState.lastKnown(snapshot).phase, .settled)
-    }
-
-    func testEverySceneStateMapsToTheRightPhase() {
-        let snapshot = SceneSnapshot()
-        let expected: [(SceneUnderstandingState, CartridgePhase)] = [
-            (.unsupported(reason: "x"), .unsupported),
-            (.idle, .idle),
-            (.awaitingFirstScene, .waiting),
-            (.observing(snapshot), .live),
-            (.lastKnown(snapshot), .settled),
-            (.failed(CartridgeFailure(kind: .transport, message: "x")), .failed),
-        ]
-        for (state, phase) in expected {
-            XCTAssertEqual(state.phase, phase, "\(state) mapped to the wrong phase")
-        }
-        for state in expected where !state.1.mayCarryData {
-            XCTAssertNil(state.0.snapshot, "\(state.0) carried a scene it may not have")
         }
     }
 }

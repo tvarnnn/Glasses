@@ -212,12 +212,17 @@ final class WorldBuilderViewModel: ObservableObject {
     /// like a room and mean nothing.
     @Published private(set) var fragmentsModel = WorldFragmentsModel(segments: [])
 
-    /// The points and poses for those segments, keyed by content hash.
+    /// The points and poses for those segments, keyed by
+    /// `(content_hash, placement_hash)` — `WorldSegmentSummary.cacheKey`.
     ///
     /// Keyed by hash and not by index so that a segment re-solved under the
-    /// same index cannot be drawn from the previous solve's points. A segment
-    /// whose chunk failed to fetch is simply absent here, and `FragmentCanvas`
-    /// draws an empty tile for it rather than guessing.
+    /// same index cannot be drawn from the previous solve's points. Keyed by
+    /// **both** hashes so that a segment whose points did not move but whose
+    /// placement did cannot be drawn from the placement it used to have — the
+    /// failure that looks like nothing at all, because the fragment simply
+    /// sits in the wrong place forever. A segment whose chunk failed to fetch
+    /// is simply absent here, and `FragmentCanvas` draws an empty tile for it
+    /// rather than guessing.
     @Published private(set) var geometryChunks: [String: WorldSegmentChunk] = [:]
 
     private let client: any WorldBuilderClient
@@ -354,9 +359,14 @@ final class WorldBuilderViewModel: ObservableObject {
         // Everything the manifest still names is kept and everything else is
         // dropped, so a long walk does not accumulate superseded segments
         // forever. The cache and the published copy are rebuilt from the same
-        // list in the same pass: a hash held by one and not the other would
+        // list in the same pass: a key held by one and not the other would
         // either refetch what is already in hand or draw what is already gone.
-        await geometryStore.retainOnly(Set(manifest.segments.map(\.contentHash)))
+        //
+        // `cacheKey`, not `contentHash`: a registration pass moves every
+        // placement hash without moving a single content hash, so retaining by
+        // content alone would keep 51 chunks that no key in the new manifest
+        // can ever name again.
+        await geometryStore.retainOnly(Set(manifest.segments.map(\.cacheKey)))
 
         logGeometry(
             "manifest world=\(worldID) revision=\(revision) segments=\(manifest.segments.count) "
@@ -372,8 +382,14 @@ final class WorldBuilderViewModel: ObservableObject {
         // at the end of this function.
         var anySegmentFailed = false
         for summary in manifest.segments {
-            if let cached = await geometryStore.chunk(forHash: summary.contentHash) {
-                chunks[summary.contentHash] = cached
+            // The cache hit that decides whether a placement change is ever
+            // seen. Keyed on `contentHash` this line is the whole bug: the
+            // content hash of a segment that gained a placement is unchanged
+            // BY DESIGN, so this would hit, the refetch below would be
+            // skipped, and the unplaced chunk would be drawn for the life of
+            // the world. `cacheKey` carries the placement half.
+            if let cached = await geometryStore.chunk(forKey: summary.cacheKey) {
+                chunks[summary.cacheKey] = cached
                 cacheHits += 1
                 continue
             }
@@ -385,13 +401,19 @@ final class WorldBuilderViewModel: ObservableObject {
             }
             await geometryStore.insert(chunk)
             fetched += 1
-            // Filed under the chunk's OWN hash, not the summary's. A rebuild
+            // Filed under the chunk's OWN key, not the summary's. A rebuild
             // between the two requests returns different geometry under the
-            // same segment index, and filing it under the hash we asked for
+            // same segment index, and filing it under the key we asked for
             // would draw the new points inside the old segment's bounds. Filed
             // under its own, it simply does not match and is not drawn — which
             // is the honest outcome, and the next manifest resolves it.
-            chunks[chunk.contentHash] = chunk
+            //
+            // The key is composite, so this now also covers a REGISTRATION
+            // landing between the manifest and the chunk: the points are the
+            // same, the placement is not, and a chunk placed differently from
+            // the row that asked for it is exactly as unusable as one built
+            // from different points.
+            chunks[chunk.cacheKey] = chunk
         }
 
         // Checked again, for the same reason: the segment fetches above are the

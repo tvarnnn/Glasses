@@ -4,6 +4,37 @@ import CoreGraphics
 import Combine
 @testable import Glasses
 
+// MARK: - Placement fixtures
+
+/// A segment the Tower reported as not registered, with nothing more said —
+/// the shape a row from a Tower predating `registration_state` and
+/// `placement_hash` decodes to, and the right placement for any test whose
+/// subject is not placement.
+private func notRegistered(placementHash: String? = nil) -> WorldPlacementFields {
+    WorldPlacementFields(
+        registered: false, state: nil, refusalReason: nil,
+        transform: nil, placementHash: placementHash
+    )
+}
+
+/// A placed segment, in the frame of `reference`.
+///
+/// Identity rotation because the tests that care about the rotation build their
+/// own; what varies here is `reference`, because "same reference or nothing" is
+/// the composition rule these fixtures exist to exercise.
+private func placed(
+    into reference: Int, frameRevision: Int = 1, placementHash: String? = nil
+) -> WorldPlacementFields {
+    WorldPlacementFields(
+        registered: true, state: .registered, refusalReason: nil,
+        transform: WorldTransform(
+            rotationWXYZ: [1, 0, 0, 0], translation: [0, 0, 0], scale: 1,
+            referenceSegment: reference, frameRevision: frameRevision
+        ),
+        placementHash: placementHash
+    )
+}
+
 final class WorldGeometryDecoderTests: XCTestCase {
 
     private func manifestJSON(upAxis: String = "unknown") -> [String: Any] {
@@ -137,6 +168,94 @@ final class WorldGeometryDecoderTests: XCTestCase {
         XCTAssertNotNil(chunk?.poses[0].translation)
     }
 
+    func testTheManifestCarriesTheScaleBlock() {
+        let manifest = WorldGeometryDecoder.manifest(from: manifestJSON())
+        XCTAssertEqual(manifest?.scale.state, .unknown)
+        XCTAssertNil(manifest?.scale.metersPerUnit)
+        XCTAssertFalse(manifest!.scale.convertibleToMetres)
+    }
+
+    /// An absent scale block reads as `unknown` rather than refusing the
+    /// manifest — the weakest claim, not a convenient one. Refusing would
+    /// discard real geometry over metadata the viewer is forbidden from
+    /// turning into a distance anyway.
+    func testAManifestWithNoScaleBlockReadsAsUnknownAndNotAsRelative() {
+        var json = manifestJSON()
+        json.removeValue(forKey: "scale")
+        let manifest = WorldGeometryDecoder.manifest(from: json)
+        XCTAssertNotNil(manifest)
+        XCTAssertEqual(manifest?.scale.state, .unknown)
+    }
+
+    /// The manifest row carries the placement, and `transform_to_world: null`
+    /// arrives as nothing rather than as identity.
+    func testAManifestRowCarriesItsPlacement() {
+        var json = manifestJSON()
+        var segments = json["segments"] as! [[String: Any]]
+        segments[0]["registration_state"] = "refused"
+        segments[0]["registration_refusal_reason"] = "span_over_depth"
+        segments[0]["placement_hash"] = "p0"
+        json["segments"] = segments
+
+        let manifest = WorldGeometryDecoder.manifest(from: json)
+        XCTAssertEqual(manifest?.segments[0].placement.state, .refused)
+        XCTAssertEqual(
+            manifest?.segments[0].placement.refusalReason, "span_over_depth"
+        )
+        XCTAssertNil(manifest?.segments[0].transformToWorld)
+        XCTAssertEqual(manifest?.segments[0].cacheKey, "h0:p0")
+        // The row that carries no placement hash names the absence instead.
+        XCTAssertEqual(manifest?.segments[1].cacheKey, "h1:-")
+    }
+
+    /// A row that disagrees with itself about its own placement drops the
+    /// whole manifest, for the same reason a malformed row does: skipping it
+    /// would silently shrink the world.
+    func testARowThatContradictsItsOwnPlacementDropsTheWholeManifest() {
+        var json = manifestJSON()
+        var segments = json["segments"] as! [[String: Any]]
+        segments[0]["registered"] = true  // and transform_to_world is still null
+        json["segments"] = segments
+        XCTAssertNil(WorldGeometryDecoder.manifest(from: json))
+    }
+
+    /// A chunk's points are in the SEGMENT's frame. `transform_to_world` is
+    /// the only route into the reference segment's frame, and there is no
+    /// route at all when the segment is not placed — "not registered" is not
+    /// "registered at the origin".
+    func testAChunksPointsReachTheReferenceFrameOnlyThroughItsTransform() {
+        let placed: [String: Any] = [
+            "contract": "world_builder.geometry/2026-08-25",
+            "segment_index": 0, "content_hash": "h0", "frame_id": "segment:0",
+            "registered": true, "registration_state": "registered",
+            "transform_to_world": [
+                "rotation_wxyz": [1.0, 0.0, 0.0, 0.0],
+                "translation": [10.0, 0.0, 0.0], "scale": 2.0,
+                "reference_segment": 4, "frame_revision": 1,
+            ],
+            "placement_hash": "p1",
+            "poses": [[String: Any]](), "points": [[1.0, 0.0, 0.0]],
+            "points_sent": 1, "points_total": 1, "point_sampling": "none",
+        ]
+        let chunk = WorldGeometryDecoder.chunk(from: placed)
+        XCTAssertEqual(chunk?.transformToWorld?.referenceSegment, 4)
+        XCTAssertEqual(chunk?.pointsInReferenceFrame ?? [], [[12.0, 0.0, 0.0]])
+        XCTAssertEqual(chunk?.cacheKey, "h0:p1")
+
+        var unplaced = placed
+        unplaced["registered"] = false
+        unplaced["registration_state"] = "unplaced"
+        unplaced["transform_to_world"] = NSNull()
+        let loose = WorldGeometryDecoder.chunk(from: unplaced)
+        XCTAssertNotNil(loose)
+        XCTAssertNil(
+            loose?.pointsInReferenceFrame,
+            "an unplaced segment's points were offered as though they were in a "
+                + "shared frame; they are in its own and nowhere else"
+        )
+        XCTAssertEqual(loose?.points, [[1.0, 0.0, 0.0]])
+    }
+
     func testASampledChunkKnowsItIsPartial() {
         let json: [String: Any] = [
             "contract": "world_builder.geometry/2026-08-25",
@@ -152,46 +271,429 @@ final class WorldGeometryDecoderTests: XCTestCase {
     }
 }
 
+// MARK: - transform_to_world
+
+/// The Sim3, and the four refusals around it.
+final class WorldTransformDecoderTests: XCTestCase {
+
+    private func transformJSON(
+        rotation: [Double] = [1.0, 0.0, 0.0, 0.0],
+        translation: [Double] = [1.0, 2.0, 3.0],
+        scale: Double = 0.3533,
+        reference: Int = 4,
+        frameRevision: Int = 1
+    ) -> [String: Any] {
+        [
+            "rotation_wxyz": rotation, "translation": translation,
+            "scale": scale, "reference_segment": reference,
+            "frame_revision": frameRevision,
+        ]
+    }
+
+    func testASim3DecodesFieldForField() {
+        let transform = WorldTransform(json: transformJSON())
+        XCTAssertEqual(transform?.rotationWXYZ, [1, 0, 0, 0])
+        XCTAssertEqual(transform?.translation, [1, 2, 3])
+        XCTAssertEqual(transform?.scale, 0.3533)
+        XCTAssertEqual(transform?.referenceSegment, 4)
+        XCTAssertEqual(transform?.frameRevision, 1)
+    }
+
+    /// `p_ref = scale * (R(q) · p_segment) + t`, asserted on a rotation that
+    /// would come out differently under any of the plausible wrong readings —
+    /// a transposed matrix, an xyzw quaternion, or scale applied before the
+    /// rotation instead of after.
+    func testAPointIsMappedIntoTheReferenceFrame() throws {
+        // +90 degrees about +Y, right-handed. (1,0,0) -> (0,0,-1).
+        let s = (0.5 as Double).squareRoot()
+        let transform = try XCTUnwrap(
+            WorldTransform(
+                json: transformJSON(
+                    rotation: [s, 0, s, 0], translation: [10, 0, 0], scale: 2
+                )
+            )
+        )
+
+        let mapped = try XCTUnwrap(transform.apply(to: [1, 0, 0]))
+        XCTAssertEqual(mapped[0], 10, accuracy: 1e-9)
+        XCTAssertEqual(mapped[1], 0, accuracy: 1e-9)
+        XCTAssertEqual(mapped[2], -2, accuracy: 1e-9)
+
+        // The identity case, which must be exactly the input plus t.
+        let identity = try XCTUnwrap(WorldTransform(json: transformJSON(scale: 1)))
+        XCTAssertEqual(try XCTUnwrap(identity.apply(to: [5, 6, 7])), [6, 8, 10])
+    }
+
+    func testAShortPointIsRefusedRatherThanIndexedPastItsEnd() throws {
+        let transform = try XCTUnwrap(WorldTransform(json: transformJSON()))
+        XCTAssertNil(transform.apply(to: [1, 2]))
+    }
+
+    /// **A non-unit quaternion scales the geometry it rotates, silently and on
+    /// top of `scale`.** The Tower validates at write time; this validates at
+    /// read time, because a client that trusts the writer has no way to notice
+    /// when the writer is a Tower it has never met.
+    func testANonUnitQuaternionIsRefusedRatherThanNormalised() {
+        XCTAssertNil(WorldTransform(json: transformJSON(rotation: [2, 0, 0, 0])))
+        XCTAssertNil(WorldTransform(json: transformJSON(rotation: [0, 0, 0, 0])))
+        XCTAssertNil(
+            WorldTransform(json: transformJSON(rotation: [0.5, 0.5, 0.5, 0.6]))
+        )
+    }
+
+    /// And not tighter than the Tower's own bar. A quaternion serialised at
+    /// five decimal places lands ~1.9e-6 off unit, so a validator at 1e-6
+    /// would refuse the Tower's own valid output — silently, since the rows
+    /// would drop and the world would read as unregistered.
+    func testAQuaternionOffUnitByLessThanTheToleranceIsAccepted() {
+        XCTAssertEqual(WorldTransform.quaternionNormTolerance, 1e-3)
+        XCTAssertNotNil(
+            WorldTransform(json: transformJSON(rotation: [1.0000019, 0, 0, 0]))
+        )
+        XCTAssertNotNil(
+            WorldTransform(json: transformJSON(rotation: [0.9999, 0, 0, 0]))
+        )
+    }
+
+    /// A zero scale collapses the segment to a dot at the reference's origin,
+    /// which the registration research records as invisible in every aggregate
+    /// metric. A non-finite one is applied all the same and places the
+    /// geometry nowhere in particular.
+    func testAnUnusableScaleIsRefused() {
+        XCTAssertNil(WorldTransform(json: transformJSON(scale: 0)))
+        XCTAssertNil(WorldTransform(json: transformJSON(scale: -1)))
+        XCTAssertNil(WorldTransform(json: transformJSON(scale: .infinity)))
+        XCTAssertNil(WorldTransform(json: transformJSON(scale: .nan)))
+    }
+
+    func testAnIncompleteSim3IsRefusedRatherThanDefaulted() {
+        // Half a transform means a default supplies the rest, and the default
+        // is wrong.
+        for key in ["rotation_wxyz", "translation", "scale",
+                    "reference_segment", "frame_revision"] {
+            var json = transformJSON()
+            json.removeValue(forKey: key)
+            XCTAssertNil(WorldTransform(json: json), "\(key) was defaulted")
+        }
+        XCTAssertNil(WorldTransform(json: transformJSON(rotation: [1, 0, 0])))
+        XCTAssertNil(WorldTransform(json: transformJSON(translation: [1, 2])))
+    }
+
+    /// The contract calls a `frame_revision` mismatch a refuse-to-draw
+    /// condition, so a revision that cannot be compared must not reach a
+    /// renderer as something to compare against.
+    func testAnImpossibleReferenceOrRevisionIsRefused() {
+        XCTAssertNil(WorldTransform(json: transformJSON(reference: -1)))
+        XCTAssertNil(WorldTransform(json: transformJSON(frameRevision: 0)))
+    }
+
+    /// `null` is the wire saying **not registered into any shared frame**.
+    /// Decoding it to anything at all — identity most of all — would place the
+    /// segment at the reference origin, and the result looks like a map.
+    func testANullTransformDecodesToNothingAndNotToIdentity() {
+        XCTAssertNil(WorldTransform(json: NSNull()))
+        XCTAssertNil(WorldTransform(json: nil))
+    }
+}
+
+// MARK: - The placement fields, and the rows they refuse
+
+final class WorldPlacementDecoderTests: XCTestCase {
+
+    private static let sim3: [String: Any] = [
+        "rotation_wxyz": [1.0, 0.0, 0.0, 0.0],
+        "translation": [1.0, 2.0, 3.0], "scale": 0.5,
+        "reference_segment": 4, "frame_revision": 1,
+    ]
+
+    func testAPlacedRowCarriesItsStateAndItsSim3() {
+        let placement = WorldPlacementFields(json: [
+            "registered": true, "registration_state": "registered",
+            "registration_refusal_reason": NSNull(),
+            "transform_to_world": Self.sim3, "placement_hash": "p1",
+        ])
+        XCTAssertEqual(placement?.registered, true)
+        XCTAssertEqual(placement?.state, .registered)
+        XCTAssertNil(placement?.refusalReason)
+        XCTAssertEqual(placement?.transform?.referenceSegment, 4)
+        XCTAssertEqual(placement?.placementHash, "p1")
+    }
+
+    /// `refused` and `unplaced` are the distinction `registered: false` alone
+    /// could not carry — "we tried and the solves disagreed" against "nobody
+    /// looked" — and on the real corpus the refusal is usually *the wearer
+    /// stood still*, which is a message to the wearer.
+    func testARefusalKeepsItsReasonAndIsNotJustUnplaced() {
+        let refused = WorldPlacementFields(json: [
+            "registered": false, "registration_state": "refused",
+            "registration_refusal_reason": "span_over_depth",
+            "transform_to_world": NSNull(), "placement_hash": "p2",
+        ])
+        XCTAssertEqual(refused?.state, .refused)
+        XCTAssertEqual(refused?.refusalReason, "span_over_depth")
+
+        let unplaced = WorldPlacementFields(json: [
+            "registered": false, "registration_state": "unplaced",
+            "registration_refusal_reason": NSNull(),
+            "transform_to_world": NSNull(), "placement_hash": "p3",
+        ])
+        XCTAssertEqual(unplaced?.state, .unplaced)
+        XCTAssertNil(unplaced?.refusalReason)
+        XCTAssertNotEqual(unplaced?.state, refused?.state)
+    }
+
+    /// **`registration_state` absent is not `unplaced`.** The whole reason the
+    /// field exists is that the bool cannot tell a refusal from an untried
+    /// segment, so synthesising `.unplaced` from the bool would fabricate the
+    /// distinction the field was added to carry. A Tower that predates the
+    /// field has simply not said.
+    func testAnAbsentRegistrationStateStaysAbsent() {
+        let placement = WorldPlacementFields(json: [
+            "registered": false, "transform_to_world": NSNull(),
+        ])
+        XCTAssertEqual(placement?.registered, false)
+        XCTAssertNil(placement?.state)
+        XCTAssertNil(placement?.placementHash)
+    }
+
+    /// A word this build does not know is not quietly folded into one it does.
+    func testAnUnknownRegistrationStateIsNotGuessed() {
+        let placement = WorldPlacementFields(json: [
+            "registered": false, "registration_state": "provisional",
+            "transform_to_world": NSNull(),
+        ])
+        XCTAssertNil(placement?.state)
+    }
+
+    /// A row claiming to be placed and carrying no usable Sim3 has told us it
+    /// is placed and not where. There is no safe reading of that, so the row
+    /// is refused — which drops the whole payload rather than drawing half a
+    /// claim.
+    func testARegisteredRowWithNoUsableTransformIsRefused() {
+        XCTAssertNil(WorldPlacementFields(json: [
+            "registered": true, "registration_state": "registered",
+            "transform_to_world": NSNull(),
+        ]))
+        var broken = Self.sim3
+        broken["rotation_wxyz"] = [3.0, 0.0, 0.0, 0.0]
+        XCTAssertNil(WorldPlacementFields(json: [
+            "registered": true, "registration_state": "registered",
+            "transform_to_world": broken,
+        ]))
+    }
+
+    /// The converse, which the Tower enforces on its own side in the same
+    /// words: anything with a transform gets drawn, so a row that is not
+    /// registered must not carry one.
+    func testAnUnregisteredRowCarryingATransformIsRefused() {
+        XCTAssertNil(WorldPlacementFields(json: [
+            "registered": false, "registration_state": "refused",
+            "transform_to_world": Self.sim3,
+        ]))
+    }
+
+    func testAMissingRegisteredFlagRefusesTheRow() {
+        XCTAssertNil(WorldPlacementFields(json: ["transform_to_world": NSNull()]))
+    }
+}
+
+// MARK: - The manifest's scale block
+
+/// The truthfulness rule, at the one place the wire states it.
+final class WorldGeometryScaleTests: XCTestCase {
+
+    /// **The load-bearing refusal.** `unknown` means no unit at all, which is
+    /// a strictly weaker claim than `relative`'s "internally consistent with
+    /// an arbitrary unit". Mapping it up would assert a consistency nobody
+    /// established.
+    func testUnknownIsNeverMappedToRelative() {
+        let scale = WorldGeometryScale(
+            json: ["state": "unknown", "meters_per_unit": NSNull()]
+        )
+        XCTAssertEqual(scale.state, .unknown)
+        XCTAssertNotEqual(scale.state, .relative)
+    }
+
+    /// `meters_per_unit: null` means no metric scale was ever established. It
+    /// does not mean 1.0, and there is no `?? 1.0` in this build to make it so.
+    func testANullMetersPerUnitIsAbsentAndNotOne() {
+        let scale = WorldGeometryScale(
+            json: ["state": "relative", "meters_per_unit": NSNull()]
+        )
+        XCTAssertEqual(scale.state, .relative)
+        XCTAssertNil(scale.metersPerUnit)
+        XCTAssertFalse(scale.convertibleToMetres)
+    }
+
+    /// The two the Tower cannot reach on this hardware are mapped rather than
+    /// discarded, so one arriving later is not silently downgraded into a
+    /// claim weaker than the one it made.
+    func testTheUnreachableStatesAreStillMapped() {
+        XCTAssertEqual(
+            WorldGeometryScale(json: ["state": "estimated"]).state, .inferredMetric
+        )
+        XCTAssertEqual(
+            WorldGeometryScale(json: ["state": "measured"]).state, .measuredMetric
+        )
+        // And only `measured` with a real factor ever admits metres, which is
+        // the Tower's own rule.
+        XCTAssertTrue(
+            WorldGeometryScale(
+                json: ["state": "measured", "meters_per_unit": 0.5]
+            ).convertibleToMetres
+        )
+        XCTAssertFalse(
+            WorldGeometryScale(
+                json: ["state": "estimated", "meters_per_unit": 0.5]
+            ).convertibleToMetres
+        )
+    }
+
+    /// A word this build does not know is a claim it cannot verify, so it
+    /// reads as the weakest state and never as `relative`.
+    func testAnUnknownWordFallsToUnknownAndNotToRelative() {
+        XCTAssertEqual(WorldGeometryScale(json: ["state": "metric"]).state, .unknown)
+        XCTAssertEqual(WorldGeometryScale(json: [:]).state, .unknown)
+        XCTAssertEqual(WorldGeometryScale(json: NSNull()).state, .unknown)
+        XCTAssertEqual(WorldGeometryScale(json: nil).state, .unknown)
+    }
+}
+
 final class WorldGeometryStoreTests: XCTestCase {
 
-    private func chunk(index: Int, hash: String) -> WorldSegmentChunk {
+    private func chunk(
+        index: Int, hash: String, placement: WorldPlacementFields = notRegistered()
+    ) -> WorldSegmentChunk {
         WorldSegmentChunk(
-            segmentIndex: index, contentHash: hash, registered: false,
+            segmentIndex: index, contentHash: hash,
+            registered: placement.registered, placement: placement,
             poses: [], points: [[0, 0, 0]], pointsSent: 1, pointsTotal: 1,
             pointSampling: "none"
         )
     }
 
     func testACachedSegmentIsNotRefetched() async {
-        // The property the whole design rests on: a closed segment is frozen,
-        // so it crosses the wire exactly once.
+        // The property the whole design rests on: a closed segment's GEOMETRY
+        // is frozen, so its points and poses cross the wire exactly once —
+        // for as long as nothing about where it sits has moved. The key is a
+        // pair for precisely that reason; see the placement tests below.
         let store = WorldGeometryStore()
-        await store.insert(chunk(index: 0, hash: "h0"))
+        let cached = chunk(index: 0, hash: "h0")
+        await store.insert(cached)
 
-        let needed = await store.hashesMissing(from: ["h0", "h1"])
-        XCTAssertEqual(needed, ["h1"])
+        let needed = await store.keysMissing(from: [cached.cacheKey, "h1:-"])
+        XCTAssertEqual(needed, ["h1:-"])
     }
 
-    func testAChangedHashIsRefetched() async {
+    func testAChangedContentHashIsRefetched() async {
         let store = WorldGeometryStore()
         await store.insert(chunk(index: 0, hash: "h0"))
 
-        let needed = await store.hashesMissing(from: ["h0-moved"])
-        XCTAssertEqual(needed, ["h0-moved"])
+        let needed = await store.keysMissing(from: ["h0-moved:-"])
+        XCTAssertEqual(needed, ["h0-moved:-"])
+    }
+
+    /// **The pin that used to say `content_hash` alone was the key, and was
+    /// wrong.**
+    ///
+    /// `content_hash` covers poses and points only, BY DESIGN, so that a
+    /// segment that gains a placement keeps it and every cached chunk stays
+    /// valid across a registration pass. That is safe only because
+    /// `placement_hash` moves instead — and only if the cache is keyed on
+    /// both. Keyed on the content half alone this store hands back the
+    /// unplaced chunk forever, and the client draws a segment the world knows
+    /// how to place in the place it used to have no claim about. Nothing
+    /// throws and no tile goes blank.
+    func testTheCacheIsKeyedOnContentAndPlacementNotContentAlone() async {
+        let store = WorldGeometryStore()
+        // Same points. Same content hash. Only the placement moved.
+        let unplaced = chunk(
+            index: 0, hash: "same-points",
+            placement: notRegistered(placementHash: "place-none")
+        )
+        let registered = chunk(
+            index: 0, hash: "same-points",
+            placement: placed(into: 4, placementHash: "place-moved")
+        )
+        XCTAssertEqual(unplaced.contentHash, registered.contentHash)
+        XCTAssertNotEqual(
+            unplaced.cacheKey, registered.cacheKey,
+            "a placement change moved no cache key; the client will never refetch"
+        )
+
+        await store.insert(unplaced)
+        let stillMissing = await store.keysMissing(from: [registered.cacheKey])
+        XCTAssertEqual(stillMissing, [registered.cacheKey])
+
+        await store.insert(registered)
+        let placedBack = await store.chunk(forKey: registered.cacheKey)
+        XCTAssertEqual(placedBack?.transformToWorld?.referenceSegment, 4)
+        // And the old one is still addressable under its own key, so
+        // `retainOnly` is what drops it rather than a silent overwrite.
+        let unplacedBack = await store.chunk(forKey: unplaced.cacheKey)
+        XCTAssertNil(unplacedBack?.transformToWorld)
+    }
+
+    /// A registration pass moves every placement hash and no content hash, so
+    /// retaining by content alone would leave every superseded chunk behind.
+    func testRePlacedChunksAreDroppedByTheManifestsOwnKeys() async {
+        let store = WorldGeometryStore()
+        let unplaced = chunk(
+            index: 0, hash: "same-points",
+            placement: notRegistered(placementHash: "place-none")
+        )
+        let registered = chunk(
+            index: 0, hash: "same-points",
+            placement: placed(into: 4, placementHash: "place-moved")
+        )
+        await store.insert(unplaced)
+        await store.insert(registered)
+
+        await store.retainOnly([registered.cacheKey])
+        // Hoisted rather than written inside the assertion: `XCTAssert…` takes
+        // an autoclosure, and an autoclosure cannot carry an `await`.
+        let dropped = await store.chunk(forKey: unplaced.cacheKey)
+        let kept = await store.chunk(forKey: registered.cacheKey)
+        XCTAssertNil(dropped)
+        XCTAssertNotNil(kept)
     }
 
     func testTheCacheIsKeyedByHashNotBySegmentIndex() async {
         // A re-solved segment keeps its index and changes its content. Keying
         // on the index would serve stale geometry under a fresh revision.
         let store = WorldGeometryStore()
-        await store.insert(chunk(index: 0, hash: "old"))
-        await store.insert(chunk(index: 0, hash: "new"))
+        let old = chunk(index: 0, hash: "old")
+        let new = chunk(index: 0, hash: "new")
+        await store.insert(old)
+        await store.insert(new)
 
-        let old = await store.chunk(forHash: "old")
-        let new = await store.chunk(forHash: "new")
-        XCTAssertNotNil(old)
-        XCTAssertNotNil(new)
-        XCTAssertEqual(new?.contentHash, "new")
+        let fromOld = await store.chunk(forKey: old.cacheKey)
+        let fromNew = await store.chunk(forKey: new.cacheKey)
+        XCTAssertNotNil(fromOld)
+        XCTAssertNotNil(fromNew)
+        XCTAssertEqual(fromNew?.contentHash, "new")
+    }
+
+    /// The absent placement hash is NAMED in the key rather than dropped.
+    ///
+    /// The Tower added `placement_hash` without bumping
+    /// `world_builder.geometry/2026-08-25`, so a conforming Tower may not send
+    /// it and the verbatim fixtures in this file do not. `"h0"` and `"h0:"`
+    /// would both read as truncations of a key; `"h0:-"` reads as a key with a
+    /// stated absence in it.
+    func testAnAbsentPlacementHashIsNamedInTheKey() {
+        XCTAssertEqual(
+            WorldGeometryCacheKey.make(contentHash: "h0", placementHash: nil),
+            "h0:-"
+        )
+        XCTAssertEqual(
+            WorldGeometryCacheKey.make(contentHash: "h0", placementHash: "p1"),
+            "h0:p1"
+        )
+        XCTAssertNotEqual(
+            WorldGeometryCacheKey.make(contentHash: "h0", placementHash: nil),
+            WorldGeometryCacheKey.make(contentHash: "h0", placementHash: "p1")
+        )
     }
 }
 
@@ -199,11 +701,13 @@ final class WorldFragmentsModelTests: XCTestCase {
 
     private func summary(
         index: Int, points: Int, state: WorldSegmentResolution,
-        bounds: WorldBounds? = nil
+        bounds: WorldBounds? = nil,
+        placement: WorldPlacementFields = notRegistered()
     ) -> WorldSegmentSummary {
         WorldSegmentSummary(
             segmentIndex: index, contentHash: "h\(index)",
-            frameID: "segment:\(index)", registered: false,
+            frameID: "segment:\(index)", registered: placement.registered,
+            placement: placement,
             resolutionState: state, dominantDegeneracy: "low_parallax",
             keyframeCount: 10, solvedCount: points > 0 ? 5 : 0,
             pointCount: points, bounds: bounds
@@ -282,17 +786,93 @@ final class WorldFragmentsModelTests: XCTestCase {
         XCTAssertTrue(model.fragments.isEmpty)
     }
 
-    func testRegisteredSegmentsWouldShareAFrame() {
+    func testSegmentsRegisteredIntoTheSameReferenceShareAFrame() {
         // Forward compatibility: when registration lands, the renderer does
-        // not change -- the fragments merge.
-        let registered = WorldSegmentSummary(
-            segmentIndex: 0, contentHash: "h0", frameID: "world",
-            registered: true, resolutionState: .resolved,
-            dominantDegeneracy: nil, keyframeCount: 10, solvedCount: 5,
-            pointCount: 100, bounds: box
-        )
-        let model = WorldFragmentsModel(segments: [registered, registered])
+        // not change -- the fragments merge. But only these do: same
+        // reference, same gauge.
+        let model = WorldFragmentsModel(segments: [
+            summary(index: 0, points: 100, state: .resolved, bounds: box,
+                    placement: placed(into: 4)),
+            summary(index: 1, points: 100, state: .resolved, bounds: box,
+                    placement: placed(into: 4)),
+        ])
         XCTAssertTrue(model.hasSharedFrame)
+        XCTAssertEqual(model.headline, "1 world")
+    }
+
+    /// **The refusal `registered` alone cannot express.**
+    ///
+    /// A Sim3 maps a segment into the frame of its `reference_segment`, and
+    /// there is no global world frame — so two segments registered against
+    /// different references are in different spaces, and compositing them
+    /// fabricates geometry exactly as compositing two unregistered ones would.
+    /// Both rows say `registered: true`, which is why the bool is not the test.
+    func testSegmentsRegisteredAgainstDifferentReferencesAreNeverComposited() {
+        let model = WorldFragmentsModel(segments: [
+            summary(index: 0, points: 100, state: .resolved, bounds: box,
+                    placement: placed(into: 4)),
+            summary(index: 1, points: 100, state: .resolved, bounds: box,
+                    placement: placed(into: 19)),
+        ])
+
+        XCTAssertTrue(model.segments.allSatisfy(\.registered))
+        XCTAssertFalse(
+            model.hasSharedFrame,
+            "two reference frames were composited into one; the map would look "
+                + "like a room and mean nothing"
+        )
+        XCTAssertEqual(model.headline, "2 fragments, not yet connected")
+    }
+
+    /// A coordinate stamped with one gauge may not be reinterpreted under
+    /// another. The contract calls a `frame_revision` mismatch a refuse-to-draw
+    /// condition rather than something to guess past.
+    func testSegmentsStampedWithDifferentFrameRevisionsAreNeverComposited() {
+        let model = WorldFragmentsModel(segments: [
+            summary(index: 0, points: 100, state: .resolved, bounds: box,
+                    placement: placed(into: 4, frameRevision: 1)),
+            summary(index: 1, points: 100, state: .resolved, bounds: box,
+                    placement: placed(into: 4, frameRevision: 2)),
+        ])
+        XCTAssertFalse(model.hasSharedFrame)
+    }
+
+    /// **`transform_to_world: null` is not identity.**
+    ///
+    /// A row that claims `registered: true` and carries no transform has told
+    /// us it is placed and not where. Treating the missing Sim3 as identity
+    /// would put the segment at the reference origin, which looks entirely
+    /// plausible. It is refused instead.
+    func testARegisteredSegmentWithNoTransformIsNotTreatedAsIdentity() {
+        let placedRow = summary(index: 0, points: 100, state: .resolved,
+                                bounds: box, placement: placed(into: 4))
+        let claimsPlacedButIsNot = summary(
+            index: 1, points: 100, state: .resolved, bounds: box,
+            placement: WorldPlacementFields(
+                registered: true, state: .registered, refusalReason: nil,
+                transform: nil, placementHash: nil
+            )
+        )
+
+        XCTAssertFalse(placedRow.mayBeCompositedWith(claimsPlacedButIsNot))
+        XCTAssertFalse(
+            WorldFragmentsModel(segments: [placedRow, claimsPlacedButIsNot])
+                .hasSharedFrame
+        )
+    }
+
+    /// `registered: false` forbids placing two segments in one space outright.
+    /// Their scales disagree by up to ~87x on a real walk.
+    func testAnUnregisteredSegmentIsNeverCompositedWithARegisteredOne() {
+        let placedRow = summary(index: 0, points: 100, state: .resolved,
+                                bounds: box, placement: placed(into: 4))
+        let unplacedRow = summary(index: 1, points: 100, state: .resolved,
+                                  bounds: box)
+        XCTAssertFalse(placedRow.mayBeCompositedWith(unplacedRow))
+        XCTAssertFalse(unplacedRow.mayBeCompositedWith(placedRow))
+        // And an unplaced segment is not even in one space with itself, which
+        // is the honest answer: there is no frame to be in.
+        XCTAssertFalse(unplacedRow.mayBeCompositedWith(unplacedRow))
     }
 
     func testEachFragmentIsScaledToItsOwnBoundsAndNeverToASharedOne() {
@@ -445,9 +1025,14 @@ final class WorldBuilderContractAdoptionTests: XCTestCase {
     /// implements. A bump that reached one and not the other would leave the
     /// app refusing a Tower that was speaking its own contract.
     func testTheAdoptedContractIsTheOneThisBuildDeclaresItImplements() {
-        XCTAssertEqual(
-            TowerCapabilities.supported,
-            [WorldBuilderResultContract.identifier],
+        // Membership, not set equality — see the note in
+        // `WorldBuilderIntegrationTests.testThisBuildImplementsTheContractTheTowerNowOffers`.
+        // What this test is for is the *link* between the identifier the client
+        // subscribes with and the set the subscribe guard consults; a bump that
+        // reached one and not the other stops the subscription. Four other
+        // contracts joining that set does not weaken it.
+        XCTAssertTrue(
+            TowerCapabilities.supported.contains(WorldBuilderResultContract.identifier),
             "the subscribe guard reads `supported`; a bump that missed it stops the subscription"
         )
     }
@@ -723,7 +1308,14 @@ final class WorldGeometryRetryTests: XCTestCase {
             2,
             "a refused segment was never retried; on a finalized world that tile stays blank forever"
         )
-        XCTAssertEqual(viewModel.geometryChunks["h0"]?.points.count, 1)
+        // Keyed on the composite key. This fixture predates `placement_hash`,
+        // so the placement half is the stated absence rather than a value.
+        XCTAssertEqual(
+            viewModel.geometryChunks[
+                WorldGeometryCacheKey.make(contentHash: "h0", placementHash: nil)
+            ]?.points.count,
+            1
+        )
     }
 
     /// The negative control, and the reason the test above is not vacuous.
@@ -767,6 +1359,215 @@ final class WorldGeometryRetryTests: XCTestCase {
 
         XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.manifestPath), 2)
         XCTAssertEqual(viewModel.fragmentsModel.segments.count, 1)
+        XCTAssertEqual(viewModel.geometryChunks.count, 1)
+    }
+}
+
+// MARK: - The cache trap: a placement that moves under unmoved points
+
+/// **The deliberate regression test**, and the one that is invisible if the
+/// cache key is wrong.
+///
+/// `content_hash` covers poses and points *only*, by design, so a segment that
+/// gains a placement keeps its content hash. Keyed on that alone the client
+/// holds its cached chunk forever and draws an **unplaced** version of a
+/// segment the world now knows how to place. Nothing throws, nothing logs,
+/// no tile goes blank — the fragment simply sits in the wrong place, for good.
+///
+/// So the fixtures below change *only* the placement. Same segment index, same
+/// `content_hash`, byte-identical points and poses. Only `placement_hash`,
+/// `registered`, `registration_state` and `transform_to_world` move, and the
+/// `geometry_revision` moves with them because the Tower rolls it up over both
+/// hashes.
+@MainActor
+final class WorldGeometryPlacementCacheTests: XCTestCase {
+
+    private static let host = URL(string: "http://stub.invalid")!
+    private static let manifestPath = "/worlds/w1/geometry/manifest"
+    private static let segmentPath = "/worlds/w1/geometry/segment/0"
+
+    /// One resolved segment, unplaced. `placement_hash` is the hash the Tower
+    /// computes over `{"state": "unplaced"}` — a real value, not a null.
+    private static let unplacedManifest = """
+        {"contract": "world_builder.geometry/2026-08-25",
+         "world_id": "w1", "session_id": "s1", "geometry_revision": "g-unplaced",
+         "pose_convention": {
+           "pose_type": "T_world_camera", "quaternion_order": "wxyz",
+           "handedness": "right",
+           "camera_axes": "opencv_x_right_y_down_z_forward",
+           "translation_units": "world",
+           "world_axes_origin": "first_keyframe_camera",
+           "up_axis": "unknown", "pose_dtype": "float64",
+           "point_dtype": "float32"},
+         "scale": {"state": "unknown", "meters_per_unit": null},
+         "segment_count": 1,
+         "segments": [
+           {"segment_index": 0, "content_hash": "same-points", "frame_id": "segment:0",
+            "registered": false, "registration_state": "unplaced",
+            "registration_refusal_reason": null,
+            "transform_to_world": null, "placement_hash": "place-none",
+            "resolution_state": "resolved", "dominant_degeneracy": null,
+            "keyframe_count": 2, "solved_count": 1, "point_count": 1,
+            "bounds": {"min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 1.0]}}]}
+        """
+
+    /// The same world after a registration pass. **`content_hash` is
+    /// unchanged** — that is the whole point — and everything about where the
+    /// segment sits has moved.
+    private static let placedManifest = """
+        {"contract": "world_builder.geometry/2026-08-25",
+         "world_id": "w1", "session_id": "s1", "geometry_revision": "g-placed",
+         "pose_convention": {
+           "pose_type": "T_world_camera", "quaternion_order": "wxyz",
+           "handedness": "right",
+           "camera_axes": "opencv_x_right_y_down_z_forward",
+           "translation_units": "world",
+           "world_axes_origin": "first_keyframe_camera",
+           "up_axis": "unknown", "pose_dtype": "float64",
+           "point_dtype": "float32"},
+         "scale": {"state": "unknown", "meters_per_unit": null},
+         "segment_count": 1,
+         "segments": [
+           {"segment_index": 0, "content_hash": "same-points", "frame_id": "segment:0",
+            "registered": true, "registration_state": "registered",
+            "registration_refusal_reason": null,
+            "transform_to_world": {"rotation_wxyz": [1.0, 0.0, 0.0, 0.0],
+                                   "translation": [10.0, 0.0, -4.0],
+                                   "scale": 0.3533, "reference_segment": 4,
+                                   "frame_revision": 1},
+            "placement_hash": "place-moved",
+            "resolution_state": "resolved", "dominant_degeneracy": null,
+            "keyframe_count": 2, "solved_count": 1, "point_count": 1,
+            "bounds": {"min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 1.0]}}]}
+        """
+
+    private static func segmentBody(placed: Bool) -> String {
+        let placement = placed
+            ? """
+              "registered": true, "registration_state": "registered",
+              "registration_refusal_reason": null,
+              "transform_to_world": {"rotation_wxyz": [1.0, 0.0, 0.0, 0.0],
+                                     "translation": [10.0, 0.0, -4.0],
+                                     "scale": 0.3533, "reference_segment": 4,
+                                     "frame_revision": 1},
+              "placement_hash": "place-moved",
+              """
+            : """
+              "registered": false, "registration_state": "unplaced",
+              "registration_refusal_reason": null,
+              "transform_to_world": null, "placement_hash": "place-none",
+              """
+        // The points and poses are IDENTICAL in both branches. If they were
+        // not, `content_hash` would have moved and the refetch would happen
+        // for a reason that has nothing to do with the placement.
+        return """
+            {"contract": "world_builder.geometry/2026-08-25",
+             "segment_index": 0, "content_hash": "same-points",
+             "frame_id": "segment:0",
+             \(placement)
+             "poses": [{"keyframe_id": "s1:0", "status": "anchor",
+                        "degeneracy": "",
+                        "rotation": [1.0, 0.0, 0.0, 0.0],
+                        "translation": [0.0, 0.0, 0.0]}],
+             "points": [[0.5, 0.5, 0.5]],
+             "points_sent": 1, "points_total": 1, "point_sampling": "none"}
+            """
+    }
+
+    private func makeViewModel() -> WorldBuilderViewModel {
+        WorldBuilderViewModel(
+            client: UnavailableWorldBuilderClient(),
+            geometry: WorldGeometryClient(
+                baseURL: Self.host, session: StubbedGeometryProtocol.makeSession()
+            )
+        )
+    }
+
+    func testASegmentThatGainsAPlacementIsRefetchedAndRePlaced() async {
+        StubbedGeometryProtocol.reset(routes: [
+            Self.manifestPath: (200, Self.unplacedManifest),
+            Self.segmentPath: (200, Self.segmentBody(placed: false)),
+        ])
+        let viewModel = makeViewModel()
+
+        await viewModel.geometryDidChange(
+            worldID: "w1", sessionID: "s1", revision: "g-unplaced"
+        )
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.segmentPath), 1)
+        XCTAssertEqual(viewModel.geometryChunks.count, 1)
+
+        // The registration pass lands. Same points, new placement.
+        StubbedGeometryProtocol.set(route: Self.manifestPath, to: (200, Self.placedManifest))
+        StubbedGeometryProtocol.set(
+            route: Self.segmentPath, to: (200, Self.segmentBody(placed: true))
+        )
+        await viewModel.geometryDidChange(
+            worldID: "w1", sessionID: "s1", revision: "g-placed"
+        )
+
+        XCTAssertEqual(
+            StubbedGeometryProtocol.requestCount(for: Self.segmentPath),
+            2,
+            "the cached chunk was reused across a placement change; the client "
+                + "is drawing an unplaced version of a segment the world can place"
+        )
+
+        // And it was RE-PLACED, not merely refetched. The chunk on screen
+        // carries the Sim3, under a key that names the new placement.
+        XCTAssertEqual(viewModel.geometryChunks.count, 1)
+        let key = WorldGeometryCacheKey.make(
+            contentHash: "same-points", placementHash: "place-moved"
+        )
+        let drawn = viewModel.geometryChunks[key]
+        XCTAssertNotNil(drawn, "the chunk is still filed under its old placement")
+        XCTAssertEqual(drawn?.transformToWorld?.referenceSegment, 4)
+        XCTAssertEqual(drawn?.transformToWorld?.scale, 0.3533)
+        XCTAssertEqual(drawn?.transformToWorld?.translation, [10.0, 0.0, -4.0])
+        XCTAssertEqual(viewModel.fragmentsModel.segments.first?.placement.state,
+                       .registered)
+
+        // The superseded chunk is gone rather than lingering under its old
+        // key: one registration pass over a real 51-segment world would
+        // otherwise strand 51 of them.
+        XCTAssertNil(
+            viewModel.geometryChunks[
+                WorldGeometryCacheKey.make(
+                    contentHash: "same-points", placementHash: "place-none"
+                )
+            ]
+        )
+    }
+
+    /// The negative control, and the reason the test above is not vacuous.
+    ///
+    /// If the client simply refetched every segment on every manifest, the
+    /// assertion above would pass with no cache key doing any work at all.
+    /// This pins the other half: an unchanged placement over unchanged points
+    /// is served from cache, which is what stops a two-minute walk's 67
+    /// manifests from pulling a megabyte 67 times.
+    func testAnUnchangedPlacementIsStillServedFromCache() async {
+        StubbedGeometryProtocol.reset(routes: [
+            Self.manifestPath: (200, Self.unplacedManifest),
+            Self.segmentPath: (200, Self.segmentBody(placed: false)),
+        ])
+        let viewModel = makeViewModel()
+
+        await viewModel.geometryDidChange(
+            worldID: "w1", sessionID: "s1", revision: "g-unplaced"
+        )
+        // A second manifest under a moved revision, identical in every field.
+        // The revision is what unlocks the manifest fetch; the cache key is
+        // what decides whether the SEGMENT is fetched again.
+        await viewModel.geometryDidChange(
+            worldID: "w1", sessionID: "s1", revision: "g-unplaced-again"
+        )
+
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.manifestPath), 2)
+        XCTAssertEqual(
+            StubbedGeometryProtocol.requestCount(for: Self.segmentPath),
+            1,
+            "an unchanged segment was refetched; the cache key is doing nothing"
+        )
         XCTAssertEqual(viewModel.geometryChunks.count, 1)
     }
 }
@@ -822,6 +1623,60 @@ final class WorldGeometryRealTowerTests: XCTestCase {
         // absent and empty stay different claims all the way from the wire.
         let empty = try XCTUnwrap(manifest.segments.first { $0.pointCount == 0 })
         XCTAssertNil(empty.bounds)
+
+        // Every `transform_to_world` on this world is null, and null decodes
+        // to nothing — never to identity, which would stack all 51 segments on
+        // one origin and draw a room nobody walked.
+        XCTAssertTrue(manifest.segments.allSatisfy { $0.transformToWorld == nil })
+
+        // Scale: `unknown`, with no metres-per-unit. A world with more than
+        // one segment stays `unknown` — segments do not share a coordinate
+        // frame — and calibration will not change it.
+        XCTAssertEqual(manifest.scale.state, .unknown)
+        XCTAssertNil(manifest.scale.metersPerUnit)
+        XCTAssertFalse(manifest.scale.convertibleToMetres)
+    }
+
+    /// **This capture predates `placement_hash`**, and it is what the
+    /// compatibility decision was made for: the Tower added the field without
+    /// bumping `world_builder.geometry/2026-08-25`, so a decoder that required
+    /// it would refuse all 51 of these segments from a Tower speaking this
+    /// exact contract.
+    func testTheRealFixturesPredatePlacementHashAndStillDecode() throws {
+        XCTAssertFalse(Self.manifestFromTower.contains("placement_hash"))
+        XCTAssertFalse(Self.segmentFromTower.contains("placement_hash"))
+
+        let manifest = try XCTUnwrap(
+            WorldGeometryDecoder.manifest(from: decode(Self.manifestFromTower))
+        )
+        XCTAssertEqual(manifest.segments.count, 51)
+        XCTAssertTrue(manifest.segments.allSatisfy { $0.placement.placementHash == nil })
+        // Absent is NAMED in the key rather than dropped, so these rows still
+        // key distinctly from one another and from any later placed version of
+        // themselves.
+        XCTAssertEqual(
+            Set(manifest.segments.map(\.cacheKey)).count, 51,
+            "two segments collided on one cache key; one of them would never be drawn"
+        )
+        XCTAssertEqual(manifest.segments[1].cacheKey, "5dec8e3d298549d3:-")
+
+        // And `registration_state` stays absent rather than being invented
+        // from `registered: false` — this Tower has not said which of "refused"
+        // and "nobody looked" applies.
+        XCTAssertTrue(manifest.segments.allSatisfy { $0.placement.state == nil })
+    }
+
+    /// **No imagery, ever.** `image_relpath` and every keyframe byte stay
+    /// Tower-side, and the assertion is made against the bytes rather than
+    /// against the Swift type, because the type could only ever prove that
+    /// this decoder ignores a field — not that the field never arrives.
+    func testNeitherRealPayloadCarriesAnyImagery() {
+        for payload in [Self.manifestFromTower, Self.segmentFromTower] {
+            XCTAssertFalse(payload.contains("image"))
+            XCTAssertFalse(payload.contains("relpath"))
+            XCTAssertFalse(payload.contains("keyframe_path"))
+            XCTAssertFalse(payload.contains("thumbnail"))
+        }
     }
 
     func testARealSegmentChunkDecodesFieldForField() throws {
