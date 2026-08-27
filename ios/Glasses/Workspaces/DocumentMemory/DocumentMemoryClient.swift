@@ -401,8 +401,27 @@ final class TowerDocumentMemoryClient: DocumentMemoryClient {
             else { return }
             if error.closesSubscription {
                 subscriptionID = nil
-                isSubscribing = false
             }
+            // Any error of ours ends an in-flight subscribe attempt.
+            //
+            // `closesSubscription` answers a different question -- "is an
+            // ESTABLISHED subscription now gone?" -- and is true for only two
+            // reasons. Using it alone to clear `isSubscribing` left the flag
+            // stuck `true` for every other refusal, and `subscribeIfPossible()`
+            // guards on `!isSubscribing`, so **the cartridge never retried for
+            // the life of the connection**.
+            //
+            // That is reachable on transients, not just on permanent faults:
+            // the Tower sends `snapshot_failed` INSTEAD of `result_subscribed`
+            // when the first snapshot raises, which is exactly the case that
+            // must recover. `contract_mismatch`, `unknown_cartridge`,
+            // `cartridge_unavailable` and `too_many_subscriptions` all behaved
+            // the same way.
+            //
+            // Clearing it unconditionally is correct because the Tower answers
+            // a `result_subscribe` with either an ack or an error: once an
+            // error of ours arrives, nothing is in flight any more.
+            isSubscribing = false
             // The recorder's status stops being current, and nothing about the
             // library changes: an error on the status channel says nothing
             // about what is on disk.

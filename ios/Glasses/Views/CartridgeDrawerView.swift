@@ -73,7 +73,28 @@ struct CartridgeDrawerView: View {
                 } header: {
                     Text("Modules")
                 } footer: {
-                    Text("Opening a cartridge changes this app's workspace. It does not start anything on the Tower — the Tower chooses what it runs at startup and this app cannot ask it for anything else. Badges describe this app: \u{201C}Ready to test\u{201D} means there is something here to try, not that the Tower you are connected to is serving it right now. Each workspace says what that Tower can actually do.")
+                    // The middle clause of this footer used to read: "It does
+                    // not start anything on the Tower — the Tower chooses what
+                    // it runs at startup and this app cannot ask it for
+                    // anything else."
+                    //
+                    // That was true when written and is now false in the worst
+                    // direction. This build sends `cv_lab_start`,
+                    // `POST /documents-session/start` and
+                    // `POST /cartridges/object_memory/session/start`, and three
+                    // workspaces draw a Start control.
+                    //
+                    // It is not merely stale — it is the sentence a person
+                    // reads *before* deciding whether opening a screen can make
+                    // the Tower begin recording. Telling someone the app cannot
+                    // ask the Tower for anything, on a build that can ask it to
+                    // start keeping what its camera sees, is the one direction
+                    // this claim must never be wrong in.
+                    //
+                    // What survives is the true and useful half: opening a
+                    // cartridge is not itself a start. The recording verbs are
+                    // deliberate and live inside the workspace.
+                    Text("Opening a cartridge changes this app's workspace. Opening one does not start anything on the Tower by itself — but some workspaces can, and they say so where the control is. Badges describe this app: \u{201C}Ready to test\u{201D} means there is something here to try, not that the Tower you are connected to is serving it right now. Each workspace says what that Tower can actually do.")
                         .padding(.top, 4)
                 }
             }

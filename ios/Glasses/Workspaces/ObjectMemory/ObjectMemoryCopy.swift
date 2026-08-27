@@ -1186,13 +1186,29 @@ enum ObjectMemoryCopy {
     }
 
     /// A detector score as a percentage. Scores are floats in 0…1 on this wire.
+    ///
+    /// "on this wire" described the Tower's intent, not what arrives. `Int(_:)`
+    /// **traps** on NaN, on ±∞ and on anything past `Int.max`, and this is the
+    /// highest-fan-out formatter in the cartridge: `best_score`,
+    /// `detector_score`, verification scores, `bounding_box_normalized`, and
+    /// `subject_obscured` — which is a **required** field on the imagery sheet,
+    /// so a malformed value there crashed the picture view rather than
+    /// degrading it.
+    ///
+    /// Deferred to the shared `ObservationProvenance.percent`, which guards
+    /// finiteness and clamps, so the two do not disagree about what an
+    /// out-of-range score looks like.
     static func percent(_ value: Double) -> String {
-        "\(Int((value * 100).rounded()))%"
+        ObservationProvenance.percent(value)
     }
 
     /// A retention window in days, without a trailing `.0` on a whole number
     /// and without pretending a fractional window is a whole one.
     static func days(_ value: Double) -> String {
+        // `rounded == rounded.rounded()` below excludes NaN (every comparison
+        // with it is false) but admits `+∞` and `1e300`, and `Int(_:)` traps on
+        // both. Retention windows come off the wire like everything else.
+        guard value.isFinite else { return "an unreported window" }
         let rounded = (value * 10).rounded() / 10
         let text: String
         if rounded == rounded.rounded() {

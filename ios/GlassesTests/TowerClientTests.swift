@@ -2856,6 +2856,93 @@ final class TowerClientTests: XCTestCase {
         client.disconnect()
     }
 
+    /// The run change this phone did **not** cause.
+    ///
+    /// ## Why the test above is not enough
+    ///
+    /// `testAdoptingANewRunDropsThePreviousRunsReading` drives the change with a
+    /// `cv_lab_status` message — and the Tower sends that **only in reply to a
+    /// command on the same connection** (`tower/routes/cv_lab_ws.py`). There is
+    /// no unsolicited push. So that test covers exactly the case where this
+    /// phone started the new run itself.
+    ///
+    /// The Lab has **one slot shared by every connection, and last start wins**.
+    /// When a second operator — or the bench's own `cv_lab_smoke.py` — starts a
+    /// different experiment, the only thing that reaches this app is a
+    /// `cartridge_result` on the subscription. That path did not feed the gate,
+    /// and the consequences were entirely silent:
+    ///
+    ///  - every following `frame_result` carried the new run and was discarded,
+    ///    so the counter the product screen reads froze while frames were being
+    ///    answered normally;
+    ///  - the held reading was never cleared, so the card kept showing the
+    ///    **previous experiment's figures** under the new experiment's name.
+    ///
+    /// Reproduced against a live Tower during review. This is the regression.
+    func testARunStartedByAnotherClientIsAdoptedFromTheSubscription() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        // Constructed and retained: the client is what listens to the result
+        // channel and feeds the gate. Without it this test would pass against
+        // the bug, because nothing would be subscribed.
+        let lab = TowerExperimentalCVClient(tower: tower)
+        withExtendedLifetime(lab) {}
+        tower.connect(to: url(port: port))
+        await expect { tower.status == .online }
+        tower.sendStreamStart()
+
+        // This phone's own run, learned the ordinary way.
+        server.send(text: cvLabStatusJSON(runID: "f863dcc35bce-6"))
+        await expect { tower.watchedCVLabRunID == "f863dcc35bce-6" }
+        server.send(text: frameResultJSON(seq: 30, runID: "f863dcc35bce-6", resultSeq: 1))
+        await expect { tower.latestFrameResult != nil }
+
+        // Somebody else starts a different experiment. The Tower pushes the new
+        // document on the SUBSCRIPTION, and sends this phone no `cv_lab_status`.
+        server.send(text: cvLabStatusOnSubscriptionJSON(runID: "f863dcc35bce-7"))
+        await expect { tower.watchedCVLabRunID == "f863dcc35bce-7" }
+
+        XCTAssertNil(
+            tower.latestFrameResult,
+            """
+            the previous experiment's reading survived a run change this phone \
+            did not cause -- it would sit on screen under the new experiment's name
+            """
+        )
+
+        // And the new run's results are accepted rather than discarded.
+        server.send(text: frameResultJSON(seq: 60, runID: "f863dcc35bce-7", resultSeq: 1))
+        await expect { tower.latestFrameResult != nil }
+
+        tower.disconnect()
+    }
+
+    /// The CV Lab's status document as it arrives on the **result channel**,
+    /// which is the only way a run change caused by another client is seen.
+    private func cvLabStatusOnSubscriptionJSON(runID: String) -> String {
+        """
+        {"type":"cartridge_result",
+         "envelope_contract":"cartridge_results.envelope/2026-08-23",
+         "subscription_id":"sub-cv","cartridge":"experimental_cv","result_type":"status",
+         "contract":"experimental_cv.status/2026-08-27",
+         "seq":2,"revision":"r2","revision_changed":true,
+         "coalesced":0,"cursor_status":null,"snapshot":true,
+         "tower_sent_at":1787463092.958,"time_basis":"tower-receipt",
+         "payload":{"contract":"experimental_cv.status/2026-08-27",
+           "tower_instance_id":"f863dcc35bce",
+           "lifecycle":{"state":"running","reason":null,
+                        "since":1787833032.19,"run_id":"\(runID)"},
+           "available":[],"selected":"optical_flow",
+           "source":{"clients_connected":2,"receiving_frames":true,
+                     "last_frame_at":1787833032.32,"frames_offered_total":9,
+                     "frames_rejected_before_lab":0,"idle_after_s":5.0}}}
+        """
+    }
+
     /// The three clear points, asserted as three.
     ///
     /// The held run id has the same lifetime as the held reading —

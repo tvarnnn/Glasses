@@ -151,16 +151,33 @@ struct WorldCanvasView: View {
             fragmentGallery
 
         case .finalizing(let snapshot):
-            // Progress is honest here — the Tower is genuinely working — but
-            // the badge must not say "live", because no new observations are
-            // arriving and the camera may already be off.
-            HStack(spacing: 10) {
-                ProgressView()
-                Text(snapshot.name.map { "Finishing \($0)…" } ?? "Finishing the world…")
-                    .font(.headline)
-            }
+            // ## No spinner here, and the reason is not style
+            //
+            // This drew a `ProgressView` beside "Finishing the world…" under a
+            // comment reading *"Progress is honest here — the Tower is
+            // genuinely working"*. **The Tower says it cannot know that.**
+            //
+            // `tower/tower/results/world_builder.py` is explicit: the writer
+            // lock is released before `build()` is called, and `build()` emits
+            // no event and writes nothing until it finishes, so *"a build in
+            // progress is indistinguishable on disk from one that never started
+            // and from one that crashed"*. Its `build_in_progress` field is
+            // `null` for exactly that reason, and the Tower spells out that
+            // `null` is not `False` because `False` would itself be a claim.
+            //
+            // This app's own client already knew. `TowerWorldBuilderClient`
+            // says this state means *"the stored figures are not the final
+            // figures", **not** "a process is working right now"*. Two comments
+            // in this repo contradicted each other and the pixels followed the
+            // wrong one — an animating spinner is the strongest possible
+            // assertion that work is underway, made from a fact that cannot
+            // support it. If the builder crashed, this span forever.
+            //
+            // What is true and worth saying is the staleness, which is what the
+            // state actually means.
+            headline(snapshot.name ?? "World", systemImage: "cube")
             WorldSummaryView(snapshot: snapshot, isLive: false)
-            detailText("Capture has ended. The Tower is still working, so these figures may still change.")
+            detailText("Capture has ended and these figures are not final. The Tower does not report whether a build is running, so this app cannot say whether one is.")
             fragmentGallery
 
         case .finalized(let snapshot):

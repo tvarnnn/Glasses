@@ -980,9 +980,38 @@ enum ExperimentalCVState: Equatable, Sendable {
     /// The Tower publishes the counters specifically so this question has an
     /// answer, and its own table is reproduced in `CVLabDiagnosis`. `nil` when
     /// there is no run to diagnose.
+    /// ## Why `receivingFrames` is consulted before any counter
+    ///
+    /// Every counter on `run` is **cumulative for the life of the run**, and
+    /// three of this enum's five cases are written in the present tense
+    /// ("Frames **are** arriving…"). Reading a present-tense claim off a
+    /// monotonic counter means the claim latches: one frame processed an hour
+    /// ago made `.measuring` true forever, and the panel printed
+    ///
+    ///     Frames reaching the Tower    no
+    ///     Frames are arriving and being measured.
+    ///
+    /// as adjacent rows, because `sourceRows` is drawn under every state. The
+    /// contradiction was visible on screen and the app asserted the false half.
+    ///
+    /// `source.receivingFrames` is the Tower's own answer to "now": it is
+    /// `lastFrameAt` within `idleAfterSeconds`. Consulting it first turns the
+    /// present tense back into a statement about the present.
+    ///
+    /// `.someFramesFailed` stays above the gate deliberately — it is the one
+    /// case that is *not* a claim about now. An experiment that raised on a
+    /// frame stays worth reporting after the frames stop, and its wording is
+    /// past tense already.
     func diagnosis(source: CVLabStatus.Source) -> CVLabDiagnosis? {
         guard let run else { return nil }
         if let failed = run.framesFailed, failed > 0 { return .someFramesFailed(count: failed) }
+        guard source.receivingFrames else {
+            // Nothing is arriving *now*, whatever this run measured earlier.
+            // Undecodable frames are still worth naming when they are the
+            // reason nothing reached the Lab, but only as the count they are.
+            let rejected = source.framesRejectedBeforeLab ?? 0
+            return rejected > 0 ? .arrivingButUndecodable(count: rejected) : .nothingArriving
+        }
         let offered = run.framesOffered ?? 0
         guard offered > 0 else {
             let rejected = source.framesRejectedBeforeLab ?? 0

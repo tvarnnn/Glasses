@@ -732,7 +732,7 @@ struct DocumentSessionPanel: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             if session.inDwell {
-                Text("A page is in view now. Stopping will keep it — the reading in progress is written out, not discarded.")
+                Text("A page is in view now. Stopping will keep it — the page in progress is written out, not discarded.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -752,7 +752,7 @@ struct DocumentSessionPanel: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             if !session.followsStream {
-                Text("Recording is started here, not by the camera. Connecting the glasses does not begin keeping what you read.")
+                Text("Recording is started here, not by the camera. Connecting the glasses does not begin keeping what comes into view.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -762,12 +762,55 @@ struct DocumentSessionPanel: View {
 
     /// The state, in words, from `state` — with the qualification that `state`
     /// is what somebody asked for.
+    ///
+    /// ## None of these may say "read"
+    ///
+    /// This headline said **"Recording what is read"** and two strings above it
+    /// said "keeping what you read" and "the reading in progress". All three
+    /// were wrong in the same way, and the proof is 700 lines away in this
+    /// app's own decoder: `DocumentMemoryDecoder` **refuses a Tower** whose
+    /// `claim` says a document was read, because the contract's claim is
+    /// `a-page-was-in-view-and-was-ocred` and the older spelling was the
+    /// stronger claim.
+    ///
+    /// So this build declined the claim on the wire and then made it in its own
+    /// voice. The Tower is explicit that it cannot be made — `record_notes`
+    /// carries *"This platform cannot establish that the wearer looked at it,
+    /// noticed it, or read it"* — and this very screen's header already says
+    /// *"Being in view is not the same as your having read it"*, which the old
+    /// headline directly contradicted.
+    ///
+    /// A camera that sees a page establishes that a page was in view. It
+    /// establishes nothing whatever about a person's attention.
+    /// ## The two negative cases may not be stated absolutely
+    ///
+    /// These read *"Paused. Nothing is being recorded."* and *"Not recording."*
+    /// — absolute claims about whether a wearer is being recorded, derived from
+    /// `state`, which is **what somebody asked for**. The doc line above said so
+    /// and none of the rendered strings carried the qualification.
+    ///
+    /// The contract is explicit that a Pause whose producer ignores `SIGTERM`
+    /// answers 200 with `state: "paused"` while still recording, and Object
+    /// Memory renders liveness from `following` for exactly that reason.
+    ///
+    /// **Document Memory's session block carries no `following`** — it is not
+    /// the generic `cartridge_session.control` surface and declares no
+    /// `state_means`, checked on the live wire. So the corroborating field is
+    /// genuinely unavailable here, and the honest move is not to fake it but to
+    /// stop overstating: "the recorder was asked to stop" is true of an intent
+    /// field; "nothing is being recorded" is a claim about the world.
+    ///
+    /// The asymmetry is deliberate. `running` may be stated plainly, because
+    /// the failure direction there is harmless — a session that says it is
+    /// recording and is not costs a person nothing. The reverse tells someone
+    /// they are not being recorded when they may be, and that is the one
+    /// direction this screen must never be confidently wrong in.
     private var headline: String {
         switch session.state {
-        case "running": return "Recording what is read"
+        case "running": return "Recording pages that come into view"
         case "starting": return "Starting the text recogniser"
-        case "paused": return "Paused. Nothing is being recorded."
-        case "stopped": return "Not recording. Everything already recorded is kept."
+        case "paused": return "Pause was requested. The Tower does not report whether the recorder has stopped."
+        case "stopped": return "Stop was requested. Everything already recorded is kept."
         case "failed": return "The recorder failed."
         default: return session.state
         }

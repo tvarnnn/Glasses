@@ -760,7 +760,23 @@ private struct CVFrameReadingPanel: View {
                     .foregroundStyle(.tertiary)
             }
             if let captureIndex = reading.captureIndex {
-                Text("From capture \(captureIndex). The sender forwards one frame in thirty, so this number skips.")
+                // NOT "one frame in thirty". That stride was deleted --
+                // `FrameRateGate` says so in its own words -- and replaced by a
+                // rate gate at `towerTargetFPS` (12). At a 24 fps source that
+                // is roughly one frame in two, so the old sentence told a
+                // reader 28 captures were skipped between consecutive numbers
+                // when the real figure is about one.
+                //
+                // Worth naming the failure mode, because it is not the usual
+                // one: this is a claim about THIS APP, not about the Tower, and
+                // the code that refutes it is in this same target. The contract
+                // document repeats the stale figure too -- iOS is the authority
+                // on its own sender, so the contract is what is wrong there.
+                //
+                // The number is deliberately not restated here. A literal would
+                // be a third copy to go stale; what a reader needs is that the
+                // index skips and why, not the ratio.
+                Text("From capture \(captureIndex). The sender does not forward every frame, so this number skips.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)

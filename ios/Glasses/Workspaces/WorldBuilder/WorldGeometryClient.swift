@@ -105,10 +105,46 @@ nonisolated struct WorldGeometryClient {
     }
 
     private func get(_ url: URL, query: [URLQueryItem]) async throws -> [String: Any] {
-        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+        // Not force-unwrapped. Both of these are built from a wire-supplied
+        // `world_id`/`session_id`, so "this cannot fail" is a claim about the
+        // Tower's output, not about this code.
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            throw WorldGeometryFetchError.transport("the geometry address could not be parsed")
+        }
         components.queryItems = query
+        guard let requestURL = components.url else {
+            throw WorldGeometryFetchError.transport("the geometry address could not be built")
+        }
+        // ## Why this does not use `session.data(from:)`
+        //
+        // That builds a request with `.useProtocolCachePolicy` against
+        // `URLSession.shared`'s on-disk `URLCache`, and this was the **only**
+        // HTTP client in the app that did not opt out — TowerClient, all three
+        // Object Memory clients and the Document library all set a reload
+        // policy explicitly.
+        //
+        // It matters more here than anywhere else, because of what this route's
+        // URL is: `/worlds/{id}/geometry/segment/{index}`. **A segment gaining
+        // a placement does not change that URL.** The whole point of keying the
+        // chunk store on `(content_hash, placement_hash)` is that a re-placed
+        // segment must be refetched — and a URL-keyed cache sitting in front of
+        // that store can answer the refetch with the unplaced body, defeating
+        // the tuple key one layer below where it is written.
+        //
+        // The Tower sends no validators at all on this route — no
+        // `Cache-Control`, no `ETag`, no `Last-Modified` (checked against a
+        // running Tower) — so freshness would fall to CFNetwork's heuristic.
+        // Correctness here is not something to leave to a heuristic in the one
+        // subsystem whose entire thesis is that the caching must be exact.
+        //
+        // The test harness already sets `.ephemeral` with `urlCache = nil` and
+        // this same policy, which means the layer being disabled in test was
+        // left on in production — the configuration under which the deliberate
+        // placement regression test passes was not the shipped one.
+        var request = URLRequest(url: requestURL)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         do {
-            let (data, response) = try await session.data(from: components.url!)
+            let (data, response) = try await session.data(for: request)
             if let http = response as? HTTPURLResponse, http.statusCode == 404 {
                 throw WorldGeometryFetchError.notFound
             }

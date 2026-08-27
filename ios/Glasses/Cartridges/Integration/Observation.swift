@@ -192,7 +192,28 @@ enum ObservationProvenance: Equatable, Sendable {
     /// Clamping is not the same as hiding: an out-of-range confidence is a Tower
     /// defect worth seeing in a log, and the decode site — not this formatter —
     /// is where it should be noticed.
+    /// ## The old clamp did not clamp
+    ///
+    /// This was `min(max(value, 0), 1)`, and the comment above asserted the
+    /// range was handled. **Swift's `min`/`max` propagate NaN** — every
+    /// comparison with NaN is false, so `min(max(.nan, 0), 1) == .nan` — and
+    /// `Int(Double.nan.rounded())` is a **trap**, not a garbage number. So did
+    /// `+∞`, and so does any finite value past `Int.max` (`1e300` is legal JSON
+    /// that `JSONSerialization` hands over as a `Double`).
+    ///
+    /// This formatter is reached from `confidence`, `best_score`,
+    /// `detector_score`, verification scores, `bounding_box_normalized`, and
+    /// Object Memory's **required** `subject_obscured` — so a single malformed
+    /// number anywhere on those paths crashed the app rather than rendering
+    /// oddly. Wire data is not trusted input, and a formatter is the wrong
+    /// place to find that out.
+    ///
+    /// `isFinite` first, then the clamp. A non-finite value is not rendered as
+    /// a percentage at all, because there is no percentage it could honestly
+    /// stand for — and saying so is better than picking 0% or 100%, either of
+    /// which would be this app inventing a figure the Tower did not send.
     static func percent(_ value: Double) -> String {
+        guard value.isFinite else { return "not reported" }
         let clamped = min(max(value, 0), 1)
         return "\(Int((clamped * 100).rounded()))%"
     }
@@ -269,8 +290,18 @@ struct ObservedDuration: Equatable, Sendable {
     /// Seconds the subject was in frame, as reported by the Tower.
     let seconds: TimeInterval
 
+    /// `max(0, …)` neutralises NaN by accident (the comparison is false, so the
+    /// `0` wins) but passes `+∞` and `1e300` straight through — and `label`
+    /// below does `Int(seconds.rounded())`, which **traps** on both. This runs
+    /// on every document record, so one malformed `observed_seconds` from the
+    /// Tower took the app down rather than showing a strange duration.
+    ///
+    /// A non-finite duration becomes 0 rather than being rejected: this type is
+    /// a rendering detail on a row that has other true things to say, and
+    /// dropping the whole record over an unusable number would hide more than
+    /// it protects. `label` states the floor case honestly.
     init(seconds: TimeInterval) {
-        self.seconds = max(0, seconds)
+        self.seconds = seconds.isFinite ? max(0, seconds) : 0
     }
 
     /// Rendered so the claim is about the camera, not the wearer.

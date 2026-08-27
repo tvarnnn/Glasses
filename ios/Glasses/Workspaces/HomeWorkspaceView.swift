@@ -316,10 +316,35 @@ private extension HomeWorkspaceView {
             //
             // That contrast is exactly why the line is owed. Sitting unremarked
             // among genuine counters, an experiment's output reads as the same kind
-            // of number as its neighbours, and `frame_result` carries no provenance
-            // field at all. Rule 16: silence must not be read as "measured".
+            // of number as its neighbours. Rule 16: silence must not be read as
+            // "measured".
+            //
+            // ## Why this reads the instance and not the static fallback
+            //
+            // This used to read the static `CVFrameReading.provenance`, which is
+            // `.unknown`, and rendered *"The Tower did not say whether this was
+            // measured or estimated."*
+            //
+            // On the unified Tower that sentence is **false**. The comment above
+            // used to end "and `frame_result` carries no provenance field at all",
+            // which was the premise — and `experimental_cv.frame_result/2026-08-27`
+            // carries `provenance` on every single reply, required and never
+            // omitted. This build already decodes it; Home was reading past the
+            // value it was holding.
+            //
+            // It was defended as harmless on the grounds that it states the
+            // strongest caveat and so is never a lie. It is not harmless:
+            // *"The Tower did not say X"* is a positive factual claim about the
+            // other machine, and stating it falsely is Rule 3 in the direction
+            // Rule 3 exists to forbid. It also flattened the distinction the line
+            // was written for — an `inferred` figure from `object_detection` or
+            // `depth` reached this screen wearing the same words as a `measured`
+            // one.
+            //
+            // Home matters more than the workspace here, not less: as the comment
+            // above says, this is where most people will ever see the number.
             if reading?.headline != nil || reading?.meanIntensity != nil,
-                let caveat = CVFrameReading.provenance.caveat {
+                let caveat = (reading?.provenance ?? CVFrameReading.provenance).caveat {
                 Text("The experiment's figures above: \(caveat)")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)

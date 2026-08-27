@@ -1521,7 +1521,40 @@ final class TowerClient: NSObject, ObservableObject {
     /// rather than being ignored: there is no current run, so there is nothing
     /// to gate against, and holding the previous one would discard the results
     /// of whatever starts next.
-    private func watchCVLabRun(_ runID: String?) {
+    ///
+    /// ## Why this is not `private`, and why that is the whole fix
+    ///
+    /// It was, and the two callers below are both `cv_lab_status` messages.
+    /// **The Tower sends `cv_lab_status` only in reply to a message on that
+    /// same connection** (`tower/routes/cv_lab_ws.py`) — there is no unsolicited
+    /// push. So those two callers cover exactly one case: a run change *this
+    /// phone caused*.
+    ///
+    /// The Lab has **one slot shared by every connection, and last start wins**.
+    /// A run change caused by anyone else — a second operator, the bench's own
+    /// `cv_lab_smoke.py` — reaches this app only as a `cartridge_result` on the
+    /// subscription. With the gate private, nothing on that path could update
+    /// it, and the consequences were silent and severe:
+    ///
+    ///  - every subsequent `frame_result` carried the new run and was
+    ///    discarded, so `SenderMetrics.frameResults` — the counter the product
+    ///    screen reads — **froze while frames were being answered normally**;
+    ///  - `latestFrameResult` was never cleared, so the card kept showing the
+    ///    **previous experiment's figures**, indefinitely, while the panel above
+    ///    it correctly updated to the new experiment's name with a `live` badge.
+    ///
+    /// That is precisely the outcome this gate exists to prevent — a number
+    /// from the wrong experiment on a screen — produced *by* the gate.
+    ///
+    /// So the cartridge client calls this when it applies a status document it
+    /// received over the subscription. That does not weaken the rule the doc
+    /// above states: the feed is still a **status document** and never a
+    /// `frame_result`, which is the distinction that matters. It widens the set
+    /// of status documents from "the ones we asked for" to "all of them".
+    ///
+    /// Idempotent by the first guard, so a client that also asked directly can
+    /// call it twice with no effect.
+    func watchCVLabRun(_ runID: String?) {
         guard runID != watchedCVLabRunID else { return }
         log("cv_lab run watch: \(watchedCVLabRunID ?? "none") -> \(runID ?? "none")")
         watchedCVLabRunID = runID

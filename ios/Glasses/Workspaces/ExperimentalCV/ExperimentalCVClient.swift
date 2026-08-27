@@ -624,15 +624,47 @@ final class TowerExperimentalCVClient: ExperimentalCVClient {
                 )
                 return
             }
-            apply(CVLabStatus(json: envelope.payload))
+            let pushed = CVLabStatus(json: envelope.payload)
+            // Feed the frame gate from the subscription, not only from replies
+            // to our own commands.
+            //
+            // The Lab has one slot shared by every connection and last start
+            // wins, and the Tower sends `cv_lab_status` ONLY to the client that
+            // sent a command. So this document is the sole way this app learns
+            // about a run somebody else started — and until it fed the gate,
+            // that case discarded every subsequent `frame_result` while leaving
+            // the previous experiment's figures on screen under the new
+            // experiment's name.
+            //
+            // Still a status document, never a `frame_result`: the rule that a
+            // result must not nominate its own run is untouched.
+            // `lifecycle.run_id` specifically, which is the same field the
+            // direct `cv_lab_status` path reads. Two feeds into one gate must
+            // not disagree about where the run id lives.
+            // Only when the document decoded. A payload this build could not
+            // read says nothing about which run is current, and clearing the
+            // watch on it would discard the results of a run that is fine.
+            if let pushed { tower.watchCVLabRun(pushed.lifecycle.runID) }
+            apply(pushed)
 
         case .failed(let error):
             guard isOurs(error) else { return }
             // A result-channel failure is about the **subscription**, not about
             // the Lab: the commands and `cv_lab_status` still work, and the
             // screen keeps whatever document it last read rather than being
-            // emptied by a transport problem one layer below it.
+            // emptied by a transport problem one layer below it. That reasoning
+            // is why `state` is deliberately untouched here.
             if error.closesSubscription { subscriptionID = nil }
+            // But the in-flight attempt is over either way, and this cleared
+            // nothing at all before — so any refused subscribe left
+            // `isSubscribing == true` and `subscribeIfPossible()` returned at
+            // its first guard for the rest of the connection. The Lab kept
+            // showing the document it read at connect time, forever, with no
+            // retry and nothing on screen to say so.
+            //
+            // `snapshot_failed` is the reachable transient: the Tower sends it
+            // instead of `result_subscribed` when the first snapshot raises.
+            isSubscribing = false
         }
     }
 

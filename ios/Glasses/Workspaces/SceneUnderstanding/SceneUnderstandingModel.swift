@@ -213,7 +213,21 @@ struct SceneSideCounts: Equatable, Sendable {
     let right: Int
     let unknown: Int
 
-    var total: Int { left + centre + right + unknown }
+    /// Overflow-safe. These four are `as? Int ?? 0` straight off the wire and
+    /// this runs on the WebSocket push path for every positions row, so a Tower
+    /// sending four large integers would trap on the `+` rather than render a
+    /// strange total. `&+` is wrong here (it would wrap to a negative count);
+    /// saturating at `Int.max` keeps the number meaningless-but-safe, and
+    /// `isEmpty` — the only thing that reads it for a decision — stays correct.
+    var total: Int {
+        var sum = 0
+        for part in [left, centre, right, unknown] {
+            let (next, overflowed) = sum.addingReportingOverflow(part)
+            if overflowed { return .max }
+            sum = next
+        }
+        return sum
+    }
     var isEmpty: Bool { total == 0 }
 }
 
@@ -282,7 +296,14 @@ struct ScenePeople: Equatable, Sendable {
     /// facing away".
     var undifferentiatedRemainder: Int? {
         guard let facingWearer, let facingUnknown else { return nil }
-        return max(0, count - facingWearer - facingUnknown)
+        // Subtraction before the clamp traps on overflow, and all three are
+        // unvalidated wire integers on the push path. Reporting form first,
+        // then the clamp that was always intended.
+        let (afterWearer, o1) = count.subtractingReportingOverflow(facingWearer)
+        guard !o1 else { return nil }
+        let (remainder, o2) = afterWearer.subtractingReportingOverflow(facingUnknown)
+        guard !o2 else { return nil }
+        return max(0, remainder)
     }
 }
 
