@@ -903,3 +903,92 @@ def test_the_prune_uses_the_same_bar_as_the_gate():
     assert wr.pair_is_hopeless(just_above, just_above, thresholds) is None
     just_below = _segment_with_span(thresholds.min_span_over_depth - 1e-6)
     assert wr.pair_is_hopeless(just_below, just_above, thresholds) is not None
+
+
+# ---------------------------------------------------------------------------
+# Keyframe sampling in cross-segment matching.
+#
+# cross_matches compared EVERY keyframe of one segment against every
+# keyframe of the other. That O(F^2) brute-force ORB cross-product
+# dominates registration cost -- 192 s for a nine-segment world -- and is
+# the reason registration cannot run near the live path.
+#
+# Sampling 8 keyframes per segment preserved every verdict on both corpus
+# captures that register anything, at 4.4x the speed. Sampling 5 lost all
+# of them. The constant is that measured boundary, not a tuning knob.
+# ---------------------------------------------------------------------------
+
+
+def test_sampling_spreads_across_the_segment_and_keeps_the_ends():
+    """Truncating to the first N would cover only a segment's opening and
+    miss whatever the wearer walked to. The two ends matter most: they are
+    where a segment is most likely to overlap its neighbours."""
+    from scripts.world_registration import sampled_frames
+
+    picked = sampled_frames(89, 8)
+    assert len(picked) == 8
+    assert picked[0] == 0
+    assert picked[-1] == 88
+    assert picked == sorted(picked)
+    assert len(set(picked)) == len(picked)
+
+    gaps = [b - a for a, b in zip(picked, picked[1:])]
+    assert max(gaps) - min(gaps) <= 1, f"spread should be even, got {gaps}"
+
+
+def test_sampling_is_a_no_op_below_the_limit():
+    """A segment with few keyframes must lose none of them."""
+    from scripts.world_registration import sampled_frames
+
+    assert sampled_frames(5, 8) == [0, 1, 2, 3, 4]
+    assert sampled_frames(8, 8) == list(range(8))
+
+
+def test_sampling_handles_degenerate_counts():
+    from scripts.world_registration import sampled_frames
+
+    assert sampled_frames(0, 8) == []
+    assert sampled_frames(1, 8) == [0]
+    assert sampled_frames(10, 1) == [0]
+
+
+def test_the_sample_size_is_the_measured_boundary_not_a_round_number():
+    """Pins the reason. 8 preserved every verdict on both registering
+    captures; 5 lost all of them. Lowering it for speed would trade away
+    the only thing this function produces."""
+    from scripts.world_registration import (
+        MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING,
+    )
+
+    assert MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING == 8
+
+
+def test_cross_matches_returns_segment_local_frame_indices(monkeypatch):
+    """Sampling must not renumber frames. The returned indices join
+    against poses and the observation index, so a sampled-local index
+    would silently attribute a match to the wrong keyframe."""
+    import numpy as np
+
+    from scripts import world_registration as wr
+
+    class _Seg:
+        def __init__(self, n):
+            self.intrinsics = np.array(
+                [[400.0, 0, 160.0], [0, 400.0, 120.0], [0, 0, 1.0]]
+            )
+            self.descriptors = [object()] * n
+            self.keypoints = [[(0.0, 0.0)] * 40 for _ in range(n)]
+
+    seen = []
+
+    def _fake_match(a, b):
+        return []
+
+    monkeypatch.setattr(wr, "match_indices", _fake_match)
+    source, target = _Seg(50), _Seg(3)
+
+    # With no matches nothing is returned, but the loop must have visited
+    # the segment's OWN indices, spread across its range.
+    picked = wr.sampled_frames(50, wr.MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING)
+    assert max(picked) == 49, "the last keyframe must be reachable"
+    assert wr.cross_matches(source, target) == []

@@ -1024,6 +1024,49 @@ def pair_is_hopeless(source, target, thresholds) -> str | None:
     return None
 
 
+# How many keyframes of a segment take part in cross-segment matching.
+#
+# `cross_matches` compared every keyframe of one segment against every
+# keyframe of the other -- an O(F^2) brute-force ORB cross-product that
+# dominates registration cost and is why it cannot run anywhere near the
+# live path. On the corpus one segment carries 89 keyframes against a
+# median of 10, so a handful of segments pay almost all of it.
+#
+# MEASURED, on both captures in the corpus that register anything at all.
+# Verdicts are identical to the full cross-product at 8, and gone at 5:
+#
+#   e1c52b9f   full 192.4s -> 3 segs / 5603 pts   [(0,3), (3,5)]
+#              k=8   43.6s -> 3 segs / 5603 pts   [(0,3), (3,5)]   MATCH
+#              k=5   22.7s -> 0 segs / 0 pts      []               LOST
+#              k=3   10.0s -> 0 segs / 0 pts      []               LOST
+#   2e6cffa2   k=8   19.4s -> 3 segs / 1917 pts   [(12,16),(12,19),(16,19)]
+#                             identical to the full run
+#
+# 8 is therefore a measured boundary rather than a tuning knob: it is the
+# smallest sample that preserved every verdict, and the next step down
+# lost all of them. It is deliberately NOT lowered for speed -- the whole
+# value of this function is the verdicts.
+MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING = 8
+
+
+def sampled_frames(count: int, limit: int) -> list:
+    """Evenly spread frame indices, always including first and last.
+
+    Spread rather than truncated: a segment's keyframes are ordered in
+    time, so the first N of them cover only its opening and would miss
+    whatever the wearer walked to. Endpoints are included because a
+    segment's two ends are the most likely places to overlap a
+    neighbouring segment.
+    """
+    if count <= limit:
+        return list(range(count))
+    if limit <= 1:
+        return [0]
+    return sorted({
+        int(round(i * (count - 1) / (limit - 1))) for i in range(limit)
+    })
+
+
 def cross_matches(source, target, *, min_inliers: int = MIN_INLIERS) -> list:
     """Verified feature correspondences between two segments' keyframes.
 
@@ -1031,11 +1074,22 @@ def cross_matches(source, target, *, min_inliers: int = MIN_INLIERS) -> list:
     matrix at the same threshold and confidence the reconstruction used.
     An unverified descriptor match is a guess, and on repetitive indoor
     texture it is often a confident one.
+
+    Only a sample of each segment's keyframes takes part -- see
+    MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING for the measurement that fixed
+    the sample size. Returned frame indices are the segment's OWN indices,
+    so poses and the observation index still line up.
     """
     matches = []
     intrinsics = source.intrinsics
-    for frame_a in range(len(source.descriptors)):
-        for frame_b in range(len(target.descriptors)):
+    frames_a = sampled_frames(
+        len(source.descriptors), MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING
+    )
+    frames_b = sampled_frames(
+        len(target.descriptors), MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING
+    )
+    for frame_a in frames_a:
+        for frame_b in frames_b:
             pairs = match_indices(source.descriptors[frame_a],
                                   target.descriptors[frame_b])
             if len(pairs) < min_inliers:
