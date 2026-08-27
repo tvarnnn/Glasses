@@ -1208,7 +1208,10 @@ enum ObjectMemoryCopy {
         // `rounded == rounded.rounded()` below excludes NaN (every comparison
         // with it is false) but admits `+∞` and `1e300`, and `Int(_:)` traps on
         // both. Retention windows come off the wire like everything else.
-        guard value.isFinite else { return "an unreported window" }
+        // A quantity, because both call sites embed this in a slot expecting
+        // one -- "in the last \(days(x))" and "a window of \(days(x)) was asked
+        // for". A bare noun phrase reads as "in the last an unreported window".
+        guard value.isFinite else { return "an unusable number of days" }
         let rounded = (value * 10).rounded() / 10
         let text: String
         if rounded == rounded.rounded() {

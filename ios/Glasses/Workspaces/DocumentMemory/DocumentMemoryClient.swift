@@ -140,6 +140,27 @@ final class TowerDocumentMemoryClient: DocumentMemoryClient {
 
     private var subscriptionID: String?
     private var isSubscribing = false
+    /// Resubscribes spent on this connection, and the cap.
+    ///
+    /// `channel_failed` and `consumer_too_slow` are the two errors the Tower
+    /// sends **unsolicited**, after which the subscription is gone and a new
+    /// `result_subscribe` is the only way to resume — the Tower says exactly
+    /// that in the message text. Clearing the flags without resubscribing
+    /// leaves the socket up, the cartridge silent, and nothing to retrigger it:
+    /// `subscribeIfPossible()` is only reached from the declaration sink and
+    /// from going `.online`, and neither fires on a mid-connection error.
+    ///
+    /// `consumer_too_slow` is not exotic — it fires when this phone does not
+    /// accept a result inside the send timeout, which is a backgrounded or
+    /// thermally-throttled phone, i.e. the normal state of a device on a walk.
+    ///
+    /// Bounded rather than unlimited, and matched to `TowerWorldBuilderClient`
+    /// deliberately: a Tower that closes a subscription three times on one
+    /// connection is not going to be fixed by a fourth attempt, and an
+    /// unbounded retry against the Tower's 8-subscription cap is how a client
+    /// starves its own siblings.
+    private var resubscribesUsed = 0
+    private static let resubscribeBudget = 3
     /// The query in flight, so a late answer to a superseded question cannot
     /// overwrite a newer one.
     private var inFlight: Int = 0
@@ -183,7 +204,10 @@ final class TowerDocumentMemoryClient: DocumentMemoryClient {
         CartridgeAvailability.resolve(
             declared: declaredLibraryContract,
             supported: [DocumentMemoryContract.libraryIdentifier],
-            isTowerReachable: isTowerReachable
+            isTowerReachable: isTowerReachable,
+            // This build has a Document Memory client, so a silent socket means
+            // "nobody has asked yet", not "this Tower will never do it".
+            knownToThisBuild: true
         )
     }
 
@@ -192,7 +216,36 @@ final class TowerDocumentMemoryClient: DocumentMemoryClient {
             let offer = tower.cartridgeDeclaration?
                 .httpContract(forTowerCartridge: DocumentMemoryContract.towerCartridge)
         else { return nil }
+        // `available` is honoured, and it was not before.
+        //
+        // `TowerHTTPContractOffer` carries six fields and only `contract` was
+        // ever read here, so with `TOWER_DOCUMENT_ROOT` unset this resolved
+        // `.available`, enabled the search field, and let the query fail with a
+        // 404 -- while the Tower's own sentence naming the variable that would
+        // fix it was decoded and never shown. Every other cartridge checks this
+        // flag at subscribe time; the library is fetched rather than subscribed,
+        // so it had no equivalent gate.
+        //
+        // The reason travels to the screen through `clientReason` rather than
+        // being lost here, so a person is told what the Tower said and not
+        // merely that nothing is available.
+        guard offer.available else { return nil }
         return CartridgeContract(cartridgeID: cartridgeID, identifier: offer.contract)
+    }
+
+    /// The Tower's own words for why the library cannot be served, when it has
+    /// declared the contract and marked it unavailable.
+    ///
+    /// Surfaced so the reason survives `declaredLibraryContract` returning nil
+    /// -- it names the `TOWER_` variable that would fix it, which nothing local
+    /// can.
+    var libraryUnavailableReason: String? {
+        guard
+            let offer = tower.cartridgeDeclaration?
+                .httpContract(forTowerCartridge: DocumentMemoryContract.towerCartridge),
+            !offer.available
+        else { return nil }
+        return offer.unavailableReason
     }
 
     // MARK: Queries
@@ -342,6 +395,10 @@ final class TowerDocumentMemoryClient: DocumentMemoryClient {
         guard status == .online else {
             subscriptionID = nil
             isSubscribing = false
+            // A fresh connection gets a fresh budget: the cap exists to stop a
+            // hopeless retry loop within one socket, not to remember a bad
+            // socket forever.
+            resubscribesUsed = 0
             // The session status describes a socket that is gone, so it stops
             // being current. **The query result is deliberately not cleared:**
             // a document the Tower recorded is exactly as true with the socket
@@ -401,6 +458,28 @@ final class TowerDocumentMemoryClient: DocumentMemoryClient {
             else { return }
             if error.closesSubscription {
                 subscriptionID = nil
+                isSubscribing = false
+                // The Tower closed this subscription and its own message says to
+                // subscribe again to resume. Nothing else will: `subscribeIfPossible()`
+                // is reached only from the declaration sink and from going `.online`,
+                // and the socket is still up, so without this the cartridge goes
+                // permanently silent on a live connection.
+                guard resubscribesUsed < Self.resubscribeBudget else {
+                    state = .failed(
+                        CartridgeFailure(
+                                kind: .transport,
+                                message: """
+                                    The Tower closed this cartridge's result subscription \
+                                    \(Self.resubscribeBudget) times on one connection. \
+                                    Reconnecting is what resolves it.
+                                    """
+                        )
+                    )
+                    return
+                }
+                resubscribesUsed += 1
+                subscribeIfPossible()
+                return
             }
             // Any error of ours ends an in-flight subscribe attempt.
             //
@@ -537,6 +616,11 @@ final class DocumentMemoryViewModel: ObservableObject {
     }
 
     private var clientReason: String? {
+        // The declaration's own reason outranks any local state: it names the
+        // `TOWER_` variable that would fix it, which no state here can.
+        if let reason = (client as? TowerDocumentMemoryClient)?.libraryUnavailableReason {
+            return reason
+        }
         switch state {
         case .unsupported(let reason): return reason
         case .failed(let failure): return failure.message

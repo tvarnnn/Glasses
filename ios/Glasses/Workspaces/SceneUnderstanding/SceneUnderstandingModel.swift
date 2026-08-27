@@ -717,6 +717,29 @@ enum SceneUnderstandingState: Equatable, Sendable {
         // disconnect) and `.awaitingFirstScene` always holds the reading that
         // says what it is waiting for.
         case .idle(let reading):
+            // A `stopped` session carrying a `failure_reason` did not stop
+            // because anybody asked, and saying "the last scene was discarded"
+            // tells an operator a comforting story about a dead engine. The
+            // bench Tower reports exactly this: `state: "stopped"` with *"the
+            // engine could not be loaded: ModuleNotFoundError: No module named
+            // 'torch'"*.
+            //
+            // Corrected in the **sentence**, not in the state. Routing it to
+            // `.failed` was tried and is wrong: the Tower keeps
+            // `failure_reason` across a stop, so a session that failed, was
+            // restarted successfully and then stopped normally would report a
+            // failure it had recovered from — and it would put a
+            // `.failed` state where `.idle` belongs, weakening the
+            // stop-discards invariant to fix a copy problem.
+            // `stopped` ONLY. An `unrecognised` state must still yield `nil` so
+            // it reaches the screen as the Tower's own prose rather than being
+            // assigned one of the known headlines — that is the whole reason
+            // `unrecognised` exists, and a failure reason riding along does not
+            // license this build to name a state it does not know.
+            if reading?.lifecycle.state == .stopped,
+               let why = reading?.lifecycle.failureReason, !why.isEmpty {
+                return .towerFailed(why)
+            }
             return Self.silence(for: reading?.unavailableReason)
         case .awaitingFirstScene(let reading):
             return Self.silence(for: reading.unavailableReason)

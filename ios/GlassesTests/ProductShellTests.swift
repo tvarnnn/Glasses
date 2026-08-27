@@ -871,24 +871,75 @@ final class CartridgeIntegrationTests: XCTestCase {
     /// a UI that suggested reconnecting would fix a missing contract would send
     /// a user round a loop that cannot terminate.
     ///
-    /// Asserted through the no-declaration entry point, which is still the
-    /// whole truth for the three cartridges the Tower lists under
-    /// `not_offered`.
+    /// Asserted through the no-declaration entry point.
+    ///
+    /// ## Why this no longer expects one answer for all eight
+    ///
+    /// It used to assert `.noContract` for every cartridge in both reachability
+    /// states, which was right when the Tower declared nothing. **With no
+    /// declaration and no connection, the honest answer now depends on whether
+    /// this build could ever receive one:**
+    ///
+    /// - A cartridge with a client and a Tower-name mapping — World Builder,
+    ///   the CV Lab, Scene, Document — gets `.towerUnreachable`. Saying "this
+    ///   Tower has not declared it" on a cold launch is a claim about a machine
+    ///   nobody has spoken to, and the shipped `.noContract` string goes
+    ///   further and denies being about the connection.
+    /// - A cartridge with **no Tower code anywhere** — Visual Q&A,
+    ///   Accessibility, Environmental Memory — stays `.noContract` in both
+    ///   states, because "the Tower is unreachable" would be its own false
+    ///   story: reconnecting cannot help.
+    /// - Object Memory stays `.noContract` here too, and that is not an
+    ///   oversight: it is undeclared by design and resolves its real
+    ///   availability by probing over HTTP, not through this path.
+    ///
+    /// What the test still pins is the property in its name — **connectivity
+    /// alone never makes anything available.** `.isAvailable` is false in every
+    /// one of the sixteen combinations.
     func testNoCartridgeIsAvailableWhetherOrNotTheTowerIsReachable() {
         for cartridge in Cartridge.catalog {
+            let thisBuildCanReceiveADeclaration =
+                TowerCapabilities.towerCartridgeNames[cartridge.id] != nil
             for reachable in [true, false] {
                 let availability = TowerCapabilities.availability(
                     for: cartridge.id,
                     isTowerReachable: reachable
                 )
+                let expected: CartridgeAvailability =
+                    (thisBuildCanReceiveADeclaration && !reachable)
+                        ? .towerUnreachable
+                        : .noContract
                 XCTAssertEqual(
                     availability,
-                    .noContract,
+                    expected,
+                    "\(cartridge.name) resolved wrongly with reachable=\(reachable)"
+                )
+                XCTAssertFalse(
+                    availability.isAvailable,
                     "\(cartridge.name) claimed availability with reachable=\(reachable)"
                 )
-                XCTAssertFalse(availability.isAvailable)
-                XCTAssertEqual(availability.forcedPhase, .unsupported)
+                XCTAssertEqual(
+                    availability.forcedPhase,
+                    expected == .towerUnreachable ? .disconnected : .unsupported
+                )
             }
+        }
+    }
+
+    /// The cold-launch case, stated on its own because it is what a person
+    /// actually meets first.
+    ///
+    /// Before the fix this returned `.noContract` for all four, whose shipped
+    /// explanation reads *"That is a statement about what the Tower offers, not
+    /// about this connection"* — false in precisely the situation that produced
+    /// it, and the first thing anyone sees if the Tower is not up yet.
+    func testAColdLaunchWithNoTowerBlamesTheConnectionNotTheTower() {
+        for cartridgeID in TowerCapabilities.towerCartridgeNames.keys {
+            XCTAssertEqual(
+                TowerCapabilities.availability(for: cartridgeID, isTowerReachable: false),
+                .towerUnreachable,
+                "\(cartridgeID) told a cold-launched app the Tower had never heard of it"
+            )
         }
     }
 
@@ -1378,14 +1429,34 @@ final class CartridgeClientTests: XCTestCase {
 @MainActor
 final class CartridgeViewModelTests: XCTestCase {
 
-    func testEveryViewModelReportsUnsupportedWhetherOrNotTheTowerIsReachable() {
-        for reachable in [true, false] {
-            XCTAssertEqual(WorldBuilderViewModel(client: UnavailableWorldBuilderClient()).phase(isTowerReachable: reachable), .unsupported)
-            XCTAssertEqual(ExperimentalCVViewModel(client: UnavailableExperimentalCVClient()).phase(isTowerReachable: reachable), .unsupported)
-            XCTAssertEqual(DocumentMemoryViewModel(client: UnavailableDocumentMemoryClient()).phase(isTowerReachable: reachable), .unsupported)
-            XCTAssertEqual(SceneUnderstandingViewModel(client: UnavailableSceneUnderstandingClient()).phase(isTowerReachable: reachable), .unsupported)
+    /// With no declaration, the phase now depends on whether the Tower is
+    /// reachable — and that difference is the point, not an inconsistency.
+    ///
+    /// `.unsupported` says "this Tower will never do this"; `.disconnected`
+    /// says "ask again when connected". All four of these cartridges have a
+    /// client and a Tower-name mapping, so on a cold launch the second is the
+    /// true one. Asserting `.unsupported` in both states — which this test did
+    /// — is what let a disconnected app tell a person the Tower had never heard
+    /// of four cartridges it serves.
+    func testEveryViewModelSeparatesAnAbsentContractFromAnAbsentConnection() {
+        for (name, phaseFor) in Self.viewModelPhases {
+            XCTAssertEqual(
+                phaseFor(true), .unsupported,
+                "\(name) with a reachable Tower and no declaration is not 'unsupported'"
+            )
+            XCTAssertEqual(
+                phaseFor(false), .disconnected,
+                "\(name) blamed the Tower for what is a missing connection"
+            )
         }
     }
+
+    private static let viewModelPhases: [(String, (Bool) -> CartridgePhase)] = [
+        ("World Builder", { WorldBuilderViewModel(client: UnavailableWorldBuilderClient()).phase(isTowerReachable: $0) }),
+        ("Experimental CV Lab", { ExperimentalCVViewModel(client: UnavailableExperimentalCVClient()).phase(isTowerReachable: $0) }),
+        ("Document Memory", { DocumentMemoryViewModel(client: UnavailableDocumentMemoryClient()).phase(isTowerReachable: $0) }),
+        ("Scene Understanding", { SceneUnderstandingViewModel(client: UnavailableSceneUnderstandingClient()).phase(isTowerReachable: $0) })
+    ]
 
     /// Availability must outrank the client's own state, or a cartridge whose
     /// Tower cannot serve it would render `.idle` and invite a user to start

@@ -188,7 +188,12 @@ enum TowerCapabilities {
             declared: declaredContract(for: cartridgeID, in: declaration)
                 ?? declaredContract(for: cartridgeID),
             supported: supported,
-            isTowerReachable: isTowerReachable
+            isTowerReachable: isTowerReachable,
+            // A cartridge is "known to this build" exactly when it has a Tower
+            // name here — that map is what makes a declaration for it legible
+            // at all. Object Memory is deliberately absent and reaches its own
+            // availability over HTTP, which is why it is not special-cased.
+            knownToThisBuild: towerCartridgeNames[cartridgeID] != nil
         )
     }
 }

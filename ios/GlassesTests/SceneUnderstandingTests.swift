@@ -686,8 +686,32 @@ final class SceneSilenceTests: XCTestCase {
         return SceneUnderstandingState.forReading(reading).silence
     }
 
+    /// A cleanly stopped session: the bench fixture with its failure cleared.
+    ///
+    /// `SceneFixtures.stopped` is verbatim bytes from a Tower whose engine
+    /// could not load, so it carries a `failure_reason` **through** the stop --
+    /// the Tower clears that only when a new session begins. That makes it the
+    /// wrong fixture for "somebody pressed stop", which is what `.stopped` is
+    /// for, and the right fixture for the case below it.
+    private func cleanlyStopped() -> [String: Any] {
+        var payload = SceneFixtures.stopped
+        var lifecycle = payload["lifecycle"] as! [String: Any]
+        lifecycle["failure_reason"] = NSNull()
+        payload["lifecycle"] = lifecycle
+        return payload
+    }
+
     func testTheFiveSilencesAreToldApart() throws {
-        XCTAssertEqual(try silence(SceneFixtures.stopped), .stopped)
+        XCTAssertEqual(try silence(cleanlyStopped()), .stopped)
+        // The same state, from the real bench, is NOT the same sentence. A
+        // stopped session carrying a failure did not stop because anybody
+        // asked, and "the last scene was discarded" is a comforting story about
+        // a dead engine.
+        XCTAssertEqual(
+            try silence(SceneFixtures.stopped),
+            .towerFailed("the engine could not be loaded: ModuleNotFoundError: No module named 'torch'"),
+            "a stopped-because-it-failed session read as an ordinary stop"
+        )
         XCTAssertEqual(try silence(SceneFixtures.starting), .stillLoading)
         XCTAssertEqual(
             try silence(SceneFixtures.failed),
@@ -1008,11 +1032,16 @@ final class SceneUnderstandingClientTests: XCTestCase {
     }
 
     /// The view model projects the client's state and adds nothing.
-    func testTheViewModelReportsUnsupportedWhateverTheConnectionSays() {
-        for reachable in [true, false] {
-            let scene = SceneUnderstandingViewModel(client: UnavailableSceneUnderstandingClient())
-            XCTAssertEqual(scene.phase(isTowerReachable: reachable), .unsupported)
-        }
+    /// Renamed, because "whatever the connection says" is no longer the
+    /// behaviour and was never the right one: `.unsupported` means "this Tower
+    /// will never do this" and `.disconnected` means "ask again when
+    /// connected". Scene Understanding has a client and a Tower name, so on a
+    /// cold launch the second is true and the first is a claim about a machine
+    /// nobody has spoken to.
+    func testTheViewModelBlamesTheConnectionWhenThereIsNone() {
+        let scene = SceneUnderstandingViewModel(client: UnavailableSceneUnderstandingClient())
+        XCTAssertEqual(scene.phase(isTowerReachable: true), .unsupported)
+        XCTAssertEqual(scene.phase(isTowerReachable: false), .disconnected)
     }
 
     /// Every state that has no scene exposes no scene, which is the invariant

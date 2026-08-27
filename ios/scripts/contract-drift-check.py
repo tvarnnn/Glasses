@@ -121,6 +121,17 @@ def served(tower: str) -> tuple[dict[str, str], list[dict], set[str]]:
     status, body = fetch(tower, "/object-memory/observations")
     if status == 200 and isinstance(body, dict) and (contract := body.get("contract")):
         live[contract] = "/object-memory/observations"
+        # The imagery contract travels NESTED inside this same body, under
+        # `imagery.contract`. This function already held those bytes and threw
+        # them away -- the same class of blind spot as the `http_contracts` one
+        # fixed above, and worse in consequence: iOS compares
+        # `object_memory.imagery/...` for equality and REFUSES the payload on a
+        # mismatch, so drift there means every frame and crop hard-refuses and
+        # the picture view goes permanently blank, silently, with this gate
+        # still printing AGREEMENT.
+        imagery = body.get("imagery")
+        if isinstance(imagery, dict) and (imagery_contract := imagery.get("contract")):
+            live[imagery_contract] = "/object-memory/observations imagery.contract"
     elif status == 404:
         live["<object-memory: no root configured>"] = f"/object-memory/observations 404"
 

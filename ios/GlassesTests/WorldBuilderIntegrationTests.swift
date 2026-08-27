@@ -850,7 +850,11 @@ final class TowerWorldBuilderClientTests: XCTestCase {
 
         let tower = TowerClient(metrics: SenderMetrics())
         let client = TowerWorldBuilderClient(tower: tower)
-        XCTAssertEqual(client.availability(isTowerReachable: false), .noContract)
+        // `.towerUnreachable`, not `.noContract`: nothing has been declared
+        // because nobody has connected yet, and World Builder is a cartridge
+        // this build can receive a declaration for. Blaming the Tower here
+        // would be a claim about a machine no socket has reached.
+        XCTAssertEqual(client.availability(isTowerReachable: false), .towerUnreachable)
 
         tower.connect(to: url(port: port))
         await expect { tower.cartridgeDeclaration != nil }
@@ -1193,7 +1197,7 @@ final class TowerWorldBuilderClientTests: XCTestCase {
         // it has declared is the only way this client answers at all.
         XCTAssertEqual(
             project.cartridgeClients.worldBuilder.availability(isTowerReachable: false),
-            .noContract,
+            .towerUnreachable,
             "the client answered from something other than the graph's connection"
         )
     }

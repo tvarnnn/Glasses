@@ -810,7 +810,18 @@ struct DocumentSessionPanel: View {
         case "running": return "Recording pages that come into view"
         case "starting": return "Starting the text recogniser"
         case "paused": return "Pause was requested. The Tower does not report whether the recorder has stopped."
-        case "stopped": return "Stop was requested. Everything already recorded is kept."
+        // NOT "Stop was requested" unconditionally. `stopped` is also where a
+        // session lands when the engine could not load — the bench Tower right
+        // now reports `state: "stopped"` with `failure_reason: "…No module
+        // named 'easyocr'"`, and nobody requested anything. The old copy ("Not
+        // recording.") was merely incomplete; attributing it to a human action
+        // is a positive false claim, and `failure_reason` is rendered as a
+        // caption directly underneath, so the screen would contradict itself
+        // in two adjacent lines with the false one in bold.
+        case "stopped":
+            return session.failureReason == nil
+                ? "Stop was requested. Everything already recorded is kept."
+                : "Not recording. Everything already recorded is kept."
         case "failed": return "The recorder failed."
         default: return session.state
         }

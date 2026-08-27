@@ -296,6 +296,27 @@ final class TowerExperimentalCVClient: ExperimentalCVClient {
     /// declaration republished while the ack is in flight would open a second
     /// subscription for the same cartridge.
     private var isSubscribing = false
+    /// Resubscribes spent on this connection, and the cap.
+    ///
+    /// `channel_failed` and `consumer_too_slow` are the two errors the Tower
+    /// sends **unsolicited**, after which the subscription is gone and a new
+    /// `result_subscribe` is the only way to resume — the Tower says exactly
+    /// that in the message text. Clearing the flags without resubscribing
+    /// leaves the socket up, the cartridge silent, and nothing to retrigger it:
+    /// `subscribeIfPossible()` is only reached from the declaration sink and
+    /// from going `.online`, and neither fires on a mid-connection error.
+    ///
+    /// `consumer_too_slow` is not exotic — it fires when this phone does not
+    /// accept a result inside the send timeout, which is a backgrounded or
+    /// thermally-throttled phone, i.e. the normal state of a device on a walk.
+    ///
+    /// Bounded rather than unlimited, and matched to `TowerWorldBuilderClient`
+    /// deliberately: a Tower that closes a subscription three times on one
+    /// connection is not going to be fixed by a fourth attempt, and an
+    /// unbounded retry against the Tower's 8-subscription cap is how a client
+    /// starves its own siblings.
+    private var resubscribesUsed = 0
+    private static let resubscribeBudget = 3
 
     /// Monotonic, per connection, and used only to build a `request_id`.
     ///
@@ -476,6 +497,10 @@ final class TowerExperimentalCVClient: ExperimentalCVClient {
             // cleanup.
             subscriptionID = nil
             isSubscribing = false
+            // A fresh connection gets a fresh budget: the cap exists to stop a
+            // hopeless retry loop within one socket, not to remember a bad
+            // socket forever.
+            resubscribesUsed = 0
             // The **document** is dropped, unlike World Builder's last report.
             // A CV Lab status carries `source.receiving_frames`,
             // `clients_connected` and a run's elapsed time, all of which
@@ -654,7 +679,31 @@ final class TowerExperimentalCVClient: ExperimentalCVClient {
             // screen keeps whatever document it last read rather than being
             // emptied by a transport problem one layer below it. That reasoning
             // is why `state` is deliberately untouched here.
-            if error.closesSubscription { subscriptionID = nil }
+            if error.closesSubscription {
+                subscriptionID = nil
+                isSubscribing = false
+                // The Tower closed this subscription and its own message says to
+                // subscribe again to resume. Nothing else will: `subscribeIfPossible()`
+                // is reached only from the declaration sink and from going `.online`,
+                // and the socket is still up, so without this the cartridge goes
+                // permanently silent on a live connection.
+                guard resubscribesUsed < Self.resubscribeBudget else {
+                    state = .failed(
+                        CartridgeFailure(
+                                kind: .transport,
+                                message: """
+                                    The Tower closed this cartridge's result subscription \
+                                    \(Self.resubscribeBudget) times on one connection. \
+                                    Reconnecting is what resolves it.
+                                    """
+                        )
+                    )
+                    return
+                }
+                resubscribesUsed += 1
+                subscribeIfPossible()
+                return
+            }
             // But the in-flight attempt is over either way, and this cleared
             // nothing at all before — so any refused subscribe left
             // `isSubscribing == true` and `subscribeIfPossible()` returned at

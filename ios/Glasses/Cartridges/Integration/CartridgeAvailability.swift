@@ -214,12 +214,62 @@ enum CartridgeAvailability: Equatable, Sendable {
     ///     identifier a live Tower offers, which is why `.available` is a
     ///     reachable outcome rather than a theoretical one.
     ///   - isTowerReachable: whether the connection is currently up.
+    /// - Parameter knownToThisBuild: whether this build has a client and a
+    ///   Tower-name mapping for the cartridge — i.e. whether a declaration for
+    ///   it could ever arrive.
+    ///
+    ///   This is the discriminator between the two honest answers when nothing
+    ///   has been declared. For Visual Q&A there is **no Tower code anywhere**
+    ///   and no mapping, so "the Tower is unreachable" would be its own false
+    ///   story — `.noContract` is right whether or not a socket is up. For
+    ///   Scene Understanding, which has both, a silent socket means only that
+    ///   nobody has asked yet.
+    ///
+    ///   Defaults to `false` so that a caller which has not thought about it
+    ///   gets the old, more conservative answer rather than a claim about a
+    ///   connection.
     static func resolve(
         declared: CartridgeContract?,
         supported: Set<String>,
-        isTowerReachable: Bool
+        isTowerReachable: Bool,
+        knownToThisBuild: Bool = false
     ) -> CartridgeAvailability {
-        guard let declared else { return .noContract }
+        guard let declared else {
+            // Only a cartridge this build could actually receive a declaration
+            // for may report `.towerUnreachable` here. See `knownToThisBuild`.
+            guard knownToThisBuild else { return .noContract }
+            // ## Reachability is checked FIRST when nothing was declared
+            //
+            // This used to `return .noContract` unconditionally, and on a cold
+            // launch with no Tower that was a **false statement rendered to a
+            // person** — the explanation for `.noContract` reads *"That is a
+            // statement about what the Tower offers, not about this
+            // connection"*, which is exactly wrong in the case that produced
+            // it.
+            //
+            // Four of the five cartridges learn `declared` **only** from the
+            // socket declaration. Before any successful connection there is no
+            // declaration to have, so `.towerUnreachable` was unreachable on a
+            // first run and every one of them said the Tower had never heard of
+            // it. Object Memory was the only one that got this right, because
+            // it probes over HTTP instead of waiting on the declaration.
+            //
+            // The contract names this failure and prescribes the cure: `GET
+            // /cartridges` exists over HTTP as well as the socket precisely
+            // because *"a client that can only learn the contract set by
+            // opening the socket cannot tell 'unreachable' from 'not built'"*.
+            // This app does not issue that request yet, so it cannot always
+            // tell them apart — but when the socket is **down** it knows which
+            // one it is looking at, and saying so is free.
+            //
+            // The reasoning already existed one layer up: `TowerClient` keeps a
+            // declaration across a teardown, arguing that clearing it *"would
+            // turn every dropped connection into `.noContract` — 'this will
+            // never work' — when the truthful reading is `.towerUnreachable`,
+            // and those two call for opposite responses."* That fixed the
+            // drop-after-success case. This fixes never-connected.
+            return isTowerReachable ? .noContract : .towerUnreachable
+        }
         guard supported.contains(declared.identifier) else {
             return .unsupportedContract(declared: declared)
         }

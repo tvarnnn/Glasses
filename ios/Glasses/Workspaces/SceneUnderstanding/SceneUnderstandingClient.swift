@@ -114,6 +114,27 @@ final class TowerSceneUnderstandingClient: SceneUnderstandingClient {
     /// republished while the ack is outstanding opens a second subscription for
     /// the same cartridge.
     private var isSubscribing = false
+    /// Resubscribes spent on this connection, and the cap.
+    ///
+    /// `channel_failed` and `consumer_too_slow` are the two errors the Tower
+    /// sends **unsolicited**, after which the subscription is gone and a new
+    /// `result_subscribe` is the only way to resume — the Tower says exactly
+    /// that in the message text. Clearing the flags without resubscribing
+    /// leaves the socket up, the cartridge silent, and nothing to retrigger it:
+    /// `subscribeIfPossible()` is only reached from the declaration sink and
+    /// from going `.online`, and neither fires on a mid-connection error.
+    ///
+    /// `consumer_too_slow` is not exotic — it fires when this phone does not
+    /// accept a result inside the send timeout, which is a backgrounded or
+    /// thermally-throttled phone, i.e. the normal state of a device on a walk.
+    ///
+    /// Bounded rather than unlimited, and matched to `TowerWorldBuilderClient`
+    /// deliberately: a Tower that closes a subscription three times on one
+    /// connection is not going to be fixed by a fourth attempt, and an
+    /// unbounded retry against the Tower's 8-subscription cap is how a client
+    /// starves its own siblings.
+    private var resubscribesUsed = 0
+    private static let resubscribeBudget = 3
     /// The tracking session the held reading belongs to. See the type note.
     private var heldSessionID: Int?
 
@@ -174,6 +195,10 @@ final class TowerSceneUnderstandingClient: SceneUnderstandingClient {
         guard status == .online else {
             subscriptionID = nil
             isSubscribing = false
+            // A fresh connection gets a fresh budget: the cap exists to stop a
+            // hopeless retry loop within one socket, not to remember a bad
+            // socket forever.
+            resubscribesUsed = 0
             // The discard that World Builder does not do. A dropped socket ends
             // the session that produced this scene — `stream_stop` or a
             // disconnect is how a wearable's session normally ends — so the
@@ -345,6 +370,28 @@ final class TowerSceneUnderstandingClient: SceneUnderstandingClient {
     private func apply(_ error: CartridgeResultError) {
         if error.closesSubscription {
             subscriptionID = nil
+            isSubscribing = false
+            // The Tower closed this subscription and its own message says to
+            // subscribe again to resume. Nothing else will: `subscribeIfPossible()`
+            // is reached only from the declaration sink and from going `.online`,
+            // and the socket is still up, so without this the cartridge goes
+            // permanently silent on a live connection.
+            guard resubscribesUsed < Self.resubscribeBudget else {
+                state = .failed(
+                    CartridgeFailure(
+                        kind: .transport,
+                        message: """
+                            The Tower closed this cartridge's result subscription \
+                            \(Self.resubscribeBudget) times on one connection. \
+                            Reconnecting is what resolves it.
+                            """
+                    )
+                )
+                return
+            }
+            resubscribesUsed += 1
+            subscribeIfPossible()
+            return
         }
         // Any error of ours ends an in-flight subscribe attempt.
         //
