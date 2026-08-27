@@ -306,6 +306,27 @@ class MutualEvidence:
         """
         return float(self.forward.scale * self.reverse.scale)
 
+    @property
+    def rotation_disagreement_deg(self) -> float:
+        """How far the two directions disagree about orientation.
+
+        The forward fit rotates source into target; the reverse rotates
+        target into source. Composed, an honest pair returns to identity,
+        so the residual rotation angle IS the disagreement.
+
+        Reciprocity checked SCALE and nothing else, so a pair agreeing on
+        scale to 1% while disagreeing 40 degrees about which way a segment
+        faces was admitted -- folding one segment's geometry through
+        another's, which reads as a slightly odd floor plan rather than as
+        an error. Both rotations were already in hand; only the comparison
+        was missing.
+        """
+        composed = np.asarray(self.forward.rotation, dtype=np.float64) @ np.asarray(
+            self.reverse.rotation, dtype=np.float64
+        )
+        cosine = (float(np.trace(composed)) - 1.0) / 2.0
+        return float(math.degrees(math.acos(max(-1.0, min(1.0, cosine)))))
+
 
 @dataclass(frozen=True)
 class Thresholds:
@@ -328,6 +349,20 @@ class Thresholds:
     # success sat at 1.0-1.2x.
     max_scale_ambiguity: float = 3.0
     # Necessary, nowhere near sufficient -- see the module docstring.
+    # How far the two directions may disagree about ORIENTATION.
+    #
+    # Set from measurement, not taste. On the real world 3dd986b1 all six
+    # solvable pairs compose back to identity within 2.31 deg -- including
+    # (30,50), which is 3.2x wrong on SCALE. The research note records
+    # wrong rotations at 31.9 to 166.0 deg. 15 sits between, ~6x above the
+    # worst honest pair and ~2x below the mildest catastrophic one.
+    #
+    # HONEST STATUS: this clause changes no verdict on the corpus
+    # available today. It guards a documented failure class, it does not
+    # fix an observed one. Recorded so a successor does not mistake an
+    # inert guard for a load-bearing one -- or delete it as dead weight.
+    max_rotation_disagreement_deg: float = 15.0
+
     max_reprojection_px: float = 3.0
     # The pre-check. A segment whose own cameras carry no parallax cannot
     # have its scale measured from them at any quality of match, so this
@@ -399,6 +434,56 @@ class _Observation:
     t_pnp: np.ndarray
 
 
+def _solve_pnp_ransac_or_refuse(object_points, image_points, camera_matrix):
+    """solvePnPRansac, converting a solver assertion into a refusal.
+
+    SQPNP raises rather than returning False when the minimal sample
+    RANSAC draws has degenerate coordinate variance:
+
+        sqpnp.cpp:236 (-215) point_coordinate_variance >= POINT_VARIANCE_THRESHOLD
+
+    Which sample gets drawn is data-dependent, so this fires on some real
+    walks and not others. Reproduced on the 33-segment world built from
+    capture 22e9d428.
+
+    A degenerate configuration is exactly what a refusal is FOR. Letting
+    the assertion escape turns "this keyframe could not be posed" into
+    "the reconstruction process died", which on the live path means a walk
+    ends mid-room.
+
+    Inputs are validated BEFORE the call, so a cv2.error reaching the
+    handler is a statement about the GEOMETRY rather than about our
+    argument marshalling. That distinction needs enforcing rather than
+    asserting: OpenCV raises cv2.error for malformed arguments too, so
+    catching it without validating first would hide a real bug in this
+    repo as an innocent refusal -- which is how a pipeline quietly stops
+    reconstructing.
+    """
+    object_points = np.asarray(object_points, dtype=np.float64)
+    image_points = np.asarray(image_points, dtype=np.float64)
+    if object_points.ndim != 2 or object_points.shape[1] != 3:
+        raise ValueError(
+            f"object_points must be (N, 3), got {object_points.shape}"
+        )
+    if image_points.shape != (len(object_points), 2):
+        raise ValueError(
+            f"image_points must be ({len(object_points)}, 2), got "
+            f"{image_points.shape}"
+        )
+    try:
+        return cv2.solvePnPRansac(
+            object_points,
+            image_points,
+            camera_matrix,
+            None,
+            reprojectionError=PNP_REPROJECTION_ERROR_PX,
+            confidence=RANSAC_CONFIDENCE,
+            flags=cv2.SOLVEPNP_SQPNP,
+        )
+    except cv2.error:
+        return False, None, None, None
+
+
 def _pnp_observations(source, target, matches, intrinsics) -> list:
     """PnP the source segment's landmarks into each of the target's keyframes.
 
@@ -433,14 +518,8 @@ def _pnp_observations(source, target, matches, intrinsics) -> list:
         image_points = np.asarray(
             [images[f] for f in features], dtype=np.float64
         )
-        ok, rvec, tvec, inliers = cv2.solvePnPRansac(
-            object_points,
-            image_points,
-            intrinsics,
-            None,
-            reprojectionError=PNP_REPROJECTION_ERROR_PX,
-            confidence=RANSAC_CONFIDENCE,
-            flags=cv2.SOLVEPNP_SQPNP,
+        ok, rvec, tvec, inliers = _solve_pnp_ransac_or_refuse(
+            object_points, image_points, intrinsics
         )
         if not ok or inliers is None or len(inliers) < MIN_PNP_CORRESPONDENCES:
             continue
@@ -459,6 +538,114 @@ def _pnp_observations(source, target, matches, intrinsics) -> list:
             )
         )
     return observations
+
+
+@dataclass(frozen=True)
+class _Pack:
+    """Every observation's arrays, stacked once.
+
+    `_refine` evaluates residuals 200-odd times per call and the
+    observation arrays never change across any of them, so the Python loop
+    that walked them was re-doing per-call work that is invariant. This is
+    that work, hoisted.
+
+    `camera` indexes rows back to the observation they came from, which is
+    what lets the whole set be projected in one pass instead of one pass
+    per camera.
+    """
+
+    object_points: np.ndarray   # (N, 3)
+    image_points: np.ndarray    # (N, 2)
+    r_target: np.ndarray        # (C, 3, 3)
+    t_target: np.ndarray        # (C, 3)
+    camera: np.ndarray          # (N,) int, row -> camera
+    count: int                  # N
+
+
+def _pack(observations: list) -> _Pack:
+    """Stack observations for repeated residual evaluation.
+
+    Row order is observation-then-point, matching what the per-observation
+    loop produced, because `_refine` pairs residual rows elementwise with
+    per-row weights and a different order would silently mis-weight them.
+    """
+    if not observations:
+        empty3 = np.zeros((0, 3), dtype=np.float64)
+        return _Pack(
+            object_points=empty3,
+            image_points=np.zeros((0, 2), dtype=np.float64),
+            r_target=np.zeros((0, 3, 3), dtype=np.float64),
+            t_target=np.zeros((0, 3), dtype=np.float64),
+            camera=np.zeros(0, dtype=np.intp),
+            count=0,
+        )
+    counts = [len(o.object_points) for o in observations]
+    return _Pack(
+        object_points=np.concatenate(
+            [np.asarray(o.object_points, dtype=np.float64).reshape(-1, 3)
+             for o in observations]
+        ),
+        image_points=np.concatenate(
+            [np.asarray(o.image_points, dtype=np.float64).reshape(-1, 2)
+             for o in observations]
+        ),
+        r_target=np.stack(
+            [np.asarray(o.r_target, dtype=np.float64) for o in observations]
+        ),
+        t_target=np.stack(
+            [np.asarray(o.t_target, dtype=np.float64).reshape(3)
+             for o in observations]
+        ),
+        camera=np.repeat(np.arange(len(observations), dtype=np.intp), counts),
+        count=int(sum(counts)),
+    )
+
+
+def _residuals_packed(params: np.ndarray, pack: _Pack, intrinsics) -> np.ndarray:
+    """`_residuals` over a stacked pack. Same arithmetic, no Python loop.
+
+    MEASURED, and the reason this exists: the per-observation loop cost
+    327 ns per point-residual -- roughly two orders of magnitude above the
+    arithmetic -- because it made about forty numpy calls per invocation
+    on arrays of ~44 rows, where numpy cannot amortise its dispatch. The
+    working size is 4.5 cameras and 197.6 points per call.
+
+    `_residuals` remains as the reference implementation and the two are
+    checked against each other in
+    tests/test_world_registration_residual_parity.py.
+    """
+    if pack.count == 0:
+        return np.zeros((0, 2))
+
+    scale = math.exp(params[0])
+    rotation, _ = cv2.Rodrigues(params[1:4])
+    translation = params[4:7]
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+
+    # Per CAMERA -- a handful of rows, so the cost here is negligible.
+    r_source = pack.r_target @ rotation.T                       # (C, 3, 3)
+    t_source = scale * pack.t_target - r_source @ translation   # (C, 3)
+
+    # Per POINT, in one pass. The gather is (N, 3, 3), which at the
+    # measured working size is a few tens of kilobytes.
+    index = pack.camera
+    camera = (
+        np.einsum("nij,nj->ni", r_source[index], pack.object_points)
+        + t_source[index]
+    )
+
+    depth = camera[:, 2]
+    behind = depth <= 1e-6
+    safe = np.where(behind, 1e-6, depth)
+    residual = np.empty((pack.count, 2))
+    residual[:, 0] = fx * camera[:, 0] / safe + cx - pack.image_points[:, 0]
+    residual[:, 1] = fy * camera[:, 1] / safe + cy - pack.image_points[:, 1]
+    # A point behind the camera is not a large error, it is a different
+    # solution. Saturate PER POINT rather than let the projection wrap
+    # sign and look like a good fit.
+    residual[behind] = 1e4
+    return residual
 
 
 def _residuals(params: np.ndarray, observations: list, intrinsics) -> np.ndarray:
@@ -501,7 +688,11 @@ def _residuals(params: np.ndarray, observations: list, intrinsics) -> np.ndarray
 
 
 def _huber_cost(params, observations, intrinsics) -> float:
-    norms = np.linalg.norm(_residuals(params, observations, intrinsics), axis=1)
+    return _huber_cost_packed(params, _pack(observations), intrinsics)
+
+
+def _huber_cost_packed(params, pack: _Pack, intrinsics) -> float:
+    norms = np.linalg.norm(_residuals_packed(params, pack, intrinsics), axis=1)
     return float(
         np.mean(np.where(norms < HUBER_PX, norms ** 2,
                          HUBER_PX * (2 * norms - HUBER_PX)))
@@ -518,10 +709,15 @@ def _refine(params, observations, intrinsics, *, iterations=40, fix_scale=False)
     params = np.asarray(params, dtype=np.float64).copy()
     free = [i for i in range(7) if not (fix_scale and i == 0)]
     damping = 1e-3
-    cost = _huber_cost(params, observations, intrinsics)
+    # Stacked ONCE. The observation arrays are invariant across every
+    # residual evaluation below -- roughly 200 of them per call -- and
+    # walking them per evaluation was the single largest cost in
+    # registration (38.8% of a run, 327 ns per point-residual).
+    pack = _pack(observations)
+    cost = _huber_cost_packed(params, pack, intrinsics)
 
     for _ in range(iterations):
-        base = _residuals(params, observations, intrinsics)
+        base = _residuals_packed(params, pack, intrinsics)
         norms = np.linalg.norm(base, axis=1)
         weights = np.repeat(
             np.where(norms < HUBER_PX, 1.0,
@@ -533,7 +729,7 @@ def _refine(params, observations, intrinsics, *, iterations=40, fix_scale=False)
             probe = params.copy()
             probe[index] += step
             jacobian[:, column] = (
-                (_residuals(probe, observations, intrinsics) - base) / step
+                (_residuals_packed(probe, pack, intrinsics) - base) / step
             ).ravel()
         weighted_j = jacobian * weights[:, None]
         weighted_r = base.ravel() * weights
@@ -552,7 +748,7 @@ def _refine(params, observations, intrinsics, *, iterations=40, fix_scale=False)
             probe = params.copy()
             for column, index in enumerate(free):
                 probe[index] += delta[column]
-            probe_cost = _huber_cost(probe, observations, intrinsics)
+            probe_cost = _huber_cost_packed(probe, pack, intrinsics)
             if probe_cost < cost:
                 params, cost = probe, probe_cost
                 damping = max(damping * 0.3, 1e-9)
@@ -683,9 +879,11 @@ def admit(evidence: MutualEvidence, thresholds: Thresholds) -> Verdict:
     span_over_depth = min(
         forward.target_span_over_depth, reverse.target_span_over_depth
     )
+    rotation_disagreement = evidence.rotation_disagreement_deg
     clauses = {
         "cameras": cameras,
         "reciprocity": reciprocity,
+        "rotation_disagreement_deg": rotation_disagreement,
         "scale_ambiguity": ambiguity,
         "reprojection_px": reprojection,
         "span_over_depth": span_over_depth,
@@ -725,6 +923,13 @@ def admit(evidence: MutualEvidence, thresholds: Thresholds) -> Verdict:
             f"the two directions disagree on scale by {_ratio(reciprocity):.2f}x; "
             "each was solved independently, so they should be reciprocal"
         )
+    if rotation_disagreement > thresholds.max_rotation_disagreement_deg:
+        return refuse(
+            f"the two directions disagree about orientation by "
+            f"{rotation_disagreement:.1f} degrees; composed they should "
+            "return to identity, so one of them folds this segment's "
+            "geometry through the other's"
+        )
     if ambiguity > thresholds.max_scale_ambiguity:
         return refuse(
             f"the scale is ambiguous over a {ambiguity:.1f}x range -- the fit "
@@ -738,7 +943,8 @@ def admit(evidence: MutualEvidence, thresholds: Thresholds) -> Verdict:
     return Verdict(
         evidence.pair,
         True,
-        f"both directions agree on scale to {abs(reciprocity - 1.0):.1%}",
+        f"both directions agree on scale to {abs(reciprocity - 1.0):.1%} "
+        f"and on orientation to {rotation_disagreement:.1f} deg",
         reciprocity,
         clauses,
     )
@@ -754,7 +960,139 @@ def _ratio(value: float) -> float:
 # -- composition -----------------------------------------------------------
 
 
+# How far a loop may fail to close before the cluster containing it is
+# refused.
+#
+# Every clause in `admit()` judges ONE pair from that pair's own evidence.
+# None can see an error that only appears going round a loop, which is
+# the failure the research note calls the dangerous one: a wrong Sim3
+# fits well and reads as a slightly odd floor plan rather than as an
+# error.
+#
+# Set from evidence, like the other thresholds here. The only real cycle
+# in the corpus -- (12,16), (12,19), (16,19) on capture 2e6cffa2 --
+# closes to 5.899 degrees and a 1.06x scale ratio, and every one of those
+# three edges passed reciprocity individually. The documented broken
+# cases are wrong rotations of 31.9 to 166.0 degrees and a scale 3.2x
+# out. These bars sit between: roughly 3x the measured honest residual
+# and comfortably below every documented failure.
+#
+# Deliberately looser than the single-edge bars (15 deg, 10% scale),
+# because a residual accumulates over a whole path while those judge one
+# hop.
+MAX_CYCLE_ROTATION_DEG = 20.0
+MAX_CYCLE_SCALE_RATIO = 2.0
+
+
+def cycle_refusal_for(residuals, thresholds=None) -> str | None:
+    """The reason a cluster's loops disqualify it, or None.
+
+    Refuses on the WHOLE cluster rather than on the closing edge. The
+    closure is not in the spanning tree, so dropping it would change no
+    placement and leave the bad edge in place. A cycle proves an
+    inconsistency exists without saying which edge carries it, and a
+    cluster known to contain a false merge must not be presented as one
+    space -- that is the failure mode the registration research calls the
+    dangerous one, because it reads as a slightly odd floor plan.
+    """
+    rotation_bar = MAX_CYCLE_ROTATION_DEG
+    scale_bar = MAX_CYCLE_SCALE_RATIO
+    if thresholds is not None:
+        rotation_bar = getattr(thresholds, "max_cycle_rotation_deg", rotation_bar)
+        scale_bar = getattr(thresholds, "max_cycle_scale_ratio", scale_bar)
+    for residual in residuals:
+        if (
+            residual["rotation_deg"] > rotation_bar
+            or residual["scale_ratio"] > scale_bar
+        ):
+            return (
+                f"the loop through {tuple(residual['edge'])} does not "
+                f"close: composing round it disagrees with the direct "
+                f"estimate by {residual['rotation_deg']:.1f} degrees and "
+                f"{residual['scale_ratio']:.2f}x in scale. One of this "
+                "cluster's edges is wrong and the cycle cannot say which, "
+                "so the whole cluster is refused rather than drawn with a "
+                "fold in it"
+            )
+    return None
+
+
+def cycle_residuals(edges, placements, tree_edges=()) -> list:
+    """How badly each closing edge disagrees with the path around the loop.
+
+    `compose_tree` places segments along a SPANNING TREE, so every
+    admitted edge it did not need is a cycle closure -- an independent
+    second opinion about a relationship the tree already asserts.
+
+    For a closure a->b, the placements say where both segments sit, so
+    `placement[b] . placement[a]^-1` is the relationship the tree claims.
+    The edge's own fit says something too. The difference between them is
+    evidence no single pair could produce.
+
+    Tree edges are named explicitly rather than inferred from a
+    near-zero residual: a PERFECTLY consistent closure is the best
+    possible outcome and would be indistinguishable from a tree edge,
+    so inferring would silently discard exactly the evidence worth
+    having. Edges touching an unplaced segment are skipped because there
+    is nothing to compose against, and inventing a residual would be
+    fiction.
+
+    Scale is reported as a ratio >= 1 whichever way it is wrong: 0.31x and
+    3.2x are the same disagreement, and a bar on the raw ratio would catch
+    one and miss the other.
+    """
+    tree = {tuple(edge) for edge in tree_edges}
+    residuals = []
+    for source, target, scale, rotation, translation in edges:
+        if (source, target) in tree:
+            # The tree was BUILT from this edge. Comparing it against
+            # placements derived from it agrees trivially, and counting
+            # that as a passing check would overstate the evidence.
+            continue
+        if source not in placements or target not in placements:
+            continue
+        edge = Sim3(
+            float(scale),
+            np.asarray(rotation, dtype=np.float64),
+            np.asarray(translation, dtype=np.float64),
+        )
+        claimed = placements[target].compose(_invert_sim3(placements[source]))
+        difference = edge.compose(_invert_sim3(claimed))
+
+        ratio = float(difference.scale)
+        if ratio <= 0:
+            ratio = float("inf")
+        elif ratio < 1.0:
+            ratio = 1.0 / ratio
+        cosine = (float(np.trace(difference.rotation)) - 1.0) / 2.0
+        degrees = math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+        offset = float(np.linalg.norm(difference.translation))
+
+        residuals.append({
+            "edge": (source, target),
+            "scale_ratio": ratio,
+            "rotation_deg": degrees,
+            "translation": offset,
+        })
+    return residuals
+
+
+def _invert_sim3(transform):
+    rotation = np.asarray(transform.rotation, dtype=np.float64).T
+    scale = 1.0 / float(transform.scale)
+    return Sim3(
+        scale,
+        rotation,
+        -scale * (rotation @ np.asarray(transform.translation, dtype=np.float64)),
+    )
+
+
 def compose_tree(edges, reference: int) -> dict:
+    """Placements only. See compose_tree_with_edges for the edges used."""
+    return compose_tree_with_edges(edges, reference)[0]
+
+
+def compose_tree_with_edges(edges, reference: int):
     """Place every segment reachable from `reference`, by composing edges.
 
     Breadth-first, so each segment is placed along the shortest path of
@@ -776,25 +1114,32 @@ def compose_tree(edges, reference: int) -> dict:
     for source, target, scale, rotation, translation in edges:
         transform = Sim3(float(scale), np.asarray(rotation, dtype=np.float64),
                          np.asarray(translation, dtype=np.float64))
-        adjacency.setdefault(source, []).append((target, transform))
+        adjacency.setdefault(source, []).append(
+            (target, transform, (source, target))
+        )
         inverse_rotation = transform.rotation.T
         inverse_scale = 1.0 / transform.scale
         adjacency.setdefault(target, []).append((
             source,
             Sim3(inverse_scale, inverse_rotation,
                  -inverse_scale * (inverse_rotation @ transform.translation)),
+            # The edge is named by its ORIGINAL orientation, so the tree
+            # reports the same identity whichever way it traversed it.
+            (source, target),
         ))
 
     placements = {reference: IDENTITY}
+    used_edges = set()
     queue = [reference]
     while queue:
         current = queue.pop(0)
-        for neighbour, transform in adjacency.get(current, ()):
+        for neighbour, transform, edge in adjacency.get(current, ()):
             if neighbour in placements:
                 continue
             placements[neighbour] = placements[current].compose(transform)
+            used_edges.add(edge)
             queue.append(neighbour)
-    return placements
+    return placements, used_edges
 
 
 # -- reading a world -------------------------------------------------------
@@ -904,6 +1249,80 @@ def _poses_in_segment_frame(rows: list) -> dict:
     return poses
 
 
+
+def pair_is_hopeless(source, target, thresholds) -> str | None:
+    """Why this pair cannot register, decided before any matching.
+
+    `admit()` refuses on min(forward.target_span_over_depth,
+    reverse.target_span_over_depth). The forward fit's target is `target`
+    and the reverse fit's target is `source`, so that minimum is just the
+    smaller of the two segments' own span/depth -- a number computable
+    from poses.json and points.json alone, which is what
+    `span_over_depth` above already says it is for.
+
+    Using it only AFTER matching meant every hopeless pair paid a full
+    keyframe cross-product of brute-force ORB plus a MAGSAC
+    essential-matrix fit to reach a conclusion already available. Measured
+    before this: 139 s for a seven-segment world, which is why
+    registration cannot run anywhere near the live path.
+
+    Returns the refusal reason, or None if the pair is worth matching.
+    Deliberately the SAME bar as the gate: a prune stricter than admit()
+    would silently refuse pairs the gate would have taken.
+    """
+    span = min(source.span_over_depth, target.span_over_depth)
+    if span < thresholds.min_span_over_depth:
+        return (
+            f"the wearer stood still: one segment's cameras span only "
+            f"{span:.3f} of the scene depth, so its scale is not "
+            "recoverable from them at any quality of match"
+        )
+    return None
+
+
+# How many keyframes of a segment take part in cross-segment matching.
+#
+# `cross_matches` compared every keyframe of one segment against every
+# keyframe of the other -- an O(F^2) brute-force ORB cross-product that
+# dominates registration cost and is why it cannot run anywhere near the
+# live path. On the corpus one segment carries 89 keyframes against a
+# median of 10, so a handful of segments pay almost all of it.
+#
+# MEASURED, on both captures in the corpus that register anything at all.
+# Verdicts are identical to the full cross-product at 8, and gone at 5:
+#
+#   e1c52b9f   full 192.4s -> 3 segs / 5603 pts   [(0,3), (3,5)]
+#              k=8   43.6s -> 3 segs / 5603 pts   [(0,3), (3,5)]   MATCH
+#              k=5   22.7s -> 0 segs / 0 pts      []               LOST
+#              k=3   10.0s -> 0 segs / 0 pts      []               LOST
+#   2e6cffa2   k=8   19.4s -> 3 segs / 1917 pts   [(12,16),(12,19),(16,19)]
+#                             identical to the full run
+#
+# 8 is therefore a measured boundary rather than a tuning knob: it is the
+# smallest sample that preserved every verdict, and the next step down
+# lost all of them. It is deliberately NOT lowered for speed -- the whole
+# value of this function is the verdicts.
+MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING = 8
+
+
+def sampled_frames(count: int, limit: int) -> list:
+    """Evenly spread frame indices, always including first and last.
+
+    Spread rather than truncated: a segment's keyframes are ordered in
+    time, so the first N of them cover only its opening and would miss
+    whatever the wearer walked to. Endpoints are included because a
+    segment's two ends are the most likely places to overlap a
+    neighbouring segment.
+    """
+    if count <= limit:
+        return list(range(count))
+    if limit <= 1:
+        return [0]
+    return sorted({
+        int(round(i * (count - 1) / (limit - 1))) for i in range(limit)
+    })
+
+
 def cross_matches(source, target, *, min_inliers: int = MIN_INLIERS) -> list:
     """Verified feature correspondences between two segments' keyframes.
 
@@ -911,11 +1330,22 @@ def cross_matches(source, target, *, min_inliers: int = MIN_INLIERS) -> list:
     matrix at the same threshold and confidence the reconstruction used.
     An unverified descriptor match is a guess, and on repetitive indoor
     texture it is often a confident one.
+
+    Only a sample of each segment's keyframes takes part -- see
+    MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING for the measurement that fixed
+    the sample size. Returned frame indices are the segment's OWN indices,
+    so poses and the observation index still line up.
     """
     matches = []
     intrinsics = source.intrinsics
-    for frame_a in range(len(source.descriptors)):
-        for frame_b in range(len(target.descriptors)):
+    frames_a = sampled_frames(
+        len(source.descriptors), MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING
+    )
+    frames_b = sampled_frames(
+        len(target.descriptors), MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING
+    )
+    for frame_a in frames_a:
+        for frame_b in frames_b:
             pairs = match_indices(source.descriptors[frame_a],
                                   target.descriptors[frame_b])
             if len(pairs) < min_inliers:
@@ -958,6 +1388,17 @@ def register(store: WorldStore, world_id: str, session_id: str,
     verdicts, admitted = [], []
     for position, left in enumerate(indices):
         for right in indices[position + 1:]:
+            hopeless = pair_is_hopeless(
+                segments[left], segments[right], thresholds
+            )
+            if hopeless is not None:
+                # Refused on evidence already in hand, without paying for
+                # the matching. Same verdict, same reason string as the
+                # gate would have produced -- only sooner.
+                verdicts.append(
+                    Verdict((left, right), False, hopeless, float("nan"), {})
+                )
+                continue
             matches = cross_matches(segments[left], segments[right])
             if not matches:
                 continue
@@ -1000,7 +1441,24 @@ def register(store: WorldStore, world_id: str, session_id: str,
                 )
 
     reference = _pick_reference(admitted, points_by_segment)
-    placements = compose_tree(admitted, reference) if reference is not None else {}
+    if reference is None:
+        placements, tree_edges = {}, set()
+    else:
+        placements, tree_edges = compose_tree_with_edges(admitted, reference)
+
+    # The first independent check this module can run. Every clause in
+    # admit() judges one pair from that pair's own evidence; a loop is the
+    # only thing that can disagree with a relationship the tree already
+    # asserts.
+    residuals = cycle_residuals(admitted, placements, tree_edges)
+    cycle_refusal = cycle_refusal_for(residuals)
+    if cycle_refusal is not None:
+        # Refusing the WHOLE component, not the closing edge. The closure
+        # is not in the tree, so dropping it would change nothing and
+        # leave the bad edge in place. A cycle proves an inconsistency
+        # exists without localising it, and a cluster known to contain a
+        # false merge must not be presented as one space.
+        placements = {}
 
     rows = []
     for index in all_segments:
@@ -1020,6 +1478,20 @@ def register(store: WorldStore, world_id: str, session_id: str,
         ),
         "candidate_pairs": len(verdicts),
         "admitted_pairs": [[a, b] for a, b, *_ in admitted],
+        # Reported whether or not they refuse anything. A cluster whose
+        # loops close tightly is better evidence than one with no loops at
+        # all, and until now there was no way to tell those apart.
+        "cycles_checked": len(residuals),
+        "cycle_residuals": [
+            {
+                "edge": [r["edge"][0], r["edge"][1]],
+                "rotation_deg": r["rotation_deg"],
+                "scale_ratio": r["scale_ratio"],
+                "translation": r["translation"],
+            }
+            for r in residuals
+        ],
+        "cycle_refusal": cycle_refusal,
         "pairs": [_verdict_row(v) for v in verdicts],
         "segments": rows,
     }
@@ -1246,11 +1718,69 @@ def _quaternion_wxyz_to_rotation(quaternion) -> np.ndarray:
 # -- cli -------------------------------------------------------------------
 
 
+def placements_from_report(report: dict, input_digest=None):
+    """Turn a registration report into records the store can hold.
+
+    Every segment the report mentions gets a row, registered or refused,
+    because "refused, and here is why" is a different and more useful fact
+    than the absence of a row -- and absence would be indistinguishable
+    from "this pass never looked at that segment".
+    """
+    from tower.world_builder.records import SegmentPlacement
+
+    reference = report.get("reference_segment")
+    rows = []
+    # Every row carries the digest of the build it was solved against. A
+    # placement is a statement about SPECIFIC points; without this it
+    # outlives the reconstruction it was fitted to and is served against
+    # geometry that no longer exists.
+    for entry in report.get("segments", []):
+        transform = entry.get("transform_to_world")
+        if entry.get("registered") and transform:
+            rows.append(
+                SegmentPlacement(
+                    segment_index=int(entry["segment_index"]),
+                    state="registered",
+                    rotation_wxyz=tuple(transform["rotation_wxyz"]),
+                    translation=tuple(transform["translation"]),
+                    scale=float(transform["scale"]),
+                    reference_segment=reference,
+                    refusal_reason=None,
+                    input_digest=input_digest,
+                    evidence={
+                        key: entry[key]
+                        for key in ("points", "cameras", "span_over_depth")
+                        if key in entry
+                    },
+                )
+            )
+        else:
+            rows.append(
+                SegmentPlacement(
+                    segment_index=int(entry["segment_index"]),
+                    state="refused",
+                    rotation_wxyz=None,
+                    translation=None,
+                    scale=None,
+                    reference_segment=None,
+                    refusal_reason=entry.get("reason"),
+                    input_digest=input_digest,
+                    evidence={
+                        key: entry[key]
+                        for key in ("points", "cameras", "span_over_depth")
+                        if key in entry
+                    },
+                )
+            )
+    return rows
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Estimate a per-segment Sim3 for a saved world. Analysis only: "
-            "reads a world, writes nothing into it."
+            "Estimate a per-segment Sim3 for a saved world. Reads a world "
+            "and prints the result; writes placements back only with "
+            "--write, and never touches poses, points or support."
         )
     )
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
@@ -1260,6 +1790,17 @@ def main(argv=None) -> int:
         help="Session id. Defaults to the world's only session.",
     )
     parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument(
+        "--write",
+        action="store_true",
+        help=(
+            "Persist the result as derived/<session>/placements.json. "
+            "Off by default: registration is an expensive pass whose "
+            "verdicts change with its thresholds, and a run made to "
+            "explore a threshold must not silently become what the world "
+            "serves."
+        ),
+    )
     parser.add_argument(
         "--max-reciprocity-error", type=float,
         default=Thresholds.max_reciprocity_error,
@@ -1301,6 +1842,24 @@ def main(argv=None) -> int:
     except SupportMissingError as error:
         print(str(error), file=sys.stderr)
         return 1
+
+    if args.write:
+        # The RAW report, not report_to_json(): that rounds for
+        # display, and a transform that will be applied must not be
+        # rounded. Five decimal places puts a quaternion 1.9e-6 off
+        # unit, which is invisible until a validator refuses it.
+        manifest = store.read_derived_manifest(args.world) or {}
+        placements = placements_from_report(
+            report, input_digest=manifest.get("input_digest")
+        )
+        store.write_placements(args.world, session_id, placements)
+        registered = sum(1 for p in placements if p.state == "registered")
+        print(
+            f"wrote {len(placements)} placements "
+            f"({registered} registered) to derived/{session_id}/"
+            "placements.json",
+            file=sys.stderr,
+        )
 
     if args.format == "json":
         print(json.dumps(report_to_json(report), indent=2))

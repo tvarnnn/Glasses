@@ -45,6 +45,25 @@ criteria. You should not need git history or prior chat to execute.
 
 ## 1. What changed on the Tower this run, and whether iOS cares
 
+### 2026-08-27 — Object Memory lifecycle, policy and imagery
+
+Full record: **`docs/agent-handoffs/OBJECT-MEMORY-HANDOFF.md`**, and §7 of
+it is written for you. Contract detail: `docs/contracts/OBJECT-MEMORY.md`
+§§8–13.
+
+| Tower change | iOS consequence |
+|---|---|
+| **`object_memory.observations/2026-08-26` UNCHANGED** | **None.** `claim`, `identity`, `absence_means` and the explicit `null` `spatial_ref` all travel exactly as before. New record keys are additive and a `Codable` decoder ignores them. |
+| **`recorded_classes` is now configuration-dependent** | **SMALL BUT REAL — §3.9.** Its value on a default Tower is byte-identical (`["laptop", "cell phone"]`, same order). A Tower with a verifier enabled sends twelve more. Read the list from the payload; do not hard-code it. |
+| **Start/Pause/Stop exists** — `POST /cartridges/object_memory/session/{action}`, contract `cartridge_session.control/2026-08-27` | **NEW WORK — §3.10.** This is the button that was missing. |
+| **Pictures exist** — `/object-memory/observations/{id}/{imagery,frame,crop}`, contract `object_memory.imagery/2026-08-27` | **NEW WORK — §3.11.** The frame reference stops being a diagnostic. |
+| **`TOWER_OBSERVATION_ROOT` now defaults** | **Test instructions change.** The 404 state is now reached with `TOWER_OBSERVATION_ENABLED=false`. Everything else about that screen state is unchanged. |
+| **Records gain `observation_id`, `last_seen_at`, `frame_count`, `tier`, `verification`** | Optional. `observation_id` is required to build an imagery URL. |
+| **Object Memory still NOT declared over the socket** | **None.** `testTheTowerDeclaresOnlyTheWorldBuilderContract` is untouched, deliberately. Declaring it is a decision for both halves together. |
+| **The face filter fires on 40% of real frames and is mostly wrong when it does** | Affects §3.11 copy: `subject_obscured > 0` means part of the object is behind a fill. |
+
+### 2026-08-26
+
 | Tower change | iOS consequence |
 |---|---|
 | **Object Memory got its first HTTP route** (5th router) | **NEW WORK — §3.2.** Two endpoints, new contract |
@@ -62,7 +81,7 @@ criteria. You should not need git history or prior chat to execute.
 
 ## 2. The Tower surface iOS talks to
 
-Five routers registered in `tower/tower/main.py`:
+Six routers registered in `tower/tower/main.py`:
 
 | Method | Path | Contract |
 |---|---|---|
@@ -72,6 +91,11 @@ Five routers registered in `tower/tower/main.py`:
 | GET | `/worlds/{world_id}/geometry/segment/{segment_index}?session_id=`&`max_points=` | `world_builder.geometry/2026-08-25` |
 | GET | `/object-memory/observations?object_class=&retention_days=` | `object_memory.observations/2026-08-26` |
 | GET | `/object-memory/last-seen/{object_class}?retention_days=` | `object_memory.observations/2026-08-26` |
+| GET | `/object-memory/observations/{observation_id}/imagery` | `object_memory.imagery/2026-08-27` |
+| GET | `/object-memory/observations/{observation_id}/frame` | `object_memory.imagery/2026-08-27` (returns `image/jpeg`) |
+| GET | `/object-memory/observations/{observation_id}/crop` | `object_memory.imagery/2026-08-27` (returns `image/jpeg`) |
+| GET | `/cartridges/{cartridge}/session` | `cartridge_session.control/2026-08-27` |
+| **POST** | `/cartridges/{cartridge}/session/{action}` | `cartridge_session.control/2026-08-27` |
 | WS | `/ws` | `cartridge_results.envelope/2026-08-23`, `world_builder.status/2026-08-25` |
 
 Contract identifiers are **opaque and compared for equality only** —
@@ -199,6 +223,86 @@ The corpus holds 55 observations: 29 `laptop`, 26 `cell phone`, and
 **Acceptance.** Builds; tests green; the screen renders all three
 branches correctly against the live route; no string asserts possession,
 location, or present tense.
+
+---
+
+### 3.9 Read `recorded_classes`, do not assume it
+
+`ObjectMemoryCopy`'s forbidden-phrase tests generate per-class phrases
+("your laptop", "the laptop is", "laptop is on"). If that generation is
+driven by a hard-coded `["laptop", "cell phone"]`, a Tower with
+`TOWER_OBSERVATION_VERIFIER=owlv2` will render classes the copy safety
+net never covered. Drive it from the payload's `recorded_classes`.
+
+### 3.10 The Start button — `cartridge_session.control/2026-08-27`
+
+```
+GET  /cartridges/object_memory/session
+POST /cartridges/object_memory/session/{start|pause|resume|stop}
+```
+
+Six things to get right. Contract detail is
+`docs/contracts/OBJECT-MEMORY.md` §9.
+
+1. **Render liveness from `following`, never from `state`.** `state` is
+   what the wearer asked for; `following` is the list of capture ids a
+   producer is actually alive on. The payload carries
+   `state_means: "intent-not-liveness"` so this is a value you can switch
+   on. An `active` session with an empty `following` *while a capture is
+   recording* is a producer that died, and it needs its own copy — it is
+   the "looks successful but does nothing" failure the whole surface
+   exists to expose.
+2. **`supported: false` disables Start with a reason.** True on a Tower
+   with the cartridge switched off. A Start button that silently does
+   nothing is worse than one that says why it cannot.
+3. **409 is an answer, not an error toast.** Body carries `reason`
+   (`not-active` | `not-paused` | `unsupported` | `unknown-action`), a
+   human-readable `message`, and the state actually reached.
+4. **200 with `changed: false` is a double tap**, not a failure.
+5. **Start before the camera is normal.** `state: "active"`,
+   `attached_capture_id: null`. Do not treat it as an error.
+6. **A Tower restart comes back `stopped`.** Deliberate — resuming a
+   memory of what a camera sees without anybody asking again is the wrong
+   direction to fail in. Do not cache a session across a reconnect.
+
+### 3.11 The picture — `object_memory.imagery/2026-08-27`
+
+```
+GET /object-memory/observations/{observation_id}/imagery   -> JSON
+GET /object-memory/observations/{observation_id}/frame     -> image/jpeg
+GET /object-memory/observations/{observation_id}/crop      -> image/jpeg
+```
+
+Ask `/imagery` first; it answers **without** downloading an image, which
+is what lets a row decide between a thumbnail, a caption, and "the memory
+is kept and the picture is not".
+
+| you must handle | what it means |
+|---|---|
+| **410** on `/frame` or `/crop` | Capture-side retention removed the imagery. `memory_retained: true` is in the body. **This must not render as a broken image or an empty row** — it is a true and useful sentence. |
+| **503** | This Tower cannot serve imagery at all: no face-detection weights, or no capture root. Configuration, not a claim about the record. |
+| `subject_obscured > 0` | Part of the OBJECT is behind a filter fill. Say so, or fall back to `/frame`. Do not show a black rectangle without comment. |
+| `regions_filled == 0` | **Nothing was detected**, not "there were no faces". The detector has measured blind spots. |
+| `filter` | Always starts `display-filter/`. It runs on READ; the stored frame is unchanged. Never render it as "redacted", "anonymised" or "privacy-safe". |
+
+**The copy problem this creates, and it is the real one.** Everything on
+this screen is held by a forbidden-phrase test that refuses present-tense
+possession and location claims. **A picture is a far stronger location
+cue than any sentence, and no string test can catch it.** The published
+evidence says that is the point — MemPal's last-seen images were right
+only 53% of the time and still moved retrieval accuracy from 0.81 to 0.95
+— but it means the caption around the picture is doing *more* work than
+before, not less.
+
+A starting shape, to be tested on a person rather than accepted from the
+Tower lane:
+
+> *A laptop was visible. This is the frame the Tower kept the record
+> against — a picture from the recording, not a place. It does not say
+> anything about now.*
+
+`testTheCatalogSummaryDoesNotPromiseALocation` and the
+`everyString(for:)` sweep should both be extended to the new copy.
 
 ---
 
@@ -385,7 +489,9 @@ either proven or explicitly documented as unproven at the boundary.
 | `docs/contracts/OBJECT-MEMORY.md` | **CURRENT** — observations wire truth |
 | `docs/contracts/WORLD-BUILDER-IOS.md` | **CURRENT** — the reconciled seam |
 | `docs/agent-handoffs/WORLD-BUILDER-MAC-HANDOFF.md` | **REFERENCE** — deep detail on the geometry viewer; its §7–9 compile notes are superseded by §4 here |
-| `docs/agent-handoffs/OBJECT-MEMORY-MAC-HANDOFF.md` | **REFERENCE** — deep detail on the Object Memory screen |
+| `docs/agent-handoffs/OBJECT-MEMORY-HANDOFF.md` | **CURRENT** — the 2026-08-27 Object Memory record; §7 is written for this lane |
+| `tower/docs/superpowers/research/2026-08-27-object-memory-corpus-precision.md` | **CURRENT** — every figure behind the policy, the model choice and the face-filter finding |
+| `docs/agent-handoffs/OBJECT-MEMORY-MAC-HANDOFF.md` | **REFERENCE, PARTLY SUPERSEDED** — deep detail on the Object Memory screen; its own header says which parts moved |
 | `docs/agent-handoffs/IOS-STATIC-REVIEW.md` | **REFERENCE** — the findings §4 summarises |
 | `docs/agent-handoffs/WORLD-BUILDER-STATUS.md` | **CURRENT** for P1–P11 physical gates |
 | `docs/agent-handoffs/CARTRIDGE-ROADMAP.md` | **CURRENT** — program-level blockers |
@@ -418,6 +524,13 @@ edge). Redaction on real bystanders cannot be validated here at all.
 ---
 
 ## 9. Changelog
+
+**2026-08-27** — Object Memory lifecycle, policy and imagery. Adds §3.9
+(read `recorded_classes`), §3.10 (the Start button) and §3.11 (the
+picture). The observations contract is unchanged; two new contracts are
+offered alongside it. Records the copy problem a picture creates, which
+no string test can catch. Full record:
+`docs/agent-handoffs/OBJECT-MEMORY-HANDOFF.md`.
 
 **2026-08-26 (b)** — Added §6.5: the capture-clock contract addition, after
 the iOS lane's `f77b623` was corroborated Tower-side. Records that "the frame

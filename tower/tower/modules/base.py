@@ -26,11 +26,24 @@ class ModuleUnavailableError(Exception):
 
 class FrameProcessingError(Exception):
     """Raised by a module's _do_process() to signal a recoverable,
-    frame-scoped failure (e.g. an undecodable frame). ModuleContainer
+    frame-scoped failure OR refusal (e.g. an undecodable frame, or a
+    module that is deliberately not processing right now). ModuleContainer
     treats this as "drop this one frame" -- it must NOT take the whole
     module down. Any other exception from _do_process() is still a
     genuine module failure and still marks the module FAILED.
+
+    `reason` is an optional machine-readable code that reaches the client
+    as `frame_error.reason` in place of the generic `frame_skipped`.
+    Optional because the transport must keep working for a module that
+    names nothing, and useful because "that frame was undecodable" and
+    "this module is paused" are different facts a person acts on
+    differently. It is a CODE, not prose -- the prose is the exception
+    message, which travels beside it.
     """
+
+    def __init__(self, *args, reason: str | None = None) -> None:
+        super().__init__(*args)
+        self.reason = reason
 
 
 class FrameSkippedError(ModuleUnavailableError):
@@ -40,7 +53,16 @@ class FrameSkippedError(ModuleUnavailableError):
     frame dropped" can keep catching ModuleUnavailableError unchanged;
     callers that want to distinguish "one bad frame" from "module died"
     (e.g. metrics) can catch this subtype specifically.
+
+    Carries the `reason` of the FrameProcessingError it was raised from,
+    when there was one. The container is the only thing that translates
+    between the two, so the code the module chose survives the hop
+    without the transport having to know which module chose it.
     """
+
+    def __init__(self, *args, reason: str | None = None) -> None:
+        super().__init__(*args)
+        self.reason = reason
 
 
 @dataclass(frozen=True)

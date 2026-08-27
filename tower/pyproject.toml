@@ -103,6 +103,45 @@ ocr = [
     # Windows wheel over them -- the same trap that extra documents.
     "easyocr==1.7.2",
 ]
+semantic = [
+    # Object Memory's second opinion on a detector label. Optional, off
+    # by default, and gated at the settings layer: with
+    # TOWER_OBSERVATION_VERIFIER unset nothing here is imported, no
+    # weights are fetched, and the cartridge records exactly what it
+    # recorded before this extra existed.
+    #
+    # WHAT IT BUYS, MEASURED. `google/owlv2-base-patch16-ensemble`
+    # (Apache-2.0, ~600 MB of weights fetched once) accepts 93.2% of
+    # correct detector labels and rejects 94.3% of wrong ones over 94
+    # human-labelled crops from the real corpus, at 128 ms and 842 MB of
+    # peak VRAM per call -- called once per sighting, which measured 53
+    # times across 18,821 frames. Evidence:
+    # docs/superpowers/research/2026-08-27-object-memory-corpus-precision.md
+    #
+    # A FLOOR, NOT AN EXACT PIN, unlike torch and easyocr above. Those
+    # two are pinned because a measurement is calibrated against the
+    # version; here the calibrated thing is the WEIGHTS, which are
+    # addressed by repo id and are not what pip resolves. The library is
+    # a loader.
+    #
+    # THE MAJOR VERSION IS LOAD-BEARING. transformers 5.x exposes
+    # `Owlv2ForObjectDetection` through `AutoModelForZeroShotObjectDetection`
+    # and `post_process_grounded_object_detection` with the signature
+    # `tower/object_memory/verification.py` calls. Verified on this host
+    # 2026-08-27 at 5.16.1.
+    #
+    # WHAT IT DOES NOT DISTURB, checked with `pip install --dry-run`
+    # BEFORE installing: the resolve adds only tokenizers, regex, typer,
+    # rich, markdown-it-py, mdurl and shellingham -- all pure Python --
+    # and reports every existing package "already satisfied". Nothing
+    # touches torch, torchvision, numpy or cv2. Re-check that after any
+    # change here; a resolver that decides to "help" with torch is
+    # exactly the failure the `ml` extra exists to prevent.
+    #
+    # `huggingface_hub` and `safetensors` are already present via timm,
+    # so they are not listed.
+    "transformers>=5.16,<6",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

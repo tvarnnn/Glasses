@@ -38,12 +38,34 @@ renaming one, or changing what a field means is.
 CARTRIDGE_WORLD_BUILDER = "world_builder"
 CARTRIDGE_EXPERIMENTAL_CV = "experimental_cv"
 CARTRIDGE_DOCUMENT_MEMORY = "document_memory"
+# Present here before it is present in `registry.declare()`, and that is
+# not an oversight. The name is what a session URL and a `/health` row
+# are keyed on, and both exist now; the socket DECLARATION is a separate
+# decision that breaks a pinned iOS test the moment it lands, so it waits
+# for the iOS lane to take both halves at once. See
+# `docs/agent-handoffs/OBJECT-MEMORY-MAC-HANDOFF.md` section 3.
+CARTRIDGE_OBJECT_MEMORY = "object_memory"
 CARTRIDGE_SCENE_UNDERSTANDING = "scene_understanding"
 
 # Result types within a cartridge. A cartridge may eventually offer more
 # than one; the pair (cartridge, result_type) is what a subscription
 # names.
 RESULT_TYPE_STATUS = "status"
+
+# Scene Understanding's result type is `live`, not `status`, and the
+# difference is the payload rather than the cadence. World Builder's
+# `status` describes a BUILD -- how far it has got, what it has accepted.
+# Scene Understanding's payload IS the answer: the counts are the product,
+# not progress towards one. Naming it `status` would have invited a client
+# to render it in the place it renders "building...".
+RESULT_TYPE_LIVE = "live"
+
+# Document Memory's result type is `status` -- and there it is the right
+# word, because the payload really is progress: how long this Tower has
+# been watching for documents, how many it has recorded, whether it is
+# mid-dwell. The documents themselves do not travel here. They are bulk,
+# they are text, and a list of them belongs on HTTP for the same reason
+# World Builder's geometry does -- see `tower/routes/documents.py`.
 
 # The one contract that exists.
 #
@@ -62,6 +84,42 @@ RESULT_TYPE_STATUS = "status"
 # alone would not have justified this; changing what an existing figure
 # counts does.
 WORLD_BUILDER_STATUS_CONTRACT = "world_builder.status/2026-08-25"
+
+# Scene Understanding's live scene.
+#
+# Dated 2026-08-27 rather than the 2026-08-26 of
+# `docs/superpowers/specs/2026-08-26-scene-understanding-wire-path-design.md`
+# because the payload that shipped is not byte-for-byte the payload that
+# was designed: `where` carries per-label SIDE COUNTS rather than one side
+# per label (one side cannot describe a chair on the left and a chair on
+# the right), and a `lifecycle` block was added because this cartridge has
+# a Start and a Stop that World Builder's file-reading status did not.
+#
+# Nothing had ever served the 2026-08-26 identifier -- the design was
+# explicitly "designed, not implemented" -- so no consumer is being broken.
+# Minting the date the agreement actually reached a wire is the whole
+# discipline these identifiers exist for.
+SCENE_LIVE_CONTRACT = "scene_understanding.live/2026-08-27"
+
+# Document Memory's session status. The library itself is not here; see
+# `DOCUMENT_LIBRARY_CONTRACT` in `tower/results/document_memory.py`, which
+# governs the HTTP surface.
+DOCUMENT_MEMORY_STATUS_CONTRACT = "document_memory.status/2026-08-27"
+
+# Document Memory's library, which travels over HTTP rather than on this
+# channel. Declared all the same -- see `registry.declare`'s
+# `http_contracts` -- because iOS CACHES a declaration, and a contract it
+# can only discover by making a call is a contract it cannot plan around.
+DOCUMENT_MEMORY_LIBRARY_CONTRACT = "document_memory.library/2026-08-27"
+
+# The Experimental CV Lab status document. Restated here rather than
+# imported from `tower/cv_lab/contracts.py`, and a test asserts the two
+# are equal: this module is the result channel cartridge-blind core, and
+# importing a cartridge to learn its identifier is exactly the coupling
+# `test_the_result_channel_core_is_cartridge_blind` forbids. A duplicated
+# string that a test pins cannot drift; an import would make the shared
+# surface depend on one cartridge package layout.
+EXPERIMENTAL_CV_STATUS_CONTRACT = "experimental_cv.status/2026-08-27"
 
 # The channel's own envelope contract, distinct from any cartridge's.
 # A change here affects every cartridge at once, which is exactly why it

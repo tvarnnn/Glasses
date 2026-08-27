@@ -64,6 +64,12 @@ class ObjectDetectionExperiment:
         self._transform = None
         self._device = None
         self._categories = None
+        # What was ASKED for, kept beside what was resolved.
+        # `auto` resolving to `cpu` on a machine with no CUDA is a
+        # correct outcome; `cuda` resolving to `cpu` would be a
+        # silent downgrade, and only both numbers together can
+        # tell the two apart after the fact.
+        self._requested_device = None
         # Guards the handover from a load that may have been abandoned by
         # the module's load timeout. See tower/loading.py.
         self._invalidation = LoadInvalidation()
@@ -86,7 +92,9 @@ class ObjectDetectionExperiment:
 
         from tower.experiments.depth import resolve_device
 
-        device = resolve_device("auto" if settings is None else settings.device)
+        requested = "auto" if settings is None else settings.device
+        self._requested_device = requested
+        device = resolve_device(requested)
         weights = SSDLite320_MobileNet_V3_Large_Weights.COCO_V1
         model = ssdlite320_mobilenet_v3_large(weights=weights)
         model.eval()
@@ -159,6 +167,33 @@ class ObjectDetectionExperiment:
             import torch
 
             torch.cuda.empty_cache()
+
+    def describe(self) -> dict:
+        """Runtime facts about what is actually loaded. Never raises.
+
+        OPTIONAL on the `Experiment` protocol, and the Lab treats a
+        missing `describe()` as "this experiment holds nothing worth
+        reporting" rather than as an error. It exists because
+        `TOWER_CV_DEVICE=auto` is a REQUEST and `resolve_device` decides
+        the answer: a run that says "auto" has not told anyone whether it
+        used the GPU, and a CPU figure with a GPU label on it is the
+        specific failure `resolve_device` was written to prevent.
+
+        Read outside the invalidation lock on purpose. This is a
+        diagnostic, and taking the lock that guards a model handover in
+        order to print a device name would let a status read contend with
+        a load. A single attribute read is atomic; the worst case is a
+        `null` device on a run that was mid-load a microsecond ago.
+        """
+        device = self._device
+        return {
+            "backend": "torch",
+            "device": "unknown" if device is None else str(device),
+            "device_requested": self._requested_device or "auto",
+            "model": "ssdlite320_mobilenet_v3_large",
+            "weights": "COCO_V1",
+            "score_threshold": SCORE_THRESHOLD,
+        }
 
     def run(self, raw_bytes: bytes) -> ExperimentResult:
         timer = StageTimer()

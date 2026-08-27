@@ -20,6 +20,23 @@ and `test_no_wire_module_can_reach_purge_or_prune` fails if it ever
 does. Deletion stays with `scripts/object_query.py --purge-all`, where a
 human types it.
 
+THE IMAGERY ROUTES SERVE PIXELS, AND THAT IS NEW.
+
+Until now this cartridge exposed a POINTER to a frame and never the
+frame. Three rules hold that step:
+
+  * every picture passes a face filter on the way out, and a Tower whose
+    filter cannot run serves NOTHING rather than an unfiltered
+    first-person frame;
+  * the label says `display-filter/...`, because the stored frame is
+    unchanged and calling this a privacy transformation would be false;
+  * a record whose imagery has aged out answers "the memory is kept and
+    the picture is not", which is the whole reason the shape exists.
+
+`Cache-Control: no-store` on both binary routes. This is sensitive
+first-person imagery on a LAN-local origin, and a proxy or a browser
+holding a copy is a second store nobody chose.
+
 RETENTION IS NARROWABLE, NEVER WIDENABLE.
 
 `retention_days` is a request, not an authority. It travels into the
@@ -31,15 +48,37 @@ store's, not this route's -- this file consumes the property and adds
 nothing of its own that could weaken it.
 """
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from tower.results.object_memory import (
+    FILTER_UNAVAILABLE,
+    IMAGERY_EXPIRED,
+    NO_CAPTURE_ROOT,
+    NO_FRAME_REFERENCE,
+    NOT_FOUND,
+    UNREADABLE,
+    build_face_filter,
+    build_imagery_view,
     build_last_seen,
     build_observations,
+    render_imagery,
     store_from_root,
 )
 
 router = APIRouter()
+
+
+def _recorded_classes(request: Request):
+    """What this Tower will actually record, or None to mean the safe default.
+
+    Read from `app.state` rather than imported, because it depends on
+    whether a semantic verifier is configured -- and the route is not
+    allowed to know what a verifier is. `main.py` puts the answer here
+    from the same `Settings` object the producer's argv is built from, so
+    the read surface and the producer cannot disagree about it any more
+    than they can disagree about where the store lives.
+    """
+    return getattr(request.app.state, "object_memory_recorded_classes", None)
 
 
 def _store(request: Request, retention_days: float | None):
@@ -79,6 +118,7 @@ def observations(
         _store(request, retention_days),
         object_class=object_class,
         requested_retention_days=retention_days,
+        recorded_classes=_recorded_classes(request),
     )
 
 
@@ -92,4 +132,124 @@ def last_seen(
         _store(request, retention_days),
         object_class,
         requested_retention_days=retention_days,
+        recorded_classes=_recorded_classes(request),
+    )
+
+
+# How a refusal maps onto a status code.
+#
+# A picture that has aged out is 410 GONE, and that is the one carrying
+# meaning: it says the resource existed and does not now, which is
+# exactly what capture-side retention did. Everything else is either a
+# handle that matched nothing (404) or this Tower being unable to serve
+# imagery at all right now (503) -- a configuration answer, not a claim
+# about the record.
+#
+# The reason VALUE is on the body in every case, and a client should
+# switch on that rather than on the code.
+_IMAGERY_STATUS = {
+    NOT_FOUND: 404,
+    NO_FRAME_REFERENCE: 404,
+    IMAGERY_EXPIRED: 410,
+    NO_CAPTURE_ROOT: 503,
+    FILTER_UNAVAILABLE: 503,
+    UNREADABLE: 503,
+}
+
+# Never cached. Sensitive first-person imagery on a LAN-local origin.
+_NO_STORE = {"Cache-Control": "no-store"}
+
+# The stand-in for an app that was built without a filter -- which is
+# most of this repository's tests. The failure has to be a REFUSAL, never
+# an AttributeError and never a raw frame.
+#
+# `path=""` means "no model", explicitly, since `imagery.FaceFilter` grew
+# a blank check. It did not always: `Path("")` is `Path(".")` and
+# `Path(".").exists()` is True, so this reported itself AVAILABLE and
+# refused only because `cv2.FaceDetectorYN.create(".")` happened to
+# raise. Every test that asserted a refusal here was passing for that
+# reason rather than for this one.
+_REFUSING_FILTER = build_face_filter(path="")
+
+
+def _face_filter(request: Request):
+    return getattr(request.app.state, "object_memory_face_filter", None) or (
+        _REFUSING_FILTER
+    )
+
+
+def _capture_root(request: Request):
+    return getattr(request.app.state, "capture_root", None)
+
+
+def _imagery(request: Request, observation_id: str, *, crop: bool):
+    return render_imagery(
+        _store(request, None),
+        observation_id,
+        capture_root=_capture_root(request),
+        face_filter=_face_filter(request),
+        crop=crop,
+    )
+
+
+def _refuse(observation, image, observation_id: str):
+    raise HTTPException(
+        status_code=_IMAGERY_STATUS.get(image.reason, 503),
+        detail=build_imagery_view(observation, image, observation_id=observation_id),
+    )
+
+
+@router.get("/object-memory/observations/{observation_id}/imagery")
+def imagery_view(observation_id: str, request: Request) -> dict:
+    """Whether there is a picture, and what may be said about it.
+
+    Answerable without downloading anything, which is the point: a phone
+    deciding between a thumbnail, a caption and "the memory is kept and
+    the picture is not" should not have to fetch an image to find out
+    which.
+
+    200 even when there is no picture. The resource -- what this
+    cartridge knows about the imagery behind a record -- exists either
+    way, and a 404 here would read as "no such memory". A handle that
+    matched nothing is the exception, and is a real 404.
+    """
+    observation, image = _imagery(request, observation_id, crop=False)
+    if observation is None:
+        raise HTTPException(
+            status_code=404,
+            detail=build_imagery_view(None, image, observation_id=observation_id),
+        )
+    return build_imagery_view(observation, image, observation_id=observation_id)
+
+
+@router.get("/object-memory/observations/{observation_id}/frame")
+def frame(observation_id: str, request: Request):
+    """The whole frame this record was derived from, filtered.
+
+    The CONTEXT, not the object. Where the wearer was and what else was
+    in view is most of what makes a small crop recognisable, and the
+    published evidence on memory aids is that context is what people
+    actually use.
+    """
+    observation, image = _imagery(request, observation_id, crop=False)
+    if not image.available:
+        _refuse(observation, image, observation_id)
+    return Response(
+        content=image.image_bytes, media_type="image/jpeg", headers=_NO_STORE
+    )
+
+
+@router.get("/object-memory/observations/{observation_id}/crop")
+def crop(observation_id: str, request: Request):
+    """The object itself, padded, filtered.
+
+    Padded rather than tight: a 3%-of-frame box cropped exactly is
+    unreadable, and the surroundings are most of what tells a person
+    whether the label is right.
+    """
+    observation, image = _imagery(request, observation_id, crop=True)
+    if not image.available:
+        _refuse(observation, image, observation_id)
+    return Response(
+        content=image.image_bytes, media_type="image/jpeg", headers=_NO_STORE
     )

@@ -388,9 +388,18 @@ class _JournalTail:
 
     __slots__ = ("_path", "_offset", "_remainder")
 
-    def __init__(self, path) -> None:
+    def __init__(self, path, *, start_at_end: bool = False) -> None:
         self._path = path
+        # Where reading begins. Zero -- the whole journal -- unless a
+        # caller has said it arrived late and must not read the part of
+        # the recording that happened before it was asked for. A journal
+        # that does not exist yet is empty, so both answers are 0.
         self._offset = 0
+        if start_at_end:
+            try:
+                self._offset = path.stat().st_size
+            except OSError:
+                self._offset = 0
         self._remainder = b""
 
     def read_new(self) -> list:
@@ -485,6 +494,7 @@ class CaptureFollower:
         sleep=time.sleep,
         follow_reconnects: bool = True,
         resume_grace_seconds: float = RESUME_GRACE_SECONDS,
+        start_at_end: bool = False,
     ):
         from pathlib import Path
 
@@ -493,6 +503,21 @@ class CaptureFollower:
         self._sleep = sleep
         self._follow_reconnects = follow_reconnects
         self._resume_grace_seconds = resume_grace_seconds
+        # Skip whatever the journal already holds, and yield only frames
+        # recorded from now on.
+        #
+        # Off by default, because every existing caller follows a capture
+        # from the moment it opens and must see all of it. It is turned
+        # on by a consumer ATTACHED LATE -- a cartridge a wearer started
+        # three minutes into a walk. Reading the earlier frames would be
+        # cheap and wrong: nobody asked for the first three minutes to be
+        # processed, and a follower is not the right place to decide that
+        # they should be.
+        #
+        # It applies to THIS directory only. A successor capture after a
+        # reconnect is read whole, because by then the consumer has been
+        # attached the entire time that capture existed.
+        self._start_at_end = start_at_end
 
     @property
     def directory(self):
@@ -513,7 +538,7 @@ class CaptureFollower:
 
     def follow(self, *, max_idle_polls: int | None = None):
         journal = self._directory / FRAMES_FILENAME
-        tail = _JournalTail(journal)
+        tail = _JournalTail(journal, start_at_end=self._start_at_end)
         idle_polls = 0
 
         while True:

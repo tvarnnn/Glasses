@@ -98,6 +98,18 @@ class Dwell:
     best: list[ScoredFrame] = field(default_factory=list)
     end_reason: str = END_REASON_LOST
     reference: PageCandidate | None = None
+    # Whatever the caller said the frames belonged to when this dwell
+    # STARTED, kept opaque so this module stays free of any notion of a
+    # capture. Set once, in `_start`, and never touched by `_extend`.
+    #
+    # Set once is the entire point. Document Memory stamps a capture id
+    # onto the record a dwell produces, and it used to read that id at
+    # RECORD time -- so a `stream_start` arriving mid-dwell (a phone
+    # reconnect re-arms the recorder) moved every frame of that reading
+    # onto a capture it did not come from, and a `stream_stop` erased it
+    # entirely. Both were measured. A pointer that resolves to the wrong
+    # frame is worse than no pointer at all.
+    lineage: object | None = None
     # Accumulated FORWARD-ONLY, one inter-frame delta at a time.
     elapsed_seconds: float = 0.0
     clock_regressions: int = 0
@@ -155,21 +167,38 @@ class DwellTracker:
         gray: np.ndarray | None = None,
         source_seq: int | None = None,
         frame_diagonal: float | None = None,
+        lineage: object | None = None,
     ) -> Dwell | None:
         """Feed one frame. Returns a completed dwell, or None."""
         if candidate is None:
             return self._miss(at)
 
         if self._current is None:
-            self._start(candidate, at, gray, source_seq)
+            self._start(candidate, at, gray, source_seq, lineage)
             return None
+
+        if lineage != self._current.lineage:
+            # The frames stopped belonging to the recording this dwell
+            # started in. A reconnect re-arms the recorder, mints a new
+            # capture id, and `source_seq` restarts with it.
+            #
+            # Ending the dwell is the only honest answer. Keeping it open
+            # froze `capture_id` at the old capture while letting frames
+            # from the new one win the OCR slots -- so the published
+            # `page_source_seqs` resolved into the OLD journal and named
+            # completely different frames. Silent, plausible and wrong,
+            # which is worse than no pointer at all. Same reasoning
+            # `_is_same_region` applies to a different page.
+            finished = self._finish(END_REASON_LOST)
+            self._start(candidate, at, gray, source_seq, lineage)
+            return finished
 
         if at - self._current.last_seen_at > self._policy.max_frame_gap_s:
             # Too long since the last detection for this to be one
             # continuous reading -- a stalled stream, or a clock jump.
             # Ending the dwell contains the damage either way.
             finished = self._finish(END_REASON_LOST)
-            self._start(candidate, at, gray, source_seq)
+            self._start(candidate, at, gray, source_seq, lineage)
             return finished
 
         if not self._is_same_region(candidate, frame_diagonal):
@@ -177,7 +206,7 @@ class DwellTracker:
             # this, turning from one document to another would merge two
             # documents into one record with interleaved text.
             finished = self._finish(END_REASON_LOST)
-            self._start(candidate, at, gray, source_seq)
+            self._start(candidate, at, gray, source_seq, lineage)
             return finished
 
         self._extend(candidate, at, gray, source_seq)
@@ -194,8 +223,13 @@ class DwellTracker:
 
     # -- internals -----------------------------------------------------
 
-    def _start(self, candidate, at, gray, source_seq) -> None:
-        self._current = Dwell(started_at=at, last_seen_at=at, reference=candidate)
+    def _start(self, candidate, at, gray, source_seq, lineage=None) -> None:
+        self._current = Dwell(
+            started_at=at,
+            last_seen_at=at,
+            reference=candidate,
+            lineage=lineage,
+        )
         self._extend(candidate, at, gray, source_seq)
 
     def _extend(self, candidate, at, gray, source_seq) -> None:

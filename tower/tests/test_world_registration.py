@@ -730,3 +730,265 @@ class TestTheRealWalk:
         encoded = report_to_json(report)
 
         assert json.loads(json.dumps(encoded)) == encoded
+
+
+# ---------------------------------------------------------------------------
+# Rotation reciprocity.
+#
+# The gate compared the two directions on ONE quantity: forward.scale *
+# reverse.scale. It never compared rotations, so a pair agreeing on scale
+# to 1% while disagreeing 40 degrees in rotation was admitted -- folding
+# one segment's geometry through another's, which the research note
+# records as a real failure class (31.9 to 166.0 degrees observed on
+# ill-conditioned pairs before refinement).
+#
+# HONEST STATUS: measured on the real world 3dd986b1, all six solvable
+# pairs agree on rotation to within 2.31 degrees, INCLUDING the dangerous
+# (30,50) pair that is 3.2x wrong on scale. This clause therefore changes
+# no verdict on the corpus available today. It is a guard against a
+# documented catastrophic failure, not a fix for an observed one, and the
+# distinction is recorded rather than blurred.
+# ---------------------------------------------------------------------------
+
+
+def _fit_rot(source, target, *, scale, rotation):
+    """_fit with an explicit rotation, which the base helper hardcodes to I."""
+    import dataclasses as _dc
+
+    return _dc.replace(_fit(source, target, scale=scale), rotation=rotation)
+
+
+def _rotation_about_z(degrees):
+    t = math.radians(degrees)
+    return np.array(
+        [[math.cos(t), -math.sin(t), 0.0],
+         [math.sin(t), math.cos(t), 0.0],
+         [0.0, 0.0, 1.0]]
+    )
+
+
+def test_a_pair_agreeing_on_scale_but_not_rotation_is_refused():
+    """The hole this clause closes. Scale reciprocity is perfect; the two
+    directions disagree by 40 degrees about which way the segment faces."""
+    rotation = _rotation_about_z(20.0)
+    forward = _fit_rot(0, 1, scale=2.0, rotation=rotation)
+    # A correct reverse would be rotation.T. This one is off by 40 deg.
+    reverse = _fit_rot(1, 0, scale=0.5, rotation=_rotation_about_z(20.0))
+    verdict = admit(MutualEvidence(forward=forward, reverse=reverse), Thresholds())
+    assert not verdict.registered
+    assert "orientation" in verdict.reason.lower()
+    assert verdict.clauses["rotation_disagreement_deg"] == pytest.approx(40.0)
+    # And the scale clause would have waved it straight through.
+    assert abs(verdict.clauses["reciprocity"] - 1.0) < 1e-9
+
+
+def test_a_pair_agreeing_on_both_is_admitted():
+    """Positive control: the clause must not refuse honest agreement."""
+    rotation = _rotation_about_z(20.0)
+    forward = _fit_rot(0, 1, scale=2.0, rotation=rotation)
+    reverse = _fit_rot(1, 0, scale=0.5, rotation=rotation.T)
+    verdict = admit(MutualEvidence(forward=forward, reverse=reverse), Thresholds())
+    assert verdict.registered, verdict.reason
+
+
+def test_the_rotation_bound_separates_measured_good_from_measured_bad():
+    """The bound is set from measurement, not taste.
+
+    Measured on world 3dd986b1: the worst rotation disagreement among six
+    solvable real pairs is 2.31 deg. The research note records wrong
+    rotations at 31.9 to 166.0 deg. The bound sits between, with margin on
+    both sides -- roughly 6x above the worst honest pair and 2x below the
+    mildest catastrophic one.
+    """
+    assert 2.31 < Thresholds().max_rotation_disagreement_deg < 31.9
+
+
+def test_rotation_disagreement_is_reported_even_when_it_passes():
+    """A consumer of a registered pair should be able to see HOW well the
+    two directions agreed, not just that they cleared the bar."""
+    rotation = _rotation_about_z(20.0)
+    evidence = MutualEvidence(
+        forward=_fit_rot(0, 1, scale=2.0, rotation=rotation),
+        reverse=_fit_rot(1, 0, scale=0.5, rotation=rotation.T),
+    )
+    assert evidence.rotation_disagreement_deg < 1e-6
+    verdict = admit(evidence, Thresholds())
+    assert "rotation_disagreement_deg" in verdict.clauses
+
+
+def _segment_with_span(span):
+    """A stand-in segment whose cameras span  of the scene depth."""
+    import numpy as _np
+
+    class _Seg:
+        index = 0
+        span_over_depth = span
+        points = _np.zeros((10, 3))
+
+    return _Seg()
+
+
+def _segment_with_span(value):
+    """A stand-in segment whose cameras span `value` of the scene depth."""
+
+    class _Seg:
+        index = 0
+        span_over_depth = value
+
+    return _Seg()
+
+
+# ---------------------------------------------------------------------------
+# Cheap refusal before expensive matching.
+#
+# `admit()` refuses on min(forward.target_span_over_depth,
+# reverse.target_span_over_depth), so if EITHER segment's cameras span too
+# little of the scene depth, the pair is refused no matter how well the
+# imagery matches. That value is computable from poses.json and
+# points.json alone, before any ORB.
+#
+# It was not used that way: every pair paid a full keyframe cross-product
+# of brute-force ORB matching plus a MAGSAC essential-matrix fit, and then
+# was refused on a number known before any of it ran. Measured: 139 s for
+# a 7-segment world, which is why registration cannot run live.
+#
+# On the real 19-segment world, 16 segments fail span/depth -- so all but
+# a handful of the 74 candidate pairs were being matched to reach a
+# foregone conclusion.
+# ---------------------------------------------------------------------------
+
+
+def test_a_pair_is_refused_on_span_before_any_matching(monkeypatch):
+    """The prune must not change the verdict, only when it is reached."""
+    from scripts import world_registration as wr
+
+    calls = {"cross_matches": 0}
+    real = wr.cross_matches
+
+    def _counting(*args, **kwargs):
+        calls["cross_matches"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(wr, "cross_matches", _counting)
+
+    still = _segment_with_span(0.01)
+    moving = _segment_with_span(0.40)
+    assert wr.pair_is_hopeless(still, moving, Thresholds()) is not None
+    assert wr.pair_is_hopeless(moving, moving, Thresholds()) is None
+    assert calls["cross_matches"] == 0, (
+        "deciding a pair is hopeless must not require matching it"
+    )
+
+
+def test_the_prune_names_the_real_reason():
+    """A pruned pair must say the wearer stood still, not 'neither
+    direction could be solved' -- those are different facts and the second
+    one would send a reader looking for a correspondence problem."""
+    from scripts import world_registration as wr
+
+    reason = wr.pair_is_hopeless(
+        _segment_with_span(0.01), _segment_with_span(0.40), Thresholds()
+    )
+    assert reason is not None
+    assert "stood still" in reason or "span" in reason
+
+
+def test_the_prune_uses_the_same_bar_as_the_gate():
+    """If the prune were stricter than admit(), it would silently refuse
+    pairs the gate would have accepted."""
+    from scripts import world_registration as wr
+
+    thresholds = Thresholds()
+    just_above = _segment_with_span(thresholds.min_span_over_depth + 1e-6)
+    assert wr.pair_is_hopeless(just_above, just_above, thresholds) is None
+    just_below = _segment_with_span(thresholds.min_span_over_depth - 1e-6)
+    assert wr.pair_is_hopeless(just_below, just_above, thresholds) is not None
+
+
+# ---------------------------------------------------------------------------
+# Keyframe sampling in cross-segment matching.
+#
+# cross_matches compared EVERY keyframe of one segment against every
+# keyframe of the other. That O(F^2) brute-force ORB cross-product
+# dominates registration cost -- 192 s for a nine-segment world -- and is
+# the reason registration cannot run near the live path.
+#
+# Sampling 8 keyframes per segment preserved every verdict on both corpus
+# captures that register anything, at 4.4x the speed. Sampling 5 lost all
+# of them. The constant is that measured boundary, not a tuning knob.
+# ---------------------------------------------------------------------------
+
+
+def test_sampling_spreads_across_the_segment_and_keeps_the_ends():
+    """Truncating to the first N would cover only a segment's opening and
+    miss whatever the wearer walked to. The two ends matter most: they are
+    where a segment is most likely to overlap its neighbours."""
+    from scripts.world_registration import sampled_frames
+
+    picked = sampled_frames(89, 8)
+    assert len(picked) == 8
+    assert picked[0] == 0
+    assert picked[-1] == 88
+    assert picked == sorted(picked)
+    assert len(set(picked)) == len(picked)
+
+    gaps = [b - a for a, b in zip(picked, picked[1:])]
+    assert max(gaps) - min(gaps) <= 1, f"spread should be even, got {gaps}"
+
+
+def test_sampling_is_a_no_op_below_the_limit():
+    """A segment with few keyframes must lose none of them."""
+    from scripts.world_registration import sampled_frames
+
+    assert sampled_frames(5, 8) == [0, 1, 2, 3, 4]
+    assert sampled_frames(8, 8) == list(range(8))
+
+
+def test_sampling_handles_degenerate_counts():
+    from scripts.world_registration import sampled_frames
+
+    assert sampled_frames(0, 8) == []
+    assert sampled_frames(1, 8) == [0]
+    assert sampled_frames(10, 1) == [0]
+
+
+def test_the_sample_size_is_the_measured_boundary_not_a_round_number():
+    """Pins the reason. 8 preserved every verdict on both registering
+    captures; 5 lost all of them. Lowering it for speed would trade away
+    the only thing this function produces."""
+    from scripts.world_registration import (
+        MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING,
+    )
+
+    assert MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING == 8
+
+
+def test_cross_matches_returns_segment_local_frame_indices(monkeypatch):
+    """Sampling must not renumber frames. The returned indices join
+    against poses and the observation index, so a sampled-local index
+    would silently attribute a match to the wrong keyframe."""
+    import numpy as np
+
+    from scripts import world_registration as wr
+
+    class _Seg:
+        def __init__(self, n):
+            self.intrinsics = np.array(
+                [[400.0, 0, 160.0], [0, 400.0, 120.0], [0, 0, 1.0]]
+            )
+            self.descriptors = [object()] * n
+            self.keypoints = [[(0.0, 0.0)] * 40 for _ in range(n)]
+
+    seen = []
+
+    def _fake_match(a, b):
+        return []
+
+    monkeypatch.setattr(wr, "match_indices", _fake_match)
+    source, target = _Seg(50), _Seg(3)
+
+    # With no matches nothing is returned, but the loop must have visited
+    # the segment's OWN indices, spread across its range.
+    picked = wr.sampled_frames(50, wr.MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING)
+    assert max(picked) == 49, "the last keyframe must be reachable"
+    assert wr.cross_matches(source, target) == []

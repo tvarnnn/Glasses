@@ -103,8 +103,51 @@ _RESULT_CHANNEL_ADAPTERS = frozenset(
         TOWER / "results" / "world_builder.py",
         TOWER / "results" / "world_builder_geometry.py",
         TOWER / "results" / "__init__.py",
+        # Added 2026-08-27 with the Scene Understanding and Document
+        # Memory wire paths. Same shape, same rule: one adapter per
+        # cartridge, named after it, and it is the only file outside the
+        # cartridge's own package that may know its record shapes.
+        TOWER / "results" / "scene_understanding.py",
+        TOWER / "results" / "document_memory.py",
     }
 )
+
+# Files that may know a LIVE cartridge exists, as opposed to a persisted
+# one. A separate set from the adapters above because they are exempted
+# for a different reason and the difference matters.
+#
+# An adapter reads a record shape. These two RUN something: they construct
+# a session object that owns a worker thread and a model. That is a
+# stronger permission and it is granted to exactly two files.
+#
+#   tower/cartridge_runtime.py  the single factory `main.py` calls
+#                               generically -- `main.py` asks for "the
+#                               live cartridges this configuration
+#                               enables" and is told, exactly as it
+#                               already asks `tower.results` for a hub.
+#                               Keeping the cartridge names out of
+#                               `main.py` is not a dodge around
+#                               test_scene_understanding_is_not_registered
+#                               _as_a_production_module; it is what that
+#                               test is protecting -- `main.py:68` is
+#                               explicitly "the ONE place in the web
+#                               process that knows a world builder
+#                               exists", and the answer to a second
+#                               cartridge is to stop adding places, not
+#                               to add one.
+#
+#   tower/routes/scene.py       the control surface. Named after the
+#   tower/routes/documents.py   QUESTION, not the cartridge, exactly as
+#                               `geometry.py` and `observations.py` are.
+_LIVE_CARTRIDGE_WIRING = frozenset(
+    {
+        TOWER / "cartridge_runtime.py",
+        TOWER / "routes" / "scene.py",
+        TOWER / "routes" / "documents.py",
+    }
+)
+
+_CARTRIDGE_AWARE_FILES = _RESULT_CHANNEL_ADAPTERS | _LIVE_CARTRIDGE_WIRING
 
 
 def test_the_result_channel_core_is_cartridge_blind():
@@ -125,6 +168,11 @@ def test_the_result_channel_core_is_cartridge_blind():
         TOWER / "results" / "contracts.py",
         TOWER / "routes" / "results_ws.py",
         TOWER / "routes" / "cartridges.py",
+        # The session control surface. Added to the CORE list rather
+        # than exempted: it is the first mutating route in this Tower and
+        # it addresses a cartridge by an id in the URL path, which is
+        # exactly the shape that invites an import "just to look one up".
+        TOWER / "routes" / "sessions.py",
     ]
     offenders = []
     for path in core:
@@ -583,14 +631,109 @@ def test_the_ocr_dependency_is_not_imported_at_module_load():
 
 
 def test_shared_code_does_not_import_document_memory():
-    """Transport and the module system must not know this cartridge exists."""
+    """Transport and the module system must not know this cartridge exists.
+
+    Exempts the same small set the World Builder rule exempts, for the
+    same stated reason: something has to import a cartridge or there is
+    nothing to report, and an adapter named after its cartridge cannot
+    leak that cartridge's assumptions into the next one.
+
+    The match narrowed from a bare `"document_memory" in name` to the
+    qualified package path when the adapter arrived, and that is not a
+    weakening -- it is the identical correction the World Builder rule
+    already carries above: a bare substring also matches
+    `tower.results.document_memory`, which is the ADAPTER, and a rule that
+    cannot tell an adapter from its cartridge pushes the fix into
+    restyling the import rather than into the boundary.
+    """
     offenders = []
     for path in _modules_outside("document_memory"):
+        if path in _CARTRIDGE_AWARE_FILES:
+            continue
         for name in _imports(path):
-            if "document_memory" in name:
+            if "tower.document_memory" in name:
                 offenders.append(f"{path} -> {name}")
 
     assert offenders == []
+
+
+# The two files that may know Object Memory's shapes, for the same
+# reason `_RESULT_CHANNEL_ADAPTERS` exists above: the result channel has
+# to import SOMETHING or there is nothing to report, and an adapter named
+# after its cartridge cannot leak that cartridge's assumptions into the
+# next one, because the next one gets its own file.
+#
+#   tower/results/object_memory.py   the adapter, and the only module
+#                                    outside the cartridge that may know
+#                                    its record shapes or its policy
+#   tower/routes/observations.py     the route, which imports only the
+#                                    adapter and never the cartridge
+_OBJECT_MEMORY_ADAPTERS = frozenset({TOWER / "results" / "object_memory.py"})
+
+
+def test_shared_code_does_not_import_object_memory():
+    """The rule that was missing while the other three cartridges had one.
+
+    Written after `main.py` acquired `from tower.object_memory.relevance
+    import recordable_classes` inside a function and no test noticed. The
+    wiring point knows the world builder as an argv and must know this
+    cartridge the same way; what it needs from the policy travels through
+    the adapter as a tuple of strings.
+
+    Function-level imports count. The AST walk sees them, and hiding an
+    import inside a function is the commonest way a boundary is crossed
+    while looking untouched at the top of the file.
+    """
+    offenders = []
+    for path in _modules_outside("object_memory"):
+        if path in _OBJECT_MEMORY_ADAPTERS:
+            continue
+        for name in _imports(path):
+            if "tower.object_memory" in name:
+                offenders.append(f"{path} -> {name}")
+
+    assert offenders == []
+
+
+def test_the_object_memory_route_reaches_only_its_adapter():
+    """`tower/routes/observations.py` is a route, not a second adapter.
+
+    Stricter than the rule above, and deliberately: this file is the one
+    most likely to acquire a "just to look up a class name" import,
+    because it is where the question is asked.
+    """
+    path = TOWER / "routes" / "observations.py"
+
+    for name in _imports(path):
+        assert "tower.object_memory" not in name, f"observations.py -> {name}"
+
+
+def test_the_evidence_behind_the_class_policy_travels_with_it():
+    """A tier is a claim, and a claim needs its sample size attached.
+
+    `PERSISTED_CLASSES` was once a bare two-name tuple justified by a
+    comment. Its replacement carries counts, so a later corpus can be
+    compared against it and a reviewer can see what a tier was decided
+    on rather than trusting that it was decided on something.
+    """
+    import sys
+
+    sys.path.insert(0, ".")
+    from tower.object_memory.classes import CLASS_EVIDENCE, REMEMBERED
+
+    remembered = [
+        name
+        for name, evidence in CLASS_EVIDENCE.items()
+        if evidence.tier == REMEMBERED
+    ]
+    assert remembered, "no class is remembered outright; the guard is vacuous"
+    for name in remembered:
+        evidence = CLASS_EVIDENCE[name]
+        assert evidence.inspected > 0, (
+            f"{name} is remembered on the detector's word alone with no "
+            "crop ever inspected"
+        )
+        assert evidence.precision == 1.0, name
 
 
 def test_scene_understanding_does_not_import_another_cartridge():
@@ -652,9 +795,7 @@ def test_scene_understanding_persists_nothing():
         "touch",
     )
     offenders = []
-    for path in (TOWER / "scene").rglob("*.py"):
-        if "__pycache__" in path.parts:
-            continue
+    for path in _scene_wire_path():
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
@@ -667,6 +808,36 @@ def test_scene_understanding_persists_nothing():
     assert offenders == []
 
 
+def _scene_wire_path() -> list:
+    """Every file between a frame and this cartridge's payload.
+
+    Widened 2026-08-27, and the widening is the point. Scanning only
+    `tower/scene/**` was sufficient while the cartridge had no consumer:
+    there was nowhere else for a write to hide. The moment a live session
+    is published, "publish" can quietly become "buffer to disk" in the
+    adapter, the runtime factory or the route -- none of which the old
+    glob saw -- and that is the single most likely way this change
+    destroys the cartridge's best property.
+
+    `tower/routes/scene.py` is included even though it is a route, because
+    a route is exactly where somebody would cache a payload to a file to
+    make a dashboard faster.
+    """
+    paths = [
+        path
+        for path in (TOWER / "scene").rglob("*.py")
+        if "__pycache__" not in path.parts
+    ]
+    for extra in (
+        TOWER / "results" / "scene_understanding.py",
+        TOWER / "routes" / "scene.py",
+        TOWER / "cartridge_runtime.py",
+    ):
+        if extra.exists():
+            paths.append(extra)
+    return paths
+
+
 def test_scene_understanding_is_not_registered_as_a_production_module():
     main = (TOWER / "main.py").read_text(encoding="utf-8")
 
@@ -675,8 +846,19 @@ def test_scene_understanding_is_not_registered_as_a_production_module():
 
 
 def test_shared_code_does_not_import_scene_understanding():
+    """Same rule, same exemption set, same reason as World Builder's.
+
+    Note what is NOT exempted and must never be: `results/envelope.py`,
+    `results/publisher.py`, `results/registry.py`, `results/contracts.py`,
+    `routes/results_ws.py` and `routes/cartridges.py` are pinned
+    separately by `test_the_result_channel_core_is_cartridge_blind`, and
+    that test names `scene` explicitly. The generic half of the channel
+    stays blind whatever is exempted here.
+    """
     offenders = []
     for path in _modules_outside("scene"):
+        if path in _CARTRIDGE_AWARE_FILES:
+            continue
         for name in _imports(path):
             if name.startswith("tower.scene"):
                 offenders.append(f"{path} -> {name}")

@@ -21,24 +21,33 @@ Frame sources:
 
 WHAT THIS WILL AND WILL NOT REMEMBER
 
-Only the classes in `relevance.PERSISTED_CLASSES` -- today `laptop` and
-`cell phone`, the only two COCO classes the real 9,199-frame corpus
-supports with confidence above 0.8. `person` is excluded, and there is
-deliberately NO FLAG to widen the list: re-admitting `person` commits the
-project to persisting a record per detected bystander, which is an open
-ruling no human has settled here. Read the comment on PERSISTED_CLASSES
-before changing it; a command-line switch would let that decision happen
-by accident.
+The classes `tower/object_memory/classes.py` admits, which is not one
+list but two. `laptop` and `cell phone` are written on the detector's
+word, because 36 of 36 inspected crops of them over the real corpus were
+right. A dozen more -- `remote`, `backpack`, `bottle`, `cup` and the
+rest -- are written only if a VERIFIER agrees, because inspection found
+the same detector calling a ceiling fan `airplane` at 0.99 and a laptop
+keyboard `remote` at 0.87. With `--verifier none`, which is the default,
+nothing in the second list is ever written and this script behaves
+exactly as the one that was physically validated.
 
-A record says a CATEGORY was visible at a time, with a confidence. It is
-not a claim that the object is there now, not a claim about WHICH laptop,
-and not a position in a room -- `spatial_ref` is null and stays null.
+`person` is excluded, and there is deliberately NO FLAG to widen the
+list: re-admitting `person` commits the project to persisting a record
+per detected bystander, which is an open ruling no human has settled
+here. A command-line switch would let that decision happen by accident.
 
-A record is written the moment a class comes into view, so a killed
-session loses nothing and `observed_at` means what it says. A stronger
-look at the same sighting inside the resample window is folded back into
-that record as `best_score`; `detector_score` keeps meaning "the frame
-this record describes". Neither is a calibrated probability.
+A record says a CATEGORY was visible over a span of time, with a
+confidence. It is not a claim that the object is there now, not a claim
+about WHICH laptop, and not a position in a room -- `spatial_ref` is null
+and stays null.
+
+The unit is a SIGHTING: a run of frames in which a class stayed in view,
+broken by a gap of more than three seconds. A record is written once the
+sighting is three frames old -- about a quarter of a second -- stamped
+with the FIRST frame, so a killed session loses at most that. What the
+sighting later becomes (its duration, its frame count, its strongest
+look) is folded back into the same record rather than becoming a second
+one. None of the scores is a calibrated probability.
 
 `--retention-days` is recorded in the store's manifest at first append,
 and every later read clamps to min(persisted, requested). A reader can
@@ -57,6 +66,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tower.capture import CaptureFollower, FRAMES_FILENAME  # noqa: E402
+from tower.capture_workers import (  # noqa: E402
+    ATTACH_MODE_FROM_NOW,
+    ATTACH_MODE_FROM_START,
+)
+from tower.config import DEFAULT_OBSERVATION_ROOT  # noqa: E402
 from tower.object_memory.detector import (  # noqa: E402
     SCORE_THRESHOLD,
     FixedDetector,
@@ -64,8 +78,11 @@ from tower.object_memory.detector import (  # noqa: E402
 )
 from tower.object_memory.engine import ObjectMemoryEngine  # noqa: E402
 from tower.object_memory.relevance import (  # noqa: E402
-    PERSISTED_CLASSES,
     RelevancePolicy,
+    recordable_classes,
+)
+from tower.object_memory.verification import (  # noqa: E402
+    VerificationQueue,
 )
 from tower.object_memory.store import (  # noqa: E402
     DEFAULT_RETENTION_DAYS,
@@ -73,7 +90,15 @@ from tower.object_memory.store import (  # noqa: E402
 )
 from tower.storage import read_raw_jsonl  # noqa: E402
 
-DEFAULT_ROOT = Path("data/object_memory")
+# THE SAME DEFAULT THE WEB PROCESS USES, IMPORTED RATHER THAN RESTATED.
+#
+# This line used to read `Path("data/object_memory")` while
+# `tower/config.py` defaulted its observation root to None, and the two
+# were never compared. The 2026-08-26 physical run is what that cost: a
+# real walk was remembered into this directory, and every HTTP request
+# answered 404 about it until an operator set an environment variable by
+# hand. One constant, in the settings module, imported here.
+DEFAULT_ROOT = Path(DEFAULT_OBSERVATION_ROOT)
 
 
 def journal_frames(directory: Path):
@@ -92,7 +117,12 @@ def journal_frames(directory: Path):
         path = directory / relpath
         if not path.exists():
             continue
-        yield path.read_bytes(), record.get("source_seq"), record.get("received_at")
+        yield (
+            path.read_bytes(),
+            record.get("source_seq"),
+            record.get("received_at"),
+            relpath,
+        )
 
 
 def loose_frames(directory: Path):
@@ -102,7 +132,44 @@ def loose_frames(directory: Path):
     for index, path in enumerate(paths):
         # received_at None, not a fabricated interval: this source has no
         # clock, and the records must not pretend otherwise (Rule 3).
-        yield path.read_bytes(), index, None
+        yield path.read_bytes(), index, None, path.name
+
+
+VERIFIERS = ("none", "owlv2")
+
+
+def _build_verifier(name: str, device: str):
+    """Whatever may second-guess a detector label, or None.
+
+    A NAME rather than a flag, because the answer is a model identifier
+    and a boolean could never have become one. `none` returns None, and
+    None is what makes `verification_available` False -- which keeps the
+    `verify` tier unreachable on a Tower with no semantic model, rather
+    than reachable and always refused.
+
+    `none` is the DEFAULT, and that is a deliberate conservatism rather
+    than a lack of confidence in the alternative. `owlv2` measured ~93%
+    acceptance of correct labels and ~94% rejection of wrong ones over
+    94 human-labelled crops -- but those 94 crops are from one home, and
+    turning it on downloads ~600 MB of weights and takes ~620 MB of VRAM
+    on a GPU this cartridge shares. One environment variable enables it;
+    the evidence for doing so is in
+    `docs/superpowers/research/2026-08-27-object-memory-corpus-precision.md`.
+    """
+    if name == "none":
+        return None
+    if name == "owlv2":
+        from tower.object_memory.classes import prompt_for, verifier_vocabulary
+        from tower.object_memory.verification import OwlV2Verifier
+
+        return OwlV2Verifier(
+            device=device,
+            vocabulary=verifier_vocabulary(),
+            prompt_for=prompt_for,
+        )
+    raise SystemExit(
+        f"unknown verifier {name!r}; this build offers {', '.join(VERIFIERS)}"
+    )
 
 
 def main(argv=None) -> int:
@@ -123,6 +190,29 @@ def main(argv=None) -> int:
         ),
     )
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument(
+        "--verifier",
+        default="none",
+        help=(
+            "What may second-guess a detector label. 'none' (the default) "
+            "agrees with nothing, so only the classes measured reliable on "
+            "the detector's own word are written. 'owlv2' loads "
+            "google/owlv2-base-patch16-ensemble (~600 MB, Apache-2.0) and "
+            "unlocks the verify tier."
+        ),
+    )
+    parser.add_argument(
+        "--verifier-device",
+        choices=("cpu", "cuda"),
+        default="cuda",
+        help=(
+            "Where the verifier runs. CUDA by default even though the "
+            "detector defaults to CPU, and deliberately: measured 128 ms "
+            "a crop on this GPU against 2,473 ms on this CPU, and putting "
+            "the two stages on different devices is what keeps a 2.5-second "
+            "burst off the cores the detector is using."
+        ),
+    )
     parser.add_argument("--score-threshold", type=float, default=SCORE_THRESHOLD)
     parser.add_argument(
         "--min-score",
@@ -131,10 +221,23 @@ def main(argv=None) -> int:
         help="Detections below this are seen but never remembered.",
     )
     parser.add_argument(
-        "--resample-seconds",
+        "--gap-seconds",
         type=float,
-        default=RelevancePolicy.resample_seconds,
-        help="How long after remembering a class before it is worth again.",
+        default=RelevancePolicy.gap_seconds,
+        help=(
+            "How long a class may be out of view before its next "
+            "appearance counts as a new sighting."
+        ),
+    )
+    parser.add_argument(
+        "--min-frames",
+        type=int,
+        default=RelevancePolicy.min_frames,
+        help=(
+            "How many frames a sighting must last before it is written. A "
+            "third of the sightings in the real corpus are shorter than "
+            "three frames, and those are flickers."
+        ),
     )
     parser.add_argument(
         "--retention-days",
@@ -144,6 +247,20 @@ def main(argv=None) -> int:
             "Forget observations older than this. 0 means keep forever. "
             "Recorded in the store manifest at first append, and every "
             "later read is clamped to it."
+        ),
+    )
+    parser.add_argument(
+        "--attach-mode",
+        choices=(ATTACH_MODE_FROM_START, ATTACH_MODE_FROM_NOW),
+        default=ATTACH_MODE_FROM_START,
+        help=(
+            "Only meaningful with --follow-capture. 'from-start' reads the "
+            "whole capture, which is right for a producer attached when the "
+            "recording opened. 'from-now' skips whatever the journal "
+            "already holds: a producer attached three minutes into a walk "
+            "was not asked for the first three minutes, and reading them "
+            "would be a consent decision this script has no standing to "
+            "make."
         ),
     )
     parser.add_argument("--poll-seconds", type=float, default=0.25)
@@ -166,14 +283,19 @@ def main(argv=None) -> int:
     if args.follow_capture:
         if not args.follow_capture.exists():
             raise SystemExit(f"no capture directory at {args.follow_capture}")
-        follower = CaptureFollower(args.follow_capture, poll_seconds=args.poll_seconds)
+        follower = CaptureFollower(
+            args.follow_capture,
+            poll_seconds=args.poll_seconds,
+            start_at_end=args.attach_mode == ATTACH_MODE_FROM_NOW,
+        )
         frames = (
-            (frame.raw_bytes, frame.source_seq, frame.received_at)
+            (frame.raw_bytes, frame.source_seq, frame.received_at, frame.relpath)
             for frame in follower.follow(max_idle_polls=args.max_idle_polls)
         )
         session_id = args.follow_capture.name
         source = "live-capture"
         timing = "capture-journal"
+        attach_mode = args.attach_mode
     else:
         if not args.frames.exists():
             raise SystemExit(f"no frame directory at {args.frames}")
@@ -185,6 +307,11 @@ def main(argv=None) -> int:
             timing = "none"
         session_id = args.frames.name
         source = "recorded-frames"
+        # A replay reads what it was pointed at. There is no live journal
+        # to arrive late to, so the flag has nothing to describe and the
+        # report says so rather than reporting a default that would look
+        # like a decision.
+        attach_mode = None
 
     detector = (
         TorchvisionDetector(
@@ -195,12 +322,26 @@ def main(argv=None) -> int:
     )
     retention = None if args.retention_days <= 0 else args.retention_days * 86400.0
     store = ObservationStore(args.root, retention_seconds=retention)
+    verifier = _build_verifier(args.verifier, args.verifier_device)
+    # Synchronous for a replay, threaded for a live follow. A replay has
+    # no reason to be asynchronous and every reason to be deterministic;
+    # a live session must not stall the frame path on a model.
+    verification = (
+        None
+        if verifier is None
+        else VerificationQueue(verifier, workers=0 if args.frames else 1)
+    )
+    policy = RelevancePolicy(
+        min_score=args.min_score,
+        gap_seconds=args.gap_seconds,
+        min_frames=args.min_frames,
+        verification_available=verifier is not None,
+    )
     engine = ObjectMemoryEngine(
         store,
         detector,
-        policy=RelevancePolicy(
-            min_score=args.min_score, resample_seconds=args.resample_seconds
-        ),
+        policy=policy,
+        verification=verification,
         # The capture id, which is a FRAME identity owned by shared
         # transport -- not a World Builder session. This cartridge cannot
         # see a world and must not imply it can.
@@ -211,10 +352,16 @@ def main(argv=None) -> int:
     started = time.perf_counter()
     engine.load()
     try:
-        for index, (payload, source_seq, received_at) in enumerate(frames):
+        for index, frame in enumerate(frames):
             if args.limit is not None and index >= args.limit:
                 break
-            engine.observe(payload, received_at=received_at, source_seq=source_seq)
+            payload, source_seq, received_at, relpath = frame
+            engine.observe(
+                payload,
+                received_at=received_at,
+                source_seq=source_seq,
+                relpath=relpath,
+            )
     finally:
         engine.release()
     elapsed = time.perf_counter() - started
@@ -227,21 +374,19 @@ def main(argv=None) -> int:
         "session_id": session_id,
         "detector": detector.name,
         "device": args.device if detector.name != "fixed" else None,
+        "verifier": args.verifier,
+        "verifier_device": args.verifier_device if verifier is not None else None,
         "timing_source": timing,
-        "persisted_classes": list(PERSISTED_CLASSES),
-        "frames_observed": engine.frames_observed,
-        "frames_undecodable": engine.frames_undecodable,
-        "detections_seen": engine.detections_seen,
-        "observations_recorded": engine.observations_recorded,
-        "recorded_by_class": engine.recorded_by_class,
-        # An upgrade is a record whose best_score was raised by a
-        # stronger look at the SAME sighting -- not a second record.
-        "best_score_upgrades": engine.best_score_upgrades,
-        # Not noise: "wrote 11 records" is meaningless without "and
-        # declined 4,000, nearly all of them for being off the whitelist".
-        "declined": engine.dropped,
-        "write_failures": engine.write_failures,
-        "upgrade_failures": engine.upgrade_failures,
+        "attach_mode": attach_mode,
+        # What this run could have written, which is narrower than what
+        # the store would have accepted: the verify tier is only in reach
+        # when something can second-guess the detector.
+        "recordable_classes": list(recordable_classes(verifier is not None)),
+        # Every counter the engine kept, including why detections did NOT
+        # become observations. "wrote 11 records" means nothing without
+        # "and declined 4,000, nearly all of them for classes it has no
+        # evidence it can read".
+        **engine.counters(),
         "stored_observations": len(store.all_observations()),
         "pruned_expired": pruned,
         "retention_days": args.retention_days,
@@ -259,8 +404,10 @@ def main(argv=None) -> int:
             "There is no position in a room here -- spatial_ref is null."
         )
         print(
-            f"Only {', '.join(PERSISTED_CLASSES)} are remembered. `person` "
-            "is excluded on purpose; see relevance.PERSISTED_CLASSES."
+            "Only "
+            + ", ".join(report["recordable_classes"])
+            + " could be remembered on this run. `person` is excluded on "
+            "purpose; see object_memory.classes.EXCLUDED_CLASSES."
         )
         print("Times are tower-receipt, never on-glasses capture time.")
         print(

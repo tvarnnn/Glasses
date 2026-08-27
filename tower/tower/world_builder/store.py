@@ -43,6 +43,7 @@ from tower.storage import (
 )
 
 from tower.world_builder.records import (
+    SegmentPlacement,
     Keyframe,
     KeyframeEdge,
     Session,
@@ -441,6 +442,76 @@ class WorldStore:
             logger.warning("world builder: derived output unreadable for %s", world_id)
             return None
 
+    def write_placements(self, world_id: str, session_id: str, placements) -> None:
+        """Persist where each segment sits, or why it does not sit anywhere.
+
+        Its own file, for the same reason `support` has one: geometry is
+        immutable once solved and PLACEMENT is not, so a later registration
+        pass must be able to change where a segment sits without rewriting
+        the points that decide its content hash. Folding placement into
+        points.json would couple the two and make every re-placement look
+        like new geometry.
+        """
+        with self._lock:
+            derived = self.derived_dir(world_id) / session_id
+            payload = {"placements": [p.to_json_dict() for p in placements]}
+            # allow_nan=False: Python writes NaN and Infinity as bare
+            # tokens that JSON.parse, Swift's JSONSerialization and Go's
+            # encoding/json all reject. A file only this runtime can read
+            # is not a wire artifact. Raising here leaves no file, because
+            # the write is atomic.
+            json.dumps(payload, allow_nan=False)
+            write_json_atomic(derived / "placements.json", payload)
+
+    def read_placements(self, world_id: str, session_id: str):
+        """The placements, or None. Never raises, never refuses a read.
+
+        Absent and unreadable are the same answer, exactly as for
+        `support`: every world built before placements existed has no such
+        file, and a reconstruction is complete without one. Refusing a
+        world over a truncated index beside it would turn an optional file
+        into a hard dependency by the back door.
+
+        A row that fails its own invariants is dropped rather than
+        poisoning the rest -- a placement that cannot be represented is
+        one that must not be drawn, and the others are still good.
+        """
+        path = self.derived_dir(world_id) / session_id / "placements.json"
+        if not path.exists():
+            return None
+        # Broad on purpose. An earlier version caught only JSONDecodeError
+        # and KeyError, which covers a truncated file and nothing else --
+        # `{"placements": null}`, a top-level list, a string, or a null row
+        # are all VALID JSON and each raised straight through
+        # build_manifest into an HTTP 500, taking poses and points that
+        # were perfectly good down with an optional index beside them.
+        # That is exactly what this method's contract exists to prevent,
+        # so the contract is enforced rather than described.
+        try:
+            document = read_json_closed(path)
+            rows = document["placements"]
+            if not isinstance(rows, list):
+                raise TypeError(f"placements must be a list, got {type(rows)}")
+        except Exception:
+            logger.warning(
+                "world builder: placements unreadable at %s; treating as "
+                "absent",
+                path,
+            )
+            return None
+        kept = []
+        for row in rows:
+            try:
+                kept.append(SegmentPlacement.from_json_dict(row))
+            except Exception:
+                logger.warning(
+                    "world builder: dropping unrepresentable placement in "
+                    "%s: %r",
+                    path,
+                    row,
+                )
+        return kept
+
     def _read_support(self, derived: Path):
         """The association, or None. Never raises, never refuses a read.
 
@@ -455,8 +526,17 @@ class WorldStore:
         if not path.exists():
             return None
         try:
-            return read_json_closed(path)["support"]
-        except (json.JSONDecodeError, KeyError):
+            support = read_json_closed(path)["support"]
+            # Shape-checked, not just parsed. A top-level list raised
+            # TypeError straight out of a method whose docstring promises
+            # it never raises, and a string was returned AS the support
+            # table -- which cross-segment registration then consumes.
+            if not isinstance(support, list):
+                raise TypeError(
+                    f"support must be a list, got {type(support)}"
+                )
+            return support
+        except Exception:
             logger.warning(
                 "world builder: support association unreadable at %s; "
                 "treating as absent",

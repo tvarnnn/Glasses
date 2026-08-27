@@ -523,7 +523,7 @@ There is no device-keyed calibration profile store — see §6.4.
 `event_id` is **dense within a session on purpose**: a gap means an event
 was genuinely dropped, so a consumer can always tell it missed something.
 
-The kind vocabulary is a closed set of nine. Five are actually emitted
+The kind vocabulary is a closed set of ten. Six are actually emitted
 today:
 
 | Kind | Emitted? | Payload |
@@ -531,12 +531,26 @@ today:
 | `session_started` | yes | `{frame_source}` |
 | `frame_rejected` | yes | `{reason}` |
 | `tracking_lost` | yes | `{segment_index}` |
+| `solve_chain_broken` | yes | `{segment_index}` |
 | `keyframe_accepted` | yes | `{keyframe_id, reason, segment_index}` |
 | `session_stopped` | yes | `{end_reason}` |
 | `segment_started` | reserved | — |
 | `backend_downgraded` | reserved | — |
 | `mapping_stalled` | reserved | — |
 | `build_completed` | reserved | — |
+
+`solve_chain_broken` announces that the SOLVE chain failed and a new
+segment was opened. It is deliberately **not** `tracking_lost` and must
+not be treated as one: tracking is healthy at that moment and keeps its
+reference. Reading it as a tracking loss would tell a wearer they had
+lost the world when they had not. It does not participate in
+`last_tracking`.
+
+Like `tracking_lost` it carries the index of the segment it OPENS, and it
+is journalled after the keyframe that preceded it, so a consumer
+rebuilding segmentation by streaming the journal should attribute
+keyframes by their own `segment_index` rather than by position relative
+to this event.
 
 A consumer must tolerate a kind it does not know by ignoring it, and must
 not assume the reserved kinds will never appear.

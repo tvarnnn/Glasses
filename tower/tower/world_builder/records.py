@@ -13,6 +13,7 @@ importing a frozen enum is not promoting data to a shared service. Revisit
 a tower/confidence.py only when a third consumer appears.
 """
 
+import math
 from dataclasses import dataclass, field, replace
 
 from tower.confidence import Confidence
@@ -256,6 +257,223 @@ def camera_intrinsics_from_json_dict(data: dict) -> CameraIntrinsics:
             "scales_linearly_across_resolutions"
         ],
     )
+
+
+def _check_vector(values, length: int, name: str) -> None:
+    """A transform component that is the wrong shape, or carries a NaN, is
+    still applied by a renderer -- it just puts the geometry nowhere in
+    particular. Checked here because this record is the last place that
+    can refuse it before it reaches a screen."""
+    if values is None or len(values) != length:
+        raise ValueError(
+            f"{name} must have {length} components, got "
+            f"{None if values is None else len(values)}"
+        )
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be numbers, got {value!r}")
+        if not math.isfinite(value):
+            raise ValueError(
+                f"{name} must be finite, got {value!r}; a non-finite "
+                "transform is applied all the same and places the geometry "
+                "nowhere in particular"
+            )
+
+
+# How far a stored quaternion may drift from unit length.
+#
+# A norm off by t scales the geometry it rotates by t, on top of `scale`,
+# so this is a bound on silent scale error: 1e-3 is 0.1%, below anything
+# the reconstruction can resolve.
+#
+# NOT tighter than that. A first attempt used 1e-6 and rejected real
+# placements read back from disk: a quaternion serialised at five decimal
+# places lands 1.9e-6 off unit, so the bar was tighter than the precision
+# of the data it was judging. A validator that refuses its own valid
+# output is worse than no validator, because it fails silently -- the
+# rows are dropped and the world reads as unregistered.
+QUATERNION_NORM_TOLERANCE = 1e-3
+
+PLACEMENT_REGISTERED = "registered"
+PLACEMENT_REFUSED = "refused"
+PLACEMENT_STATES = (PLACEMENT_REGISTERED, PLACEMENT_REFUSED)
+
+
+@dataclass(frozen=True)
+class SegmentPlacement:
+    """Where one segment sits in a shared world frame, or why it does not.
+
+    Segment geometry is immutable once solved; WHERE a segment sits is
+    not, and a later pass may place a segment that an earlier one could
+    not. Keeping placement in its own record is what lets a placement
+    change without the geometry changing -- and lets a refusal carry its
+    reason instead of being indistinguishable from "nobody tried".
+
+    `refused` is a first-class state for that reason. `registered: false`
+    alone conflated "we tried and the two independent solves disagreed"
+    with "no attempt has been made", and the refusal is the more
+    interesting fact: on the real corpus most pairs are refused because
+    the wearer stood still, which is a message about how to walk, not
+    about the software.
+
+    The invariants below are enforced rather than documented because each
+    represents geometry that would be DRAWN. A refusal carrying a
+    transform gets rendered; a registered placement missing its scale gets
+    a default from somewhere, and that somewhere is wrong; a zero or
+    non-finite scale collapses a segment to a dot at another's origin,
+    which the registration research records as invisible in every
+    aggregate metric.
+    """
+
+    segment_index: int
+    state: str
+    rotation_wxyz: tuple | None
+    translation: tuple | None
+    scale: float | None
+    reference_segment: int | None
+    refusal_reason: str | None
+    evidence: dict
+    # The build this placement was solved against.
+    #
+    # A placement is a statement about SPECIFIC points. Rewriting
+    # poses.json and points.json does not touch placements.json, so
+    # without this a Sim3 survives a full rebuild and is served against
+    # geometry that no longer exists -- still flagged registered. The
+    # cache guarantee does not rescue that: content_hash moves, the
+    # client dutifully refetches, and is handed a transform solved
+    # against points that are gone.
+    #
+    # None means "not bound", which cannot be verified and is therefore
+    # not served. An unverifiable transform is the failure this exists to
+    # prevent.
+    input_digest: str | None = None
+    # Which gauge this Sim3 is expressed in. A coordinate stamped with one
+    # frame revision may not be silently reinterpreted under another.
+    frame_revision: int = 1
+    schema_version: int = SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.state not in PLACEMENT_STATES:
+            raise ValueError(
+                f"unknown placement state {self.state!r}; the set is closed "
+                f"because consumers switch on it: {PLACEMENT_STATES}"
+            )
+        has_transform = (
+            self.rotation_wxyz is not None
+            or self.translation is not None
+            or self.scale is not None
+        )
+        if self.state == PLACEMENT_REFUSED and has_transform:
+            raise ValueError(
+                "a refused placement must not carry a transform: anything "
+                "with a transform gets drawn"
+            )
+        if self.state == PLACEMENT_REGISTERED:
+            if (
+                self.rotation_wxyz is None
+                or self.translation is None
+                or self.scale is None
+            ):
+                raise ValueError(
+                    "a registered placement needs a complete Sim3; half a "
+                    "transform means a default supplies the rest, and the "
+                    "default is wrong"
+                )
+            _check_vector(self.rotation_wxyz, 4, "rotation_wxyz")
+            _check_vector(self.translation, 3, "translation")
+            norm = math.sqrt(sum(v * v for v in self.rotation_wxyz))
+            if abs(norm - 1.0) > QUATERNION_NORM_TOLERANCE:
+                raise ValueError(
+                    f"rotation_wxyz must be a unit quaternion, got norm "
+                    f"{norm!r}; a non-unit quaternion scales the geometry it "
+                    "rotates, silently and on top of `scale`"
+                )
+            if isinstance(self.scale, bool) or not isinstance(
+                self.scale, (int, float)
+            ):
+                raise ValueError(
+                    f"scale must be a real number, got {self.scale!r}"
+                )
+            if self.refusal_reason is not None:
+                raise ValueError(
+                    "a registered placement must not carry a refusal reason; "
+                    "the wire drops it silently, so it would be a field that "
+                    "looks meaningful and is not"
+                )
+            if not math.isfinite(self.scale) or self.scale <= 0:
+                raise ValueError(
+                    f"scale must be finite and positive, got {self.scale!r}; "
+                    "a zero scale collapses the segment to a dot at the "
+                    "reference's origin and is invisible in every aggregate"
+                )
+        if (
+            isinstance(self.segment_index, bool)
+            or not isinstance(self.segment_index, int)
+            or self.segment_index < 0
+        ):
+            raise ValueError(
+                f"segment_index must be a non-negative int, got "
+                f"{self.segment_index!r}"
+            )
+        if (
+            isinstance(self.frame_revision, bool)
+            or not isinstance(self.frame_revision, int)
+            or self.frame_revision < 1
+        ):
+            raise ValueError(
+                f"frame_revision must be an int >= 1, got "
+                f"{self.frame_revision!r}; the contract calls a revision "
+                "mismatch a refuse-to-draw condition, so an impossible "
+                "revision must not reach a client"
+            )
+        if self.state == PLACEMENT_REGISTERED:
+            if (
+                isinstance(self.reference_segment, bool)
+                or not isinstance(self.reference_segment, int)
+                or self.reference_segment < 0
+            ):
+                raise ValueError(
+                    f"a registered placement needs a real reference_segment, "
+                    f"got {self.reference_segment!r}; the composition rule is "
+                    "defined only relative to one"
+                )
+
+    def to_json_dict(self) -> dict:
+        return {
+            "schema_version": self.schema_version,
+            "segment_index": self.segment_index,
+            "state": self.state,
+            "rotation_wxyz": (
+                list(self.rotation_wxyz) if self.rotation_wxyz else None
+            ),
+            "translation": (
+                list(self.translation) if self.translation else None
+            ),
+            "scale": self.scale,
+            "reference_segment": self.reference_segment,
+            "refusal_reason": self.refusal_reason,
+            "evidence": dict(self.evidence),
+            "frame_revision": self.frame_revision,
+            "input_digest": self.input_digest,
+        }
+
+    @classmethod
+    def from_json_dict(cls, row: dict) -> "SegmentPlacement":
+        rotation = row.get("rotation_wxyz")
+        translation = row.get("translation")
+        return cls(
+            segment_index=int(row["segment_index"]),
+            state=row["state"],
+            rotation_wxyz=tuple(rotation) if rotation else None,
+            translation=tuple(translation) if translation else None,
+            scale=row.get("scale"),
+            reference_segment=row.get("reference_segment"),
+            refusal_reason=row.get("refusal_reason"),
+            evidence=dict(row.get("evidence") or {}),
+            frame_revision=int(row.get("frame_revision", 1)),
+            input_digest=row.get("input_digest"),
+            schema_version=int(row.get("schema_version", SCHEMA_VERSION)),
+        )
 
 
 @dataclass(frozen=True)

@@ -18,6 +18,8 @@ import base64
 import numpy as np
 import pytest
 
+from tower.main import WORLD_BUILD_WORKER
+
 
 def _jpeg() -> str:
     import cv2
@@ -223,8 +225,8 @@ def test_a_world_root_builds_a_supervisor_that_will_follow(monkeypatch, tmp_path
     app = create_app()
 
     supervisor = app.state.capture_workers
-    assert supervisor.enabled
-    argv = " ".join(supervisor._spec.argv)
+    assert WORLD_BUILD_WORKER in supervisor.worker_names()
+    argv = " ".join(supervisor.spec_for(WORLD_BUILD_WORKER).argv)
     assert "world_build_session.py" in argv
     assert "--follow-capture" in argv
     assert "{capture_dir}" in argv
@@ -245,7 +247,11 @@ def test_no_world_root_means_the_supervisor_is_honestly_disabled(
     monkeypatch.delenv("TOWER_WORLD_ROOT", raising=False)
     app = create_app()
 
-    assert not app.state.capture_workers.enabled
+    # Named, not `enabled`: the supervisor can hold a spec for another
+    # cartridge, so "nothing at all is configured" stopped being the same
+    # claim as "no builder is configured" the moment a second worker
+    # existed.
+    assert WORLD_BUILD_WORKER not in app.state.capture_workers.worker_names()
 
 
 def test_autobuild_can_be_turned_off_without_giving_up_the_result_channel(
@@ -263,7 +269,7 @@ def test_autobuild_can_be_turned_off_without_giving_up_the_result_channel(
     monkeypatch.setenv("TOWER_WORLD_AUTOBUILD", "false")
     app = create_app()
 
-    assert not app.state.capture_workers.enabled
+    assert WORLD_BUILD_WORKER not in app.state.capture_workers.worker_names()
     assert app.state.world_root == str(tmp_path / "world")
 
 
@@ -281,7 +287,7 @@ def test_the_rebuild_cadence_reaches_the_worker(monkeypatch, tmp_path):
     monkeypatch.setenv("TOWER_WORLD_REBUILD_EVERY", "7")
     app = create_app()
 
-    argv = list(app.state.capture_workers._spec.argv)
+    argv = list(app.state.capture_workers.spec_for(WORLD_BUILD_WORKER).argv)
     assert argv[argv.index("--rebuild-every") + 1] == "7"
 
 
@@ -293,7 +299,7 @@ def test_the_default_rebuild_cadence_is_live_not_batch(monkeypatch, tmp_path):
     monkeypatch.delenv("TOWER_WORLD_REBUILD_EVERY", raising=False)
     app = create_app()
 
-    argv = list(app.state.capture_workers._spec.argv)
+    argv = list(app.state.capture_workers.spec_for(WORLD_BUILD_WORKER).argv)
     cadence = int(argv[argv.index("--rebuild-every") + 1])
     assert cadence > 0, (
         "the Tower attached a follower in build-once-at-the-end mode, so "
@@ -317,4 +323,8 @@ def test_health_reports_whether_anything_is_building(monkeypatch, tmp_path):
 
     body = client.get("/health").json()
 
-    assert body["capture_workers"] == {"enabled": True, "workers": []}
+    assert body["capture_workers"]["enabled"] is True
+    assert WORLD_BUILD_WORKER in body["capture_workers"]["configured"]
+    # Nothing is following a capture between walks, which is the correct
+    # answer here and the wrong one during one.
+    assert body["capture_workers"]["workers"] == []

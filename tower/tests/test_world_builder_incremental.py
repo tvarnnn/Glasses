@@ -175,8 +175,20 @@ def _digest(estimate):
     points = estimate.points
     return (
         tuple(_pose_digest(pose) for pose in estimate.poses),
-        None if points is None else (points.xyz.dtype.str, points.xyz.shape,
-                                     points.xyz.tobytes()),
+        None if points is None else (
+            points.xyz.dtype.str,
+            points.xyz.shape,
+            points.xyz.tobytes(),
+            # The support table was omitted here, so "bit-identical live
+            # vs batch" did not cover the association index at all -- the
+            # very table publication filtering rewrites. An adversarial
+            # review verified equality held; it was simply unasserted.
+            None if points.support_views is None else (
+                points.support_views.dtype.str,
+                points.support_views.shape,
+                points.support_views.tobytes(),
+            ),
+        ),
         estimate.diagnostics,
         estimate.scale_is_metric,
     )

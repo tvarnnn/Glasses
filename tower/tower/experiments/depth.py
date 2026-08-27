@@ -48,6 +48,12 @@ class DepthEstimation:
         self._model = None
         self._transform = None
         self._device = None
+        # What was ASKED for, kept beside what was resolved.
+        # `auto` resolving to `cpu` on a machine with no CUDA is a
+        # correct outcome; `cuda` resolving to `cpu` would be a
+        # silent downgrade, and only both numbers together can
+        # tell the two apart after the fact.
+        self._requested_device = None
         # Opt-in, bounded observability hook for offline research analysis
         # (World Builder Experiment 1, depth_temporal_consistency): the wire
         # protocol only carries the scalar mean, but temporal-stability
@@ -67,9 +73,9 @@ class DepthEstimation:
         self._device = device
 
     def load(self, settings: ExperimentSettings | None = None) -> None:
-        device = resolve_device(
-            "auto" if settings is None else settings.device
-        )
+        requested = "auto" if settings is None else settings.device
+        self._requested_device = requested
+        device = resolve_device(requested)
         import torch  # local import: torch is an optional [ml] extra;
         # nothing outside a depth-selected module may require it.
 
@@ -193,6 +199,32 @@ class DepthEstimation:
                 "[Tower][Module] depth experiment released; peak cuda allocation %.1fMB",
                 freed["peak_mb"],
             )
+
+    def describe(self) -> dict:
+        """Runtime facts about what is actually loaded. Never raises.
+
+        OPTIONAL on the `Experiment` protocol, and the Lab treats a
+        missing `describe()` as "this experiment holds nothing worth
+        reporting" rather than as an error. It exists because
+        `TOWER_CV_DEVICE=auto` is a REQUEST and `resolve_device` decides
+        the answer: a run that says "auto" has not told anyone whether it
+        used the GPU, and a CPU figure with a GPU label on it is the
+        specific failure `resolve_device` was written to prevent.
+
+        Read outside the invalidation lock on purpose. This is a
+        diagnostic, and taking the lock that guards a model handover in
+        order to print a device name would let a status read contend with
+        a load. A single attribute read is atomic; the worst case is a
+        `null` device on a run that was mid-load a microsecond ago.
+        """
+        device = self._device
+        return {
+            "backend": "torch",
+            "device": "unknown" if device is None else str(device),
+            "device_requested": self._requested_device or "auto",
+            "model": "MiDaS_small",
+            "output": "relative inverse depth, not metric distance",
+        }
 
     def run(self, raw_bytes: bytes) -> ExperimentResult:
         timer = StageTimer()

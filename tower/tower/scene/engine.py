@@ -171,7 +171,14 @@ class SceneEngine:
             self._estimate_orientation(frame_bgr, at)
         self._age_orientation(at)
 
-        confirmed = self._tracker.confirmed()
+        # Copied, not referenced. `Tracker.confirmed()` hands back its own
+        # mutable `Track` objects, and the tracker rewrites them on every
+        # subsequent frame -- so a state that kept them would keep
+        # changing after the moment it claims to describe. Nothing noticed
+        # while the only consumer was a CLI keeping one state; a publisher
+        # holding a snapshot for a poll interval is the consumer that
+        # does. See tests/test_scene_snapshot_isolation.py.
+        confirmed = [track.snapshot() for track in self._tracker.confirmed()]
         width, height = self._frame_size
         counts: dict = {}
         for track in confirmed:
