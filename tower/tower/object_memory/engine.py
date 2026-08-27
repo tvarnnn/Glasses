@@ -22,10 +22,10 @@ THE FUNNEL, AND WHERE EACH STAGE'S COST GOES.
 
 The physical run produced 4,287 detections in 150 seconds. The stage that
 costs real money is asked ONCE PER SIGHTING and only for classes the
-detector cannot be trusted to name -- about sixty times across the whole
-18,821-frame corpus, or one call per three hundred frames. Every one of
-those figures is counted at runtime and printed, because a funnel whose
-narrowing is not measured is a funnel that has quietly stopped narrowing.
+detector cannot be trusted to name -- 53 times across the whole
+18,821-frame corpus, one call per 355 frames. Every one of those figures
+is counted at runtime and printed, because a funnel whose narrowing is
+not measured is a funnel that has quietly stopped narrowing.
 
 WHY A RECORD IS WRITTEN EARLY AND UPDATED LATER.
 

@@ -19,12 +19,21 @@ THE RATE, WHICH IS THE POINT.
 
 The physical run produced 4,287 detections in 150 seconds. Nothing here
 runs on any of them. Verification is asked ONCE PER SIGHTING, when the
-sighting matures -- and the corpus contains 763 sightings across 18,821
-frames, of which the `verify`-tier classes account for about 60. That is
-roughly **one call per 300 frames**, or one every 25 seconds of delivered
-video, against a detector that runs 12 times a second. A semantic model
-at 300 ms is then 0.1% of the frame budget, and it is not on the frame
-path at all.
+sighting matures -- and across the whole 18,821-frame corpus there are
+499 sightings of at least three frames, of which the `verify` tier
+accounts for **53**. That is one call per 355 frames, or one every
+30 seconds of delivered video, against a detector that runs 12 times a
+second.
+
+Measured end to end rather than projected. Replaying the physically
+validated capture, one run at a time:
+
+    verifier none    8 observations   152.6 s   69.262 ms/frame
+    verifier owlv2  13 observations   153.1 s   69.487 ms/frame
+                                      7 calls in 1.5 s of model time
+
+**+0.225 ms/frame, 0.3%**, for five more memories -- and the queue never
+queued: peak depth 0, zero backlog drops.
 
 Every one of those numbers is counted at runtime rather than assumed:
 `VerificationQueue` reports submissions, completions, refusals, drops and

@@ -98,6 +98,43 @@ staleness and tracking all consume delivered frames, which is the correct
 denominator for them. But **"the frame rate" is now ambiguous** and should
 be qualified as capture or delivery wherever it appears.
 
+**4.4 The face-redaction filter fires on 40% of real frames, and is
+mostly wrong when it does — PRICING, not correctness.**
+`tower/tower/world_builder/redaction.py` fills detected face regions
+BEFORE persistence, and its own analysis priced the honest cost as "the
+5% row -- no keyframes lost, about 9% of the point cloud". That pricing
+rests on "0 false positives on 40 face-free frames", measured on forty
+**synthetic room renders**.
+
+Measured at the same settings on the real corpus (1,845 evenly-spaced
+frames from all 34 captures, `scripts/research/face_filter_false_positives.py`):
+
+    frames with at least one firing   741 of 1,845 -- 40.2%
+    regions filled                    976
+    median region area                12.5% of the frame
+    largest region                    84.2% of the frame
+
+Of 36 firings inspected by eye, **4 were a real face** (the wearer
+reflected in a mirror) and **32 were not**: hands on a keyboard in the
+large majority, plus laptop and phone screens, a white interior door, and
+a sink.
+
+The detector is not being accused of being bad at faces -- it found the
+mirror. The finding is that the 5% assumption does not hold on this
+footage, and World Builder destroys these pixels permanently. Object
+Memory hit the same thing on read and responded by REPORTING the overlap
+rather than weakening the filter, because a face-detection threshold is
+not a picture-quality knob; the equivalent response here is a
+re-pricing, not a threshold change.
+
+Detail: `docs/superpowers/research/2026-08-27-object-memory-corpus-precision.md` §6.
+
+**4.5 `spatial_ref`, when there is a world to anchor against.**
+`docs/contracts/OBJECT-MEMORY.md` §12 specifies the shape Object Memory
+will consume, including the `anchor_keyframe_id` and `frame_revision`
+that `CARTRIDGE-GROUNDWORK.md` §4 requires. Object Memory will not build
+it and keeps working without it.
+
 **4.3 Deferred World Builder findings** remain triaged at
 `tower/docs/superpowers/plans/2026-08-25-geometry-transport-followups.md`
 items 1–6 (Tower side) and 7–21 (iOS side). This lane has not acted on any

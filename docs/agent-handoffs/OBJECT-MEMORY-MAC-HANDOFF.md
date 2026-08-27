@@ -6,6 +6,29 @@
 > what is already settled, and what the Tower has measured and refused.
 > Where the two disagree, the plan wins.
 
+> ## SUPERSEDED IN PART, 2026-08-27 — read `OBJECT-MEMORY-HANDOFF.md` §7
+>
+> The Tower half grew three things this document predates, and one of
+> them removes a manual step this document tells you to perform:
+>
+> * **`TOWER_OBSERVATION_ROOT` no longer needs setting.** §7 below says
+>   to export it. It now defaults, and the producer and the read routes
+>   are handed the same value. The 404 state still exists and is now
+>   reached with `TOWER_OBSERVATION_ENABLED=false` — so §8 item 2's
+>   "a Tower with `TOWER_OBSERVATION_ROOT` unset" is that variable now.
+> * **There is a Start button to build.** `POST
+>   /cartridges/object_memory/session/{start,pause,resume,stop}`,
+>   contract `cartridge_session.control/2026-08-27`.
+> * **There are pictures to show.**
+>   `/object-memory/observations/{id}/{imagery,frame,crop}`, contract
+>   `object_memory.imagery/2026-08-27`.
+>
+> `object_memory.observations/2026-08-26` is **unchanged** — every
+> constraint §2 and §4 of this file describe still holds, and the new
+> record fields are additive keys a `Codable` decoder ignores. The one
+> thing to change in the existing screen: read `recorded_classes` from
+> the payload instead of assuming `["laptop", "cell phone"]`.
+
 **Everything described here is UNCOMPILED and UNVERIFIED.** It was written on
 Windows, where `swiftc`, `swift` and `xcodebuild` are all absent. No build has
 been attempted, no test has been executed, no simulator has been launched, and
