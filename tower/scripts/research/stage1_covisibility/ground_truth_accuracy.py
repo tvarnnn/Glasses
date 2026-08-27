@@ -135,6 +135,7 @@ def main() -> int:
     ap.add_argument("--seeds", default="1000,1001,1002,1003")
     ap.add_argument("--scratch", required=True)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--frames", type=int, default=8)
     args = ap.parse_args()
 
     from tests import synthetic_scene as ss
@@ -143,8 +144,8 @@ def main() -> int:
     print(f"production code: {where}")
 
     motions = {
-        "lateral": lambda: ss.strafe(8, step=0.15),
-        "forward": lambda: ss.forward_walk(8, step=0.15),
+        "lateral": lambda: ss.strafe(args.frames, step=0.15),
+        "forward": lambda: ss.forward_walk(args.frames, step=0.15),
     }
     depths = [int(d) for d in args.depths.split(",")]
     seeds = [int(s) for s in args.seeds.split(",")]

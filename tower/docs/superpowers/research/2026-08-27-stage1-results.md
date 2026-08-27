@@ -262,6 +262,25 @@ translation is defined only up to sign — the same metric
 **Verdict: no measurable effect on trajectory accuracy in either
 direction.**
 
+**Longer walks, because 8-frame walks solve only 3 poses each and that is
+a thin sample.** Re-run at 24 frames, where lateral motion solves 10-11
+poses per run (n=8 paired):
+
+| | better | same | worse | median delta |
+|---|---|---|---|---|
+| median direction error | 4 | 2 | 2 | **-0.334 deg** |
+| worst-case direction error | 3 | 3 | 2 | 0.0 |
+| poses_solved | 0 | 8 | 0 | 0 |
+
+Pooled over all **24 paired runs** (8-frame and 24-frame): median error
+better on 9, same on 11, worse on 4. A slight favourable tilt that is
+still short of decisive.
+
+**The one unambiguous result across every synthetic run: `poses_solved`
+is unchanged on 24 of 24.** So on synthetic footage the change never
+costs a pose, which makes the `4fea31e2` regression a property of that
+real capture rather than of the mechanism in general.
+
 **An honest correction to my own first reading.** The first four runs
 (seeds 1000–1001) came back better on 3 of 4 for worst-case error with a
 median delta of −0.32°, and I took that as evidence Stage 1 improves
