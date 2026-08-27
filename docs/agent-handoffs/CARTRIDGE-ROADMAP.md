@@ -26,7 +26,7 @@ detail), `WORLD-BUILDER-STATUS.md` (P1–P11 physical gates),
 | 1 | **World Builder** | Tower complete, tested | **Yes** — 5 real captures; 51 segments, 3 registered | **Owned by `world-builder/next-generation`; frozen to this lane** |
 | 2 | **Experimental CV Lab** | Implemented, 86 tests | Partly — `baseline` only, 2026-08-21 | Nothing; it is a lab |
 | 3 | **Scene Understanding** | Implemented, persists nothing | **Yes** — constants re-derived at the true 12 fps delivery rate | **UNBLOCKED 2026-08-26** — needs a wire path built |
-| 4 | **Object Memory** | Store + producer + route + **iOS surface (UNCOMPILED)** | **Yes** — 55 observations from 9,199 frames | iOS compile; the `person` ruling |
+| 4 | **Object Memory** | Store + producer + routes + **Start/Pause/Stop** + **imagery** + **iOS surface (UNCOMPILED)** | **Yes** — and the corpus doubled: every detection over 18,821 frames dumped, crops read by eye | iOS compile; the `person` ruling; **capture resolution** |
 | 5 | **Document Memory** | Engine + CLI, 145 tests | **Yes, and it falsified the premise** | Camera resolution |
 | 6 | **Environmental Memory** | Design only | None | Its own design says *do not begin* |
 | 7 | **Translator** | Two plans, both stamped DO NOT IMPLEMENT | None | No audio path exists |
@@ -224,6 +224,30 @@ halves of Visual Q&A and Accessibility.
 - **Object Memory** — went from a data layer with no producer to a
   cartridge with 55 real observations, an enforced retention promise, and
   its first route.
+- **Object Memory, 2026-08-27** — attaches itself (no second terminal, no
+  copied capture id, no environment variable), can be started and paused,
+  serves the picture behind a record rather than a frame number, and
+  replaced its two-class whitelist with a tiered policy whose evidence is
+  **crops read by eye**: a ceiling fan is `airplane` at 0.99, a white
+  door is `refrigerator` at 0.95, and the three highest-scoring `remote`
+  sightings in 18,821 frames are all laptop keyboards. Score does not
+  order correctness across classes. An optional Apache-2.0
+  open-vocabulary verifier (`owlv2-base`, ~93% accept / ~94% reject over
+  94 human-labelled crops, +0.45 ms/frame) unlocks twelve more classes;
+  it ships OFF. Full record: `OBJECT-MEMORY-HANDOFF.md`.
+
+  **And its binding constraint is now capture resolution**, which is not
+  this cartridge's to fix. The shipped detector has 0.000 recall below 1%
+  of frame area; a second opinion moves that floor one stage later rather
+  than removing it — every verifier false reject is a crop of 5.3% of the
+  frame or smaller, including three real remotes at 3.7–3.9% — and an
+  open-vocabulary pass over whole frames found a set of keys **once in
+  674 frames**, at 0.11% of the frame. The source is 360×640; DAT offers
+  504×896 and 720×1280. **Raising it is the single change that would help
+  Object Memory, Document Memory and Scene Understanding at once**, and
+  it costs bandwidth on a link already delivering roughly every other
+  captured frame. Somebody should measure that before more model work is
+  built on top of a blind stage one.
 - **Document Memory** — premise falsified, gate re-derived, false
   positives **6 → 0**. It stopped being wrong, which is not the same as
   starting to be useful.
