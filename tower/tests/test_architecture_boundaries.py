@@ -125,6 +125,11 @@ def test_the_result_channel_core_is_cartridge_blind():
         TOWER / "results" / "contracts.py",
         TOWER / "routes" / "results_ws.py",
         TOWER / "routes" / "cartridges.py",
+        # The session control surface. Added to the CORE list rather
+        # than exempted: it is the first mutating route in this Tower and
+        # it addresses a cartridge by an id in the URL path, which is
+        # exactly the shape that invites an import "just to look one up".
+        TOWER / "routes" / "sessions.py",
     ]
     offenders = []
     for path in core:

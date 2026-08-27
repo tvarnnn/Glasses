@@ -57,6 +57,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tower.capture import CaptureFollower, FRAMES_FILENAME  # noqa: E402
+from tower.capture_workers import (  # noqa: E402
+    ATTACH_MODE_FROM_NOW,
+    ATTACH_MODE_FROM_START,
+)
+from tower.config import DEFAULT_OBSERVATION_ROOT  # noqa: E402
 from tower.object_memory.detector import (  # noqa: E402
     SCORE_THRESHOLD,
     FixedDetector,
@@ -73,7 +78,15 @@ from tower.object_memory.store import (  # noqa: E402
 )
 from tower.storage import read_raw_jsonl  # noqa: E402
 
-DEFAULT_ROOT = Path("data/object_memory")
+# THE SAME DEFAULT THE WEB PROCESS USES, IMPORTED RATHER THAN RESTATED.
+#
+# This line used to read `Path("data/object_memory")` while
+# `tower/config.py` defaulted its observation root to None, and the two
+# were never compared. The 2026-08-26 physical run is what that cost: a
+# real walk was remembered into this directory, and every HTTP request
+# answered 404 about it until an operator set an environment variable by
+# hand. One constant, in the settings module, imported here.
+DEFAULT_ROOT = Path(DEFAULT_OBSERVATION_ROOT)
 
 
 def journal_frames(directory: Path):
@@ -146,6 +159,20 @@ def main(argv=None) -> int:
             "later read is clamped to it."
         ),
     )
+    parser.add_argument(
+        "--attach-mode",
+        choices=(ATTACH_MODE_FROM_START, ATTACH_MODE_FROM_NOW),
+        default=ATTACH_MODE_FROM_START,
+        help=(
+            "Only meaningful with --follow-capture. 'from-start' reads the "
+            "whole capture, which is right for a producer attached when the "
+            "recording opened. 'from-now' skips whatever the journal "
+            "already holds: a producer attached three minutes into a walk "
+            "was not asked for the first three minutes, and reading them "
+            "would be a consent decision this script has no standing to "
+            "make."
+        ),
+    )
     parser.add_argument("--poll-seconds", type=float, default=0.25)
     parser.add_argument("--max-idle-polls", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None, help="Stop after N frames.")
@@ -166,7 +193,11 @@ def main(argv=None) -> int:
     if args.follow_capture:
         if not args.follow_capture.exists():
             raise SystemExit(f"no capture directory at {args.follow_capture}")
-        follower = CaptureFollower(args.follow_capture, poll_seconds=args.poll_seconds)
+        follower = CaptureFollower(
+            args.follow_capture,
+            poll_seconds=args.poll_seconds,
+            start_at_end=args.attach_mode == ATTACH_MODE_FROM_NOW,
+        )
         frames = (
             (frame.raw_bytes, frame.source_seq, frame.received_at)
             for frame in follower.follow(max_idle_polls=args.max_idle_polls)
@@ -174,6 +205,7 @@ def main(argv=None) -> int:
         session_id = args.follow_capture.name
         source = "live-capture"
         timing = "capture-journal"
+        attach_mode = args.attach_mode
     else:
         if not args.frames.exists():
             raise SystemExit(f"no frame directory at {args.frames}")
@@ -185,6 +217,11 @@ def main(argv=None) -> int:
             timing = "none"
         session_id = args.frames.name
         source = "recorded-frames"
+        # A replay reads what it was pointed at. There is no live journal
+        # to arrive late to, so the flag has nothing to describe and the
+        # report says so rather than reporting a default that would look
+        # like a decision.
+        attach_mode = None
 
     detector = (
         TorchvisionDetector(
@@ -228,6 +265,7 @@ def main(argv=None) -> int:
         "detector": detector.name,
         "device": args.device if detector.name != "fixed" else None,
         "timing_source": timing,
+        "attach_mode": attach_mode,
         "persisted_classes": list(PERSISTED_CLASSES),
         "frames_observed": engine.frames_observed,
         "frames_undecodable": engine.frames_undecodable,

@@ -1,31 +1,43 @@
 import asyncio
 import logging
 import sys
+import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI
 
 from tower.capture import CaptureRecorder
 from tower.capture_workers import CaptureWorkerSupervisor, WorkerSpec
-from tower.config import Settings, get_settings
+from tower.cartridge_session import CartridgeSession
+from tower.config import TOWER_ROOT, Settings, get_settings
 from tower.experiments import ExperimentSettings
 from tower.logging_config import configure_logging
 from tower.modules.base import Module
 from tower.modules.container import ModuleContainer
 from tower.modules.experimental_cv import ExperimentalCVModule
 from tower.results import build_hub
-from tower.routes import cartridges, geometry, health, observations, ws
+from tower.results.contracts import CARTRIDGE_OBJECT_MEMORY
+from tower.routes import cartridges, geometry, health, observations, sessions, ws
 from tower.session import ConnectionTracker
 
 logger = logging.getLogger(__name__)
 
-# The tower project root -- the directory holding `scripts/`, `models/`
-# and, by default, `data/`. Resolved from this file rather than from the
-# working directory, because a builder started with the wrong CWD finds
-# no YuNet weights (`world_builder/redaction.py` resolves them
-# relatively) and silently records its redaction as `none`.
-TOWER_ROOT = Path(__file__).resolve().parent.parent
+# TOWER_ROOT moved to `tower/config.py` and is imported above. It is the
+# directory holding `scripts/`, `models/` and, by default, `data/`, and
+# it is resolved from a file rather than from the working directory
+# because a builder started with the wrong CWD finds no YuNet weights
+# (`world_builder/redaction.py` resolves them relatively) and silently
+# records its redaction as `none`. It lives beside the settings now
+# because a DEFAULT PATH is a setting, and two modules resolving the
+# same root independently is how the producer and the reader came to
+# disagree about where observations live.
+
+# The worker names this Tower can attach to a capture. Strings, and
+# strings only: `capture_workers.py` addresses a spec by name and knows
+# nothing else about it, and `test_the_capture_worker_supervisor_is_
+# cartridge_blind` is what keeps that true.
+WORLD_BUILD_WORKER = "world-build-session"
+OBJECT_MEMORY_WORKER = "object-memory-session"
 
 
 def _build_cv_module(settings: Settings) -> Module:
@@ -61,14 +73,13 @@ def _build_frame_observers(settings: Settings) -> list:
     return [CaptureRecorder(settings.capture_root)]
 
 
-def _build_capture_worker_supervisor(
-    settings: Settings,
-) -> CaptureWorkerSupervisor:
-    """Decide what, if anything, follows a capture.
+def _world_build_spec(settings: Settings) -> WorkerSpec | None:
+    """The builder that follows a capture, or nothing.
 
-    This function is the ONE place in the web process that knows a world
-    builder exists, and it knows it as an argv -- a script path and some
-    flags -- not as an import. That is deliberate and it is load-bearing:
+    This function and its neighbour are the ONLY places in the web
+    process that know a world builder and an object memory exist, and
+    they know them as an argv -- a script path and some flags -- not as
+    an import. That is deliberate and it is load-bearing:
     `test_shared_code_does_not_import_a_cartridge` forbids transport,
     config and the module system from importing a cartridge, on the
     grounds that "the next cartridge inherits its assumptions". A command
@@ -80,24 +91,109 @@ def _build_capture_worker_supervisor(
     path.
     """
     if settings.world_root is None or not settings.world_autobuild:
-        return CaptureWorkerSupervisor(None)
+        return None
 
-    return CaptureWorkerSupervisor(
-        WorkerSpec(
-            argv=(
-                sys.executable,
-                str(TOWER_ROOT / "scripts" / "world_build_session.py"),
-                "--follow-capture",
-                "{capture_dir}",
-                "--root",
-                settings.world_root,
-                "--rebuild-every",
-                str(settings.world_rebuild_every),
-            ),
-            cwd=str(TOWER_ROOT),
-            name="world-build-session",
-        )
+    return WorkerSpec(
+        argv=(
+            sys.executable,
+            str(TOWER_ROOT / "scripts" / "world_build_session.py"),
+            "--follow-capture",
+            "{capture_dir}",
+            "--root",
+            settings.world_root,
+            "--rebuild-every",
+            str(settings.world_rebuild_every),
+        ),
+        cwd=str(TOWER_ROOT),
+        name=WORLD_BUILD_WORKER,
     )
+
+
+def _observation_spec(settings: Settings, gate) -> WorkerSpec | None:
+    """The producer that remembers objects, and the gate that permits it.
+
+    GATED, unlike the builder, and the difference is a privacy decision
+    rather than a symmetry oversight. A world is geometry; a memory of
+    which objects were around is a record of a wearer's surroundings that
+    outlives the walk. So it attaches only while a session is ACTIVE --
+    something a person started, and can pause -- and a Tower that has
+    just booted starts nothing.
+
+    `{attach_mode}` is substituted by the supervisor. A producer attached
+    at capture open is told it saw the whole capture; one attached in the
+    middle is told it arrived late, and must not go back and remember the
+    part of the walk that happened before anybody asked.
+    """
+    if settings.observation_root is None:
+        return None
+
+    return WorkerSpec(
+        argv=(
+            sys.executable,
+            str(TOWER_ROOT / "scripts" / "object_memory_session.py"),
+            "--follow-capture",
+            "{capture_dir}",
+            # The SAME value the read routes are given, from the same
+            # settings object. There is no second default to drift.
+            "--root",
+            settings.observation_root,
+            "--attach-mode",
+            "{attach_mode}",
+            "--device",
+            settings.observation_device,
+            "--retention-days",
+            str(settings.observation_retention_days),
+        ),
+        cwd=str(TOWER_ROOT),
+        name=OBJECT_MEMORY_WORKER,
+        gate=gate,
+    )
+
+
+def _build_capture_worker_supervisor(settings: Settings, gates: dict):
+    """Decide what, if anything, follows a capture.
+
+    `gates` maps a worker name to the predicate that says whether it may
+    run. It is passed in rather than built here because a gate reads a
+    session's state and a session needs a supervisor to attach through --
+    the two are mutually referential, and the wiring point resolves that
+    by handing over a closure that looks the session up when asked
+    instead of capturing it at construction.
+    """
+    specs = [
+        spec
+        for spec in (
+            _world_build_spec(settings),
+            _observation_spec(settings, gates.get(OBJECT_MEMORY_WORKER)),
+        )
+        if spec is not None
+    ]
+    return CaptureWorkerSupervisor(specs)
+
+
+def _open_capture_lookup(frame_observers):
+    """What is recording right now, as `(capture_id, capture_dir)` or None.
+
+    A closure over the observers rather than a reach into `app.state`,
+    so `CartridgeSession` stays testable without an app -- and so a Tower
+    with no recorder configured makes Start a no-op that waits, rather
+    than an AttributeError on somebody's button.
+    """
+
+    def lookup():
+        for observer in frame_observers:
+            # `status` is a PROPERTY on CaptureRecorder, not a method --
+            # `tower/routes/health.py` reads it the same way. Calling it
+            # raises TypeError, which the session catches and reports as
+            # "nothing is recording": a Start that silently waits forever
+            # instead of attaching to the walk in progress.
+            status = observer.status
+            if status is None or not status.is_open:
+                continue
+            return status.capture_id, observer.capture_dir(status.capture_id)
+        return None
+
+    return lookup
 
 
 def _log_effective_configuration(
@@ -105,13 +201,16 @@ def _log_effective_configuration(
 ) -> None:
     """Say what this Tower will and will not do, at startup, once.
 
-    Both of the settings that decide whether World Builder works at all
-    are optional and BOTH fail silently when unset: no capture root means
-    no recorder is registered, and no world root means the result channel
-    reports the cartridge unavailable. On 2026-08-24 that combination
-    produced a Tower that answered every frame, recorded nothing anyone
-    could find, and told the phone there was no world -- with nothing in
-    the log saying why. Three lines fix that permanently.
+    Every setting that decides whether a cartridge works at all is
+    optional and every one of them used to fail SILENTLY when unset: no
+    capture root meant no recorder, no world root meant the result
+    channel reported the cartridge unavailable, no observation root meant
+    a producer wrote 64 records into a directory every HTTP request
+    answered 404 about. On 2026-08-24 the first pair produced a Tower
+    that answered every frame, recorded nothing anyone could find, and
+    told the phone there was no world -- with nothing in the log saying
+    why. On 2026-08-26 the third produced the same shape of surprise for
+    a different cartridge. These lines fix that permanently.
     """
     if settings.capture_root is None:
         logger.warning(
@@ -135,18 +234,23 @@ def _log_effective_configuration(
         logger.info("[Tower][Config] world root %s", settings.world_root)
 
     if settings.observation_root is None:
-        logger.info(
-            "[Tower][Config] TOWER_OBSERVATION_ROOT is unset: "
-            "/object-memory/* will answer 404"
+        logger.warning(
+            "[Tower][Config] TOWER_OBSERVATION_ENABLED is off: nothing will "
+            "produce object-memory observations and /object-memory/* will "
+            "answer 404"
         )
     else:
         logger.info(
-            "[Tower][Config] observation root %s (read-only; this process "
-            "never writes or deletes observations)",
+            "[Tower][Config] observation root %s (one path for the producer "
+            "AND the read routes; the web process never writes or deletes "
+            "observations). Producer device %s, retention %s days.",
             settings.observation_root,
+            settings.observation_device,
+            settings.observation_retention_days,
         )
 
-    if supervisor.enabled:
+    attached = supervisor.worker_names()
+    if WORLD_BUILD_WORKER in attached:
         logger.info(
             "[Tower][Config] a builder will be attached to each capture, "
             "rebuilding every %s keyframes",
@@ -156,6 +260,14 @@ def _log_effective_configuration(
         logger.warning(
             "[Tower][Config] TOWER_WORLD_AUTOBUILD is off: captures will be "
             "recorded but NOTHING will build a world from them"
+        )
+
+    if OBJECT_MEMORY_WORKER in attached:
+        logger.info(
+            "[Tower][Config] an object-memory producer will be attached to "
+            "each capture WHILE A SESSION IS ACTIVE. It is stopped at "
+            "startup: POST /cartridges/%s/session/start begins one.",
+            CARTRIDGE_OBJECT_MEMORY,
         )
 
 
@@ -199,7 +311,33 @@ def create_app() -> FastAPI:
     # observes and never deletes: the producer is its own script, and
     # deletion is a CLI a human types. Unset means that route answers 404.
     app.state.object_memory_root = settings.observation_root
-    app.state.capture_workers = _build_capture_worker_supervisor(settings)
+    # Mutually referential, resolved by a lookup rather than by an
+    # ordering trick: the worker spec's gate asks a session whether it is
+    # active, and the session needs the supervisor the spec is registered
+    # with in order to attach and detach. The dict is populated below,
+    # and the gate reads it when a capture opens -- which is always after
+    # startup, so it is never empty when it is asked.
+    cartridge_sessions: dict[str, CartridgeSession] = {}
+
+    def _object_memory_gate() -> bool:
+        session = cartridge_sessions.get(CARTRIDGE_OBJECT_MEMORY)
+        return session is not None and session.is_active()
+
+    app.state.capture_workers = _build_capture_worker_supervisor(
+        settings, {OBJECT_MEMORY_WORKER: _object_memory_gate}
+    )
+    cartridge_sessions[CARTRIDGE_OBJECT_MEMORY] = CartridgeSession(
+        cartridge=CARTRIDGE_OBJECT_MEMORY,
+        worker=OBJECT_MEMORY_WORKER,
+        supervisor=app.state.capture_workers,
+        open_capture=_open_capture_lookup(app.state.frame_observers),
+        clock=time.time,
+    )
+    # Deliberately NOT persisted anywhere. A Tower that restarts comes
+    # back with every cartridge stopped, because resuming a memory of
+    # what a camera sees without anybody asking again is the wrong
+    # direction to fail in.
+    app.state.cartridge_sessions = cartridge_sessions
     _log_effective_configuration(settings, app.state.capture_workers)
     # One shared reader for the whole app. It starts no task until a
     # client subscribes and stops again when the last one goes, so a Tower
@@ -214,6 +352,7 @@ def create_app() -> FastAPI:
     app.include_router(cartridges.router)
     app.include_router(geometry.router)
     app.include_router(observations.router)
+    app.include_router(sessions.router)
     app.include_router(ws.router)
     return app
 
