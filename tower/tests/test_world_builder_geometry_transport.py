@@ -1,5 +1,8 @@
 """The geometry adapter: grouping, hashing, manifest and chunks."""
 
+import json
+import os
+
 import pytest
 
 from tower.results.world_builder_geometry import (
@@ -7,6 +10,7 @@ from tower.results.world_builder_geometry import (
     build_manifest,
     segment_content_hash,
 )
+from tower.world_builder.records import Session, World
 
 
 def test_the_contract_identifier_is_exact():
@@ -458,4 +462,105 @@ def test_an_absent_derived_tree_is_still_absent_and_still_404(derived_world):
     response = _client(store).get(
         f"/worlds/{world_id}/geometry/manifest", params={"session_id": session_id}
     )
+    assert response.status_code == 404
+
+
+# -- Containment -----------------------------------------------------------
+#
+# `session_id` is declared as a bare `str` on both geometry routes, so FastAPI
+# binds it as a QUERY parameter -- and unlike a path parameter it is NOT
+# restricted to `[^/]+`. It arrives at `WorldStore.read_derived` as
+# `self.derived_dir(world_id) / session_id`, which is an unguarded join.
+#
+# The check these tests demand is not novel. `results/world_builder.py:283-300`
+# already whitelists these exact two identifiers against the store's own
+# listings before serving the status channel, and `object_memory/imagery.py`
+# resolves both sides for the same reason. This route family is the one place
+# that skipped it.
+#
+# Reproduced BEFORE the fix: both cases answered 200 and served a
+# `geometry_revision` computed over the PLANTED file rather than the world's.
+
+
+def _plant_derived_tree(directory):
+    """A readable derived tree, deliberately outside any world root."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "poses.json").write_text(
+        json.dumps({"poses": [{
+            "keyframe_id": "planted:00000001", "segment_index": 0,
+            "status": "anchor", "degeneracy": "",
+            "rotation": [1.0, 0.0, 0.0, 0.0],
+            "translation": [111.0, 222.0, 333.0],
+        }]}),
+        encoding="utf-8",
+    )
+    (directory / "points.json").write_text(
+        json.dumps({"points": [{"segment_index": 0, "xyz": [9.9, 9.9, 9.9]}]}),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("route", ["manifest", "segment/0"])
+def test_a_traversing_session_id_cannot_escape_the_world_root(
+    derived_world, tmp_path, route
+):
+    store, world_id, _ = derived_world
+    planted = tmp_path / "outside" / "planted"
+    _plant_derived_tree(planted)
+    escape = os.path.relpath(planted, store.derived_dir(world_id))
+
+    response = _client(store).get(
+        f"/worlds/{world_id}/geometry/{route}", params={"session_id": escape}
+    )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("route", ["manifest", "segment/0"])
+def test_an_absolute_session_id_cannot_replace_the_world_root(
+    derived_world, tmp_path, route
+):
+    """An absolute path does not traverse out of a base -- it REPLACES it.
+
+    `Path("/a/b") / "C:/elsewhere"` is `C:/elsewhere`, so a guard that only
+    looks for `..` would pass this and still read the wrong tree.
+    """
+    store, world_id, _ = derived_world
+    planted = tmp_path / "outside" / "planted"
+    _plant_derived_tree(planted)
+
+    response = _client(store).get(
+        f"/worlds/{world_id}/geometry/{route}", params={"session_id": str(planted)}
+    )
+
+    assert response.status_code == 404
+
+
+def test_one_worlds_geometry_cannot_be_served_under_another_worlds_identity(
+    derived_world,
+):
+    """Containment alone is not enough: the session must be THIS world's.
+
+    This value never leaves the world root, so a guard that only checked
+    containment would pass it -- and the reply would carry the SECOND
+    world's poses and points under the FIRST world's `world_id`, which is a
+    correctness defect as much as a disclosure one.
+    """
+    store, world_id, session_id = derived_world
+
+    # A second world, inside the same root, with its own derived tree.
+    other_id = "w_other"
+    store.write_world(World(world_id=other_id, created_at=1.0, updated_at=2.0,
+                            session_ids=(session_id,)))
+    store.write_session(Session(session_id=session_id, world_id=other_id,
+                                started_at=1.0, ended_at=2.0))
+    _plant_derived_tree(store.derived_dir(other_id) / session_id)
+
+    escape = os.path.relpath(
+        store.derived_dir(other_id) / session_id, store.derived_dir(world_id)
+    )
+    response = _client(store).get(
+        f"/worlds/{world_id}/geometry/manifest", params={"session_id": escape}
+    )
+
     assert response.status_code == 404

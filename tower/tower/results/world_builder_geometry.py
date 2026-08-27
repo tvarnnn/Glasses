@@ -150,6 +150,44 @@ def _read(store, world_id: str, session_id: str):
         world: World = store.read_world(world_id)
     except WorldStoreError:
         return None
+    # `session_id` arrives from an unauthenticated QUERY parameter on both
+    # geometry routes -- declared as a bare `str`, so unlike a path
+    # parameter it is not restricted to `[^/]+` -- and it reaches
+    # `read_derived` as `derived_dir(world_id) / session_id`, an unguarded
+    # join. Measured before this guard: `?session_id=../../../../elsewhere`
+    # and `?session_id=C:/elsewhere` both answered 200 and served poses and
+    # points read from OUTSIDE the world root, under this world's id.
+    #
+    # The whitelist rather than a `..` scan or a `resolve()` containment
+    # check, for two reasons. An absolute path does not traverse out of the
+    # base, it REPLACES it, so a `..` scan misses it entirely. And
+    # containment alone would still admit a SIBLING world's session, which
+    # stays inside the root and would be served under the wrong `world_id`.
+    #
+    # A DIRECT-CHILD check rather than a whitelist against
+    # `list_session_ids`, and the difference was measured rather than
+    # reasoned. The whitelist was written first and reddened 11 tests in
+    # `test_world_builder_placements.py`: `_tiny_world` writes a world and
+    # a derived tree without a session record, so a legitimate derived
+    # tree can exist for a session `list_session_ids` does not return.
+    # Requiring the session record would have made a containment fix into
+    # a behaviour change, which is not what this is for.
+    #
+    # `parent == base` is also the TIGHTER rule, not merely the cheaper
+    # one. A session id names one directory, so anything with a separator
+    # in it is already wrong; and basing containment on THIS world's
+    # derived directory means a sibling world's tree fails the same check
+    # -- `../../w_other/derived/s0` leaves `w0/derived` exactly as an
+    # absolute path does. One rule covers traversal, absolute replacement
+    # and cross-world reads together.
+    derived_root = store.derived_dir(world_id)
+    try:
+        if (derived_root / session_id).resolve().parent != derived_root.resolve():
+            return None
+    except (OSError, ValueError):
+        # A path the OS will not even parse -- a NUL byte, an over-long
+        # name. Absent, like any other unreadable tree.
+        return None
     derived = store.read_derived(world_id, session_id, verify=False)
     if derived is None:
         return None
