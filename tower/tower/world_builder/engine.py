@@ -109,6 +109,62 @@ class BuildResult:
     diagnostics: dict = field(default_factory=dict)
 
 
+# How many consecutive segments may produce NOTHING before a solve break
+# stops being allowed to start another one.
+#
+# Two earlier rules were measured and refused, both for the same reason.
+#
+# `MIN_SOLVED_BEFORE_RESTART = 2` (restart only if the broken chain had
+# solved two poses) leaves the cascade fully intact for the case that
+# matters most: when the SEED PAIR fails the chain has solved nothing --
+# the anchor is not a solved pose -- so no threshold >= 1 is ever met.
+# Measured on capture 4fea31e2, one seed-pair failure stranded 48 of 50
+# keyframes.
+#
+# `MIN_KEYFRAMES_BEFORE_RESTART` (wait for N keyframes) fails for a
+# subtler reason: `chain_broken` is an EDGE. Decline the restart at that
+# instant and no second opportunity ever arrives, however many keyframes
+# accumulate. Swept at 3, 4, 6 and 8 it reproduced the solved-pose
+# numbers exactly and never recovered 4fea31e2.
+#
+# Delay is the wrong axis anyway. Once a chain is broken every further
+# keyframe in that segment is refused without geometry, so waiting buys
+# nothing -- the only real question is whether restarting is worth it.
+#
+# It is worth it unless the region has already proven unmappable. A
+# segment that ends having solved NOTHING is that evidence. At 1, a
+# restart is allowed unless the segment immediately before it produced
+# nothing -- so a region that is building geometry restarts freely, and
+# genuinely untrackable footage stops after one wasted attempt instead of
+# shattering into dozens of two-keyframe shards.
+#
+# THE VALUE IS CHOSEN ON MARGINAL EFFICIENCY, measured over the pinned
+# eight. Every larger cap buys more geometry and costs more fragments,
+# monotonically, with no knee -- so the question is what each added
+# fragment card is worth:
+#
+#   cap   segments   solved   points   poses per ADDED segment
+#     -        127      346    47429   (baseline)
+#     1        230      591    75369   2.38
+#     2        306      695    86230   1.95
+#     3        360      749    91130   1.73
+#  none        470      863   107005   1.51
+#
+# The return declines monotonically, so 1 is where a fragment card buys
+# the most reconstruction.
+#
+# What settled it against a larger cap: REGISTRATION IS INVARIANT across
+# the whole range. On e1c52b9f, caps of 1, 2 and none all produce exactly
+# the same registered cluster -- 3 segments, 5603 points, the same two
+# admitted pairs. The extra fragments buy raw geometry, not cross-segment
+# coherence, so paying more fragment cards for them is a bad trade while
+# the viewer cannot rank or collapse them.
+#
+# The larger caps remain available and are worth revisiting the moment
+# fragments can be ranked: the uncapped variant is +517 solved poses over
+# baseline and grows the largest single coherent piece 28656 -> 32756.
+MAX_BARREN_SEGMENTS = 1
+
 class WorldBuilderEngine:
     def __init__(
         self,
@@ -137,6 +193,9 @@ class WorldBuilderEngine:
         self._tracker: FrameTracker | None = None
         self._events: EventLog | None = None
         self._segment_index = 0
+        self._segment_solved = 0
+        self._barren_segments = 0
+        self._segments_used: set[int] = set()
         self._rejected: dict[str, int] = {}
         # Survives stop_session() on purpose: the usual order is
         # observe... stop_session() build(), and throwing the solve away
@@ -200,6 +259,12 @@ class WorldBuilderEngine:
             self._store, world_id, session.session_id, clock=self._clock
         )
         self._segment_index = 0
+        # Reset with its sibling. start_session resets every other piece
+        # of per-session state; leaving this one behind let a new
+        # session inherit a restart budget the previous one earned.
+        self._segment_solved = 0
+        self._barren_segments = 0
+        self._segments_used: set[int] = set()
         self._rejected = {}
         self._events.append("session_started", {"frame_source": frame_source})
         self._open_live_solve(session)
@@ -243,6 +308,14 @@ class WorldBuilderEngine:
             self._tracker.reset()
             self._selector.note_lost()
             self._segment_index += 1
+            # A new segment starts with nothing solved. Without this the
+            # restart budget would be inherited from the segment that
+            # just died.
+            self._segment_solved = 0
+            # A tracking loss is not evidence that the region is
+            # unmappable -- the wearer moved too fast, that is all. It
+            # must not spend the restart budget.
+            self._barren_segments = 0
             if self._live is not None:
                 self._live.close_segment(self._segment_index)
             self._note_rejected(decision.reason)
@@ -266,6 +339,7 @@ class WorldBuilderEngine:
             motion=motion,
             reason=decision.reason,
         )
+        chain_broke_pending = False
         if self._live is not None:
             # The REDACTED bytes, because those are what landed on disk
             # and therefore what build() decodes. Feeding `gray` here
@@ -275,17 +349,73 @@ class WorldBuilderEngine:
             # redact() hands back the very object it was given whenever
             # it changed nothing, which is the overwhelmingly common case
             # and makes this free.
-            self._live.extend(
+            step = self._live.extend(
                 keyframe.keyframe_id,
                 gray if image_bytes is raw_bytes else decode_gray(image_bytes),
             )
+            if step is not None and step.pose.status == POSE_STATUS_SOLVED:
+                self._segment_solved += 1
+            if (
+                step is not None
+                and step.chain_broken
+                and self._barren_segments < MAX_BARREN_SEGMENTS
+            ):
+                # The solve chain failed on this keyframe. Everything
+                # after it shares no coordinate frame with what came
+                # before -- which is precisely what a segment boundary
+                # means here, and what the comment on the tracking-loss
+                # increment above already says.
+                #
+                # Without this, `chain.broken` latches and every later
+                # keyframe in the segment is refused WITHOUT ORB
+                # detection, matching, or any geometry attempted.
+                # Measured on capture 22e9d428: 354 refusals from 26
+                # decisions, 328 cascade, 0 of 26 segments ever
+                # recovering. classical.py has claimed for a long time
+                # that "the engine turns this into a new segment"; it did
+                # not, and this makes the claim true.
+                #
+                # The tracker keeps its reference. Tracking is healthy;
+                # only the solve failed, and discarding the reference
+                # would manufacture a tracking loss out of a geometry
+                # failure -- measured at 424 -> 389 solved poses when the
+                # reference is genuinely lost here.
+                #
+                # Honest note: inserting a reset at THIS line is an
+                # equivalent mutation, because set_reference() below runs
+                # unconditionally and re-establishes it. The invariant is
+                # real and worth stating; this position does not enforce
+                # it. The test asserts the outcome (the tracker still has
+                # a reference), not this line.
+                # A segment that ends having solved nothing is evidence
+                # the region is unmappable; a run of them stops further
+                # restarts. One that produced geometry clears the count.
+                self._barren_segments = (
+                    self._barren_segments + 1 if self._segment_solved == 0 else 0
+                )
+                self._segment_index += 1
+                self._segment_solved = 0
+                self._live.close_segment(self._segment_index)
+                chain_broke_pending = True
 
+        self._segments_used.add(keyframe.segment_index)
         self._tracker.set_reference(gray)
         self._selector.note_accepted()
         self._session = replace(
             self._session,
             keyframes_accepted=self._session.keyframes_accepted + 1,
         )
+        if chain_broke_pending:
+            # AFTER the keyframe it belongs to. `tracking_lost` always
+            # precedes the keyframes of the segment it announces, because
+            # that branch returns before persisting. This one cannot: the
+            # breaker was already stamped with the OLD index. Emitting it
+            # first inverted the convention, so a consumer rebuilding
+            # segmentation from the journal misattributed exactly one
+            # keyframe per break.
+            self._events.append(
+                "solve_chain_broken", {"segment_index": self._segment_index}
+            )
         self._events.append(
             "keyframe_accepted",
             {
@@ -317,7 +447,10 @@ class WorldBuilderEngine:
             frames_observed=session.frames_observed,
             keyframes_accepted=session.keyframes_accepted,
             rejected_by_reason=dict(self._rejected),
-            segments=self._segment_index + 1,
+            # Distinct indices that received a keyframe, NOT the
+            # high-water mark -- see _segments_used. This is the same
+            # quantity build() reports, so the two cannot disagree.
+            segments=len(self._segments_used),
             end_reason=reason,
         )
         self._session = None
@@ -386,6 +519,17 @@ class WorldBuilderEngine:
         solved_live = self._live_estimates(world_id, session_id, session, backend)
 
         poses_solved = poses_refused = 0
+        # `poses_refused` alone reads as N independent judgments about the
+        # world. It is not: once any pose in a segment is refused the
+        # chain latches and every later keyframe is refused WITHOUT ORB
+        # detection, matching, or any geometry being attempted. Measured
+        # on the real 33-segment world from capture 22e9d428: 354
+        # refusals, 26 root decisions, 328 cascaded, and 0 of 26 segments
+        # ever recovered. "26 chains died once" and "354 frames were each
+        # judged ungeometric" are different bugs with different fixes.
+        poses_refused_root = poses_refused_cascaded = 0
+        refusal_degeneracy: dict[str, int] = {}
+        refusals_by_segment: dict[int, dict] = {}
         # Counted, not derived by subtraction. `keyframes - poses_refused`
         # silently promotes every anchor to a camera position, and an
         # anchor is definitional rather than measured: identity rotation,
@@ -400,6 +544,10 @@ class WorldBuilderEngine:
         poses_anchor = 0
         poses_positioned = 0
         total_points = 0
+        # Per segment, so a specific unreadable fragment can be chased
+        # without re-running the walk. Summed for the manifest.
+        discards_by_segment: dict[int, dict[str, int]] = {}
+        total_triangulated = 0
         segments = sorted({keyframe.segment_index for keyframe in keyframes})
 
         pose_rows: list[dict] = []
@@ -439,7 +587,12 @@ class WorldBuilderEngine:
 
             segment_solved = 0
             segment_anchors = 0
-            for keyframe, pose in zip(members, estimate.poses):
+            first_refusal_index = None
+            first_refusal_degeneracy = None
+            solved_after_refusal = 0
+            for position, (keyframe, pose) in enumerate(
+                zip(members, estimate.poses)
+            ):
                 if pose.status == POSE_STATUS_SOLVED:
                     poses_solved += 1
                     segment_solved += 1
@@ -448,6 +601,23 @@ class WorldBuilderEngine:
                     segment_anchors += 1
                 else:
                     poses_refused += 1
+                    if first_refusal_index is None:
+                        first_refusal_index = position
+                        first_refusal_degeneracy = pose.degeneracy
+                        poses_refused_root += 1
+                        refusal_degeneracy[pose.degeneracy] = (
+                            refusal_degeneracy.get(pose.degeneracy, 0) + 1
+                        )
+                    else:
+                        poses_refused_cascaded += 1
+                if (
+                    pose.status == POSE_STATUS_SOLVED
+                    and first_refusal_index is not None
+                ):
+                    # Cannot happen while the chain latches. Counted anyway,
+                    # so that if a recovery mechanism is ever added its
+                    # effect is visible instead of being invisible.
+                    solved_after_refusal += 1
                 pose_rows.append(
                     self._pose_row(keyframe, pose, segment)
                 )
@@ -458,6 +628,18 @@ class WorldBuilderEngine:
             poses_positioned += segment_solved
             if segment_solved:
                 poses_positioned += segment_anchors
+
+            if first_refusal_index is not None:
+                refusals_by_segment[segment] = {
+                    "first_refusal_index": first_refusal_index,
+                    "degeneracy": first_refusal_degeneracy,
+                    # Keyframes the segment held but never attempted
+                    # geometry for, because the chain had already latched.
+                    "abandoned_keyframes": (
+                        len(members) - first_refusal_index - 1
+                    ),
+                    "recovered": solved_after_refusal > 0,
+                }
 
             for previous, current, pose in zip(
                 members, members[1:], estimate.poses[1:]
@@ -481,6 +663,17 @@ class WorldBuilderEngine:
                         quality=Confidence.from_score(pose.inlier_ratio),
                     ),
                 )
+
+            segment_discards = estimate.diagnostics.get("points_discarded") or {}
+            discards_by_segment[segment] = {
+                "low_parallax": int(segment_discards.get("low_parallax", 0)),
+                "high_reprojection": int(
+                    segment_discards.get("high_reprojection", 0)
+                ),
+            }
+            total_triangulated += int(
+                estimate.diagnostics.get("points_triangulated", 0)
+            )
 
             if estimate.points is not None:
                 # Tagged with the segment that produced them. Segments do
@@ -558,6 +751,13 @@ class WorldBuilderEngine:
                 "keyframes": len(keyframes),
                 "poses_solved": poses_solved,
                 "poses_refused": poses_refused,
+                # Split, because the total conflates a decision with its
+                # consequences. root + cascaded == poses_refused, always.
+                "poses_refused_root": poses_refused_root,
+                "poses_refused_cascaded": poses_refused_cascaded,
+                # Over ROOT refusals only -- the cascaded ones carry the
+                # root's label and would trebly count one decision.
+                "refusal_degeneracy_counts": refusal_degeneracy,
                 # Both reported. Suppressing the anchors would replace one
                 # misleading number with a missing one; a reader should be
                 # able to see "36 segment origins and no trajectory",
@@ -565,6 +765,23 @@ class WorldBuilderEngine:
                 "poses_anchor": poses_anchor,
                 "poses_positioned": poses_positioned,
                 "points": total_points,
+                # What was triangulated but refused, and why. Stated
+                # rather than left to be inferred: a consumer seeing only
+                # the surviving points cannot otherwise tell a sparse
+                # world from a heavily filtered one, and those call for
+                # different responses from whoever is wearing the glasses.
+                # Zero is written explicitly -- absent would mean "this
+                # build predates the counter", which is a different fact.
+                "points_discarded": {
+                    "low_parallax": sum(
+                        d["low_parallax"] for d in discards_by_segment.values()
+                    ),
+                    "high_reprojection": sum(
+                        d["high_reprojection"]
+                        for d in discards_by_segment.values()
+                    ),
+                },
+                "points_triangulated": total_triangulated,
                 "segments": len(segments),
                 "scale_state": scale_state,
             },
@@ -581,6 +798,10 @@ class WorldBuilderEngine:
             segments=len(segments),
             scale_state=scale_state,
             downgraded_from=selection.downgraded_from,
+            diagnostics={
+                "points_discarded_by_segment": discards_by_segment,
+                "refusals_by_segment": refusals_by_segment,
+            },
         )
 
     # -- internals -----------------------------------------------------
@@ -807,17 +1028,25 @@ class _LiveSolve:
         self._open: list[str] = []
         self._frozen: dict[int, tuple[tuple[str, ...], object]] = {}
 
-    def extend(self, keyframe_id: str, gray) -> None:
+    def extend(self, keyframe_id: str, gray):
+        """Extend the open solve and return the backend's Extension.
+
+        The return value was previously discarded. It carries
+        `chain_broken`, the signal that lets the engine split a segment
+        when the solve fails instead of refusing every later keyframe in
+        it without looking.
+        """
         if not self.usable:
-            return
+            return None
         try:
-            self.backend.extend(
+            step = self.backend.extend(
                 KeyframeInput(keyframe_id=keyframe_id, image_gray=gray)
             )
         except Exception:
             self._give_up("extending")
-            return
+            return None
         self._open.append(keyframe_id)
+        return step
 
     def close_segment(self, segment_index: int) -> None:
         if not self.usable:

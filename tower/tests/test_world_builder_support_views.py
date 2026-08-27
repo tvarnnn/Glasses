@@ -32,7 +32,10 @@ import pytest
 
 from tests import synthetic_scene as ss
 from tower.world_builder.backend import KeyframeInput
-from tower.world_builder.backends.classical import ClassicalTwoViewBackend
+from tower.world_builder.backends.classical import (
+    EXTEND_REFERENCE_DEPTH,
+    ClassicalTwoViewBackend,
+)
 from tower.world_builder.engine import WorldBuilderEngine
 from tower.world_builder.geometry import detect_and_describe
 from tower.world_builder.records import CameraIntrinsics
@@ -280,8 +283,19 @@ def test_the_live_table_outlives_the_pruning_it_survives(window, intrinsics):
         np.unique(backend.snapshot().points.support_views[:, 0]).tolist()
     )
 
-    assert len(retained) == 1, "the prune is still doing its job"
-    assert len(frames) > 1, "and the association is not derived from it"
+    # Bounded by the reference window, not fixed at one. `_extend` now
+    # looks back EXTEND_REFERENCE_DEPTH keyframes for further sightings
+    # of landmarks it already holds, so the prune must retain that many
+    # frames rather than one. The property being defended is unchanged
+    # and is the reason this test exists: what survives is a CONSTANT
+    # number of frames, not a number that grows with the walk.
+    assert 1 <= len(retained) <= EXTEND_REFERENCE_DEPTH, (
+        f"the prune is still doing its job: retained {len(retained)} frames "
+        f"against a reference depth of {EXTEND_REFERENCE_DEPTH}"
+    )
+    assert len(frames) > len(retained), (
+        "and the association is not derived from it"
+    )
 
 
 def test_the_live_delta_names_only_the_landmarks_it_carries(window, intrinsics):

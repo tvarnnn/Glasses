@@ -44,6 +44,7 @@ from tower.world_builder.geometry import (
     homography_ratio,
     match_indices,
     median_triangulation_angle_deg,
+    landmark_gate,
     triangulate_points,
 )
 from tower.world_builder.records import CameraIntrinsics
@@ -63,6 +64,42 @@ from tower.world_builder.schema import (
 MIN_PNP_CORRESPONDENCES = 12
 PNP_REPROJECTION_ERROR_PX = 3.0
 
+# How many ACCEPTED keyframes back this backend will look for further
+# sightings of landmarks it already has. 1 restores the historical
+# behaviour exactly -- match the previous keyframe and nothing else --
+# and is the control the benchmark neutralises to.
+#
+# WHY THIS EXISTS. 66.1% of landmarks were seen by exactly two views
+# (measured on the previous engine; the HEAD figure is Stage 0's job). A
+# two-view landmark is exactly determined -- two rays, one intersection
+# -- so it constrains nothing, which is why a bundle adjuster measured
+# 0.00% improvement here: two-thirds of the map was invisible to it by
+# construction, not by any failure of the solver.
+#
+# WHY 3. Per pair asked, the useful-edge yield falls off a cliff after
+# about three keyframes of separation -- roughly 58% at gap 1, 49% at
+# gaps 2-5, 30% at 6-20 -- and this pipeline's own gate accepts 50.4 /
+# 49.5 / 47.8% at gaps 1 / 2 / 3 before decaying. Gaps 1-3 are flat and
+# cheap. Past that the right instrument is retrieval, not a wider sweep.
+#
+# WHAT IT COSTS. It is NOT pose-neutral, and an earlier draft of this
+# comment claiming otherwise was wrong. Guided associations are merged
+# into `observed`, which the next keyframe's PnP draws correspondences
+# from, so later poses can move. Withholding them keeps poses frozen and
+# publishes a support table naming one image point as two landmarks --
+# measured at 2 such rows at DEPTH=1 against 147 at DEPTH=3 -- which is
+# worse, because that table is what cross-segment registration solves
+# against. See _reobserve_against_pose.
+#
+# MEASURED, 30 real segments, DEPTH 1 -> 3: >=3-view share rose on 18
+# segments and fell on ZERO (median +3.46 points); poses_solved was
+# unchanged on 27, better on 2, worse on 1; the point count FELL on 13,
+# and on every one of those 13 observations-per-landmark ROSE. That is
+# duplicate landmarks being merged, not structure being lost -- the same
+# reuse `_extend` already performs over a one-frame window, extended to
+# DEPTH frames.
+EXTEND_REFERENCE_DEPTH = 3
+
 # Rows of PointBlock.support_views: [frame index, feature index, landmark
 # index]. int32, not int64: ORB is capped at a few thousand features per
 # frame and a segment holds tens of thousands of landmarks, so every
@@ -70,6 +107,56 @@ PNP_REPROJECTION_ERROR_PX = 3.0
 # the one piece of solve state that is never pruned -- half the width is
 # half the resident cost for the whole walk.
 SUPPORT_DTYPE = np.int32
+
+
+def _solve_pnp_ransac_or_refuse(object_points, image_points, camera_matrix):
+    """solvePnPRansac, converting a solver assertion into a refusal.
+
+    SQPNP raises rather than returning False when the minimal sample
+    RANSAC draws has degenerate coordinate variance:
+
+        sqpnp.cpp:236 (-215) point_coordinate_variance >= POINT_VARIANCE_THRESHOLD
+
+    Which sample gets drawn is data-dependent, so this fires on some real
+    walks and not others. Reproduced on the 33-segment world built from
+    capture 22e9d428.
+
+    A degenerate configuration is exactly what a refusal is FOR. Letting
+    the assertion escape turns "this keyframe could not be posed" into
+    "the reconstruction process died", which on the live path means a walk
+    ends mid-room.
+
+    Inputs are validated BEFORE the call, so a cv2.error reaching the
+    handler is a statement about the GEOMETRY rather than about our
+    argument marshalling. That distinction needs enforcing rather than
+    asserting: OpenCV raises cv2.error for malformed arguments too, so
+    catching it without validating first would hide a real bug in this
+    repo as an innocent refusal -- which is how a pipeline quietly stops
+    reconstructing.
+    """
+    object_points = np.asarray(object_points, dtype=np.float64)
+    image_points = np.asarray(image_points, dtype=np.float64)
+    if object_points.ndim != 2 or object_points.shape[1] != 3:
+        raise ValueError(
+            f"object_points must be (N, 3), got {object_points.shape}"
+        )
+    if image_points.shape != (len(object_points), 2):
+        raise ValueError(
+            f"image_points must be ({len(object_points)}, 2), got "
+            f"{image_points.shape}"
+        )
+    try:
+        return cv2.solvePnPRansac(
+            object_points,
+            image_points,
+            camera_matrix,
+            None,
+            reprojectionError=PNP_REPROJECTION_ERROR_PX,
+            confidence=RANSAC_CONFIDENCE,
+            flags=cv2.SOLVEPNP_SQPNP,
+        )
+    except cv2.error:
+        return False, None, None, None
 
 
 def _support_block(rows) -> np.ndarray:
@@ -131,12 +218,22 @@ class ClassicalTwoViewBackend(GeometryBackend):
         if not window:
             return GeometryEstimate(poses=())
 
+        # Created before any early return below. The batch and live paths
+        # are asserted bit-identical (test_world_builder_incremental
+        # TestBitIdenticalEquivalence), and the live path always reports a
+        # tally -- so a degenerate window that returns early must report
+        # zeros here, not omit the key. Absent would mean "this build
+        # predates the counter", which is a different fact from "nothing
+        # was discarded".
+        tally = self._new_discard_tally()
         features = [detect_and_describe(frame.image_gray) for frame in window]
         poses: list[PoseEstimate] = [
             PoseEstimate(keyframe_id=window[0].keyframe_id, status=POSE_STATUS_ANCHOR)
         ]
         if len(window) == 1:
-            return GeometryEstimate(poses=tuple(poses))
+            return GeometryEstimate(
+                poses=tuple(poses), diagnostics=_discard_diagnostics(tally)
+            )
 
         # -- initialise from the first pair -----------------------------
         pair = self._estimate_pair(features[0], features[1], window[1].keyframe_id)
@@ -152,7 +249,10 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 )
                 for frame in window[2:]
             )
-            return GeometryEstimate(poses=tuple(poses))
+            self._add_discards(tally, pair.discarded, len(pair.points))
+            return GeometryEstimate(
+                poses=tuple(poses), diagnostics=_discard_diagnostics(tally)
+            )
 
         # World frame == first keyframe's camera frame.
         absolute = {
@@ -160,6 +260,8 @@ class ClassicalTwoViewBackend(GeometryBackend):
             1: (pair.estimate.rotation, pair.estimate.translation),
         }
         landmarks = list(pair.points)
+        # Publishability, index-aligned with `landmarks`.
+        landmark_ok = list(pair.quality)
         # (frame index, feature index) -> landmark index, so a later frame
         # can find 3-D correspondences for the features it matched.
         observed: dict[tuple[int, int], int] = {}
@@ -183,11 +285,20 @@ class ClassicalTwoViewBackend(GeometryBackend):
             seed.append((0, index_a, offset))
             seed.append((1, index_b, offset))
         support.append(_support_block(seed))
+        self._add_discards(tally, pair.discarded, len(pair.points))
 
         # -- extend by PnP ----------------------------------------------
         for current in range(2, len(window)):
             previous = current - 1
-            estimate, new_points, new_observed, reobserved = self._extend(
+            (
+                estimate,
+                new_points,
+                new_observed,
+                reobserved,
+                extend_discards,
+                extend_quality,
+                published_reobserved,
+            ) = self._extend(
                 features[previous],
                 features[current],
                 previous,
@@ -196,7 +307,15 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 landmarks,
                 observed,
                 window[current].keyframe_id,
+                extra_references=[
+                    (index, features[index])
+                    for index in range(
+                        previous - 1, current - 1 - EXTEND_REFERENCE_DEPTH, -1
+                    )
+                    if index >= 0 and index in absolute
+                ],
             )
+            self._add_discards(tally, extend_discards, len(new_points))
             poses.append(estimate)
             if estimate.status != POSE_STATUS_SOLVED:
                 # Stop chaining. Remaining frames are honestly unavailable;
@@ -215,11 +334,13 @@ class ClassicalTwoViewBackend(GeometryBackend):
             support.append(
                 _support_block(
                     (frame, feature, landmark)
-                    for (frame, feature), landmark in reobserved.items()
+                    for (frame, feature), landmark
+                    in published_reobserved.items()
                 )
             )
             base = len(landmarks)
             landmarks.extend(new_points)
+            landmark_ok.extend(extend_quality)
             for key, offset in new_observed.items():
                 observed[key] = base + offset
             support.append(
@@ -229,15 +350,12 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 )
             )
 
-        block = (
-            PointBlock(
-                xyz=np.asarray(landmarks, dtype=np.float32),
-                support_views=_support_table(support),
-            )
-            if landmarks
-            else None
+        block = _publishable_block(landmarks, landmark_ok, support)
+        return GeometryEstimate(
+            poses=tuple(poses),
+            points=block,
+            diagnostics=_discard_diagnostics(tally),
         )
-        return GeometryEstimate(poses=tuple(poses), points=block)
 
     # -- the incremental seam -------------------------------------------
     #
@@ -294,6 +412,8 @@ class ClassicalTwoViewBackend(GeometryBackend):
 
         features = detect_and_describe(frame.image_gray)
         new_points: list = []
+        # Publishability for THIS delta, index-aligned with new_points.
+        new_points_ok: list = []
         # Rows for THIS keyframe's delta block, landmark indices local to
         # it. The chain's own copy carries the same rows shifted into the
         # accumulated map.
@@ -310,12 +430,15 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 chain.previous_features, features, frame.keyframe_id
             )
             pose = pair.estimate
+            self._add_discards(chain.discarded, pair.discarded, len(pair.points))
             if pose.status != POSE_STATUS_SOLVED:
                 chain.broken = pose.degeneracy
             else:
                 chain.absolute[1] = (pose.rotation, pose.translation)
                 chain.landmarks.extend(pair.points)
+                chain.landmark_ok.extend(pair.quality)
                 new_points = pair.points
+                new_points_ok = list(pair.quality)
                 for offset, (index_a, index_b) in enumerate(
                     pair.inlier_index_pairs
                 ):
@@ -327,7 +450,15 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 # and map-relative indices coincide here and only here.
                 chain.support.append(_support_block(delta_support))
         else:
-            pose, triangulated, new_observed, reobserved = self._extend(
+            (
+                pose,
+                triangulated,
+                new_observed,
+                reobserved,
+                extend_discards,
+                extend_quality,
+                published_reobserved,
+            ) = self._extend(
                 chain.previous_features,
                 features,
                 index - 1,
@@ -336,6 +467,14 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 chain.landmarks,
                 chain.observed,
                 frame.keyframe_id,
+                extra_references=[
+                    (older_index, older)
+                    for older_index, older in chain.older_features
+                    if older_index in chain.absolute
+                ],
+            )
+            self._add_discards(
+                chain.discarded, extend_discards, len(triangulated)
             )
             if pose.status != POSE_STATUS_SOLVED:
                 chain.broken = pose.degeneracy
@@ -345,11 +484,14 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 chain.support.append(
                     _support_block(
                         (frame, feature, landmark)
-                        for (frame, feature), landmark in reobserved.items()
+                        for (frame, feature), landmark
+                        in published_reobserved.items()
                     )
                 )
                 base = len(chain.landmarks)
                 chain.landmarks.extend(triangulated)
+                chain.landmark_ok.extend(extend_quality)
+                new_points_ok = list(extend_quality)
                 new_points = triangulated
                 for key, offset in new_observed.items():
                     chain.observed[key] = base + offset
@@ -367,18 +509,28 @@ class ClassicalTwoViewBackend(GeometryBackend):
 
         chain.poses.append(pose)
         chain.count += 1
+        if chain.previous_features is not None:
+            # The frame that WAS `previous` becomes an older reference.
+            # Bounded to DEPTH - 1 because `previous_features` is the
+            # first of the DEPTH references.
+            chain.older_features.insert(0, (index - 1, chain.previous_features))
+            del chain.older_features[EXTEND_REFERENCE_DEPTH - 1 :]
         chain.previous_features = features
         if chain.broken is None:
             chain.forget_before(index)
+        # The delta is filtered exactly as the snapshot is, so a viewer
+        # that appends every delta ends up holding what snapshot() says --
+        # an invariant the incremental suite asserts directly.
         return Extension(
             pose=pose,
-            new_points=(
-                PointBlock(
-                    xyz=np.asarray(new_points, dtype=np.float32),
-                    support_views=_support_block(delta_support),
-                )
-                if new_points
-                else None
+            # An EDGE. extend() returns early above when the chain is
+            # already broken, so reaching here with chain.broken set
+            # means THIS keyframe broke it. A `not was_broken` guard
+            # used to sit here and was dead code -- it was evaluated
+            # after that early return, so it was always False.
+            chain_broken=chain.broken is not None,
+            new_points=_publishable_block(
+                new_points, new_points_ok, [_support_block(delta_support)]
             ),
         )
 
@@ -386,25 +538,71 @@ class ClassicalTwoViewBackend(GeometryBackend):
         chain = self._chain
         if chain is None or chain.count == 0:
             return GeometryEstimate(poses=())
-        block = (
-            PointBlock(
-                xyz=np.asarray(chain.landmarks, dtype=np.float32),
-                support_views=_support_table(chain.support),
-            )
-            if chain.landmarks
-            else None
+        block = _publishable_block(
+            chain.landmarks, chain.landmark_ok, chain.support
         )
-        return GeometryEstimate(poses=tuple(chain.poses), points=block)
+        return GeometryEstimate(
+            poses=tuple(chain.poses),
+            points=block,
+            diagnostics=_discard_diagnostics(chain.discarded),
+        )
 
     # -- helpers --------------------------------------------------------
 
-    class _PairResult:
-        __slots__ = ("estimate", "points", "inlier_index_pairs")
+    @staticmethod
+    def _new_discard_tally():
+        return {"low_parallax": 0, "high_reprojection": 0, "produced": 0}
 
-        def __init__(self, estimate, points, inlier_index_pairs):
+    @staticmethod
+    def _add_discards(tally, counts, kept):
+        """Fold one triangulation call into a running tally.
+
+        `produced` is the number of landmarks that entered the MAP.
+        Refusals are a subset of it -- a refused landmark is still in the
+        map, just not publishable -- so they are not added again here.
+        The manifest can then state the identity
+        published + refused == triangulated rather than leaving a consumer
+        to infer that the points it can see are all that were ever made.
+        """
+        tally["low_parallax"] += counts.get("low_parallax", 0)
+        tally["high_reprojection"] += counts.get("high_reprojection", 0)
+        # `kept` is what entered the MAP. Refusals are a subset of it --
+        # a refused landmark is still in the map, just not publishable --
+        # so it must not be added again here.
+        tally["produced"] += kept
+        return tally
+
+
+    class _PairResult:
+        __slots__ = (
+            "estimate",
+            "points",
+            "inlier_index_pairs",
+            "discarded",
+            "quality",
+        )
+
+        def __init__(
+            self,
+            estimate,
+            points,
+            inlier_index_pairs,
+            discarded=None,
+            quality=None,
+        ):
             self.estimate = estimate
             self.points = points
             self.inlier_index_pairs = inlier_index_pairs
+            self.discarded = discarded or {
+                "low_parallax": 0,
+                "high_reprojection": 0,
+            }
+            # Per-landmark publishability, index-aligned with `points`.
+            # The landmarks stay in the map either way; this only says
+            # which of them a world may state a coordinate for.
+            self.quality = (
+                list(quality) if quality is not None else [True] * len(points)
+            )
 
     def _estimate_pair(self, features_a, features_b, keyframe_id):
         keypoints_a, descriptors_a = features_a
@@ -539,9 +737,9 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 [],
             )
 
-        points, keep_mask = triangulate_points(
+        points, keep_mask, quality, discarded = triangulate_points(
             inlier_a, inlier_b, rotation, translation, camera_matrix,
-            return_mask=True,
+            return_mask=True, return_quality=True,
         )
         surviving_pairs = [
             pair for pair, keep in zip(
@@ -559,6 +757,8 @@ class ClassicalTwoViewBackend(GeometryBackend):
             ),
             list(points),
             surviving_pairs,
+            discarded,
+            [bool(q) for q in quality],
         )
 
     def _extend(
@@ -571,6 +771,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
         landmarks,
         observed,
         keyframe_id,
+        extra_references=(),
     ):
         keypoints_previous, descriptors_previous = features_previous
         keypoints_current, descriptors_current = features_current
@@ -622,16 +823,33 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 [],
                 {},
                 {},
+                {"low_parallax": 0, "high_reprojection": 0},
+                [],
+                {},
             )
 
-        ok, rotation_vector, translation, inlier_indices = cv2.solvePnPRansac(
+        # `reobserved` is built ABOVE, before the solve, because
+        # observed.update(reobserved) is what lets the NEXT keyframe find
+        # correspondences at all -- starving it is what cost 26 solved
+        # poses when the landmark gate first filtered the map.
+        #
+        # Publication is a different question. An association the solver's
+        # own RANSAC called an outlier is not evidence, and support.json
+        # is consumed by cross-segment registration, which PnPs against
+        # it. Measured on capture 64f48114: 587 of 1851 offered
+        # correspondences (31.7%) were outliers and every one was
+        # published; re-observation rows reached 723,209 px reprojection
+        # on e1c52b9f while creation rows never exceeded 3.0 px.
+        reobserved_keys = list(reobserved)
+        (
+            ok,
+            rotation_vector,
+            translation,
+            inlier_indices,
+        ) = _solve_pnp_ransac_or_refuse(
             np.asarray(object_points, dtype=np.float64),
             np.asarray(image_points, dtype=np.float64),
             self._camera_matrix,
-            None,
-            reprojectionError=PNP_REPROJECTION_ERROR_PX,
-            confidence=RANSAC_CONFIDENCE,
-            flags=cv2.SOLVEPNP_SQPNP,
         )
         if not ok or inlier_indices is None or len(inlier_indices) < MIN_PNP_CORRESPONDENCES:
             return (
@@ -645,6 +863,9 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 [],
                 {},
                 {},
+                {"low_parallax": 0, "high_reprojection": 0},
+                [],
+                {},
             )
 
         rotation, _ = cv2.Rodrigues(rotation_vector)
@@ -652,7 +873,12 @@ class ClassicalTwoViewBackend(GeometryBackend):
 
         # Triangulate the features that had no landmark yet, using the two
         # absolute poses, so new structure lands directly in world frame.
-        new_points, new_observed = self._triangulate_new(
+        (
+            new_points,
+            new_observed,
+            discard_counts,
+            new_quality,
+        ) = self._triangulate_new(
             keypoints_previous,
             keypoints_current,
             matched_pairs,
@@ -661,6 +887,56 @@ class ClassicalTwoViewBackend(GeometryBackend):
             previous_index,
             current_index,
         )
+
+        # Only the correspondences the pose solve ACCEPTED are published.
+        # The full `reobserved` still goes to `observed` for solving.
+        published_reobserved = {
+            reobserved_keys[index]: reobserved[reobserved_keys[index]]
+            for index in np.asarray(inlier_indices).ravel().tolist()
+            if 0 <= index < len(reobserved_keys)
+        }
+
+        # Further sightings from older keyframes, admitted only if they
+        # reproject through the pose just solved. This runs after the
+        # solve and cannot change it -- see _reobserve_against_pose.
+        # Published on the same terms as the inliers above, because it
+        # passed the same reprojection bar those inliers were selected by.
+        guided = self._reobserve_against_pose(
+            extra_references,
+            keypoints_current,
+            descriptors_current,
+            current_index,
+            rotation,
+            translation,
+            landmarks,
+            observed,
+            claimed,
+        )
+        # Merged into `reobserved`, and so into the caller's `observed`,
+        # and NOT only into the published support.
+        #
+        # The pose-neutral variant was built first and measured, because
+        # it looked strictly safer: keep guided rows out of `observed`
+        # and no later pose can move. It produces an INCONSISTENT support
+        # table. `observed` is what the next keyframe consults to decide
+        # whether a feature already has a landmark; a guided row withheld
+        # from it means the next step finds nothing, triangulates the
+        # same physical point a second time, and publishes a support row
+        # binding that same (frame, feature) to a different landmark.
+        # Measured on the synthetic walk: 2 such rows at DEPTH=1 -- the
+        # documented seed-pair case -- against 147 at DEPTH=3.
+        #
+        # A feature naming two landmarks is not a cosmetic duplicate.
+        # `support.json` is what cross-segment registration solves PnP
+        # against, so one of those two rows is feeding a wrong 3-D point
+        # to the thing that decides where a segment sits in the world.
+        #
+        # So the association goes where associations go. The cost is that
+        # a guided row becomes a correspondence for the NEXT pose solve,
+        # which means this change is no longer provably pose-neutral and
+        # has to be measured across the corpus rather than argued.
+        reobserved.update(guided)
+        published_reobserved.update(guided)
 
         # Re-observations index into the EXISTING landmark list, so they
         # must not be shifted by the caller's `base` offset the way newly
@@ -679,7 +955,111 @@ class ClassicalTwoViewBackend(GeometryBackend):
             new_points,
             new_observed,
             reobserved,
+            discard_counts,
+            new_quality,
+            published_reobserved,
         )
+
+    def _reobserve_against_pose(
+        self,
+        extra_references,
+        keypoints_current,
+        descriptors_current,
+        current_index,
+        rotation,
+        translation,
+        landmarks,
+        observed,
+        already_claimed,
+    ):
+        """Further sightings of landmarks we already hold, from keyframes
+        older than the one the pose was solved against.
+
+        WHAT THIS IS, AND WHAT IT DELIBERATELY IS NOT
+
+        The obvious way to widen this backend is to feed several
+        references' correspondences into ONE PnP. That is a different and
+        larger change: it alters the pose directly, and pricing it
+        honestly means measuring it across the corpus. It is a reasonable
+        eventual move and it is not this.
+
+        This runs AFTER the pose is solved, so it does not participate in
+        solving THIS keyframe. It does, however, affect LATER ones: what
+        it admits is merged into `observed`, and `observed` is where the
+        next keyframe finds its correspondences. That is a deliberate
+        choice and the alternative was measured and rejected -- see the
+        comment at the call site. What it buys is how many views each
+        landmark is known to have been seen from, which is the quantity a
+        pose graph and a bundle adjuster actually consume, and the
+        quantity cross-segment
+        registration PnPs against.
+
+        WHY A REPROJECTION TEST AND NOT A MATCHER SCORE
+
+        A descriptor match is a claim about appearance. Appearance is
+        exactly what fails on repeated indoor texture -- two identical
+        chair legs match happily -- and `support.json` is consumed by
+        registration, which solves against it. So an association is
+        admitted here only if the landmark, projected through the pose we
+        just solved, lands within PNP_REPROJECTION_ERROR_PX of the
+        feature that claims it.
+
+        That threshold is deliberately not a new number. It is the same
+        one `solvePnPRansac` used to decide what counted as an inlier for
+        this very pose, so an admitted re-observation is one the pose
+        solve itself would have accepted had it been offered. Inventing a
+        looser threshold here would be inventing evidence.
+
+        Cheirality is checked too: a landmark behind the camera is
+        refused before its pixel distance is even considered, because a
+        negative depth can still reproject onto a plausible pixel.
+
+        A current feature already bound by the pose solve is never
+        rebound, and the first extra reference to claim a free feature
+        keeps it -- references are visited nearest-first, so the claim
+        order is fixed and the output does not depend on dict iteration.
+        """
+        if not extra_references:
+            return {}
+
+        projection = self._camera_matrix @ np.hstack(
+            [rotation, translation.reshape(3, 1)]
+        )
+        limit_squared = PNP_REPROJECTION_ERROR_PX * PNP_REPROJECTION_ERROR_PX
+        admitted: dict[tuple[int, int], int] = {}
+        claimed = set(already_claimed)
+
+        for ref_index, (_keypoints_ref, descriptors_ref) in extra_references:
+            for index_ref, index_current in match_indices(
+                descriptors_ref, descriptors_current
+            ):
+                if index_current in claimed:
+                    continue
+                landmark = observed.get((ref_index, index_ref))
+                if landmark is None:
+                    # Nothing triangulated from that feature, so there is
+                    # no landmark to re-observe. Triangulating one here
+                    # would be new structure, which is the pose-changing
+                    # path this method exists to stay out of.
+                    continue
+                point = landmarks[landmark]
+                projected = projection @ np.array(
+                    [point[0], point[1], point[2], 1.0], dtype=np.float64
+                )
+                depth = projected[2]
+                if not np.isfinite(depth) or depth <= 0:
+                    continue
+                u = projected[0] / depth
+                v = projected[1] / depth
+                x, y = keypoints_current[index_current].pt
+                du = u - x
+                dv = v - y
+                if du * du + dv * dv > limit_squared:
+                    continue
+                claimed.add(index_current)
+                admitted[(current_index, index_current)] = landmark
+
+        return admitted
 
     def _triangulate_new(
         self,
@@ -692,7 +1072,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
         current_index,
     ):
         if not matched_pairs:
-            return [], {}
+            return [], {}, {"low_parallax": 0, "high_reprojection": 0}, []
 
         rotation_p, translation_p = pose_previous
         rotation_c, translation_c = pose_current
@@ -711,21 +1091,119 @@ class ClassicalTwoViewBackend(GeometryBackend):
         with np.errstate(divide="ignore", invalid="ignore"):
             xyz = (homogeneous[:3] / homogeneous[3]).T
 
-        new_points, new_observed = [], {}
+        # Two absolute poses, so these landmarks are already in world
+        # frame -- and unlike the seed pair, neither pose is identity.
+        #
+        # The gate is evaluated ONLY over landmarks that will actually
+        # enter the map (finite, and in front of both cameras). Gating a
+        # wider set would count refusals for points that were never
+        # admitted anyway, and the manifest's accounting identity
+        # -- published + refused == triangulated -- would stop closing.
+        depth_p = (rotation_p @ xyz.T).T[:, 2] + translation_p[2]
+        depth_c = (rotation_c @ xyz.T).T[:, 2] + translation_c[2]
+        admissible = (
+            np.isfinite(xyz).all(axis=1) & (depth_p > 0) & (depth_c > 0)
+        )
+
+        # points_p/points_c are built TRANSPOSED above, (2, N). The gate
+        # validates shape rather than reshaping, so passing them without
+        # the .T would raise instead of silently rejecting every landmark.
+        gate_keep = np.zeros(len(xyz), dtype=bool)
+        counts = {"low_parallax": 0, "high_reprojection": 0}
+        if admissible.any():
+            subset_keep, counts = landmark_gate(
+                xyz[admissible],
+                points_p.T[admissible],
+                points_c.T[admissible],
+                pose_previous,
+                pose_current,
+                self._camera_matrix,
+            )
+            gate_keep[admissible] = subset_keep
+
+        new_points, new_observed, new_quality = [], {}, []
         for offset, ((index_p, index_c), point) in enumerate(
             zip(matched_pairs, xyz)
         ):
-            if not np.isfinite(point).all():
-                continue
-            depth_p = (rotation_p @ point + translation_p)[2]
-            depth_c = (rotation_c @ point + translation_c)[2]
-            if depth_p <= 0 or depth_c <= 0:
+            if not admissible[offset]:
                 continue
             landmark = len(new_points)
             new_points.append(point)
+            # Kept in the map regardless of the gate -- see the comment in
+            # geometry.triangulate_points. The gate decides publication,
+            # not whether PnP may use the bearing.
+            new_quality.append(bool(gate_keep[offset]))
             new_observed[(previous_index, index_p)] = landmark
             new_observed[(current_index, index_c)] = landmark
-        return new_points, new_observed
+        return new_points, new_observed, counts, new_quality
+
+
+def _publishable_block(landmarks, landmark_ok, support_blocks):
+    """The PointBlock a world may actually state, plus remapped support.
+
+    Landmarks the gate refused stay in the solver's map -- they are usable
+    bearings -- but a world must not publish a coordinate it cannot
+    defend. Filtering happens HERE, at the boundary, so that removing a
+    point from the output can never change which poses were solved.
+
+    Support rows name landmarks by index, so dropping landmarks requires
+    remapping the survivors and discarding rows that point at the dropped
+    ones. Getting this wrong would silently mis-attribute observations to
+    the wrong 3-D point, which is worse than publishing nothing.
+    """
+    if not landmarks:
+        return None
+    # Deliberately NOT padded. On the one array whose desync means
+    # "publish a coordinate you cannot defend", defaulting to True fails
+    # in the direction that ships unvetted geometry, and an over-long
+    # list would be silently truncated. Both are bugs in this file, not
+    # conditions to tolerate at runtime.
+    if len(landmark_ok) != len(landmarks):
+        raise ValueError(
+            f"landmark_ok has {len(landmark_ok)} entries for "
+            f"{len(landmarks)} landmarks; they are appended together and "
+            f"must stay in lockstep"
+        )
+    ok = list(landmark_ok)
+    remap = {}
+    kept = []
+    for index, landmark in enumerate(landmarks):
+        if ok[index]:
+            remap[index] = len(kept)
+            kept.append(landmark)
+    if not kept:
+        return None
+
+    table = _support_table(support_blocks)
+    if len(table):
+        survives = np.array(
+            [row[2] in remap for row in table], dtype=bool
+        )
+        table = table[survives]
+        if len(table):
+            table = table.copy()
+            table[:, 2] = [remap[row[2]] for row in table]
+    return PointBlock(
+        xyz=np.asarray(kept, dtype=np.float32),
+        support_views=table,
+    )
+
+
+def _discard_diagnostics(tally):
+    """Shape the running tally into the diagnostics the manifest carries.
+
+    `points_triangulated` is stated rather than left to be inferred: a
+    consumer seeing only the surviving points cannot otherwise tell a
+    sparse world from a heavily filtered one, and those need different
+    responses from whoever is holding the glasses.
+    """
+    return {
+        "points_discarded": {
+            "low_parallax": tally["low_parallax"],
+            "high_reprojection": tally["high_reprojection"],
+        },
+        "points_triangulated": tally["produced"],
+    }
 
 
 class _Chain:
@@ -742,8 +1220,11 @@ class _Chain:
         "absolute",
         "broken",
         "count",
+        "discarded",
+        "landmark_ok",
         "landmarks",
         "observed",
+        "older_features",
         "poses",
         "previous_features",
         "support",
@@ -752,6 +1233,21 @@ class _Chain:
     def __init__(self) -> None:
         self.count = 0
         self.previous_features = None
+        # (frame index, features) for the keyframes BEFORE
+        # `previous_features`, nearest first, at most
+        # EXTEND_REFERENCE_DEPTH - 1 of them. Bounded, so this is a
+        # constant, not growth -- which is the property
+        # test_retained_state_does_not_grow_with_the_number_of_keyframes
+        # asserts and which a deque of every past frame would break.
+        self.older_features: list = []
+        self.landmark_ok = []
+        # Discards accumulate for the LIFE of the chain, so the snapshot
+        # reports the whole segment rather than the last window.
+        self.discarded = {
+            "low_parallax": 0,
+            "high_reprojection": 0,
+            "produced": 0,
+        }
         self.absolute: dict[int, tuple] = {}
         self.landmarks: list = []
         # (frame index, feature index) -> landmark index. PRUNED.
@@ -772,11 +1268,22 @@ class _Chain:
     def forget_before(self, index: int) -> None:
         """Drop observations no later step can reach.
 
-        _extend() reads exactly one key shape, `observed[(previous, f)]`,
-        so once frame `index` is solved nothing will ever look up a frame
-        older than it. estimate_window() keeps them all because it is
-        over in one call. A live solve is not over, and unpruned this
-        dict grows by roughly two entries per ORB match per keyframe.
+        _extend() reads `observed[(reference, f)]` for the previous
+        keyframe AND for the EXTEND_REFERENCE_DEPTH - 1 keyframes before
+        it (see _reobserve_against_pose), so once frame `index` is solved
+        nothing will ever look up a frame older than
+        `index - (EXTEND_REFERENCE_DEPTH - 1)`. estimate_window() keeps
+        them all because it is over in one call. A live solve is not
+        over, and unpruned this dict grows by roughly two entries per ORB
+        match per keyframe.
+
+        The retained window was one frame when this backend matched only
+        its immediate predecessor. It is now DEPTH frames, so the
+        constant below is DEPTH times larger -- still a constant, which
+        is the property that matters and the one
+        test_retained_state_does_not_grow_with_the_number_of_keyframes
+        asserts. At DEPTH = 3 that is ~0.45 MB against the ~0.15 MB the
+        measurement below records, and it does not grow with the walk.
 
         `support` is deliberately NOT pruned here. It holds the same
         association and is the reason this backend records anything at
@@ -793,6 +1300,7 @@ class _Chain:
         equivalence test exists to check, not one it is asked to
         tolerate.
         """
+        oldest = index - (EXTEND_REFERENCE_DEPTH - 1)
         self.observed = {
-            key: value for key, value in self.observed.items() if key[0] == index
+            key: value for key, value in self.observed.items() if key[0] >= oldest
         }

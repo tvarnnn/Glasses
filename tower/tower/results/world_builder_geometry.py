@@ -17,10 +17,13 @@ life of the world. Only the open segment churns.
 
 import hashlib
 import json
+import logging
 from collections import Counter
 
-from tower.world_builder.records import World
+from tower.world_builder.records import PLACEMENT_REGISTERED, World
 from tower.world_builder.schema import POSE_CONVENTION
+logger = logging.getLogger(__name__)
+
 from tower.world_builder.store import (
     WorldStore,
     WorldStoreError,
@@ -154,11 +157,151 @@ def _read(store, world_id: str, session_id: str):
     return world, derived, _grouped(derived), current
 
 
+def usable_placements(store, world_id: str, session_id: str) -> dict:
+    """Placements that may be served, keyed by segment index.
+
+    Two ways a stored placement is refused here rather than shipped.
+
+    **It was solved against different geometry.** `write_derived` rewrites
+    poses and points wholesale and never touches placements.json, so a
+    Sim3 outlives the reconstruction it was fitted to. Without this check
+    it is served against points that no longer exist, still flagged
+    registered -- and the cache guarantee does not help, because
+    content_hash moves, the client refetches exactly as it should, and is
+    handed the stale transform. A placement whose `input_digest` does not
+    match the build being served is not current evidence, and a placement
+    with no digest cannot be checked at all.
+
+    **Its reference is not itself placed.** The contract says segments
+    sharing a `reference_segment` are in one space and may be drawn
+    together. A registered row pointing at a segment that is absent,
+    dropped as unrepresentable, or itself refused invites a client to
+    composite geometry into a frame nothing defines. A cluster missing its
+    origin is worse than no cluster.
+    """
+    stored = store.read_placements(world_id, session_id) or []
+    if not stored:
+        return {}
+
+    manifest = store.read_derived_manifest(world_id) or {}
+    digest = manifest.get("input_digest")
+    fresh = {}
+    for placement in stored:
+        if digest is None or placement.input_digest != digest:
+            logger.warning(
+                "world builder: placement for segment %s was solved against "
+                "a different build (%r, current %r); serving it as unplaced",
+                placement.segment_index,
+                placement.input_digest,
+                digest,
+            )
+            continue
+        fresh[placement.segment_index] = placement
+
+    registered = {
+        index for index, p in fresh.items() if p.state == PLACEMENT_REGISTERED
+    }
+    usable = {}
+    for index, placement in fresh.items():
+        if (
+            placement.state == PLACEMENT_REGISTERED
+            and placement.reference_segment not in registered
+        ):
+            logger.warning(
+                "world builder: segment %s is placed against reference %s, "
+                "which is not itself placed; refusing the placement rather "
+                "than inviting a composite into an undefined frame",
+                index,
+                placement.reference_segment,
+            )
+            continue
+        usable[index] = placement
+    return usable
+
+
+def placement_hash(placement) -> str:
+    """A hash over WHERE a segment sits, separate from what it contains.
+
+    `content_hash` covers poses and points only, deliberately, so a
+    segment that gains a placement keeps its content hash. That is a
+    feature only if something else carries the placement -- otherwise a
+    client holding a cached chunk never refetches and draws an unplaced
+    version of a segment the world now knows how to place, and no test
+    catches it because the fields it would check are constants.
+
+    This is that something else. A client keys its cache on
+    (content_hash, placement_hash).
+    """
+    if placement is None:
+        payload = {"state": "unplaced"}
+    else:
+        payload = {
+            "state": placement.state,
+            "rotation_wxyz": (
+                list(placement.rotation_wxyz)
+                if placement.rotation_wxyz
+                else None
+            ),
+            "translation": (
+                list(placement.translation) if placement.translation else None
+            ),
+            "scale": placement.scale,
+            "reference_segment": placement.reference_segment,
+            "frame_revision": placement.frame_revision,
+            # Served, therefore hashed. It was omitted, and on the real
+            # corpus 26 of 29 segments are refused and shared ONE
+            # placement_hash -- so a re-registration that changed every
+            # refusal reason moved no hash a client is told to key on,
+            # and a conforming client showed stale reason text forever.
+            "refusal_reason": placement.refusal_reason,
+        }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _placement_fields(placement) -> dict:
+    """The wire view of a placement.
+
+    `registered` stays a plain bool so an older decoder keeps working.
+    `registration_state` is the field that can actually tell a refusal
+    from an untried segment, which `registered: false` alone could not --
+    and on the real corpus the refusal is usually "the wearer stood
+    still", a message about how to walk rather than about the software.
+    """
+    if placement is None:
+        return {
+            "registered": False,
+            "registration_state": "unplaced",
+            "transform_to_world": None,
+            "registration_refusal_reason": None,
+        }
+    if placement.state == "registered":
+        return {
+            "registered": True,
+            "registration_state": "registered",
+            "transform_to_world": {
+                "rotation_wxyz": list(placement.rotation_wxyz),
+                "translation": list(placement.translation),
+                "scale": placement.scale,
+                "reference_segment": placement.reference_segment,
+                "frame_revision": placement.frame_revision,
+            },
+            "registration_refusal_reason": None,
+        }
+    return {
+        "registered": False,
+        "registration_state": "refused",
+        "transform_to_world": None,
+        "registration_refusal_reason": placement.refusal_reason,
+    }
+
+
 def build_manifest(store, world_id: str, session_id: str) -> dict | None:
     read = _read(store, world_id, session_id)
     if read is None:
         return None
     world, _, grouped, current = read
+    placements = usable_placements(store, world_id, session_id)
 
     segments = []
     for index in sorted(grouped):
@@ -168,12 +311,12 @@ def build_manifest(store, world_id: str, session_id: str) -> dict | None:
             "segment_index": index,
             "content_hash": segment_content_hash(poses, points),
             "frame_id": f"segment:{index}",
-            # Nothing registers segments yet. When it does, this flips and
-            # `transform_to_world` carries a Sim3 -- and because the
-            # segment's own geometry does not move, every cached
-            # content_hash stays valid across that change.
-            "registered": False,
-            "transform_to_world": None,
+            # Placement is separate from content on purpose: a segment's
+            # own geometry does not move when it is placed, so every
+            # cached content_hash stays valid -- which is safe only
+            # because placement_hash exists to change instead.
+            **_placement_fields(placements.get(index)),
+            "placement_hash": placement_hash(placements.get(index)),
             "resolution_state": "resolved" if points else "unresolved",
             "dominant_degeneracy": _dominant_degeneracy(poses),
             "keyframe_count": len(poses),
@@ -191,7 +334,13 @@ def build_manifest(store, world_id: str, session_id: str) -> dict | None:
         # for one. False means "this geometry is real, and behind the
         # newest keyframes" -- the normal state during a walk.
         "current": current,
-        "geometry_revision": _revision_over([s["content_hash"] for s in segments]),
+        # Over BOTH hashes. A placement-only change moves no content
+        # hash, so a rollup over content alone would leave a client with
+        # no signal that anything had moved.
+        "geometry_revision": _revision_over(
+            [s["content_hash"] for s in segments]
+            + [s["placement_hash"] for s in segments]
+        ),
         "pose_convention": dict(world.pose_convention or POSE_CONVENTION),
         "scale": {
             "state": world.scale.state,
@@ -217,6 +366,9 @@ def build_segment(
     if read is None:
         return None
     _, _, grouped, current = read
+    placement = usable_placements(store, world_id, session_id).get(
+        segment_index
+    )
     if segment_index not in grouped:
         return None
 
@@ -255,8 +407,8 @@ def build_segment(
         "segment_index": segment_index,
         "content_hash": content_hash,
         "frame_id": f"segment:{segment_index}",
-        "registered": False,
-        "transform_to_world": None,
+        **_placement_fields(placement),
+        "placement_hash": placement_hash(placement),
         "poses": [
             {
                 "keyframe_id": p["keyframe_id"],
