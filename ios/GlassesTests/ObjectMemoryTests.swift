@@ -411,6 +411,15 @@ final class ObjectMemoryStubProtocol: URLProtocol {
     /// reset in `setUp`.
     static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
     static var requestedURLs: [URL] = []
+    /// The whole request, not just its URL.
+    ///
+    /// A URL alone cannot answer "did the request that actually ran carry the
+    /// deadline the client claims to set?", and a test that reads the client's
+    /// own `timeout` property back instead is reading the literal it was
+    /// initialised with — it stays green when the `timeoutInterval` is dropped
+    /// from the `URLRequest` and the call silently inherits `URLSession`'s
+    /// 60-second default.
+    static var requestedRequests: [URLRequest] = []
 
     override class func canInit(with request: URLRequest) -> Bool { true }
 
@@ -418,6 +427,7 @@ final class ObjectMemoryStubProtocol: URLProtocol {
 
     override func startLoading() {
         if let url = request.url { ObjectMemoryStubProtocol.requestedURLs.append(url) }
+        ObjectMemoryStubProtocol.requestedRequests.append(request)
         guard let handler = ObjectMemoryStubProtocol.handler else {
             client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
             return
@@ -461,11 +471,13 @@ final class ObjectMemoryTransportTests: XCTestCase {
         super.setUp()
         ObjectMemoryStubProtocol.handler = nil
         ObjectMemoryStubProtocol.requestedURLs = []
+        ObjectMemoryStubProtocol.requestedRequests = []
     }
 
     override func tearDown() {
         ObjectMemoryStubProtocol.handler = nil
         ObjectMemoryStubProtocol.requestedURLs = []
+        ObjectMemoryStubProtocol.requestedRequests = []
         super.tearDown()
     }
 
@@ -1150,7 +1162,16 @@ final class ObjectMemoryCopyTests: XCTestCase {
         assertNoOverclaim([cartridge.summary], classes: classes)
         XCTAssertFalse(cartridge.summary.lowercased().contains("where"))
         XCTAssertEqual(cartridge.workspace, .objectMemory)
-        XCTAssertEqual(cartridge.status, .planned, "a screen does not promote a roadmap position")
+        // Was `.planned`, asserted as "a screen does not promote a roadmap
+        // position" — true while the badge answered a roadmap question. It no
+        // longer does. `CartridgeStatus` now answers what a person can do in
+        // this build, and Object Memory has two live HTTP routes and a decoder
+        // pinned against a real Tower's bytes further down this very file.
+        //
+        // The live Tower answering 404 (`no object memory root is configured`)
+        // does not change this: that is one Tower's configuration, and the
+        // workspace renders it truthfully — see the tests above.
+        XCTAssertEqual(cartridge.status, .readyToTest)
     }
 }
 

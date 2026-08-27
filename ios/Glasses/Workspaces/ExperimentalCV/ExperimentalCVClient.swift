@@ -43,8 +43,16 @@ extension ExperimentalCVClient {
     }
 }
 
-/// The only Experimental CV Lab client that exists: the Tower cannot run
-/// experiments, and says so.
+/// The only Experimental CV Lab client that exists: the Tower runs one
+/// experiment, chose it when it started, and offers nothing this app can ask
+/// about it — so the cartridge is unsupported, and says exactly why.
+///
+/// "The Tower cannot run experiments" is what this doc used to say, and it is
+/// not true: the Tower is running one right now, and its result reaches the app
+/// on every per-frame reply. What does not exist is the *cartridge* channel —
+/// a declared contract, a list of experiments, a way to request one, a result
+/// with provenance attached — which is a much narrower and much more useful
+/// thing to say, and is what `reason` below says.
 ///
 /// It declares **no experiments**. The temptation here is a list of plausible
 /// ones — edge detection, optical flow, ORB — drawn from the module spec's
@@ -57,13 +65,33 @@ final class UnavailableExperimentalCVClient: ExperimentalCVClient {
     /// Note the boundary this sentence keeps: it describes what the Tower
     /// *replies*, which this app observes on every frame, and says nothing
     /// about what the Tower stores, which this app has no way to know.
+    ///
+    /// Compiled twice, because the middle clause is a claim about this app and
+    /// not about the Tower. The frame path is `#if DEBUG` (`ProjectManager`),
+    /// so a Release build sends no frames and receives no reply — while this
+    /// string still renders there, via `CartridgeStatePanel`, on a workspace
+    /// `ContentView` does not gate out of Release. See the note on
+    /// `ExperimentalCVWorkspaceView.headerSubtitle` for the whole picture; the
+    /// refusal itself is identical in both builds, because it is a fact about
+    /// the protocol rather than about the build.
+    #if DEBUG
     static let reason = """
         The Tower runs one experiment, chosen when it started, and this app \
         cannot ask it to run another. Its per-frame reply carries that \
-        experiment's own result, which the home screen shows; what does not \
-        exist yet is a way to list the experiments, request one, or read a \
+        experiment's own result, which this workspace shows above; what does \
+        not exist yet is a way to list the experiments, request one, or read a \
         result with provenance attached, so nothing can be launched from here.
         """
+    #else
+    static let reason = """
+        The Tower runs one experiment, chosen when it started, and this app \
+        cannot ask it to run another. Its per-frame reply carries that \
+        experiment's own result, and this build sends the Tower no frames, so \
+        no reply arrives to show; what does not exist yet is a way to list the \
+        experiments, request one, or read a result with provenance attached, \
+        so nothing can be launched from here.
+        """
+    #endif
 
     let cartridgeID = "experimental-cv"
 

@@ -347,9 +347,20 @@ final class WorldFragmentsModelTests: XCTestCase {
 
         XCTAssertEqual(model.fragments.map(\.segmentIndex), [0, 2, 4])
 
-        // And asked twice, it answers the same. The order is a function of the
-        // manifest, not of how the sort happened to run.
-        XCTAssertEqual(model.fragments, model.fragments)
+        // The order must be a function of the manifest's CONTENT, not of the
+        // order the segments happened to arrive in. `model.fragments` compared
+        // against itself would be a tautology -- `ranked` is pure, so that
+        // holds for any implementation including an unstable sort and including
+        // identity. Feeding the same segments in a different arrival order and
+        // demanding the same output is the assertion that actually
+        // discriminates.
+        let shuffled = WorldFragmentsModel(segments: [
+            summary(index: 2, points: 100, state: .resolved, bounds: box),
+            summary(index: 4, points: 100, state: .resolved, bounds: box),
+            summary(index: 0, points: 100, state: .resolved, bounds: box),
+        ])
+        XCTAssertEqual(shuffled.fragments.map(\.segmentIndex), [0, 2, 4])
+        XCTAssertEqual(shuffled.fragments, model.fragments)
     }
 
     func testRankingReordersTheGridAndNeverChangesWhatIsInIt() {
@@ -372,7 +383,14 @@ final class WorldFragmentsModelTests: XCTestCase {
         XCTAssertEqual(model.headline, "2 fragments, not yet connected")
     }
 
-    func testRankingAnEmptyOrSingleFragmentWorldIsANoOp() {
+    /// A degenerate-case guard, and named as one.
+    ///
+    /// This passes whether or not `ranked` does anything at all -- zero and one
+    /// element have exactly one possible order. It is kept because sorting an
+    /// empty collection is a classic crash site, not because it pins ranking;
+    /// the tests above are what would fail if `ranked` were reverted to
+    /// identity. Naming it "ranking..." would claim coverage it does not have.
+    func testAnEmptyOrSingleFragmentWorldSurvivesBeingOrdered() {
         let empty = WorldFragmentsModel(segments: [])
         XCTAssertTrue(empty.fragments.isEmpty)
 

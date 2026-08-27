@@ -57,11 +57,15 @@ enum CartridgeWorkspace: String, Equatable, Sendable, CaseIterable {
     case experimentalCV
     case documentMemory
     case sceneUnderstanding
-    /// The fifth, and the first whose Tower half actually answers. Its
-    /// cartridge `status` stays `.planned` regardless: the module's position on
-    /// the Tower roadmap is unchanged by two read-only HTTP routes existing,
-    /// and `CartridgeWorkspaceTests` pins that separation for every entry in
-    /// the catalog.
+    /// The fifth, and the first whose Tower half actually answers.
+    ///
+    /// Its cartridge `status` used to stay `.planned` on the argument that two
+    /// read-only HTTP routes do not move a module's roadmap position. That was
+    /// right about the roadmap and wrong about what the badge is for: it now
+    /// answers what a person can do in this build, and two live routes with a
+    /// decoder pinned against a real Tower's bytes is something they can try.
+    /// `CartridgeCatalogTests` pins every entry's status against the evidence
+    /// recorded beside it.
     case objectMemory
 }
 

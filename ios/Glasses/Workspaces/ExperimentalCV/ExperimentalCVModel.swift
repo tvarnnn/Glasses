@@ -11,7 +11,7 @@ import Foundation
 /// **Nothing in this file is a Tower protocol**, and this cartridge is the one
 /// where that restraint costs the most, because it is the cartridge closest to
 /// existing: `docs/03-ROADMAP.md` makes Experimental CV Lab Module #1 (V0.9),
-/// and it is the only cartridge whose catalog status is `.next`. The temptation
+/// and it is the only module the Tower actually runs. The temptation
 /// is therefore to guess at its result schema, which would be the most likely
 /// of all four to be wrong in detail while looking right in outline.
 ///
@@ -246,6 +246,162 @@ struct CVExperimentRun: Equatable, Sendable {
     /// caveat once for the whole run rather than repeating it per row.
     var containsInference: Bool {
         metrics.contains { $0.provenance.isInference }
+    }
+}
+
+// MARK: - The frame channel
+
+/// The running experiment's own answer for one frame, as the Tower's per-frame
+/// reply reports it.
+///
+/// ## Why this is a separate type instead of a case of `ExperimentalCVState`
+///
+/// Because it arrives on a different channel from everything above, and keeping
+/// the two apart is what lets this workspace show the experiment's real output
+/// without weakening the cartridge layer's central invariant.
+///
+/// `ExperimentalCVState` models the **cartridge channel**: a typed contract the
+/// Tower declares on `GET /cartridges`, a run this app asked for, metrics with
+/// provenance and baselines attached. The Tower offers none of that for
+/// `experimental_cv` — it lists the module under `not_offered` precisely
+/// *because* "results already reach the client on `frame_result`" — so that
+/// state is correctly `.unsupported`, its phase is `.unsupported`, and
+/// `CartridgePhase.mayCarryData` says an `.unsupported` phase carries nothing.
+///
+/// The per-frame reply is the **frame channel**: the Tower's answer to a frame
+/// this app sent, on the socket the frame went out on, with no contract behind
+/// it and no provenance attached. Folding it into `ExperimentalCVState` would
+/// have meant one of two things — inventing a cartridge state the Tower never
+/// offered, or letting `.unsupported` carry a payload. The second is
+/// `mayCarryData` reduced to a comment. So this sits *beside* the cartridge
+/// state rather than inside it, and the workspace can draw the experiment's
+/// actual number while saying, in the same breath and just as truthfully, that
+/// there is no contract, no list of experiments, and no way to choose one.
+///
+/// ## The pair rule
+///
+/// `result_value` is a bare number whose meaning belongs to the experiment;
+/// `result_label` is the experiment's own name for it. Neither is readable
+/// alone here — they are held as one `Labelled` or not at all — so no view can
+/// render the number under a caption of its own invention. That is the position
+/// `CVMetric` already takes on units, one level down.
+struct CVFrameReading: Equatable, Sendable {
+    /// A number and the Tower's own name for it. There is no way to construct
+    /// one without both, which is where the pair rule actually lives.
+    struct Labelled: Equatable, Identifiable, Sendable {
+        /// What tells one row from another within a single reading.
+        ///
+        /// **Not the label.** For a measurement it is the Tower's own
+        /// dictionary key, kept exactly as sent: keys are unique by
+        /// construction, whereas `label` is trimmed, so `{"edges": 1,
+        /// " edges": 2}` collapses to one caption. When identity was the
+        /// trimmed caption, `ForEach` saw two rows with one id and the sort key
+        /// was equal for both — and `sorted(by:)` is not stable, so the pair
+        /// could swap places on every reply, which is the twelve-times-a-second
+        /// reshuffle the sort was added to prevent.
+        let id: String
+        /// The Tower's words, shown verbatim and never matched on.
+        let label: String
+        let value: Double
+
+        /// The only initialiser, and so genuinely the only way to build one.
+        ///
+        /// It was previously a private static factory beside a synthesised
+        /// memberwise `init`, which is not the same thing: the memberwise init
+        /// was internal and walked straight past the guards below. Failable
+        /// rather than throwing because there is exactly one outcome for every
+        /// way of failing — the Tower did not send a usable pair — and nothing
+        /// downstream can act differently on which.
+        ///
+        /// A blank label counts as no label. The wire cannot distinguish an
+        /// absent string from an empty one, and a row captioned with whitespace
+        /// is a bare number with extra steps.
+        ///
+        /// - Parameter id: The wire key this came from, when there is one.
+        ///   Defaults to the trimmed label, which is right for the headline —
+        ///   a reading has at most one.
+        init?(id: String? = nil, label: String?, value: Double?) {
+            guard let value, let label else { return nil }
+            let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            self.id = id ?? trimmed
+            self.label = trimmed
+            self.value = value
+        }
+
+        /// Formatted by `CVMetric.format` — this app's single answer to "how do
+        /// you print a number whose unit nobody named". Shared with the home
+        /// screen's tile, so the two places this one figure is drawn cannot
+        /// drift apart on how it reads.
+        var displayValue: String { CVMetric.format(value) }
+    }
+
+    /// Which frame this answers, matching the `seq` the app sent. Evidence that
+    /// a round trip completed rather than a result in itself, which is why it
+    /// is deliberately excluded from `hasAnything`.
+    let sequence: Int?
+    /// The experiment's headline answer, or `nil` when either half of the pair
+    /// was missing.
+    let headline: Labelled?
+    /// Mean pixel intensity, 0...1. `nil` means the experiment reported none,
+    /// never that the frame was dark.
+    let meanIntensity: Double?
+    /// Wall-clock milliseconds the Tower spent on this frame, as the Tower
+    /// measured it. "ms" is not an invented unit: the wire field is named
+    /// `processing_ms`, so it is the Tower's own declaration.
+    let processingMs: Double?
+    /// The Tower's additive measurements, each under the name the Tower gave
+    /// it. Sorted by that name, because a dictionary has no stable order and a
+    /// list of figures that reshuffles itself twelve times a second is
+    /// unreadable — and the sort is *total*, breaking a tie between two
+    /// captions on the untrimmed wire key, so that two keys differing only in
+    /// whitespace cannot leave the order undetermined.
+    let measurements: [Labelled]
+
+    /// What this channel says about where its numbers came from: nothing.
+    ///
+    /// There is no provenance field on `frame_result`, and Rule 16 does not
+    /// permit silence to be read as "measured". `.unknown` is the honest
+    /// answer, and the caveat it carries is owed wherever these figures are
+    /// drawn — which is a real obligation on every call site, not a remark.
+    ///
+    /// Both sites discharge it, and neither does so per figure: the Experimental
+    /// CV Lab states it once under the result card
+    /// (`ExperimentalCVWorkspaceView.figures`), and the home screen states it
+    /// once under the metric grid, scoped by name to the experiment's tiles
+    /// because the rest of that grid is counters the phone measured itself.
+    /// Once for a group is enough — repeating it per row turns a caveat into
+    /// wallpaper — but *nowhere* is not, and the home screen's tiles are the
+    /// harder case rather than the easier one: an unremarked experiment figure
+    /// among genuine counters reads as another counter.
+    static let provenance: ObservationProvenance = .unknown
+
+    /// Whether the Tower reported anything at all about the frame.
+    ///
+    /// A reply carrying only a sequence number is a real answer and a different
+    /// one from no reply at all: the Tower processed the frame and the
+    /// experiment concluded nothing about it. A workspace that showed those two
+    /// identically would leave someone waiting for a result that has already
+    /// arrived and was empty.
+    var hasAnything: Bool {
+        headline != nil || meanIntensity != nil || processingMs != nil || !measurements.isEmpty
+    }
+
+    /// Projects one Tower reply. Every field is optional on the wire and stays
+    /// optional here; nothing is defaulted into existence.
+    init(_ result: TowerFrameResult) {
+        sequence = result.sequence
+        headline = Labelled(label: result.resultLabel, value: result.resultValue)
+        meanIntensity = result.meanIntensity
+        processingMs = result.processingMs
+        measurements = result.metrics
+            .compactMap { Labelled(id: $0.key, label: $0.key, value: $0.value) }
+            // Ordered on the caption first, because that is what a reader sees,
+            // and on the wire key second so the order is total. Dictionary keys
+            // are unique, so no two entries can tie on both — which is what
+            // makes this order independent of the dictionary's own, and of
+            // `sorted(by:)` not being stable.
+            .sorted { ($0.label, $0.id) < ($1.label, $1.id) }
     }
 }
 

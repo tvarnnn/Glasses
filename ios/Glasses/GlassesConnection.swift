@@ -61,6 +61,27 @@ struct CapturedFrame {
 /// deliberately **a developer control, not a product setting**: it makes the
 /// experiment runnable without pre-empting the decision.
 ///
+/// ## The privacy consequence, which is the one that actually matters
+///
+/// This was reviewed and the first draft of this comment was found to omit it.
+/// The rung is not merely an image-quality dial. `TowerClient.sendFrame` sends
+/// the frame at its full captured size with **no downscale anywhere**, and when
+/// the Tower's dataset recorder is armed it fsyncs those bytes to disk
+/// verbatim — its own manifest declares `retains_raw_imagery: true`,
+/// `redaction: "none"`, and the privacy tag `raw-imagery`. `.high` is **four
+/// times the pixels** of the default.
+///
+/// So raising the rung raises the fidelity of unredacted, first-person imagery
+/// of bystanders in a recording that persists. Face redaction does exist on the
+/// Tower now, but it is applied only to World Builder's keyframe corpus, in
+/// `_persist_keyframe`; the recorder's copy is written upstream of it and is
+/// never redacted, so both copies coexist on disk.
+///
+/// That is why the footer on this control says so in plain words rather than
+/// presenting the choice as OCR-versus-tracking, which is how it was first
+/// written and which is a complete-sounding account that omits the axis a
+/// person would most want to know about.
+///
 /// `.low` remains the default, so World Builder's physically-proven path is
 /// unchanged unless someone deliberately changes it.
 enum CaptureResolutionPreference: String, CaseIterable, Identifiable, Sendable {
@@ -575,6 +596,72 @@ final class GlassesConnection: ObservableObject {
         switch cameraStreamState {
         case .streaming, .starting, .waitingForDevice: return true
         default: return false
+        }
+    }
+
+    /// Whether a capture session is **claimed at all**, including the states
+    /// `isCaptureEngaged` deliberately excludes.
+    ///
+    /// ## Why this is not `isCaptureEngaged`
+    ///
+    /// They answer different questions and they disagree in exactly the places
+    /// that matter here. `isCaptureEngaged` answers *"should the primary button
+    /// read Stop?"* — a question about whether capture is actively running. It
+    /// treats `.paused` and `.stopping` as not-engaged, which is right for a
+    /// button.
+    ///
+    /// This answers *"is a `DeviceSession` still held?"* — and during `.paused`
+    /// and `.stopping` the answer is **yes**. Those two states are where a
+    /// control gated on `isCaptureEngaged` would unlock while the session and
+    /// camera are both still alive:
+    ///
+    /// - **`.paused`** is not hypothetical. `07-PLATFORM-CONSTRAINTS.md` §146
+    ///   records it as device-initiated — a cap-touch or a thermal pause keeps
+    ///   the connection alive, stops delivery, and resumes to `.started` on its
+    ///   own. On that resume `beginCameraStream` returns immediately at its
+    ///   `guard camera == nil`, so a `StreamConfiguration` chosen while paused
+    ///   is **never read**, and no log line records that it was dropped.
+    /// - **`.stopping`** is set synchronously by `stopCameraSession()` while
+    ///   `deviceSession` stays non-nil until the `.stopped` callback runs
+    ///   `cleanupCameraSession()`. In that window `startCameraSession()` still
+    ///   refuses at its `guard deviceSession == nil`, so "next start" is a
+    ///   start the app is currently declining to perform.
+    ///
+    /// Both switches are exhaustive rather than `default`-terminated. Both DAT
+    /// enums are `@frozen`, so this cannot silently acquire an unhandled case —
+    /// and writing every case out is what makes a future reader confront
+    /// `.paused` instead of inheriting a `default` that quietly swallowed it,
+    /// which is how this defect was introduced in the first place.
+    var isCaptureSessionClaimed: Bool {
+        Self.isCaptureSessionClaimed(
+            session: deviceSessionState,
+            stream: cameraStreamState
+        )
+    }
+
+    /// The decision itself, lifted off the instance so it is testable.
+    ///
+    /// `deviceSessionState` and `cameraStreamState` are `private(set)` and are
+    /// driven by DAT callbacks, so a test cannot put a real `GlassesConnection`
+    /// into `.paused` — and `.paused` is precisely the case this exists to get
+    /// right. A pure function over the two states can be exercised across every
+    /// combination, which is the same reason `CartridgeAvailability.resolve` is
+    /// a static function rather than a method.
+    /// `nonisolated` because it touches no actor state — it is a function of
+    /// its two arguments and nothing else. Without it the enclosing
+    /// `@MainActor` propagates and a synchronous test cannot call it, which
+    /// would have pushed this decision back out of reach of the suite.
+    nonisolated static func isCaptureSessionClaimed(
+        session: DeviceSessionState,
+        stream: MWDATCamera.StreamState
+    ) -> Bool {
+        switch session {
+        case .starting, .started, .paused, .stopping: return true
+        case .idle, .stopped: break
+        }
+        switch stream {
+        case .starting, .streaming, .waitingForDevice, .paused, .stopping: return true
+        case .stopped: return false
         }
     }
 

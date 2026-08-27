@@ -3,8 +3,9 @@
 **From:** Mac/iOS lane, branch `ios/world-builder-integration`
 **Date:** 2026-08-26
 **Upstream consumed:** `integration/world-builder-lifecycle-v1` @ `25eb794`, fully merged
-**Status:** three items. One **answers a blocking prerequisite you named**;
-two are **corrections to beliefs recorded in your own contract docs**.
+**Status:** four items. One **answers a blocking prerequisite you named**
+(§1); three are **corrections to claims recorded in your own contract docs**
+(§2 resolution, §3 discoverability, §3a redaction).
 
 This document exists because
 `tower/docs/contracts/IOS-TO-TOWER-RECONCILIATION.md` §8 ("What Tower now
@@ -183,6 +184,23 @@ default remains `.low`, so World Builder's proven path is untouched — and it
 exists so a wearer can run a Document Memory experiment at `.high` without a
 toolchain. Pair it with §2.1: you will see the change on `decoded_width`.
 
+**Two things you should know before anyone raises it.**
+
+**It is a privacy control, not only a quality one.** iOS sends frames at their
+full captured size with no downscale, and while your dataset recorder is armed
+it fsyncs those bytes to disk verbatim — `retains_raw_imagery: true`,
+`redaction: "none"`, tagged `raw-imagery`. `.high` is **4x the pixels** of the
+default, so a raised rung means more identifiable bystanders in that recording.
+The control's on-screen copy says exactly this; it did not in its first draft,
+and a privacy review is what caught it.
+
+**A raised-rung session may reconstruct nothing.**
+`_require_matching_resolution` (`tower/tower/world_builder/engine.py:882`)
+raises `IntrinsicsResolutionMismatchError` at build time when keyframes do not
+match the calibrated size. That is your guard working correctly, but it means a
+Document Memory experiment at `.high` should not be expected to also produce a
+world. Worth stating in whatever procedure you write for it.
+
 ---
 
 ## 3. Object Memory is undiscoverable from `/cartridges` — **CONTRACT GAP**
@@ -232,6 +250,56 @@ Not a redesign. Either:
 Today it is silent, and silence here is indistinguishable from "this
 capability does not exist" — which is the exact failure mode your §0.1
 separated `available` from `contract` to prevent.
+
+---
+
+## 3a. Your own contract doc is now stale about redaction — in BOTH directions
+
+`IOS-TO-TOWER-RECONCILIATION.md` §0.4 and §5 state, flatly:
+
+> *"No redaction is implemented anywhere in Tower."*
+> *"World Builder keyframes are raw first-person frames."*
+
+**Neither is true any more, and the replacement is not simply "redaction now
+exists" — it is more specific than that, and the specificity is the point.**
+
+Verified in the tree this session:
+
+- `tower/tower/world_builder/redaction.py` exists (11.9 KB), with YuNet weights
+  vendored at `tower/models/face_detection_yunet_2023mar.onnx`.
+- It is applied inside `_persist_keyframe`
+  (`tower/tower/world_builder/engine.py:715`), and the surrounding comment
+  records that the cost was measured before it was chosen: keyframe acceptance
+  and pose solving unaffected, point cloud down about 9%.
+- **The dataset recorder is NOT covered.** `CaptureRecorder.write_frame` takes
+  `raw_bytes` and is written upstream of any redaction
+  (`tower/tower/capture.py:185`), and its own manifest still declares
+  `retains_raw_imagery: True`, `redaction: "none"`,
+  `privacy_tags: ["raw-imagery", "first-person", "dataset-recording"]`
+  (`tower/tower/capture.py:363-365`).
+
+So **both copies coexist on disk**: a redacted keyframe corpus and an
+unredacted recorder corpus of the same frames.
+
+Read today, the doc misleads in both directions at once — it understates what
+World Builder does and overstates the recorder's exposure being universal. Two
+consequences worth deciding rather than inheriting:
+
+1. **§5's conclusion may no longer follow.** "Therefore no imagery is offered"
+   rested on "no redaction exists". For keyframes that premise is now false. iOS
+   is **not** asking for an imagery fetch contract — see §4 — but the reasoning
+   should be restated on its real grounds rather than a withdrawn one.
+2. **`redact()` fails open.** On any exception it persists the *original* bytes
+   and records the label `none` (`redaction.py:206-234`). That is honest and it
+   is the right default, but it means "redaction is implemented" and "this
+   frame was redacted" are different claims, and only the per-frame label
+   settles it. Any wire field should carry the label, never the capability.
+
+**Also unverified and worth measuring before anyone relies on it:** the
+redactor's constants — `CONFIDENCE 0.30`, `UPSCALE 2`, `HEAD_DILATION 1.6` —
+were all tuned at 640x360. Nothing has measured their behaviour at 720x1280. It
+may improve; this lane is asserting only that it is unmeasured, which matters
+now that §2.4 makes a raised rung reachable.
 
 ---
 

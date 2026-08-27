@@ -229,49 +229,101 @@ private extension HomeWorkspaceView {
         // local so every tile below is drawn from the same instant, and a
         // result builder is not the place to lean on local declarations.
         let snapshot = senderMetrics.snapshot
-        return LazyVGrid(
-            columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)],
-            spacing: 10
-        ) {
-            MetricTile(caption: "Frames from glasses", value: glasses.frameCount.formatted())
-            MetricTile(
-                caption: "Sent to Tower",
-                value: Self.fps(snapshot.successfulSendFPS),
-                footnote: "frames per second"
-            )
-            MetricTile(
-                caption: "Tower replies",
-                value: snapshot.frameResults.formatted(),
-                footnote: "frames processed"
-            )
-            // The running experiment's own answer, which this app decoded and
-            // then dropped on the floor for as long as it has existed. The
-            // Tower sends `result_value` and `result_label` on **every** frame;
-            // `TowerFrameResult` modelled neither, and the Experimental CV Lab
-            // workspace told the wearer the Tower could not run experiments.
-            //
-            // The label is the caption, not decoration: `result_value` is a
-            // bare number whose meaning belongs to the experiment, so rendering
-            // it without the experiment's own name for it would invent a unit.
-            // Both or neither — which is why this is one `if let` over the
-            // pair rather than two independent tiles.
-            if let value = tower.latestFrameResult?.resultValue,
-               let label = tower.latestFrameResult?.resultLabel {
+        // Read through the same type the Experimental CV Lab renders, for the
+        // same reason the snapshot above is read once: so the two screens
+        // showing this one number cannot disagree about it.
+        //
+        // **The tiles below stayed here rather than moving to the Lab, and that
+        // was a decision.** Two renderings of one figure can drift — but what
+        // can drift is the *rule*, not the pixels: whether the number may be
+        // shown without its label, whether an omitted field renders as a zero,
+        // how a unitless quantity is printed, and what must be said about where
+        // the figure came from. All four now live in `CVFrameReading` and
+        // neither screen can answer them differently — the last of them only
+        // since the caveat below this grid was added, which is the point at
+        // which the sentence became true rather than aspirational.
+        // What remains duplicated is presentation, and the two presentations
+        // are not the same job. Here it sits among frames-captured, frames-sent
+        // and replies-received: evidence that the round trip is *concluding
+        // something* rather than merely completing, which is exactly the
+        // question this grid exists to answer and the one the reply counter
+        // cannot. In the Lab it is the answer itself, in the place someone goes
+        // looking for it. Deleting it from here would take a liveness signal
+        // off the screen that carries the session and put it behind a cartridge
+        // switch.
+        //
+        // A closure rather than `map(CVFrameReading.init)`: the target builds
+        // with main-actor default isolation, and an unapplied initializer
+        // reference does not inherit the caller's isolation the way a closure
+        // literal does.
+        let reading = tower.latestFrameResult.map { CVFrameReading($0) }
+        return VStack(alignment: .leading, spacing: 8) {
+            LazyVGrid(
+                columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)],
+                spacing: 10
+            ) {
+                MetricTile(caption: "Frames from glasses", value: glasses.frameCount.formatted())
                 MetricTile(
-                    caption: label,
-                    value: String(format: "%.2f", value),
-                    footnote: "the Tower's experiment, latest frame"
+                    caption: "Sent to Tower",
+                    value: Self.fps(snapshot.successfulSendFPS),
+                    footnote: "frames per second"
                 )
+                MetricTile(
+                    caption: "Tower replies",
+                    value: snapshot.frameResults.formatted(),
+                    footnote: "frames processed"
+                )
+                // The running experiment's own answer. The Tower sends
+                // `result_value` and `result_label` on **every** frame.
+                //
+                // The label is the caption, not decoration: `result_value` is a
+                // bare number whose meaning belongs to the experiment, so rendering
+                // it without the experiment's own name for it would invent a unit.
+                // Both or neither — and that is no longer this view's discipline to
+                // keep. `CVFrameReading.headline` is `nil` unless the Tower sent
+                // both, so there is nothing here to get wrong.
+                if let headline = reading?.headline {
+                    MetricTile(
+                        caption: headline.label,
+                        value: headline.displayValue,
+                        footnote: "the Tower's experiment, latest frame"
+                    )
+                }
+                // Optional on the wire — omitted when the experiment reported none
+                // — so its absence is unknown, not dark, and the tile disappears
+                // rather than showing a zero.
+                if let intensity = reading?.meanIntensity {
+                    MetricTile(
+                        caption: "Mean intensity",
+                        value: CVMetric.format(intensity),
+                        footnote: "latest Tower reply"
+                    )
+                }
             }
-            // Optional on the wire — omitted when the experiment reported none
-            // — so its absence is unknown, not dark, and the tile disappears
-            // rather than showing a zero.
-            if let intensity = tower.latestFrameResult?.meanIntensity {
-                MetricTile(
-                    caption: "Mean intensity",
-                    value: String(format: "%.2f", intensity),
-                    footnote: "latest Tower reply"
-                )
+
+            // Rule 16, and the caveat `CVFrameReading.provenance` says "is owed
+            // wherever these figures are drawn". The Lab drew it; this screen did
+            // not, and this screen is where most people will ever see the number —
+            // the Lab is behind a cartridge switch, this grid is on the surface
+            // that carries the session.
+            //
+            // Stated once for the pair rather than per tile, because this is a
+            // dense grid and a caveat on every tile would be noise. Scoped by name,
+            // because every other tile here is something the phone measured itself
+            // — frames from the glasses, the send rate, the reply count — and a
+            // blanket disclaimer under all of them would disown measurements that
+            // are perfectly sound.
+            //
+            // That contrast is exactly why the line is owed. Sitting unremarked
+            // among genuine counters, an experiment's output reads as the same kind
+            // of number as its neighbours, and `frame_result` carries no provenance
+            // field at all. Rule 16: silence must not be read as "measured".
+            if reading?.headline != nil || reading?.meanIntensity != nil,
+                let caveat = CVFrameReading.provenance.caveat {
+                Text("The experiment's figures above: \(caveat)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

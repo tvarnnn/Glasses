@@ -1950,6 +1950,419 @@ final class TowerClientTests: XCTestCase {
 
         client.disconnect()
     }
+
+    // MARK: - 21. The Tower's dataset-recorder state, read from /health
+
+    // The Tower has reported `capture.armed` / `capture.recording` /
+    // `frames_written` on `GET /health` since 2026-08-22 and this app read
+    // none of it, so "is the Tower writing my frames to disk right now?" was
+    // unanswerable from the phone. It matters more than completeness: while
+    // the recorder is armed the Tower fsyncs every received frame **unredacted**
+    // (`tower/tower/capture.py` declares `retains_raw_imagery: true`,
+    // `redaction: "none"`).
+    //
+    // These are decode tests against real payload shapes rather than tests
+    // against a running Tower, matching how the project pins contract
+    // fixtures elsewhere. The thing being defended is not "does HTTP work" —
+    // it is that a field the Tower did not send never becomes a confident
+    // `false` or `0` on a screen a person reads to answer a privacy question.
+
+    /// The exact body a live Tower returned this session, whitespace aside.
+    private static let liveHealthPayload = """
+        {"status":"ok","service":"glasses-tower","version":"0.1.0",
+         "module_state":"active","module_id":"experimental-cv",
+         "capture":{"armed":true,"recording":false,
+                    "capture_id":"ab10cb203cf048e58cf2f79a120a54a4",
+                    "frames_written":1343,"bytes_written":27303448},
+         "capture_workers":{"enabled":true,"workers":[]}}
+        """
+
+    private func healthData(_ json: [String: Any]) throws -> Data {
+        try JSONSerialization.data(withJSONObject: json)
+    }
+
+    func testTheLiveHealthPayloadDecodesFieldByField() throws {
+        let health = try TowerHealthDecoder.health(from: Data(Self.liveHealthPayload.utf8))
+
+        XCTAssertEqual(health.status, "ok")
+        XCTAssertEqual(health.service, "glasses-tower")
+        XCTAssertEqual(health.version, "0.1.0")
+        XCTAssertEqual(health.moduleState, "active")
+        XCTAssertEqual(health.moduleID, "experimental-cv")
+
+        guard case .present(let capture) = health.capture else {
+            return XCTFail("the live payload carries a capture object: \(health.capture)")
+        }
+        XCTAssertEqual(capture.armed, true)
+        XCTAssertEqual(capture.recording, false)
+        XCTAssertEqual(capture.captureID, .present("ab10cb203cf048e58cf2f79a120a54a4"))
+        XCTAssertEqual(capture.framesWritten, 1343)
+        XCTAssertEqual(capture.bytesWritten, 27303448)
+        XCTAssertNil(capture.error)
+
+        guard case .present(let workers) = health.captureWorkers else {
+            return XCTFail("the live payload carries a worker object: \(health.captureWorkers)")
+        }
+        XCTAssertEqual(workers.enabled, true)
+        // A real, sent, empty array — so a real `0`, which is exactly the
+        // value the rest of these tests refuse to invent.
+        XCTAssertEqual(workers.workerCount, 0)
+        XCTAssertNil(workers.error)
+    }
+
+    /// An older Tower, or one whose health route grows a different shape,
+    /// simply does not mention capture. That must not read as "not recording".
+    func testCaptureKeyAbsentEntirelyIsUnreportedRatherThanFalseOrZero() throws {
+        let health = try TowerHealthDecoder.health(
+            from: healthData([
+                "status": "ok", "service": "glasses-tower", "version": "0.1.0",
+                "module_state": "active", "module_id": "experimental-cv",
+            ])
+        )
+
+        XCTAssertEqual(health.capture, .unreported)
+        XCTAssertEqual(health.captureWorkers, .unreported)
+        XCTAssertNil(health.capture.value?.armed)
+        XCTAssertNil(health.capture.value?.recording)
+        XCTAssertNil(health.capture.value?.framesWritten)
+    }
+
+    /// `capture: null` is the Tower saying something specific — no recorder is
+    /// registered at all — and it is not the same statement as saying nothing.
+    /// `tower/tower/routes/health.py` documents the difference; collapsing the
+    /// two would make "we are definitely not recording" indistinguishable from
+    /// "this build never told us".
+    func testAnExplicitNullCaptureIsAnAnswerAndNotSilence() throws {
+        let health = try TowerHealthDecoder.health(
+            from: healthData([
+                "status": "ok", "capture": NSNull(), "capture_workers": NSNull(),
+            ])
+        )
+
+        XCTAssertEqual(health.capture, .absent)
+        XCTAssertEqual(health.captureWorkers, .absent)
+        XCTAssertNotEqual(health.capture, .unreported)
+    }
+
+    /// The Tower's own error path sends `{"armed": true, "error": "unavailable"}`
+    /// — armed, and everything else unknown. Nothing there may become a zero.
+    func testFramesWrittenAbsentIsNilAndNotZero() throws {
+        let health = try TowerHealthDecoder.health(
+            from: healthData([
+                "status": "ok",
+                "capture": ["armed": true, "error": "unavailable"],
+            ])
+        )
+
+        guard case .present(let capture) = health.capture else {
+            return XCTFail("an object arrived, so it is present: \(health.capture)")
+        }
+        XCTAssertEqual(capture.armed, true)
+        XCTAssertEqual(capture.error, "unavailable")
+        XCTAssertNil(capture.recording, "an unsent `recording` must not read as not-recording")
+        XCTAssertNil(capture.framesWritten, "an unsent count must not read as zero frames written")
+        XCTAssertNil(capture.bytesWritten)
+        // Not `.absent`: the Tower's error branch omits the key entirely, which
+        // is silence about the id rather than a statement that no recording is
+        // open.
+        XCTAssertEqual(capture.captureID, .unreported)
+    }
+
+    /// `capture_id: null` is a positive statement, not a withheld field.
+    ///
+    /// `tower/tower/routes/health.py` always emits the key whenever it emits a
+    /// `capture` object at all, and sends `null` for it in exactly one
+    /// situation: a recorder is registered and has not opened a recording yet.
+    /// The Tower's `.error` branch is the only one that omits the key, and that
+    /// omission means something else entirely — the Tower could not read its
+    /// own recorder.
+    ///
+    /// Reading both as one Swift `nil` reproduces the `unreported`-vs-`absent`
+    /// conflation `TowerReported` exists to prevent, one level down at the
+    /// field, and puts "The Tower did not say" on screen for an answer the
+    /// Tower gave clearly.
+    func testANullCaptureIDIsNoRecordingYetRatherThanASilentTower() throws {
+        let notOpened = try TowerHealthDecoder.health(
+            from: healthData([
+                "capture": [
+                    "armed": true, "recording": false, "capture_id": NSNull(),
+                    "frames_written": 0, "bytes_written": 0,
+                ]
+            ])
+        )
+        let unsaid = try TowerHealthDecoder.health(
+            from: healthData(["capture": ["armed": true, "error": "unavailable"]])
+        )
+        let opened = try TowerHealthDecoder.health(
+            from: healthData([
+                "capture": ["armed": true, "recording": true, "capture_id": "ab10cb20"]
+            ])
+        )
+
+        XCTAssertNotEqual(
+            notOpened.capture.value?.captureID,
+            unsaid.capture.value?.captureID,
+            "a recorder that has opened no recording reads the same as a Tower that withheld the field"
+        )
+        XCTAssertNotEqual(opened.capture.value?.captureID, notOpened.capture.value?.captureID)
+
+        XCTAssertEqual(opened.capture.value?.captureID, .present("ab10cb20"))
+        XCTAssertEqual(notOpened.capture.value?.captureID, .absent)
+        XCTAssertEqual(unsaid.capture.value?.captureID, .unreported)
+
+        // The two counts beside it are deliberately *not* changed to match.
+        // The Tower always sends them on success and sends `0` when there is no
+        // recording, so for them a single `nil` carries a single meaning.
+        XCTAssertEqual(notOpened.capture.value?.framesWritten, 0)
+        XCTAssertEqual(notOpened.capture.value?.bytesWritten, 0)
+        XCTAssertNil(unsaid.capture.value?.framesWritten)
+    }
+
+    /// A `capture_id` that is neither a string nor a null. The Tower spoke and
+    /// this app could not read it, which is a third thing again.
+    func testACaptureIDOfTheWrongShapeIsUnreadable() throws {
+        let wrongShape = try TowerHealthDecoder.health(
+            from: healthData(["capture": ["armed": true, "capture_id": 7]])
+        )
+        let unsaid = try TowerHealthDecoder.health(
+            from: healthData(["capture": ["armed": true]])
+        )
+        XCTAssertNotEqual(
+            wrongShape.capture.value?.captureID,
+            unsaid.capture.value?.captureID,
+            "an unreadable answer reads the same as no answer"
+        )
+        XCTAssertEqual(wrongShape.capture.value?.captureID, .unreadable)
+    }
+
+    /// The one distinction the whole feature exists for.
+    func testArmedAndIdleIsDistinguishableFromArmedAndRecording() throws {
+        let idle = try TowerHealthDecoder.health(
+            from: healthData(["capture": ["armed": true, "recording": false, "frames_written": 0]])
+        )
+        let recording = try TowerHealthDecoder.health(
+            from: healthData(["capture": ["armed": true, "recording": true, "frames_written": 12]])
+        )
+
+        XCTAssertEqual(idle.capture.value?.armed, true)
+        XCTAssertEqual(idle.capture.value?.recording, false)
+        XCTAssertEqual(recording.capture.value?.recording, true)
+        XCTAssertNotEqual(idle.capture, recording.capture)
+        // A sent zero is a fact, and stays one.
+        XCTAssertEqual(idle.capture.value?.framesWritten, 0)
+    }
+
+    /// The fourth case, and the only one of `TowerReported`'s four with no test
+    /// until now — which mattered because it is also the only one that renders
+    /// its own distinct sentence ("Answered in a shape this app cannot read").
+    ///
+    /// A `capture` that is neither an object nor a null is the Tower speaking
+    /// and this app failing to understand. That is not silence (`.unreported`)
+    /// and it is not "there is no recorder" (`.absent`), and a screen answering
+    /// a privacy question must not merge it into either.
+    func testACaptureOfTheWrongShapeIsUnreadableRatherThanSilenceOrAbsence() throws {
+        let health = try TowerHealthDecoder.health(
+            from: Data(#"{"capture": "unavailable", "capture_workers": 7}"#.utf8)
+        )
+
+        XCTAssertEqual(health.capture, .unreadable)
+        XCTAssertEqual(health.captureWorkers, .unreadable)
+        XCTAssertNotEqual(health.capture, .unreported, "an unreadable answer became silence")
+        XCTAssertNotEqual(health.capture, .absent, "an unreadable answer became a registered nothing")
+        XCTAssertNil(health.capture.value, "an unreadable answer yielded a value to draw")
+    }
+
+    func testGarbageIsAFailureRatherThanASilentlyEmptySuccess() {
+        XCTAssertThrowsError(try TowerHealthDecoder.health(from: Data("not json".utf8))) { error in
+            XCTAssertEqual(error as? TowerHealthFetchError, .undecodable)
+        }
+        XCTAssertThrowsError(try TowerHealthDecoder.health(from: Data())) { error in
+            XCTAssertEqual(error as? TowerHealthFetchError, .undecodable)
+        }
+    }
+
+    /// Well-formed JSON that is not an object at all. It parses, so the
+    /// failure has to be the decoder's own decision rather than the parser's.
+    func testATopLevelArrayIsAFailureRatherThanAnEmptyHealth() {
+        XCTAssertThrowsError(try TowerHealthDecoder.health(from: Data("[1,2,3]".utf8))) { error in
+            XCTAssertEqual(error as? TowerHealthFetchError, .undecodable)
+        }
+    }
+
+    // MARK: Transport, and the four states a screen has to be able to draw
+
+    private func stubbedHealthClient(status: Int = 200, body: Data) -> TowerHealthHTTPClient {
+        stubbedHealthClient { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil
+            )!
+            return (response, body)
+        }
+    }
+
+    /// The same client, over a stub that never produces a response at all —
+    /// the shape a Tower that is not there has. Separate from the one above
+    /// because a thrown `URLError` and a returned `HTTPURLResponse` are the two
+    /// different things `TowerHealthFetchError` exists to keep apart, and one
+    /// helper that did both would take an argument nobody could read.
+    private func stubbedHealthClient(
+        failingWith error: URLError
+    ) -> TowerHealthHTTPClient {
+        stubbedHealthClient { _ in throw error }
+    }
+
+    private func stubbedHealthClient(
+        _ handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data)
+    ) -> TowerHealthHTTPClient {
+        ObjectMemoryStubProtocol.requestedURLs = []
+        ObjectMemoryStubProtocol.requestedRequests = []
+        ObjectMemoryStubProtocol.handler = handler
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ObjectMemoryStubProtocol.self]
+        return TowerHealthHTTPClient(
+            baseURL: URL(string: "http://tower.test")!,
+            session: URLSession(configuration: configuration)
+        )
+    }
+
+    /// Rule 15. A read with no ceiling is a spinner nobody can end.
+    ///
+    /// Asserted against **the request that actually ran**, not against the
+    /// client's own `timeout` property. Reading the property back only proves
+    /// the literal it was initialised with is still there; the deadline is only
+    /// real if it reaches the `URLRequest`, and dropping `timeoutInterval:` from
+    /// `health()` would leave the call inheriting `URLSession`'s 60-second
+    /// default with the property still reading 10.
+    func testTheHealthReadIsBounded() async {
+        defer { ObjectMemoryStubProtocol.handler = nil }
+        let client = TowerClient()
+        client.healthClient = stubbedHealthClient(body: Data(Self.liveHealthPayload.utf8))
+
+        client.refreshHealth()
+        await expect("the fetch never settled: \(client.healthState)") {
+            if case .fetched = client.healthState { return true }
+            return false
+        }
+
+        guard let request = ObjectMemoryStubProtocol.requestedRequests.first else {
+            return XCTFail("no request reached the stub")
+        }
+        XCTAssertEqual(
+            request.timeoutInterval, 10,
+            "the health read ran without the deadline the client claims to set"
+        )
+        // Same reasoning, same request: a health answer served out of a URL
+        // cache would report a recorder as idle after it had started writing.
+        XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalCacheData)
+        // And the value the client is configured with, so the two cannot drift
+        // apart silently. Matches `ObjectMemoryHTTPClient.timeout` deliberately.
+        XCTAssertEqual(TowerHealthHTTPClient().timeout, 10)
+    }
+
+    func testNothingIsFetchedUntilSomebodyAsks() {
+        XCTAssertEqual(TowerClient().healthState, .notFetched)
+    }
+
+    func testAnAnsweredFetchSettlesIntoTheFetchedState() async {
+        defer { ObjectMemoryStubProtocol.handler = nil }
+        let client = TowerClient()
+        client.healthClient = stubbedHealthClient(body: Data(Self.liveHealthPayload.utf8))
+
+        client.refreshHealth()
+        await expect("the fetch never settled: \(client.healthState)") {
+            if case .fetched = client.healthState { return true }
+            return false
+        }
+
+        guard case .fetched(let health, _) = client.healthState else { return }
+        XCTAssertEqual(health.capture.value?.recording, false)
+        XCTAssertEqual(ObjectMemoryStubProtocol.requestedURLs.first?.path, "/health")
+    }
+
+    /// Failure is a state. It must be reachable, and it must not look like
+    /// "nobody has asked yet".
+    ///
+    /// The body is the **live payload**, which decodes perfectly. That is the
+    /// whole point: an earlier version of this test sent `"nope"`, which is not
+    /// JSON, so the decoder threw `.undecodable` on its own and the test passed
+    /// with the HTTP status guard deleted. A Tower that refuses the question is
+    /// not a Tower that answered it, and only the status guard in
+    /// `TowerHealthHTTPClient.health()` can tell the difference here — without
+    /// it this settles into `.fetched` and the screen reports a recorder state
+    /// read out of a 503.
+    func testARefusedFetchBecomesAVisibleFailureAndNotSilence() async {
+        defer { ObjectMemoryStubProtocol.handler = nil }
+        let client = TowerClient()
+        client.healthClient = stubbedHealthClient(
+            status: 503, body: Data(Self.liveHealthPayload.utf8)
+        )
+
+        client.refreshHealth()
+        await expect("a refusal never surfaced: \(client.healthState)") {
+            if case .failed = client.healthState { return true }
+            return false
+        }
+        XCTAssertNotEqual(client.healthState, .notFetched)
+
+        guard case .failed(let error, _) = client.healthState else { return }
+        // `.transport`, not `.undecodable`: the answer was readable and the
+        // Tower declined to give one. Naming the wrong case here would send a
+        // reader looking for a decoding bug that does not exist.
+        guard case .transport(let description) = error else {
+            return XCTFail("a refusal was reported as a disagreement about the answer: \(error)")
+        }
+        XCTAssertTrue(
+            description.contains("503"),
+            "the refusal did not say what the Tower actually answered: \(description)"
+        )
+    }
+
+    /// The other half of the split, and the one with no test at all until now:
+    /// a request that never completes.
+    ///
+    /// `.transport` is the only case that is evidence about the network, and
+    /// nothing anywhere produced it — every failing path in this file went
+    /// through the decoder. A Tower that is switched off is the ordinary
+    /// failure this screen exists to name, so it gets a test that reaches it
+    /// the way it is actually reached: no response, an error from the URL
+    /// loading system.
+    func testATowerThatNeverAnswersIsATransportFailureAndNotADecodeProblem() async {
+        defer { ObjectMemoryStubProtocol.handler = nil }
+        let client = TowerClient()
+        client.healthClient = stubbedHealthClient(failingWith: URLError(.cannotConnectToHost))
+
+        client.refreshHealth()
+        await expect("an unreachable Tower never surfaced: \(client.healthState)") {
+            if case .failed = client.healthState { return true }
+            return false
+        }
+
+        guard case .failed(let error, _) = client.healthState else { return }
+        guard case .transport(let description) = error else {
+            return XCTFail("an unreachable Tower was reported as an unreadable answer: \(error)")
+        }
+        XCTAssertFalse(
+            description.isEmpty,
+            "the failure state carried no reason, which is the silence it exists to prevent"
+        )
+    }
+
+    /// A body that arrived and could not be read is a disagreement about the
+    /// answer, not a failure to get one — the same split
+    /// `ObjectMemoryHTTPClient` keeps, and for the same reason.
+    func testAnUnreadableAnswerIsUndecodableRatherThanTransport() async {
+        defer { ObjectMemoryStubProtocol.handler = nil }
+        let client = TowerClient()
+        client.healthClient = stubbedHealthClient(body: Data("<html>hi</html>".utf8))
+
+        client.refreshHealth()
+        await expect("the unreadable answer never settled: \(client.healthState)") {
+            if case .failed = client.healthState { return true }
+            return false
+        }
+        guard case .failed(let error, _) = client.healthState else { return }
+        XCTAssertEqual(error, .undecodable)
+    }
 }
 
 /// Thread-safe capture of every text message a MockTowerServer receives, so

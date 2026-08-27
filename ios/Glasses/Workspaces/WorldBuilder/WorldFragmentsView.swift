@@ -96,11 +96,33 @@ extension WorldFragmentsModel {
     /// ## Why the tie-break is not optional
     ///
     /// `sorted(by:)` is not documented as stable, so two segments with equal
-    /// point counts could come back in either order — including a different
-    /// order on the next refresh, which in a `ForEach` is cards visibly
-    /// swapping places under the reader's finger for no reason they can see.
-    /// `segmentIndex` is unique within a manifest, so breaking ties on it
-    /// makes the order total: one manifest has exactly one display order.
+    /// point counts could come back in either order — and in a `ForEach` that
+    /// is cards swapping places for no reason a reader can see. `segmentIndex`
+    /// is unique within a manifest (`docs/contracts/WORLD-BUILDER-GEOMETRY.md`
+    /// §2.1 defines it as identity within the session), so breaking ties on it
+    /// makes the order total: **one manifest has exactly one display order.**
+    ///
+    /// ## What this does NOT make stable, said plainly
+    ///
+    /// The order is a pure function of one manifest. It is **not** stable
+    /// across manifests, and during a live walk the manifest is refetched every
+    /// time the revision moves — 67 times in the two-minute P3 walk. The Tower
+    /// re-solves segments in place, so `point_count` for a segment that already
+    /// existed can change between polls, and the primary sort key changes with
+    /// it. A card can therefore move up the grid mid-walk.
+    ///
+    /// That is a real cost and it is accepted deliberately, not overlooked.
+    /// Capture order never moved an existing card, and the trade is that it
+    /// scatters the segments that actually reconstructed among the ones that
+    /// barely did — which is survivable at tens of segments and not survivable
+    /// at the hundreds the Tower's finer segmentation produces. Ranking is
+    /// worth more when the grid is read, which is after the walk, than the
+    /// movement costs while it is being built.
+    ///
+    /// **If that movement proves distracting on a real walk, the fix is not to
+    /// drop the ranking** — it is to rank only once the world stops changing,
+    /// or to animate the reorder so it reads as motion rather than as a
+    /// glitch. Neither is worth building before a wearer says it is a problem.
     static func ranked(_ fragments: [WorldSegmentSummary]) -> [WorldSegmentSummary] {
         fragments.sorted { lhs, rhs in
             if lhs.pointCount != rhs.pointCount {

@@ -16,7 +16,10 @@ import SwiftUI
 /// still exactly `ping`, `pong`, `frame`, `frame_result`, `stream_start`,
 /// `stream_stop`.
 ///
-/// That is why a row can be tappable while its badge still reads "Future".
+/// The two were once fully independent, which is how a row came to be tappable
+/// while its badge read "Future". They are no longer: a cartridge with nothing
+/// to open cannot be `.readyToTest`, and one that ships a workspace is never
+/// `.notBuilt`. `CartridgeCatalogTests` pins that in both directions.
 /// The badge describes the *module's* position on the Tower roadmap; being
 /// tappable describes whether *this app* ships a screen for it. Only cartridges
 /// with a workspace are tappable — the rest stay exactly as they were, with no
@@ -70,7 +73,7 @@ struct CartridgeDrawerView: View {
                 } header: {
                     Text("Modules")
                 } footer: {
-                    Text("Opening a cartridge changes this app's workspace. It does not start anything on the Tower — the Tower chooses what it runs at startup and this app cannot ask it for anything else, so every badge below still reflects the roadmap rather than something you can run.")
+                    Text("Opening a cartridge changes this app's workspace. It does not start anything on the Tower — the Tower chooses what it runs at startup and this app cannot ask it for anything else. Badges describe this app: \u{201C}Ready to test\u{201D} means there is something here to try, not that the Tower you are connected to is serving it right now. Each workspace says what that Tower can actually do.")
                         .padding(.top, 4)
                 }
             }
@@ -139,12 +142,22 @@ private struct CartridgeRow: View {
             Spacer(minLength: 8)
 
             VStack(alignment: .trailing, spacing: 6) {
+                // Tinted for exactly one status, so the drawer answers "which
+                // of these can I try?" in a glance rather than after reading
+                // eight identical capsules. Colour is not the only carrier —
+                // the badge still spells the status out — because a tint alone
+                // would be invisible to a reader who cannot distinguish it.
                 Text(cartridge.status.badge)
                     .font(.caption2.weight(.semibold))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(Color(.tertiarySystemFill), in: .capsule)
-                    .foregroundStyle(.secondary)
+                    .background(
+                        cartridge.status.isProminent
+                            ? AnyShapeStyle(Color.accentColor.opacity(0.18))
+                            : AnyShapeStyle(Color(.tertiarySystemFill)),
+                        in: .capsule
+                    )
+                    .foregroundStyle(cartridge.status.isProminent ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
 
                 if isSelected {
                     Image(systemName: "checkmark")
