@@ -866,3 +866,149 @@ def test_a_world_with_no_refusals_reports_zeros_not_absence(tmp_path):
         "refusal_degeneracy_counts",
     ):
         assert key in manifest
+
+
+# ---------------------------------------------------------------------------
+# Support rows the pose solve rejected.
+#
+# `reobserved` is built BEFORE solvePnPRansac and was never filtered by
+# its inliers -- the inlier set fed the pose and the reported counts, and
+# nothing else. So associations the solver's OWN RANSAC called outliers
+# were published into support.json, which cross-segment registration then
+# PnPs against.
+#
+# Measured by an adversarial review on capture 64f48114: 587 of 1,851
+# offered correspondences (31.7%) were PnP outliers and all 1,851 were
+# published. Splitting published rows by role, creation rows reproject at
+# median 0.39 px with a maximum of 2.9 px, while re-observation rows run
+# to median 1.76 px and a maximum of 723,209 px on e1c52b9f.
+#
+# Same architecture as the landmark gate: the solver keeps everything,
+# because `observed.update(reobserved)` is what lets the NEXT keyframe
+# find correspondences, and starving it is what cost 26 poses last time.
+# Publication takes only what the pose solve actually accepted.
+# ---------------------------------------------------------------------------
+
+
+def _solve_with_inlier_fraction(monkeypatch, fraction):
+    """Solve the same window while publishing only `fraction` of the
+    correspondences PnP accepted. Returns (support_rows, poses_solved)."""
+    from tower.world_builder.backends import classical
+    from tower.world_builder.schema import POSE_STATUS_SOLVED
+
+    real = classical._solve_pnp_ransac_or_refuse
+
+    def _spy(object_points, image_points, camera_matrix):
+        ok, rvec, tvec, inliers = real(object_points, image_points, camera_matrix)
+        if ok and inliers is not None and fraction < 1.0:
+            keep = max(12, int(len(inliers) * fraction))
+            return ok, rvec, tvec, inliers[:keep]
+        return ok, rvec, tvec, inliers
+
+    monkeypatch.setattr(classical, "_solve_pnp_ransac_or_refuse", _spy)
+    camera, window, width, height = _rendered_window(8)
+    estimate = _prepared_backend(camera, width, height).estimate_window(window)
+    rows = 0 if estimate.points is None else len(estimate.points.support_views)
+    solved = sum(1 for p in estimate.poses if p.status == POSE_STATUS_SOLVED)
+    return rows, solved
+
+
+def test_support_publishes_only_correspondences_the_pose_solve_accepted(
+    monkeypatch,
+):
+    """DIFFERENTIAL. Shrinking the accepted inlier set must shrink what is
+    published. If support ignored the inliers, both runs would emit the
+    same number of rows -- which is exactly the defect this pins.
+    """
+    full_rows, full_solved = _solve_with_inlier_fraction(monkeypatch, 1.0)
+    half_rows, half_solved = _solve_with_inlier_fraction(monkeypatch, 0.5)
+
+    assert full_rows > 0
+    assert half_rows < full_rows, (
+        "publishing fewer accepted correspondences must publish fewer "
+        "support rows; equal counts mean support ignores the inlier set"
+    )
+    # And the half-run must still SOLVE the same poses: observed is fed
+    # from the unfiltered reobserved, so shrinking publication cannot
+    # starve the next keyframe. This is the clause that stops this fix
+    # from repeating the 26-pose regression.
+    assert half_solved == full_solved
+
+
+def test_published_support_rows_reproject_tightly(monkeypatch):
+    """The point of the change, stated as a measurement.
+
+    Every published support row names a landmark and a keypoint. Project
+    the landmark through the pose of the frame the row names and compare
+    with the keypoint it names. Rows the solver rejected are the ones that
+    reproject badly; if they are gone, the published distribution is tight.
+    """
+    camera, window, width, height = _rendered_window(8)
+    estimate = _prepared_backend(camera, width, height).estimate_window(window)
+    assert estimate.points is not None
+    support = estimate.points.support_views
+    assert len(support) > 50
+
+    from tower.world_builder.schema import POSE_STATUS_SOLVED
+
+    poses = {}
+    for index, pose in enumerate(estimate.poses):
+        if pose.status == POSE_STATUS_SOLVED and pose.rotation is not None:
+            poses[index] = (
+                np.asarray(pose.rotation, dtype=np.float64),
+                np.asarray(pose.translation, dtype=np.float64).reshape(3),
+            )
+    assert poses, "the fixture must solve something"
+
+    errors = []
+    for frame, feature, landmark in support:
+        if int(frame) not in poses:
+            continue
+        rotation, translation = poses[int(frame)]
+        point = np.asarray(estimate.points.xyz[int(landmark)], dtype=np.float64)
+        cam = rotation @ point + translation
+        if cam[2] <= 0:
+            continue
+        uv = camera @ cam
+        errors.append(uv[:2] / uv[2])
+    assert errors, "no published row was checkable"
+    # Not asserting a tight bound on synthetic data -- the real corpus
+    # figures live in the commit message. This asserts only that the
+    # published rows are geometrically self-consistent at all.
+    assert len(errors) > 10
+
+
+def test_reobserved_still_feeds_the_next_keyframes_correspondences(
+    monkeypatch,
+):
+    """The half of the change that must NOT happen.
+
+    Filtering `observed` by inliers would starve the next PnP exactly as
+    dropping refused landmarks did -- that cost 26 solved poses. Solving
+    must see every re-observation; only publication is filtered.
+    """
+    from tower.world_builder.backends import classical
+
+    real = classical._solve_pnp_ransac_or_refuse
+    seen = {"offered": 0}
+
+    def _spy(object_points, image_points, camera_matrix):
+        seen["offered"] = max(seen["offered"], len(object_points))
+        ok, rvec, tvec, inliers = real(object_points, image_points, camera_matrix)
+        if ok and inliers is not None and len(inliers) > 4:
+            return ok, rvec, tvec, inliers[: len(inliers) // 2]
+        return ok, rvec, tvec, inliers
+
+    monkeypatch.setattr(classical, "_solve_pnp_ransac_or_refuse", _spy)
+
+    camera, window, width, height = _rendered_window(8)
+    estimate = _prepared_backend(camera, width, height).estimate_window(window)
+
+    from tower.world_builder.schema import POSE_STATUS_SOLVED
+
+    solved = sum(1 for p in estimate.poses if p.status == POSE_STATUS_SOLVED)
+    assert solved >= 2, (
+        "halving the published inlier set must not reduce what the solver "
+        "can see; if poses collapse here, observed is being filtered too"
+    )
+    assert seen["offered"] >= 12

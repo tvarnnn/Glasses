@@ -261,6 +261,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 reobserved,
                 extend_discards,
                 extend_quality,
+                published_reobserved,
             ) = self._extend(
                 features[previous],
                 features[current],
@@ -290,7 +291,8 @@ class ClassicalTwoViewBackend(GeometryBackend):
             support.append(
                 _support_block(
                     (frame, feature, landmark)
-                    for (frame, feature), landmark in reobserved.items()
+                    for (frame, feature), landmark
+                    in published_reobserved.items()
                 )
             )
             base = len(landmarks)
@@ -412,6 +414,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 reobserved,
                 extend_discards,
                 extend_quality,
+                published_reobserved,
             ) = self._extend(
                 chain.previous_features,
                 features,
@@ -433,7 +436,8 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 chain.support.append(
                     _support_block(
                         (frame, feature, landmark)
-                        for (frame, feature), landmark in reobserved.items()
+                        for (frame, feature), landmark
+                        in published_reobserved.items()
                     )
                 )
                 base = len(chain.landmarks)
@@ -493,9 +497,12 @@ class ClassicalTwoViewBackend(GeometryBackend):
     def _add_discards(tally, counts, kept):
         """Fold one triangulation call into a running tally.
 
-        `produced` is kept + refused, so the manifest can state the
-        accounting identity rather than leaving a consumer to infer that
-        the points it can see are all that were ever made.
+        `produced` is the number of landmarks that entered the MAP.
+        Refusals are a subset of it -- a refused landmark is still in the
+        map, just not publishable -- so they are not added again here.
+        The manifest can then state the identity
+        published + refused == triangulated rather than leaving a consumer
+        to infer that the points it can see are all that were ever made.
         """
         tally["low_parallax"] += counts.get("low_parallax", 0)
         tally["high_reprojection"] += counts.get("high_reprojection", 0)
@@ -757,8 +764,22 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 {},
                 {"low_parallax": 0, "high_reprojection": 0},
                 [],
+                {},
             )
 
+        # `reobserved` is built ABOVE, before the solve, because
+        # observed.update(reobserved) is what lets the NEXT keyframe find
+        # correspondences at all -- starving it is what cost 26 solved
+        # poses when the landmark gate first filtered the map.
+        #
+        # Publication is a different question. An association the solver's
+        # own RANSAC called an outlier is not evidence, and support.json
+        # is consumed by cross-segment registration, which PnPs against
+        # it. Measured on capture 64f48114: 587 of 1851 offered
+        # correspondences (31.7%) were outliers and every one was
+        # published; re-observation rows reached 723,209 px reprojection
+        # on e1c52b9f while creation rows never exceeded 3.0 px.
+        reobserved_keys = list(reobserved)
         (
             ok,
             rotation_vector,
@@ -783,6 +804,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 {},
                 {"low_parallax": 0, "high_reprojection": 0},
                 [],
+                {},
             )
 
         rotation, _ = cv2.Rodrigues(rotation_vector)
@@ -805,6 +827,14 @@ class ClassicalTwoViewBackend(GeometryBackend):
             current_index,
         )
 
+        # Only the correspondences the pose solve ACCEPTED are published.
+        # The full `reobserved` still goes to `observed` for solving.
+        published_reobserved = {
+            reobserved_keys[index]: reobserved[reobserved_keys[index]]
+            for index in np.asarray(inlier_indices).ravel().tolist()
+            if 0 <= index < len(reobserved_keys)
+        }
+
         # Re-observations index into the EXISTING landmark list, so they
         # must not be shifted by the caller's `base` offset the way newly
         # triangulated points are. Returned separately for that reason.
@@ -824,6 +854,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
             reobserved,
             discard_counts,
             new_quality,
+            published_reobserved,
         )
 
     def _triangulate_new(
@@ -864,8 +895,6 @@ class ClassicalTwoViewBackend(GeometryBackend):
         # wider set would count refusals for points that were never
         # admitted anyway, and the manifest's accounting identity
         # -- published + refused == triangulated -- would stop closing.
-        rotation_p, translation_p = pose_previous
-        rotation_c, translation_c = pose_current
         depth_p = (rotation_p @ xyz.T).T[:, 2] + translation_p[2]
         depth_c = (rotation_c @ xyz.T).T[:, 2] + translation_c[2]
         admissible = (
@@ -920,7 +949,18 @@ def _publishable_block(landmarks, landmark_ok, support_blocks):
     """
     if not landmarks:
         return None
-    ok = list(landmark_ok) + [True] * (len(landmarks) - len(landmark_ok))
+    # Deliberately NOT padded. On the one array whose desync means
+    # "publish a coordinate you cannot defend", defaulting to True fails
+    # in the direction that ships unvetted geometry, and an over-long
+    # list would be silently truncated. Both are bugs in this file, not
+    # conditions to tolerate at runtime.
+    if len(landmark_ok) != len(landmarks):
+        raise ValueError(
+            f"landmark_ok has {len(landmark_ok)} entries for "
+            f"{len(landmarks)} landmarks; they are appended together and "
+            f"must stay in lockstep"
+        )
+    ok = list(landmark_ok)
     remap = {}
     kept = []
     for index, landmark in enumerate(landmarks):
