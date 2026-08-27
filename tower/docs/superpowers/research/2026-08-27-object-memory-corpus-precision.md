@@ -473,7 +473,90 @@ cartridge may not import another cartridge.
 
 ---
 
-## 7. Reproducing all of it
+## 7. Can an open-vocabulary pass find what COCO cannot name?
+
+The verifier fixes wrong labels. It **cannot** touch the second half of
+§3.1 — that keys, a wallet and a pair of glasses have no COCO class —
+because it only ever sees crops the shipped detector produced, and the
+shipped detector never fires on a set of keys.
+
+So the obvious next move is a **discovery pass**: run the open-vocabulary
+model on whole frames, asynchronously, with a curated prompt list. Before
+anyone builds that, this measures whether it works on this footage.
+`scripts/research/open_vocab_discovery.py`, 674 frames sampled evenly
+across all 34 captures, threshold 0.15, eight target prompts against
+eight distractors.
+
+| prompt | hits | frames | captures | max score | median area |
+|---|---|---|---|---|---|
+| a charging cable | 128 | 47 | 11 | 0.475 | 1.55% |
+| a remote control | 117 | 95 | 23 | 0.605 | 0.58% |
+| a backpack | 52 | 33 | 14 | 0.624 | 5.22% |
+| a pill bottle | 36 | 19 | 9 | 0.456 | 0.32% |
+| a wallet | 23 | 21 | 6 | 0.646 | 2.66% |
+| a paper document | 21 | 18 | 11 | 0.320 | 2.12% |
+| a pair of eyeglasses | 3 | 3 | 3 | 0.620 | 0.50% |
+| **a set of keys** | **1** | 1 | 1 | 0.152 | 0.11% |
+
+**Cost: 119.6 ms per frame.** Running it on every delivered frame would
+be about 1.5× the entire frame budget, so a discovery pass is inherently
+sampled and asynchronous. That is a design constraint, not a tuning
+choice.
+
+### 7.1 What it found, read by eye
+
+Two contact sheets, 66 tiles between them.
+
+**It genuinely finds things COCO cannot name.** A black bag on a luggage
+rack comes back as `a backpack` at 0.62 across 14 captures — where
+SSDLite's single `backpack` sighting in the whole corpus was a closet of
+hanging clothes. `a pill bottle` reliably picks out toiletries on a
+bathroom counter (the name is a stretch; the region is right). `a pair of
+eyeglasses` at 0.62 is a real pair of glasses.
+
+**It does not solve the small-object problem.** `a set of keys` produced
+**one hit in 674 frames**, at 0.11% of the frame. That measures nothing
+about recall — this corpus almost certainly contains no keys — but it
+does establish that the model is not hallucinating them everywhere,
+which was the other thing worth knowing.
+
+**Precision at 0.15 is about a third.** Roughly 12 of 36 tiles on the
+general sheet are right. `a remote control` reproduces the shipped
+detector's exact failure — laptop keyboards and hands — and `a charging
+cable` fires on white door frames and blurred smears. A discovery pass
+would need its own threshold and, realistically, its own verification
+stage: the same funnel, one level up.
+
+### 7.2 A privacy finding, and it is the important one
+
+**`a pair of eyeglasses` is a face detector in disguise.** Its two
+strongest hits on this corpus are a person's face, because that is where
+glasses are.
+
+A discovery pass is prompted with a list, and it is tempting to treat
+that list as a tuning knob — add a word, see what turns up. It is not.
+**A prompt list is a privacy surface**, exactly as `PERSISTED_CLASSES`
+is: `eyeglasses`, `wristwatch`, `ring`, `name badge`, `medication` and a
+dozen other reasonable-sounding entries all resolve, on first-person
+footage, to a person. If a discovery pass is ever built, its prompt list
+needs the same treatment `classes.py` gives the class table — a
+deterministic, reviewed, closed set with the reasoning written down, and
+an exclusion check that runs *after* the model rather than before it.
+
+### 7.3 The recommendation
+
+**Worth building, on the async path, for medium-sized personal
+objects** — bags, bottles, documents, chargers — at a threshold well
+above 0.15 and behind a verification stage. **Not worth building as a
+fix for the size floor**, which is upstream of every model here and is
+fixed by capture resolution or tiling, not by vocabulary.
+
+Not built in this wave. It is a new persistence path with a new privacy
+surface, and it should be a decision rather than an inference.
+
+---
+
+## 8. Reproducing all of it
 
 ```bash
 cd tower
@@ -498,11 +581,16 @@ $V scripts/research/open_vocab_verifier_bench.py \
 $V scripts/research/detector_long_session.py --captures $C --device cuda --frames 6000
 $V scripts/research/detector_long_session.py --captures $C --device cpu  --frames 6000
 
-# 5. the face filter's firing rate
+# 5. does an open-vocabulary pass find what COCO cannot name?
+$V scripts/research/open_vocab_discovery.py \
+    --captures $C --per-capture 20 --out analysis/discovery.json \
+    --sheet analysis/sheets/_discovery.png
+
+# 6. the face filter's firing rate
 $V scripts/research/face_filter_false_positives.py \
     --captures $C --per-capture 60 --sheet analysis/sheets/_face_firings.png
 
-# 6. the end-to-end A/B, one at a time
+# 7. the end-to-end A/B, one at a time
 $V scripts/object_memory_session.py --frames $C/0fc400bbcc8e4825959f951f904f284f \
     --root analysis/ab-none --device cpu --verifier none --format json
 $V scripts/object_memory_session.py --frames $C/0fc400bbcc8e4825959f951f904f284f \

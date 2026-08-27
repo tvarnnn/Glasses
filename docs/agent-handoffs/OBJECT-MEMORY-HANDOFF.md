@@ -302,6 +302,39 @@ formalism); spatial and co-occurrence context as a first-class cue rather
 than a tiebreaker; and collapse only on evidence accumulated across
 observations.
 
+**An open-vocabulary DISCOVERY pass**, though it is measured and
+recommended. The verifier fixes wrong labels; it cannot touch the fact
+that keys, a wallet and a pair of glasses have no COCO class, because it
+only ever sees crops the shipped detector produced. Running the same
+model on WHOLE FRAMES with a curated prompt list would — and
+`scripts/research/open_vocab_discovery.py` measures whether it works
+here. Over 674 frames sampled across all 34 captures, at 119.6 ms a
+frame:
+
+* **It genuinely finds what COCO cannot name.** A black bag on a rack is
+  `a backpack` at 0.62 across 14 captures, where SSDLite's single
+  `backpack` sighting in the whole corpus was a closet of hanging
+  clothes. Toiletries come back as `a pill bottle`. Glasses come back as
+  glasses.
+* **It does not fix the size floor.** `a set of keys`: **one hit in 674
+  frames**, at 0.11% of the frame.
+* **Precision at 0.15 is about a third**, and `a remote control`
+  reproduces the shipped detector's exact failure — keyboards and hands.
+  It would need its own threshold and its own verification stage.
+* **And a finding worth more than the rest: `a pair of eyeglasses` is a
+  face detector in disguise.** Its two strongest hits on this corpus are
+  a person's face, because that is where glasses are. A prompt list is a
+  **privacy surface**, not a tuning knob — `wristwatch`, `ring`, `name
+  badge`, `medication` all resolve to a person on first-person footage.
+  If this is built, its prompt list needs what `classes.py` gives the
+  class table: a deterministic, reviewed, closed set with the reasoning
+  written down, and an exclusion check that runs *after* the model.
+
+Recommended for medium-sized personal objects on the async path, at a
+threshold well above 0.15. Not built here: it is a new persistence path
+with a new privacy surface, and that should be a decision rather than an
+inference. Full write-up in §7 of the corpus-precision research doc.
+
 **SLAM, anchors, or anything spatial.** `spatial_ref` stays an explicit
 `null`. The shape it will take when World Builder can supply one is
 written down in `docs/contracts/OBJECT-MEMORY.md` §12, including the
