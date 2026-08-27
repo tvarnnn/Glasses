@@ -246,7 +246,38 @@ and key geometry caching on both content identity and placement identity.
 
    **A clean discriminator exists on synthetic data and does not transfer
    to real footage** — see §12.
-3. `test_world_registration.py`'s real-corpus class (10 tests) **silently
+3. **`redaction.DEFAULT_MODEL_PATH` is RELATIVE** (`redaction.py:128`:
+   `Path("models") / "face_detection_yunet_2023mar.onnx"`), and
+   `model_path()` returns it only `if ... .exists()` — evaluated against
+   **cwd**. So face redaction, a PRIVACY feature, is on or off depending
+   on which directory the Tower was launched from. Measured by the Stage 0
+   lane at **112 vs 194 solved poses** on `22e9d428` — it changes
+   geometry, not just privacy.
+
+   Mitigated, and worth saying: it is **not silent** — it logs
+   `persisting UNREDACTED keyframes: no face-detection model is available`
+   loudly. But cwd-dependent behaviour makes runs non-comparable unless
+   the launch directory is pinned, and it should be an absolute path
+   anchored to the package.
+
+   **My own A/B is unaffected and I checked rather than assumed:** the
+   model IS present at `tower/models/`, both arms ran with cwd =
+   `worktree/tower`, so both were redaction-ON, which is why the DEPTH=1
+   control reproduced the baseline exactly.
+
+4. **A fraction of support rows are invisible to registration.** A
+   `(segment, frame, feature)` key can be bound to more than one landmark,
+   so any reader keyed on that tuple — including
+   `world_registration.read_segments` — silently keeps one and drops the
+   rest. MEASURED by me across all persisted worlds: **577 keys affected,
+   636 rows lost, 0.398% of 159,640.** The Stage 0 lane measured the same
+   phenomenon on its isolated rebuild (803 features / 881 rows).
+   **Pre-existing**, small, and silent — it is evidence loss in the exact
+   table cross-segment registration solves PnP against. Distinct from the
+   `duplicate_view_support_rows` item in §12, which is the inverse
+   relation (one landmark, two features).
+
+5. `test_world_registration.py`'s real-corpus class (10 tests) **silently
    skips** in this worktree because the corpus lives only in the main repo.
    Those are the only end-to-end checks that the registration gate does
    anything on real data.
