@@ -93,6 +93,27 @@ def served(tower: str) -> tuple[dict[str, str], list[dict], set[str]]:
         if contract := offer.get("contract"):
             live[contract] = f"/cartridges {offer.get('cartridge')}/{offer.get('result_type')}"
 
+    # `http_contracts` -- capabilities the Tower serves over HTTP rather than by
+    # subscription. Added 2026-08-27 with the Tower unification, and this check
+    # was blind to the whole block until then: it read `cartridges` only, so a
+    # Tower could move `document_memory.library` to a new identifier and this
+    # gate would still print AGREEMENT.
+    #
+    # That is exactly the failure this script exists to catch, so the blind spot
+    # mattered more than the missing row: a drift check that cannot see a
+    # surface is worse than no check for that surface, because it reports
+    # confidence about it.
+    #
+    # These are counted as SERVED, not as a separate class. From this script's
+    # point of view an identifier the Tower states is an identifier the build
+    # must implement, and how it travels is not this comparison's business.
+    for offer in body.get("http_contracts", []):
+        if name := offer.get("cartridge"):
+            offered_names.add(name)
+        if contract := offer.get("contract"):
+            route = offer.get("entry_route", "?")
+            live[contract] = f"/cartridges http_contracts {offer.get('cartridge')} -> {route}"
+
     # Object Memory is never declared over the socket: its contract travels in
     # the body of an answer, so the only way to learn it is to ask.
     not_offered = body.get("not_offered", []) if isinstance(body, dict) else []
