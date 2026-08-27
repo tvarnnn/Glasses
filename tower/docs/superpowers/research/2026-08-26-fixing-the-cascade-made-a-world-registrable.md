@@ -118,13 +118,18 @@ they call for different work:
 The obvious next measurement was cheap, so it was run rather than left as a
 suggestion.
 
-| | baseline | restricted (shipped) | unrestricted |
+| | baseline | shipped rule | unrestricted |
 |---|---|---|---|
-| segments | 5 | 7 | 10 |
-| candidate pairs | 10 | 19 | 34 |
+| segments | 5 | 10 | 10 |
+| candidate pairs | 10 | 34 | 34 |
 | segments registered | 0 | **3** | **3** |
 | points registered | 0 | **5,603** | **5,603** |
 | admitted pairs | — | `[0,3]`, `[3,5]` | `[0,3]`, `[3,5]` |
+
+(The middle column originally reported a withdrawn restart rule, 7 segments
+and the same registered cluster. Registration is invariant across every
+restart policy tested — caps of 1, 2 and none all land on the same three
+segments and the same 5,603 points.)
 
 **Identical.** Nearly double the segments and nearly double the candidate pairs
 produce exactly the same registered cluster, down to the same two pairs with the

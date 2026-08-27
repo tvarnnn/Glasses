@@ -113,14 +113,14 @@ solved at least two poses.
 
 | field | change | why |
 |---|---|---|
-| `segment_count` | **rises ~11%** (127 → 141 across the corpus) | breaks that used to be silent are now boundaries |
-| `solved_count` | **rises ~22%** | keyframes after a break get an anchor and a chance |
-| `point_count` | **rises ~24%** | those keyframes triangulate |
+| `segment_count` | **rises ~81%** (127 → 230 across the corpus) | breaks that used to be silent are now boundaries |
+| `solved_count` | **rises ~71%** | keyframes after a break get an anchor and a chance |
+| `point_count` | **rises ~59%** | those keyframes triangulate |
 | `resolution_state` | more segments `resolved` | same reason |
 | `unresolvedCount` on your side | **may rise** | there are simply more segments; some resolve, some do not |
 
 **This is the opposite direction from the point-quality change**, which lowered
-`point_count` per segment. Net across both, the corpus went 47,429 → 58,985
+`point_count` per segment. Net across both, the corpus went 47,429 → 75,369
 published points in more, smaller segments — with the *largest* segment in every
 capture holding the same geometry it held before.
 
@@ -163,8 +163,10 @@ filtering. The manifest already carries `point_count`, `solved_count` and
 `keyframe_count` per segment; ranking by `point_count` would put the parts of
 the room that were actually mapped first. There is a larger prize behind this:
 an unrestricted version of the segmentation change measured **poses 346 → 863
-and points 47k → 107k**, and was held back only because it produces ~470
-segments, which is unusable in an unranked grid. If fragments can be ranked or
+and points 47k → 107k** against the shipped 591/75k, and was held back only
+because it produces ~470 segments, which is unusable in an unranked grid.
+Registration is identical either way, so the extra fragments are raw geometry
+rather than coherence. If fragments can be ranked or
 collapsed, that variant becomes available.
 
 **Do not** render refused points in a dimmed colour. Their coordinates are not

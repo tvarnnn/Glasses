@@ -167,7 +167,16 @@ on `decision.lost` and never looked at the backend. Making that claim true:
 |---|---|---|---|---|
 | baseline | 346 | 47,429 | 127 | 28,656 |
 | split on **every** break | **863** | **107,005** | 470 | **32,756** |
-| split when the chain solved ≥ 2 (**shipped**) | 424 | 58,985 | 141 | 28,663 |
+| split unless the region proved barren (**shipped**) | **591** | **75,369** | 230 | 29,890 |
+| ~~split when the chain solved ≥ 2~~ (withdrawn) | 424 | 58,985 | 141 | 28,663 |
+
+The withdrawn rule is kept in the table because it was committed and then
+found wrong. It required the broken chain to have SOLVED two poses, which a
+chain whose seed pair fails can never do -- so it left the cascade fully
+intact for the worst case. On `4fea31e2` one seed-pair failure stranded 48 of
+50 keyframes. The shipped rule asks instead whether the region has proven
+unmappable, which covers both a chain that built something and one that never
+began.
 
 **The cascade was discarding roughly 60% of the recoverable poses in this
 corpus.** That is a much larger effect than any tracking lever measured here or
