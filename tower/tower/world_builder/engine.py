@@ -386,6 +386,17 @@ class WorldBuilderEngine:
         solved_live = self._live_estimates(world_id, session_id, session, backend)
 
         poses_solved = poses_refused = 0
+        # `poses_refused` alone reads as N independent judgments about the
+        # world. It is not: once any pose in a segment is refused the
+        # chain latches and every later keyframe is refused WITHOUT ORB
+        # detection, matching, or any geometry being attempted. Measured
+        # on the real 33-segment world from capture 22e9d428: 354
+        # refusals, 26 root decisions, 328 cascaded, and 0 of 26 segments
+        # ever recovered. "26 chains died once" and "354 frames were each
+        # judged ungeometric" are different bugs with different fixes.
+        poses_refused_root = poses_refused_cascaded = 0
+        refusal_degeneracy: dict[str, int] = {}
+        refusals_by_segment: dict[int, dict] = {}
         # Counted, not derived by subtraction. `keyframes - poses_refused`
         # silently promotes every anchor to a camera position, and an
         # anchor is definitional rather than measured: identity rotation,
@@ -443,7 +454,12 @@ class WorldBuilderEngine:
 
             segment_solved = 0
             segment_anchors = 0
-            for keyframe, pose in zip(members, estimate.poses):
+            first_refusal_index = None
+            first_refusal_degeneracy = None
+            solved_after_refusal = 0
+            for position, (keyframe, pose) in enumerate(
+                zip(members, estimate.poses)
+            ):
                 if pose.status == POSE_STATUS_SOLVED:
                     poses_solved += 1
                     segment_solved += 1
@@ -452,6 +468,23 @@ class WorldBuilderEngine:
                     segment_anchors += 1
                 else:
                     poses_refused += 1
+                    if first_refusal_index is None:
+                        first_refusal_index = position
+                        first_refusal_degeneracy = pose.degeneracy
+                        poses_refused_root += 1
+                        refusal_degeneracy[pose.degeneracy] = (
+                            refusal_degeneracy.get(pose.degeneracy, 0) + 1
+                        )
+                    else:
+                        poses_refused_cascaded += 1
+                if (
+                    pose.status == POSE_STATUS_SOLVED
+                    and first_refusal_index is not None
+                ):
+                    # Cannot happen while the chain latches. Counted anyway,
+                    # so that if a recovery mechanism is ever added its
+                    # effect is visible instead of being invisible.
+                    solved_after_refusal += 1
                 pose_rows.append(
                     self._pose_row(keyframe, pose, segment)
                 )
@@ -462,6 +495,18 @@ class WorldBuilderEngine:
             poses_positioned += segment_solved
             if segment_solved:
                 poses_positioned += segment_anchors
+
+            if first_refusal_index is not None:
+                refusals_by_segment[segment] = {
+                    "first_refusal_index": first_refusal_index,
+                    "degeneracy": first_refusal_degeneracy,
+                    # Keyframes the segment held but never attempted
+                    # geometry for, because the chain had already latched.
+                    "abandoned_keyframes": (
+                        len(members) - first_refusal_index - 1
+                    ),
+                    "recovered": solved_after_refusal > 0,
+                }
 
             for previous, current, pose in zip(
                 members, members[1:], estimate.poses[1:]
@@ -573,6 +618,13 @@ class WorldBuilderEngine:
                 "keyframes": len(keyframes),
                 "poses_solved": poses_solved,
                 "poses_refused": poses_refused,
+                # Split, because the total conflates a decision with its
+                # consequences. root + cascaded == poses_refused, always.
+                "poses_refused_root": poses_refused_root,
+                "poses_refused_cascaded": poses_refused_cascaded,
+                # Over ROOT refusals only -- the cascaded ones carry the
+                # root's label and would trebly count one decision.
+                "refusal_degeneracy_counts": refusal_degeneracy,
                 # Both reported. Suppressing the anchors would replace one
                 # misleading number with a missing one; a reader should be
                 # able to see "36 segment origins and no trajectory",
@@ -613,7 +665,10 @@ class WorldBuilderEngine:
             segments=len(segments),
             scale_state=scale_state,
             downgraded_from=selection.downgraded_from,
-            diagnostics={"points_discarded_by_segment": discards_by_segment},
+            diagnostics={
+                "points_discarded_by_segment": discards_by_segment,
+                "refusals_by_segment": refusals_by_segment,
+            },
         )
 
     # -- internals -----------------------------------------------------

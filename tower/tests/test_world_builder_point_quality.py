@@ -742,3 +742,127 @@ def test_manifest_reports_discards_and_the_accounting_closes(tmp_path):
         assert sum(r[reason] for r in per_segment.values()) == discarded[reason]
 
     assert result.poses_solved >= 0 and result.points == manifest["points"]
+
+
+# ---------------------------------------------------------------------------
+# Refusal accounting.
+#
+# `poses_refused` reads as N independent judgments about the world. It is
+# not. Once any pose in a segment is refused, `chain.broken` latches and
+# every later keyframe is refused WITHOUT ORB detection, matching, or any
+# geometry being attempted (classical.py, the cascade at _extend).
+#
+# Measured on the real 33-segment world from capture 22e9d428:
+#   354 refusals, 26 root decisions, 328 (92.7%) cascaded
+#   0 of 26 segments ever recovered after their first refusal
+#   segment 14 abandoned 40 of its 61 keyframes
+#
+# "26 chains each died once" and "354 frames were each judged ungeometric"
+# are different bugs with different fixes, and the manifest could not tell
+# them apart.
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_separates_root_refusals_from_cascaded_ones(tmp_path):
+    from tests import synthetic_scene as ss
+    from tower.world_builder.engine import WorldBuilderEngine
+    from tower.world_builder.records import CameraIntrinsics
+    from tower.world_builder.store import WorldStore
+
+    width, height = 480, 360
+    camera = ss.camera_matrix(width, height)
+    # Pure rotation: refusals are guaranteed, which is the point.
+    images = ss.render_sequence(
+        ss.furnished_room(), ss.pure_rotation(10), camera, width, height
+    )
+    store = WorldStore(tmp_path)
+    engine = WorldBuilderEngine(store)
+    world_id = engine.create_world()
+    session_id = engine.start_session(
+        world_id,
+        intrinsics=CameraIntrinsics(
+            source="self_calibrated",
+            fx=float(camera[0][0]),
+            fy=float(camera[1][1]),
+            cx=float(camera[0][2]),
+            cy=float(camera[1][2]),
+            calibrated_width=width,
+            calibrated_height=height,
+        ),
+        frame_source="synthetic",
+        declared_size=(width, height),
+    )
+    for index, image in enumerate(images):
+        engine.observe(ss.encode_jpeg(image), source_seq=index)
+    engine.stop_session()
+    result = engine.build(world_id, session_id)
+    manifest = store.read_derived_manifest(world_id)
+
+    assert "poses_refused_root" in manifest
+    assert "poses_refused_cascaded" in manifest
+    assert (
+        manifest["poses_refused_root"] + manifest["poses_refused_cascaded"]
+        == manifest["poses_refused"]
+    ), "every refusal is either a decision or a consequence of one"
+
+    # A root refusal is a real judgment; there can never be more of them
+    # than there are segments, because the chain latches.
+    assert manifest["poses_refused_root"] <= manifest["segments"]
+
+    assert "refusal_degeneracy_counts" in manifest
+    counts = manifest["refusal_degeneracy_counts"]
+    assert sum(counts.values()) == manifest["poses_refused_root"]
+
+    per_segment = result.diagnostics["refusals_by_segment"]
+    for row in per_segment.values():
+        assert set(row) == {
+            "first_refusal_index",
+            "degeneracy",
+            "abandoned_keyframes",
+            "recovered",
+        }
+
+
+def test_a_world_with_no_refusals_reports_zeros_not_absence(tmp_path):
+    """Absent-vs-zero, again. A clean walk must say zero refusals, not
+    omit the keys -- otherwise a consumer cannot distinguish it from a
+    build that predates the counter."""
+    from tests import synthetic_scene as ss
+    from tower.world_builder.engine import WorldBuilderEngine
+    from tower.world_builder.records import CameraIntrinsics
+    from tower.world_builder.store import WorldStore
+
+    width, height = 480, 360
+    camera = ss.camera_matrix(width, height)
+    images = ss.render_sequence(
+        ss.furnished_room(), ss.strafe(4, step=0.12), camera, width, height
+    )
+    store = WorldStore(tmp_path)
+    engine = WorldBuilderEngine(store)
+    world_id = engine.create_world()
+    session_id = engine.start_session(
+        world_id,
+        intrinsics=CameraIntrinsics(
+            source="self_calibrated",
+            fx=float(camera[0][0]),
+            fy=float(camera[1][1]),
+            cx=float(camera[0][2]),
+            cy=float(camera[1][2]),
+            calibrated_width=width,
+            calibrated_height=height,
+        ),
+        frame_source="synthetic",
+        declared_size=(width, height),
+    )
+    for index, image in enumerate(images):
+        engine.observe(ss.encode_jpeg(image), source_seq=index)
+    engine.stop_session()
+    engine.build(world_id, session_id)
+    manifest = store.read_derived_manifest(world_id)
+
+    for key in (
+        "poses_refused_root",
+        "poses_refused_cascaded",
+        "refusal_degeneracy_counts",
+    ):
+        assert key in manifest
