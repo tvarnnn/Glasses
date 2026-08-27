@@ -237,6 +237,52 @@ them.
 **VERDICT: KEEP.** With one recorded exception, `4fea31e2`, which is
 queued as physical test PT-3.
 
+## 5c. The only known-answer test in the programme — and it says NEUTRAL
+
+Every other number tonight is self-consistency. Synthetic scenes have
+exact ground truth, so this is the one place a change can be checked
+against a right answer rather than against itself.
+
+`scripts/research/stage1_covisibility/ground_truth_accuracy.py` drives the
+REAL engine (`observe()` per frame, then `build()`) over rendered walks
+with known camera positions, at both depths, and compares each solved
+pose's translation DIRECTION against the true direction. Direction and
+not position, because the reconstruction is scale-free and a two-view
+translation is defined only up to sign — the same metric
+`tests/test_world_builder_pose_accuracy.py` already uses.
+
+**16 paired runs — 8 seeds x {lateral, forward}. MEASURED:**
+
+| | better | same | worse | median delta |
+|---|---|---|---|---|
+| median direction error | 5 | 9 | 2 | 0.0 |
+| worst-case direction error | 6 | 7 | 3 | 0.0 |
+| poses_solved | 0 | 16 | 0 | 0 |
+
+**Verdict: no measurable effect on trajectory accuracy in either
+direction.**
+
+**An honest correction to my own first reading.** The first four runs
+(seeds 1000–1001) came back better on 3 of 4 for worst-case error with a
+median delta of −0.32°, and I took that as evidence Stage 1 improves
+accuracy. Extending to twelve more runs erased it. **Four paired samples
+were not enough to distinguish a real effect from scene-to-scene noise,
+and the larger sample is the one to believe.**
+
+So the case for keeping Stage 1 rests on §5b — more solved poses, more
+support rows, better multiplicity — and NOT on any accuracy claim. What
+this test establishes is the thing that actually mattered: **it does not
+degrade the trajectory where the trajectory can be checked.**
+
+### A pre-existing defect this test found
+
+`lateral seed=1006` produces a **median direction error of 84.22° and a
+worst of 87.79°** — a nearly perpendicular, confidently wrong pose — and
+it does so **identically at both depths**, so it is not caused by
+anything in this run. A ~90° error on the *easiest* motion type (lateral
+is the best case for two-view geometry) is worth investigating on its
+own. It is not investigated here, and it is recorded so it is not lost.
+
 ### What is still not known
 
 A spatial comparison of segment 19 at the two depths shows the solved
