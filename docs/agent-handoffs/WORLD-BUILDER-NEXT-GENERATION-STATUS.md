@@ -107,10 +107,10 @@ which is the highest-leverage experiment available and needs a wearer.
 
 ## 5. Known limits, stated rather than buried
 
-- **Registration cannot run live.** 116 s for a seven-segment world, dominated
-  by an O(F²) keyframe cross-product in `cross_matches` that no pair-level prune
-  touches. Finalisation-time registration is what this cost supports; live
-  registration needs appearance-based retrieval, which does not exist.
+- **Registration still cannot run live.** Keyframe sampling took it from 192 s
+  to 44 s and 20 s on the two registering worlds, which is comfortable at
+  finalisation. It is not comfortable per rebuild — a walk rebuilds ~150 times.
+  Live registration needs appearance-based retrieval, which does not exist here.
 - **The benchmark's zero-yield control is no longer a zero.** `4fea31e2` reads
   zero under the shipped rule but produces real geometry under a more permissive
   one — its zero was a cascade artifact. A control that is one algorithm change
@@ -150,8 +150,8 @@ without looking broken.
 ## 7. Promotion
 
 Not proposed yet. Per the lane's own rules this branch is promoted only after
-Tower tests pass (they do), specialist review passes (three adversarial reviews
-have run; a fourth is outstanding), the Mac lane consumes the contract change,
+Tower tests pass (they do), specialist review passes (four adversarial
+reviews have run and their findings are fixed), the Mac lane consumes the contract change,
 device validation passes, and physical World Builder validation is documented.
 
 **The physical half has not started.** Until P1 and P3 in the validation plan
