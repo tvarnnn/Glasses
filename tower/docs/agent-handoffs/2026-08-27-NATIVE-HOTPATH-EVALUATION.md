@@ -279,6 +279,15 @@ non-interoperable tokens off the wire.
 **MEASURED on 120 real frames: 1.429 ms → 0.193 ms per frame (7.40×)**,
 ~2.3 s of a 32 s replay.
 
+**The dtype guard added after review costs 0.026 ms/frame** (0.193 →
+0.219), i.e. 13% of the win back, or **48 ms across the 1,848-frame
+capture — 0.15% of the replay.** That is the price of turning a silent
+wrong answer on colour input into a loud refusal, and it is worth paying:
+`meanStdDev` returns per-channel deviations, so `[0, 0]` on a 3-channel
+array would have quietly reported channel zero where `.var()` pooled all
+three — a **7.4e-3 relative** error, twelve orders of magnitude outside
+the bound this function's docstring claims.
+
 The intermediate is **exact, not approximate**: 8-bit input with
 `ksize=1` bounds the Laplacian at ±1020 against int16's ±32767, so
 saturation is unreachable — verified by `np.array_equal` against the
