@@ -286,6 +286,30 @@ trade this lane was opened to evaluate.
 | after residual vectorisation (+19 parity tests) | **1,656 passed, 64 skipped, 0 failed** |
 | after sharpness + JSON (+9 tests) | **1,665 passed, 64 skipped, 0 failed** (4m49s) |
 
+## 6.5 CPU, RAM, GPU, VRAM
+
+- **CPU**: single-process, and the GIL is released for the large majority
+  of the work (§3), so it coexists with other cartridges rather than
+  monopolising the interpreter.
+- **RAM**: registration peak Python-traced memory **24.0 MB -> 24.1 MB**,
+  process RSS **186.7 MB -> 183.9 MB**. No regression. The sharpness
+  change strictly *reduces* memory traffic: it no longer allocates a
+  1.8 MB float64 Laplacian per frame. The JSON change adds a transient
+  string bounded by the payload (largest persisted: 1.71 MB).
+- **GPU / VRAM: not applicable, and verified rather than assumed.**
+  `tower/world_builder/` **does not import torch** and issues no CUDA
+  calls; the only two mentions of torch in the package are a comment in
+  `redaction.py` explaining a dependency that was *rejected*.
+  `FaceDetectorYN` runs on CPU — and per the toolchain lane, OpenCV
+  5.0.0's backend/target selectors are inert here (OpenCL and CUDA return
+  bit-identical output, and the runtime warns that back-ends are
+  unsupported by its new graph engine).
+
+  So World Builder's replay path uses **zero VRAM**, which is worth
+  stating plainly: it leaves the whole 12 GB free for Scene Understanding,
+  Object Memory and AI workloads. A native migration would not have
+  changed that either way.
+
 ## 7. Build / toolchain — the blunt finding
 
 **A native extension cannot be built on this host.** MEASURED by the
