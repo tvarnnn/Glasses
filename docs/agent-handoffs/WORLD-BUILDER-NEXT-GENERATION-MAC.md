@@ -1,9 +1,10 @@
-# World Builder point quality — Mac / iOS handoff
+# World Builder `next-generation` — Mac / iOS handoff
 
 **From:** World Builder lane (Tower)
 **Branch:** `world-builder/next-generation`
 **Base:** `origin/integration/world-builder-lifecycle-v1` @ `25eb794`
-**Status of this change:** **NO IOS CHANGE REQUIRED NOW.** One FOLLOW-UP, one FUTURE.
+**Status:** **NO IOS CHANGE REQUIRED.** Two FOLLOW-UPs, one FUTURE.
+**Covers:** point-quality gates, refusal accounting, solve-chain segmentation.
 **Tower tests:** 430 passed, 10 skipped.
 
 ---
@@ -91,6 +92,55 @@ Run against a world built by this branch.
 | Fewer fragment cards than before | same — `segment_count` must be identical |
 | Stale geometry after a rebuild | cache invalidation, unrelated to this change but report it |
 
+## 4a. SECOND CHANGE: a broken solve chain now starts a new segment
+
+Landed after the point-quality work. It changes what a **segment** means, so it
+is the one thing here you will actually see differ in the fragments grid.
+
+### What it does
+
+`classical.py` has claimed for a long time that when the solve chain breaks "the
+engine turns this into a new segment". It did not. The engine split only on
+tracking loss, so once a chain broke, every later keyframe in that segment was
+refused **without attempting any geometry**. Measured on capture `22e9d428`: 354
+refusals from only 26 real decisions, 328 of them cascade, and 0 of 26 segments
+ever recovered.
+
+The engine now splits when the chain breaks, provided the broken chain had
+solved at least two poses.
+
+### What you will see change
+
+| field | change | why |
+|---|---|---|
+| `segment_count` | **rises ~11%** (127 → 141 across the corpus) | breaks that used to be silent are now boundaries |
+| `solved_count` | **rises ~22%** | keyframes after a break get an anchor and a chance |
+| `point_count` | **rises ~24%** | those keyframes triangulate |
+| `resolution_state` | more segments `resolved` | same reason |
+| `unresolvedCount` on your side | **may rise** | there are simply more segments; some resolve, some do not |
+
+**This is the opposite direction from the point-quality change**, which lowered
+`point_count` per segment. Net across both, the corpus went 47,429 → 58,985
+published points in more, smaller segments — with the *largest* segment in every
+capture holding the same geometry it held before.
+
+### What must NOT change
+
+**`keyframes` is invariant.** Tracking and keyframe selection are untouched: the
+tracker is deliberately not reset on a solve break, because tracking is healthy
+and only the solve failed. If `keyframes` moves between a build on this branch
+and one on the base branch for the same capture, something leaked.
+
+### A new event kind
+
+`solve_chain_broken` joins the closed `EVENT_KINDS` set. It is deliberately
+**not** `tracking_lost` and deliberately does **not** set `last_tracking`: a
+consumer must not read a geometry failure as the wearer having lost the world.
+If anything on your side switches exhaustively on event kind, it needs to
+tolerate this one.
+
+---
+
 ## 5. FOLLOW-UP (not required now)
 
 Tower now knows, per build, how many landmarks it refused and why. Nothing
@@ -105,6 +155,17 @@ fragments view would be:
 That is a different and more honest statement than the existing "N areas were
 seen but could not be reconstructed", which counts tracking-loss windows. Do not
 merge the two counts; they answer different questions.
+
+### Second follow-up: fragment ranking
+
+More segments means more fragment cards, and the grid has no ordering or
+filtering. The manifest already carries `point_count`, `solved_count` and
+`keyframe_count` per segment; ranking by `point_count` would put the parts of
+the room that were actually mapped first. There is a larger prize behind this:
+an unrestricted version of the segmentation change measured **poses 346 → 863
+and points 47k → 107k**, and was held back only because it produces ~470
+segments, which is unusable in an unranked grid. If fragments can be ranked or
+collapsed, that variant becomes available.
 
 **Do not** render refused points in a dimmed colour. Their coordinates are not
 approximately right — they are unconstrained, sometimes by four orders of
