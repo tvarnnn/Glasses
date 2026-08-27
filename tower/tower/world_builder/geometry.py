@@ -126,12 +126,40 @@ def homography_ratio(points_a: np.ndarray, points_b: np.ndarray) -> float | None
     """
     if len(points_a) < 8:
         return None
-    _, h_mask = cv2.findHomography(points_a, points_b, cv2.RANSAC, 3.0)
-    _, f_mask = cv2.findFundamentalMat(
+
+    # THE MODEL IS CHECKED BEFORE THE MASK, AND THAT IS THE WHOLE POINT.
+    #
+    # When RANSAC cannot fit at all it returns model=None and, on OpenCV
+    # 5, leaves the mask buffer UNWRITTEN rather than zeroing it. Reading
+    # it then yields whatever was in that memory: measured here on a real
+    # pair (capture 22e9d428, keyframes 00000345 x 00001824), 242 Lowe
+    # matches landing on 3 distinct locations in a keyframe holding only
+    # 5 ORB features, so neither F (needs 8 in general position) nor H
+    # (needs 4) can fit. The mask came back uint8 with 46 distinct values
+    # summing to 9552 -- on 242 elements, where a binary mask cannot
+    # exceed 242.
+    #
+    # It is NON-DETERMINISTIC and self-heals within a warm process: the
+    # buffer is dirty on first use and zeroed after, so 50 identical
+    # calls in one process show it once. Measured one call per FRESH
+    # process: 30/40 corrupt in one run, 37/40 and 34/40 in others, with
+    # sums to 32,880.
+    #
+    # `mask.sum()` on garbage is a plausible-looking number, so this
+    # never raised. It is currently latent -- r_h is recorded and nothing
+    # reads it -- and it is fixed here because it is free while in this
+    # file, and because a non-deterministic wrong number is miserable to
+    # debug once something does depend on it.
+    h_model, h_mask = cv2.findHomography(points_a, points_b, cv2.RANSAC, 3.0)
+    f_model, f_mask = cv2.findFundamentalMat(
         points_a, points_b, cv2.FM_RANSAC, 3.0, 0.99
     )
-    h_inliers = int(h_mask.sum()) if h_mask is not None else 0
-    f_inliers = int(f_mask.sum()) if f_mask is not None else 0
+    h_inliers = (
+        int(h_mask.sum()) if h_model is not None and h_mask is not None else 0
+    )
+    f_inliers = (
+        int(f_mask.sum()) if f_model is not None and f_mask is not None else 0
+    )
     total = h_inliers + f_inliers
     if total == 0:
         return None
