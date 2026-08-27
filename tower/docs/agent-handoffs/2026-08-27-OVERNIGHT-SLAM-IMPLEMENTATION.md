@@ -144,11 +144,21 @@ Built on real evidence (10 keyframes under 20 ORB features, minimum
 two of them segment anchors) with an arithmetic threshold. **It never
 fired: 0 rejections corpus-wide, 1,712 keyframes accepted either way.**
 
-Conclusive by construction — the gate was live, so no keyframe accepted
-at HEAD is feature-starved. HEAD's existing blur and motion gates already
-reject that population; the evidence came from a world built by the
-previous engine. Removed rather than kept, because it costs an ORB
-detection per accepted keyframe to never execute. Queued as PT-2.
+**I first wrote that this was "conclusive by construction — no keyframe
+accepted at HEAD is feature-starved". That was FALSE and the review
+caught it: 22 of the 1,712 accepted keyframes ARE starved, minimum zero
+features.** My reasoning ignored an ordering detail I had already read:
+the accept decision is at `engine.py:303` and `_persist_keyframe`, which
+applies redaction, is at `:331` — **so the gate inspected the
+pre-redaction frame while geometry consumes the redacted one.** It could
+never see the population it was written for.
+
+**The removal still stands, on better evidence:** of those 22, **0 carry
+a pose and 0 contribute a support row.** They cost 6 wasted segment
+anchors and nothing else. And repairing the gate is a harder design than
+the one attempted — to see what geometry sees it must run *after*
+persistence, by which point the frame is already the tracking reference,
+which was the main argument for having it. Queued as PT-2.
 
 ## 6. Why registration was NOT wired in
 
