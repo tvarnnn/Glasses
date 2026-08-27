@@ -192,7 +192,9 @@ Transition rules worth memorising:
   **200** with `"changed": false` — honoured, nothing moved. That is not
   an error and must not be shown as one.
 - **`resume` is stricter** — it claims to continue something. From
-  `stopped` it is refused **409** with `reason: "not-active"`.
+  `stopped` it is refused **409** with `reason: "not-paused"`. (`pause`
+  from `stopped` is the neighbouring refusal and reads `"not-active"`;
+  the two are not interchangeable and were verified on the wire.)
 - **`stop` is never refused, from any state.** Refusing it would make a
   Tower restart the only way out of a bad state.
 - **Nothing is persisted.** A Tower that restarts comes back with every
@@ -828,10 +830,17 @@ plus the six `cv_lab_*` states in §6.3.
 
 **Session control**: **200** honoured (including an idempotent no-op),
 **404** no such cartridge session (a configuration answer), **409** cannot
-be honoured from this state, with `reason` in `unsupported` /
-`not-active` / `not-purchased`… precisely: `unsupported`, `not-active`,
-`not-paused`, `unknown-action`. Refusals are **409, not 200 with a flag** —
-a client ignoring the body would read 200 as success.
+be honoured from this state. Four `reason` values, verified on the wire:
+
+| `reason` | Raised by |
+|---|---|
+| `not-active` | `pause` from `stopped` |
+| `not-paused` | `resume` from `stopped` |
+| `unsupported` | any action on a Tower with no producer to start |
+| `unknown-action` | an action outside `start`/`pause`/`resume`/`stop` |
+
+Refusals are **409, not 200 with a flag** — a client ignoring the body
+would read 200 as success. `stop` never appears here: it is never refused.
 
 **HTTP 404 on this Tower usually means "not configured", not "no such
 route"**, and every such 404 names the variable. Treat a 404 with no
