@@ -259,7 +259,7 @@ trade this lane was opened to evaluate.
 |---|---|
 | before this lane | 1,637 passed, 64 skipped |
 | after residual vectorisation (+19 parity tests) | **1,656 passed, 64 skipped, 0 failed** |
-| after sharpness + JSON (+9 tests) | _(filled at close)_ |
+| after sharpness + JSON (+9 tests) | **1,665 passed, 64 skipped, 0 failed** (4m49s) |
 
 ## 7. Build / toolchain — the blunt finding
 
