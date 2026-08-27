@@ -154,6 +154,69 @@ recoverable. It is not attempted here.
 
 ---
 
+## 3a. FOLLOW-UP: the cascade was fixed, and it reframes everything above
+
+§3 said fragmentation work is gated on fixing the cascade. The cascade was
+then fixed, and the result is larger than this note anticipated.
+
+`classical.py` had long claimed that when a chain breaks "the engine turns this
+into a new segment". It did not — `engine.py` incremented the segment index only
+on `decision.lost` and never looked at the backend. Making that claim true:
+
+| variant | poses | points | segments | Σ largest-segment points |
+|---|---|---|---|---|
+| baseline | 346 | 47,429 | 127 | 28,656 |
+| split on **every** break | **863** | **107,005** | 470 | **32,756** |
+| split when the chain solved ≥ 2 (**shipped**) | 424 | 58,985 | 141 | 28,663 |
+
+**The cascade was discarding roughly 60% of the recoverable poses in this
+corpus.** That is a much larger effect than any tracking lever measured here or
+in the fragmentation research.
+
+### An intermediate reading that was wrong, recorded because it nearly shipped
+
+Splitting on every break was first judged a **coherence regression**, because the
+mean largest-segment *share* of points fell 0.549 → 0.295. That reading was an
+artifact of a ratio. The largest coherent piece **never shrinks in any capture**
+— it grows corpus-wide, 28,656 → 32,756. The share fell only because new
+geometry appeared *alongside* the main piece.
+
+A ratio moved, nothing was lost, and the ratio nearly caused a 2.5x
+reconstruction gain to be discarded. The benchmark now reports absolute
+`largest_segment_points` beside `largest_share` so that reading cannot recur.
+
+### Why the unrestricted variant is still not shipped
+
+Not coherence — fragmentation the *viewer* cannot cope with. 470 segments, median
+2 keyframes, is 470 fragment cards on a phone with no filtering or ranking. The
+restricted rule takes the conservative subset (+22% poses, +24% points, segments
++11%) and leaves the rest available once fragments can be ranked or registered.
+
+### The zero-yield control was never a zero
+
+`4fea31e2` was chosen as the benchmark's honest zero: 0 poses, 0 points. Under
+the unrestricted variant it produces 18 poses and 1,202 points, and inspection
+says that geometry is **real** — segment 1 is a 9-pose chain over 11 keyframes
+with a camera baseline of 2.53 against median depth 24.4, a span/depth of 0.104,
+above the 0.09 bar registration itself uses. The unit-1.0000 baselines in the
+smaller segments are seed-pair normalisation, not degeneracy.
+
+**The control's zero was a cascade artifact, not ground truth.** It still reads
+zero under the shipped rule, so it remains usable for now, but a benchmark whose
+honest zero is one algorithm change away from being non-zero needs a better
+control. Recorded as a known weakness of the instrument.
+
+### What §3 got right and wrong
+
+Right: the cascade was the thing to fix first, and fragmentation levers were
+being measured in a currency that converts to reconstruction loss.
+
+Wrong: the prediction that intervention #5 will lose poses was made under the
+cascade. With restarts allowed it may behave completely differently, and the
+prediction should be re-tested rather than inherited.
+
+---
+
 ## 4. Method, so this is reproducible
 
 ```
