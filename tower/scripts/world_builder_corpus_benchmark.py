@@ -443,6 +443,102 @@ def parse_policy(spec: str | None):
     return KeyframePolicy(**overrides), overrides
 
 
+
+# ---------------------------------------------------------------------
+# Integrity controls
+# ---------------------------------------------------------------------
+
+
+def run_controls(scratch_root: Path) -> dict:
+    """Two synthetic solves whose correct answers are known in advance.
+
+    The corpus originally carried a "zero-yield control" -- capture
+    4fea31e2, which produced no geometry -- so that an improvement could
+    not be confused with the pipeline starting to fabricate. That control
+    STOPPED BEING A ZERO: its emptiness turned out to be an artifact of
+    the refusal cascade, and fixing the cascade made it produce real
+    geometry. A control one algorithm change away from moving is not a
+    control.
+
+    These cannot drift, because their answers are logical rather than
+    empirical:
+
+    NEGATIVE -- pure rotation. A camera that turns without translating has
+    no baseline, so no landmark can be triangulated at any depth. Points
+    here are fabrication by definition, whatever the code does. It is the
+    stronger of the two available negatives because it still ACCEPTS
+    keyframes and forms segments, so the whole pipeline runs and refuses,
+    rather than the selector quietly discarding everything.
+
+    POSITIVE -- a strafe. Required, and required to be non-zero: a
+    negative control passes trivially in a pipeline that has stopped
+    working at all, and without this pairing "0 points" would be
+    indistinguishable from "the engine is broken".
+
+    Verified to actually fire, which took two attempts. Zeroing
+    MIN_TRIANGULATION_ANGLE_DEG and MIN_INLIER_RATIO was NOT enough --
+    pure rotation is refused by three independent conditions in the
+    seed-pair gate, so the control stayed silent and looked useless.
+    Removing the whole degeneracy check produced 9 solved poses and 389
+    points from a camera that never moved, and the control caught it.
+    The defence in depth is worth knowing about on its own.
+    """
+    from tests import synthetic_scene as ss
+    from tower.world_builder.engine import WorldBuilderEngine
+    from tower.world_builder.records import CameraIntrinsics
+    from tower.world_builder.store import WorldStore
+
+    width, height = 480, 360
+    camera = ss.camera_matrix(width, height)
+    intrinsics = CameraIntrinsics(
+        source="self_calibrated",
+        fx=float(camera[0][0]), fy=float(camera[1][1]),
+        cx=float(camera[0][2]), cy=float(camera[1][2]),
+        calibrated_width=width, calibrated_height=height,
+    )
+
+    def solve(name, poses):
+        cv2.setRNGSeed(0)
+        images = ss.render_sequence(
+            ss.furnished_room(), poses, camera, width, height
+        )
+        store = WorldStore(scratch_root / f"control-{name}")
+        engine = WorldBuilderEngine(store)
+        world_id = engine.create_world()
+        session_id = engine.start_session(
+            world_id, intrinsics=intrinsics, frame_source="synthetic",
+            declared_size=(width, height),
+        )
+        for index, image in enumerate(images):
+            engine.observe(ss.encode_jpeg(image), source_seq=index)
+        engine.stop_session()
+        result = engine.build(world_id, session_id)
+        return {
+            "keyframes": result.keyframes,
+            "segments": result.segments,
+            "poses_solved": result.poses_solved,
+            "points": result.points,
+        }
+
+    negative = solve("pure-rotation", ss.pure_rotation(24))
+    positive = solve("strafe", ss.strafe(12, step=0.12))
+    failures = []
+    if negative["poses_solved"] or negative["points"]:
+        failures.append(
+            f"NEGATIVE CONTROL FABRICATED GEOMETRY: pure rotation produced "
+            f"{negative['poses_solved']} solved poses and "
+            f"{negative['points']} points. A camera that only turns has no "
+            f"baseline; nothing can be triangulated from it."
+        )
+    if not positive["poses_solved"] or not positive["points"]:
+        failures.append(
+            f"POSITIVE CONTROL PRODUCED NOTHING: a strafe gave "
+            f"{positive['poses_solved']} solved poses and "
+            f"{positive['points']} points. The negative control below is "
+            f"meaningless until this one works."
+        )
+    return {"negative": negative, "positive": positive, "failures": failures}
+
 # ---------------------------------------------------------------------
 # One capture
 # ---------------------------------------------------------------------
@@ -735,6 +831,20 @@ def do_run(args) -> int:
         print("SUBSET RUN -- not comparable with a full-corpus run.")
     print()
 
+    controls = run_controls(scratch_root)
+    print(
+        f"controls    negative(pure rotation) "
+        f"{controls['negative']['poses_solved']} poses / "
+        f"{controls['negative']['points']} points   "
+        f"positive(strafe) {controls['positive']['poses_solved']} poses / "
+        f"{controls['positive']['points']} points"
+    )
+    for failure in controls["failures"]:
+        print(f"  !! {failure}")
+    if controls["failures"]:
+        print("  !! every number below is suspect until this is fixed.")
+    print()
+
     captures: list[dict] = []
     for index, (prefix, directory) in enumerate(resolved, start=1):
         logger.info(
@@ -757,6 +867,7 @@ def do_run(args) -> int:
         "complete_corpus": len(resolved) == len(PINNED_PREFIXES),
         # Recorded so a result file always says which policy produced it.
         "policy_overrides": policy_overrides,
+        "controls": controls,
         "captures": captures,
         "totals": totals,
     }
@@ -767,7 +878,11 @@ def do_run(args) -> int:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(f"\nwrote {args.out.resolve()}")
-    return 0
+    # A run whose integrity control failed still writes its output --
+    # the numbers are needed to diagnose the failure -- but it must
+    # not exit 0. A benchmark that reports success while fabricating
+    # geometry is worse than no benchmark.
+    return 1 if controls["failures"] else 0
 
 
 # ---------------------------------------------------------------------
