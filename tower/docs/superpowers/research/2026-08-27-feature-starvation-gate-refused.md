@@ -66,10 +66,34 @@ Implemented in `engine.observe()` after all existing gates, with reason
 Keyframes accepted: **1,712 with the gate, 1,712 without** — bit-identical
 totals (230 segments, 591 solved, 75,369 points either way).
 
-**This is conclusive by construction, not by inference.** The gate was
-live. Had any accepted keyframe carried fewer than 15 features, it would
-have rejected it. It rejected none. Therefore **no keyframe accepted at
-HEAD is feature-starved.**
+**CORRECTED 2026-08-27 — the sentence that stood here was FALSE, and the
+reasoning behind it was unsound. The adversarial review caught it.**
+
+What I wrote was: *"This is conclusive by construction... Therefore no
+keyframe accepted at HEAD is feature-starved."*
+
+**22 of the 1,712 persisted keyframes ARE feature-starved, minimum zero
+features** — measured by the reviewer directly on the persisted images.
+
+The reasoning failed because of an ordering detail I had already read and
+did not connect: the accept decision happens at `engine.py:303`, and
+`_persist_keyframe` — which applies redaction — happens at `:331`. **So
+the gate inspected the PRE-redaction frame, while the geometry backend
+consumes the REDACTED one.** A frame with plenty of features before a
+face is blacked out can have almost none afterwards. The gate could never
+have seen the population it was written for; "it never fired" was
+evidence about the wrong image.
+
+**The decision to remove it nevertheless stands, on the reviewer's own
+measurement**: of those 22 starved keyframes, **0 carry a pose and 0
+contribute a support row**. They cost nothing downstream. Six are wasted
+segment anchors, which is a real but small inefficiency.
+
+**What would need to change if this is revisited:** the gate must run on
+the redacted image, i.e. after `_persist_keyframe`, which means it can no
+longer prevent a bad frame from becoming the tracking reference — the
+main argument for having it. That is a harder design than the one
+attempted here, and it is why this stays refused rather than deferred.
 
 ## 3. Why the evidence and the result disagree
 
@@ -79,10 +103,10 @@ engine**. All 19 persisted worlds predate this branch — verified via
 so explicitly ("absent would mean this build predates the counter"), and
 which is absent from every manifest on disk.
 
-The starved keyframes are real, and at HEAD they are no longer *accepted*.
-The tracker and selector fixes of 2026-08-25 — `6e60f76` in particular —
-already reject that population through the existing blur and motion
-gates, before a feature-count gate would ever see them.
+**Superseded by §2's correction.** The starved keyframes are real and
+they ARE still accepted at HEAD — 22 of them. What was wrong was my
+inference from "the gate never fired", which measured the pre-redaction
+image and therefore could not see them.
 
 **The research package's Stage 2 recommendation was correct about the
 problem and is now obsolete about the fix.** It was written against
@@ -91,16 +115,22 @@ measurements from the older pipeline.
 ## 4. Why it was removed rather than kept as a safety net
 
 The gate runs `detect_and_describe` on every frame that clears all other
-gates — every accepted keyframe, 1,712 of them, at roughly 3.9 ms each.
-That is measurable cost for a branch that provably never executes on the
-only corpus that exists.
+gates — every accepted keyframe, 1,712 of them, at roughly 3.9 ms each —
+**and as built it inspects the wrong image**, so it never fires while the
+population it targets sails past it.
 
-Keeping it would mean shipping dead code with a real cost on the strength
-of a hypothetical: footage with a person close enough to the lens that a
-*sharp* frame is mostly redaction fill. That case is plausible and is
-**queued as physical test PT-2** rather than guessed at. If a real walk
-produces it, the gate is nine lines and this document says exactly where
-it went and why.
+It is removed rather than repaired because repairing it is a different
+and harder design: to see what geometry sees, it must run after
+`_persist_keyframe`, and by then the frame has already been installed as
+the tracking reference — which was the main argument for having a gate at
+all. Refusing a keyframe *after* persisting it is a larger change to the
+engine's flow than this stage's budget, and it should be designed rather
+than patched.
+
+What justifies leaving it out entirely rather than deferring it: of the 22
+starved keyframes that ARE accepted, **0 carry a pose and 0 contribute a
+support row**. The cost of admitting them is 6 wasted segment anchors.
+That is a real inefficiency and a small one. **Queued as PT-2.**
 
 ## 5. What was kept from the same investigation
 
