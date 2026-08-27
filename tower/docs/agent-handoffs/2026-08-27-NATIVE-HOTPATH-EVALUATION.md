@@ -90,7 +90,13 @@ it applies to every delivered frame rather than only to accepted ones.
 The live `observe()` path measures **94.7% native** by tottime in
 isolation — higher than the 79.1% for replay+build, because that figure
 includes `build()` and the filesystem. Its single largest Python frame is
-**0.092 s out of 24 s.**
+**0.092 s out of 24 s (0.4%).**
+
+And the tightest number in this document, which is the one to watch:
+**accepted-keyframe p95 is 65 ms against the 83 ms budget.** That is
+~1.28x headroom at the tail, not 1.7x and certainly not 5x. It is still
+inside budget, it is still flat in session length, and it is the figure
+that would justify future work on the live path if anything ever does.
 
 Incidentally: **face redaction is the single most expensive operation in
 World Builder**, larger than optical flow. It is already native, and §5
@@ -175,6 +181,35 @@ path. So it is live production code exercised on every registration, at
 negligible cost, rather than a dead branch nobody would notice breaking.
 That was a deliberate choice: an unexercised reference implementation is
 worse than none, because it invites trust it has not earned.
+
+#### 4.1.1 A caveat on the vectorised residual: it INVERTS on tiny inputs
+
+Found by the scaling lane's independent micro-benchmark, and it is a real
+property of the change rather than a measurement artifact:
+
+| cameras per call | speedup |
+|---|---|
+| 1 | **0.82x — SLOWER** |
+| 4 (the measured working size) | **3.04x** |
+| overall | 1.59x |
+
+The vectorised path is **overhead-bound, not FLOP-bound**: below about
+three cameras the gather and the `einsum` setup cost more than the Python
+loop they replace.
+
+**On the default configuration that case cannot arise.** MEASURED over a
+full registration run, the cameras-per-call distribution is exactly
+`{3: 46, 4: 46, 5: 46, 6: 46}` — minimum 3, never fewer. That is
+structural, not luck: `Thresholds.min_cameras = 3` is enforced at
+`world_registration.py:906` *before* a candidate reaches `_refine`, with
+the comment that fewer "are needed before a baseline means" anything.
+
+**But it is reachable by configuration.** `--min-cameras 1` would admit
+2-camera and 1-camera fits and land in the inverted regime. That is a
+research knob, the slowdown is ~18% on a stage that is not on the product
+path, and nothing silently breaks — so it is documented rather than
+guarded with a branch. A successor lowering that threshold should know
+the residual kernel stops paying for itself there.
 
 ### 4.2 JSON write — 3.58×, byte-identical
 
