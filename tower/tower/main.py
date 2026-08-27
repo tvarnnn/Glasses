@@ -9,6 +9,7 @@ from fastapi import FastAPI
 
 from tower.capture import CaptureRecorder
 from tower.capture_workers import CaptureWorkerSupervisor, WorkerSpec
+from tower.cartridge_runtime import build_live_cartridges
 from tower.cartridge_session import CartridgeSession
 from tower.config import KNOWN_VERIFIERS, TOWER_ROOT, Settings, get_settings
 from tower.experiments import ExperimentSettings
@@ -19,7 +20,16 @@ from tower.modules.experimental_cv import ExperimentalCVModule
 from tower.results import build_hub
 from tower.results.contracts import CARTRIDGE_OBJECT_MEMORY
 from tower.results.object_memory import build_face_filter, recorded_classes_for
-from tower.routes import cartridges, geometry, health, observations, sessions, ws
+from tower.routes import (
+    cartridges,
+    documents,
+    geometry,
+    health,
+    observations,
+    scene,
+    sessions,
+    ws,
+)
 from tower.session import ConnectionTracker
 
 logger = logging.getLogger(__name__)
@@ -254,6 +264,29 @@ def _log_effective_configuration(
     else:
         logger.info("[Tower][Config] world root %s", settings.world_root)
 
+    if settings.scene_understanding:
+        logger.info(
+            "[Tower][Config] Scene Understanding is enabled; it observes "
+            "nothing until a session is started and persists nothing ever"
+        )
+    else:
+        logger.info(
+            "[Tower][Config] TOWER_SCENE_UNDERSTANDING is off: the contract "
+            "is declared and reported unavailable"
+        )
+
+    if settings.document_root is None:
+        logger.info(
+            "[Tower][Config] TOWER_DOCUMENT_ROOT is unset: /documents/* "
+            "will answer 404 and the contract is reported unavailable"
+        )
+    else:
+        logger.info(
+            "[Tower][Config] document root %s (capture %s)",
+            settings.document_root,
+            "on" if settings.document_capture else "off",
+        )
+
     if settings.observation_root is None:
         logger.warning(
             "[Tower][Config] TOWER_OBSERVATION_ENABLED is off: nothing will "
@@ -328,6 +361,14 @@ async def lifespan(app: FastAPI):
     supervisor = getattr(app.state, "capture_workers", None)
     if supervisor is not None:
         await asyncio.to_thread(supervisor.shutdown)
+    # Live sessions after the hub, for the same reason as the workers: a
+    # session stopped while the hub was still polling would publish one
+    # last payload saying "stopped" that nobody asked for. Off-thread
+    # because stopping a session joins a worker thread, and a bounded
+    # join on the event loop is still a join on the event loop.
+    live = getattr(app.state, "live_cartridges", None)
+    if live is not None:
+        await asyncio.to_thread(live.shutdown)
     await app.state.module_container.shutdown()
 
 
@@ -395,11 +436,39 @@ def create_app() -> FastAPI:
     # what a camera sees without anybody asking again is the wrong
     # direction to fail in.
     app.state.cartridge_sessions = cartridge_sessions
+    # The live cartridges this configuration enables, built in one place
+    # that knows their names so this file does not have to. Often empty:
+    # both are off by default, and an empty list costs nothing on the
+    # frame path.
+    live = build_live_cartridges(settings)
+    app.state.live_cartridges = live
+    # A SECOND list, beside `frame_observers`. That one is the dataset
+    # recorder's and is shaped around capture lineage -- it mints capture
+    # ids, `/health` reports on it, and `ws.py` calls `capture_dir()` on
+    # its members unguarded. A cartridge counting frames belongs nowhere
+    # near it.
+    app.state.frame_consumers = live.frame_consumers
+    # Read by the declaration and by two HTTP routes. The web process
+    # records a document only when a session is started; unset means the
+    # routes answer 404.
+    app.state.document_root = settings.document_root
+    # Whether a live session exists is a SEPARATE question from whether
+    # the library can be read, and the two must not be conflated. A Tower
+    # reprocessing captures offline has a library and no session; that is
+    # a normal configuration and `/documents` must serve it.
+    # Whether the contract may be offered at all, which is a question
+    # about configuration and not about whether a session is running.
+    app.state.scene_enabled = bool(live.scene is not None)
     _log_effective_configuration(settings, app.state.capture_workers)
     # One shared reader for the whole app. It starts no task until a
     # client subscribes and stops again when the last one goes, so a Tower
     # nobody is watching does no polling and no disk IO on its behalf.
-    app.state.result_hub = build_hub(settings.world_root)
+    app.state.result_hub = build_hub(
+        settings.world_root,
+        document_root=settings.document_root,
+        scene_source=live.scene,
+        document_source=live.document,
+    )
     # Started here, not in `lifespan` above: TestClient(create_app()) used
     # without `with client:` (every pre-existing test in this repo) never
     # runs ASGI lifespan events, leaving the module UNLOADED forever. See
@@ -410,6 +479,8 @@ def create_app() -> FastAPI:
     app.include_router(geometry.router)
     app.include_router(observations.router)
     app.include_router(sessions.router)
+    app.include_router(scene.router)
+    app.include_router(documents.router)
     app.include_router(ws.router)
     return app
 

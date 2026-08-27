@@ -21,13 +21,20 @@ detail), `WORLD-BUILDER-STATUS.md` (P1–P11 physical gates),
 
 ## 1. Status
 
+> **Updated 2026-08-27.** Rows 3 and 5 moved. Both cartridges now offer
+> typed contracts through `/cartridges` and are reachable from a phone;
+> neither got better to earn it, and both publish their own limits as
+> fields. See `tower/docs/agent-handoffs/2026-08-27-SCENE-AND-DOCUMENT-CARTRIDGES.md`
+> for what shipped and `docs/agent-handoffs/SCENE-AND-DOCUMENT-MAC-HANDOFF.md`
+> for the integration view.
+
 | # | Cartridge | Code | Evidence on real frames | Gated by |
 |---|---|---|---|---|
 | 1 | **World Builder** | Tower complete, tested | **Yes** — 5 real captures; 51 segments, 3 registered | **Owned by `world-builder/next-generation`; frozen to this lane** |
 | 2 | **Experimental CV Lab** | Implemented, 86 tests | Partly — `baseline` only, 2026-08-21 | Nothing; it is a lab |
-| 3 | **Scene Understanding** | Implemented, persists nothing | **Yes** — constants re-derived at the true 12 fps delivery rate | **UNBLOCKED 2026-08-26** — needs a wire path built |
-| 4 | **Object Memory** | Store + producer + routes + **Start/Pause/Stop** + **imagery** + **iOS surface (UNCOMPILED)** | **Yes** — and the corpus doubled: every detection over 18,821 frames dumped, crops read by eye | iOS compile; the `person` ruling; **capture resolution** |
-| 5 | **Document Memory** | Engine + CLI, 145 tests | **Yes, and it falsified the premise** | Camera resolution |
+| 3 | **Scene Understanding** | Implemented, persists nothing, **on the wire 2026-08-27** | **Yes** — constants re-derived at the true 12 fps delivery rate; live path benchmarked over 5,204 frames | **Physical validation only** — nobody has worn these glasses near a bystander |
+| 4 | **Object Memory** | Store + producer + routes + **Start/Pause/Stop** + **imagery** + **iOS surface (UNCOMPILED)** | **Yes** — and the corpus doubled: every detection over 18,821 frames dumped, crops read by eye | iOS compile; the `person` ruling; **capture resolution**; not yet declared in `/cartridges` |
+| 5 | **Document Memory** | Engine + CLI + **library and session on the wire 2026-08-27** | **Yes, and it falsified the premise** — 0 pages detected in 5,204 live frames, confirming the offline sweep | Camera resolution. The contract is offered and states that limit as data |
 | 6 | **Environmental Memory** | Design only | None | Its own design says *do not begin* |
 | 7 | **Translator** | Two plans, both stamped DO NOT IMPLEMENT | None | No audio path exists |
 | 8 | **Visual Q&A** | Doc only | None | Voice half: audio. Visual half: nothing |

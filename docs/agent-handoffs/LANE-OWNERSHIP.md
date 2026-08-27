@@ -6,7 +6,7 @@ document is the boundary. When a lane needs something owned by another, it
 
 | Lane | Branch | Owns |
 |---|---|---|
-| **Tower / cartridges** (this lane) | `integration/world-builder-lifecycle-v1` | Everything not claimed below |
+| **Tower / cartridges** (this lane) | `integration/world-builder-lifecycle-v1`, and `integration/document-scene-cartridges-v1` branched from it on 2026-08-27 | Everything not claimed below |
 | **iOS / Mac** | `ios/world-builder-integration` | **All of `ios/`**, exclusively |
 | **World Builder** | `world-builder/next-generation` | The World Builder subsystem |
 
@@ -75,6 +75,20 @@ carried inside it (`world_builder.status/…`) is World Builder's.
 
 ---
 
+## 3b. Branches this lane has open
+
+`integration/document-scene-cartridges-v1`, from `6e325f8`, carries the
+Scene Understanding and Document Memory wire paths. It is pushed and
+**unmerged**: integrating it with `integration/world-builder-lifecycle-v1`
+is an integration decision rather than this lane's to take unilaterally.
+
+It touches no file either frozen surface owns. The one place it comes
+close is `tests/test_result_channel_hostile.py`, which it does not
+modify — the WinError 32 flake §3 rules to the World Builder lane
+appeared once in a full run and passes in isolation.
+
+---
+
 ## 4. Requirements this lane has for the World Builder lane
 
 **4.1 The capture-clock epoch across a reconnect — BLOCKING for capture
@@ -97,6 +111,18 @@ interval. Roughly every other captured frame never arrives.
 staleness and tracking all consume delivered frames, which is the correct
 denominator for them. But **"the frame rate" is now ambiguous** and should
 be qualified as capture or delivery wherever it appears.
+
+**4.3 Two HTTP contracts are undeclared, and a phone caches
+declarations.** `document_memory.library/2026-08-27` is now listed in a
+new `http_contracts` block on `/cartridges`, because a contract a client
+can only discover by making a call is one it cannot plan around.
+`world_builder.geometry/2026-08-25` is the same shape and is not listed.
+Declaring it means moving its identifier from
+`tower/results/world_builder_geometry.py` into `tower/results/contracts.py`,
+which is a World Builder file the Document/Scene lane may not change --
+`registry.py` must stay cartridge-blind, so it cannot import the adapter.
+Object Memory's `object_memory.observations/2026-08-26` has the identical
+problem and is deferred with it so both move together.
 
 **4.4 The face-redaction filter fires on 40% of real frames, and is
 mostly wrong when it does — PRICING, not correctness.**
@@ -135,7 +161,7 @@ will consume, including the `anchor_keyframe_id` and `frame_revision`
 that `CARTRIDGE-GROUNDWORK.md` §4 requires. Object Memory will not build
 it and keeps working without it.
 
-**4.3 Deferred World Builder findings** remain triaged at
+**4.6 Deferred World Builder findings** remain triaged at
 `tower/docs/superpowers/plans/2026-08-25-geometry-transport-followups.md`
 items 1–6 (Tower side) and 7–21 (iOS side). This lane has not acted on any
 of them since the freeze.

@@ -87,11 +87,24 @@ def test_cartridges_without_a_contract_are_not_offered(monkeypatch, built):
     offered = {entry["cartridge"] for entry in declaration["cartridges"]}
     silent = {entry["cartridge"] for entry in declaration["not_offered"]}
 
-    assert offered == {"world_builder"}
-    assert silent == {"experimental_cv", "document_memory", "scene_understanding"}
+    assert offered == {"world_builder", "scene_understanding", "document_memory"}
+    assert silent == {"experimental_cv"}
     assert offered.isdisjoint(silent)
     for entry in declaration["not_offered"]:
         assert "contract" not in entry
+
+    # The two that moved on 2026-08-27 must be offered AND unavailable on
+    # this fixture, which configures a world root and nothing else. That
+    # pairing is the whole point of the three-state design: iOS renders it
+    # as "connect", not "update the app" and not "not built yet".
+    by_name = {entry["cartridge"]: entry for entry in declaration["cartridges"]}
+    for name, variable in (
+        ("scene_understanding", "TOWER_SCENE_UNDERSTANDING"),
+        ("document_memory", "TOWER_DOCUMENT_ROOT"),
+    ):
+        assert by_name[name]["available"] is False
+        assert variable in by_name[name]["unavailable_reason"]
+        assert by_name[name]["contract"]
 
 
 def test_the_declaration_says_results_are_snapshots(monkeypatch, built):
@@ -340,20 +353,33 @@ def test_a_duplicate_subscription_is_independent(monkeypatch, built):
 
 
 def test_unknown_cartridge_is_refused_with_what_is_offered(monkeypatch, built):
+    """A name this Tower has never heard of, and what it offers instead.
+
+    The name changed on 2026-08-27. It used to be `scene_understanding`,
+    which is now a real offer -- and a test that kept using it would have
+    silently started asserting something else. `translator` is chosen
+    because it is a genuinely unimplemented cartridge on the roadmap
+    rather than a nonsense string: an unknown cartridge is a cartridge
+    that does not exist, not a malformed request.
+    """
     root, _, _ = built
     client = make_client(monkeypatch, root)
     with client.websocket_connect("/ws") as ws:
         ws.send_json(
             {
                 "type": "result_subscribe",
-                "cartridge": "scene_understanding",
+                "cartridge": "translator",
                 "result_type": "status",
             }
         )
         error = drain(ws, expect="result_error")
 
     assert error["reason"] == "unknown_cartridge"
-    assert error["offered"] == ["world_builder"]
+    assert error["offered"] == [
+        "document_memory",
+        "scene_understanding",
+        "world_builder",
+    ]
 
 
 def test_unknown_result_type_is_distinct_from_unknown_cartridge(monkeypatch, built):
@@ -490,8 +516,32 @@ def test_the_registry_refuses_every_unoffered_pair(monkeypatch, built):
     root, _, _ = built
     assert registry.find_offer(root, "world_builder", "status") is not None
     assert registry.find_offer(root, "world_builder", "geometry") is None
-    assert registry.find_offer(root, "document_memory", "status") is None
+    assert registry.find_offer(root, "translator", "status") is None
     assert registry.find_offer(None, "world_builder", "status")["available"] is False
+
+    # A RESULT TYPE that does not exist on a cartridge that does. Both new
+    # cartridges get this too, because each offers exactly one pair and
+    # the wrong half of a pair must refuse rather than fall through to the
+    # only offer the cartridge has.
+    assert registry.find_offer(root, "scene_understanding", "status") is None
+    assert registry.find_offer(root, "document_memory", "live") is None
+    assert (
+        registry.find_offer(root, "scene_understanding", "live", scene_enabled=True)
+        is not None
+    )
+    assert (
+        registry.find_offer(
+            root, "document_memory", "status", document_root="/somewhere"
+        )
+        is not None
+    )
+
+    # Enabled is not the same as configured elsewhere. Turning one on must
+    # not make the other available.
+    scene_on = registry.declare(root, scene_enabled=True)["cartridges"]
+    by_name = {entry["cartridge"]: entry for entry in scene_on}
+    assert by_name["scene_understanding"]["available"] is True
+    assert by_name["document_memory"]["available"] is False
 
 
 # -- the document and the code must not drift --------------------------

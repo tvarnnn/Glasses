@@ -138,7 +138,24 @@ class TestRetention:
         assert store.count() == 1
 
     def test_documents_older_than_the_window_are_really_gone(self, tmp_path):
-        store = DocumentStore(tmp_path, retention_seconds=100.0)
+        """Gone from the file, not merely hidden from a read.
+
+        The store now takes a `clock`, and needs one. Reads began
+        filtering to the retention window on 2026-08-27; before that a
+        store could be built with a real `time.time` and fed records
+        stamped at t=0 and t=950, because nothing but `prune_expired`
+        ever looked at the window and the test handed IT a `now`. A read
+        that honours the window makes that setup incoherent -- against a
+        2026 wall clock every record here is expired -- so the clock is
+        now injected and the two halves agree.
+
+        The assertion is strengthened by the change rather than weakened:
+        `read_all()` returning only "new" now proves both that the old
+        record was deleted AND that the survivor is inside the window.
+        """
+        store = DocumentStore(
+            tmp_path, retention_seconds=100.0, clock=lambda: 1000.0
+        )
         store.append(_document("old", recorded_at=0.0))
         store.append(_document("new", recorded_at=950.0))
 

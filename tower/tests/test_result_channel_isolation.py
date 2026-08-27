@@ -182,15 +182,21 @@ def test_a_world_builder_subscription_only_ever_carries_world_builder(
 
 
 def test_no_other_cartridge_can_be_subscribed_to(monkeypatch, world_root):
-    """The registry is the only gate, and it refuses everything else."""
+    """The registry is the only gate, and it refuses everything else.
+
+    Two lists now, because there are two different refusals and a client
+    switches on the difference. `unknown_cartridge` means this Tower has
+    never heard of it -- iOS's "not built yet". `cartridge_unavailable`
+    means the contract exists and this Tower is not configured to serve
+    it -- iOS's "connect". Collapsing them would tell a person to give up
+    on a cartridge that one environment variable would turn on.
+
+    This fixture configures a world root and nothing else, so both new
+    cartridges are declared and unavailable here.
+    """
     client = make_client(monkeypatch, world_root)
     with client.websocket_connect("/ws") as ws:
-        for cartridge in (
-            "experimental_cv",
-            "document_memory",
-            "scene_understanding",
-            "object_memory",
-        ):
+        for cartridge in ("experimental_cv", "object_memory", "translator"):
             ws.send_json(
                 {
                     "type": "result_subscribe",
@@ -199,7 +205,25 @@ def test_no_other_cartridge_can_be_subscribed_to(monkeypatch, world_root):
                 }
             )
             error = drain(ws, expect="result_error")
-            assert error["reason"] == "unknown_cartridge"
+            assert error["reason"] == "unknown_cartridge", cartridge
+
+        for cartridge, result_type in (
+            ("scene_understanding", "live"),
+            ("document_memory", "status"),
+        ):
+            ws.send_json(
+                {
+                    "type": "result_subscribe",
+                    "cartridge": cartridge,
+                    "result_type": result_type,
+                }
+            )
+            error = drain(ws, expect="result_error")
+            assert error["reason"] == "cartridge_unavailable", cartridge
+            # The refusal has to name the configuration that would fix it.
+            # "Unavailable" with no reason is indistinguishable from
+            # broken, and a person cannot act on it.
+            assert "TOWER_" in error["message"], cartridge
 
 
 def test_subscriptions_on_different_connections_are_independent(
@@ -269,6 +293,18 @@ def test_the_result_channel_uses_no_gaze_or_identity_vocabulary():
     paths = list((TOWER / "results").rglob("*.py"))
     paths.append(TOWER / "routes" / "results_ws.py")
     paths.append(TOWER / "routes" / "cartridges.py")
+    # Widened 2026-08-27. The two cartridge control routes serve payloads
+    # to the same consumers this channel does, and a review pointed out
+    # they were outside the scan -- `SceneEngine.describe()` builds a dict
+    # containing the literal string "orientation evidence, not gaze; the
+    # camera cannot see attention", and a route that returned it would
+    # have shipped the word and passed this test.
+    for extra in (
+        TOWER / "routes" / "scene.py",
+        TOWER / "routes" / "documents.py",
+    ):
+        if extra.exists():
+            paths.append(extra)
 
     for path in paths:
         if "__pycache__" in path.parts:

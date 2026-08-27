@@ -114,12 +114,66 @@ class DocumentStore:
 
     # -- read ----------------------------------------------------------
 
-    def read_all(self) -> list[DocumentObservation]:
-        """Every stored document, oldest first.
+    def _retention_cutoff(self) -> float | None:
+        if self._retention_seconds is None:
+            return None
+        return self._clock() - self._retention_seconds
+
+    @staticmethod
+    def _is_within_retention(raw: dict, cutoff: float | None) -> bool:
+        """Shared by reads and prune, so the two can never disagree.
+
+        `recorded_at`, not `observed_at`: retention is about how long WE
+        have held the data, which is the privacy-relevant clock. They are
+        equal today and diverge the moment a real capture timestamp is
+        threaded through.
+
+        A missing or non-numeric `recorded_at` cannot be shown to be
+        within retention, so it is treated as EXPIRED. Defaulting the
+        other way would make a malformed record permanently readable,
+        which is the wrong direction for a window that exists to remove
+        things. (`bool` is excluded because it is an `int` subclass.)
+        """
+        if cutoff is None:
+            return True
+        recorded_at = raw.get("recorded_at")
+        is_numeric = isinstance(recorded_at, (int, float)) and not isinstance(
+            recorded_at, bool
+        )
+        return is_numeric and recorded_at >= cutoff
+
+    def read_all(self, *, include_expired: bool = False) -> list[DocumentObservation]:
+        """Every stored document still within retention, oldest first.
 
         A record whose schema version is unknown is **skipped with a
         warning**, not guessed at and not fatal: one unreadable record
         must not make the whole memory unreadable.
+
+        FILTERING IS THE DEFAULT, and it was not always.
+
+        Until 2026-08-27 this method ignored `retention_seconds`
+        entirely: the window was consumed only by `prune_expired` and
+        `purge`, both deletion paths. So a reader that constructed a
+        store with an 86-second window was served a 400-day-old document
+        in full -- while the response it fed asserted, in three separate
+        strings, that the window had been applied.
+
+        That is worse than a missing feature. A privacy control that
+        reports success is what `06-PRIVACY-DATA.md` calls a false
+        assurance, and it is why iOS ships no privacy toggle backed by a
+        Tower it cannot verify.
+
+        It is also a bug this repository had already fixed one cartridge
+        over. `tower/object_memory/store.py:44` records the identical
+        defect and the identical fix; `_is_within_retention` above is
+        that method, and it is a static method for the same reason:
+        reads and prune must use one definition of "expired" or the two
+        drift.
+
+        `include_expired` is the opt-out and must be asked for by name.
+        It exists for maintenance paths -- a purge counting what it
+        deletes, an operator auditing the file -- and is never the right
+        answer for anything a wearer will be shown.
         """
         raw_records, corrupt = read_raw_jsonl(self._path)
         if corrupt:
@@ -128,8 +182,11 @@ class DocumentStore:
                 corrupt,
                 self._path,
             )
+        cutoff = None if include_expired else self._retention_cutoff()
         documents = []
         for record in raw_records:
+            if not self._is_within_retention(record, cutoff):
+                continue
             version = record.get("schema_version")
             if version != SCHEMA_VERSION:
                 logger.warning(
@@ -145,14 +202,27 @@ class DocumentStore:
                 logger.warning("document store: unparseable record skipped: %s", exc)
         return documents
 
-    def read_one(self, document_id: str) -> DocumentObservation | None:
-        for document in self.read_all():
+    def read_one(
+        self, document_id: str, *, include_expired: bool = False
+    ) -> DocumentObservation | None:
+        """One document, or None. Honours the retention window by default.
+
+        The default matters: a fetch by id is a READ, and a read that
+        ignored the window would be the whole retention bug again through
+        one route -- an id is easy to come by, because a listing hands
+        them out.
+        """
+        for document in self.read_all(include_expired=include_expired):
             if document.document_id == document_id:
                 return document
         return None
 
-    def count(self) -> int:
-        return len(self.read_all())
+    def count(self, *, include_expired: bool = False) -> int:
+        # The keyword was accepted and dropped for one commit. A privacy
+        # opt-out that reports the wrong answer without failing is the
+        # same class of defect as the one that made reads honour the
+        # window in the first place.
+        return len(self.read_all(include_expired=include_expired))
 
     def bytes_used(self) -> dict:
         """Storage growth, observable rather than assumed."""
@@ -194,13 +264,22 @@ class DocumentStore:
         cutoff = now - self._retention_seconds
 
         def expired(record: dict) -> bool:
-            return record.get("recorded_at", 0.0) < cutoff
+            # The negation of the read predicate, deliberately, rather
+            # than a second inequality that happens to agree today.
+            return not self._is_within_retention(record, cutoff)
 
         # Collect the doomed images BEFORE rewriting: once the records are
         # gone there is nothing left that names them.
+        #
+        # `include_expired=True`, and it is load-bearing. Reads began
+        # filtering to the retention window on 2026-08-27, and a prune
+        # that used the filtered read could no longer SEE the records it
+        # exists to delete -- it would report `documents_removed: 0` and
+        # leave every expired page image on disk. This is the maintenance
+        # path the opt-out was added for.
         doomed = [
             self._directory / page.image_relpath
-            for document in self.read_all()
+            for document in self.read_all(include_expired=True)
             if document.recorded_at < cutoff
             for page in document.pages
             if page.image_relpath
@@ -217,6 +296,14 @@ class DocumentStore:
 
     def purge(self, document_id: str | None = None) -> dict:
         """Really delete. Reports what it could NOT delete.
+
+        Reads with `include_expired=True` throughout, and that is not an
+        optimisation. Once reads began honouring the retention window, a
+        purge that used the filtered read could no longer SEE an expired
+        record's page images -- so it deleted the journal row, reported
+        `images_removed: 0` and `complete: true`, and left an unredacted
+        photograph of what the wearer read on disk with nothing left
+        anywhere that named it. A deletion path must see everything.
 
         A purge that cannot remove everything must never be presented as
         success -- `06-PRIVACY-DATA.md` requires real deletion, and a
@@ -236,7 +323,7 @@ class DocumentStore:
             # before the rewrite, because afterwards nothing names them.
             targets = [
                 self._directory / page.image_relpath
-                for document in self.read_all()
+                for document in self.read_all(include_expired=True)
                 if document.document_id == document_id
                 for page in document.pages
                 if page.image_relpath
