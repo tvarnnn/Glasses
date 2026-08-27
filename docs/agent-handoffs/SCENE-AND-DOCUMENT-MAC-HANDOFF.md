@@ -102,7 +102,36 @@ has.
 Everything else — ack, `seq`, `revision`, `coalesced`, `cursor_status`,
 errors, the 8-subscription cap — is the machinery you already have.
 
-### 2.2 The lifecycle state machine
+### 2.2 A phone starts it by streaming, and calls nothing
+
+**This is the part most likely to be got wrong, because it is the part
+that changed after the first review.** iOS sends nothing when a cartridge
+is opened (§6.2), so nothing on the wire could start a session — the
+contract was `available: true`, subscribable, and answered
+`scene_available: false` forever unless a human curled the Tower.
+
+So the session follows the **stream**:
+
+| Event | Effect |
+|---|---|
+| `stream_start` | the session starts (model loads, `state: "starting"`) |
+| `stream_stop` | the session stops and the scene is discarded |
+| disconnect | the same — and this is the normal case for a wearable |
+
+`lifecycle.follows_stream` reports whether that is on.
+`TOWER_SCENE_AUTOSTART=false` turns it off for an operator who wants
+manual control.
+
+**A stop only ever ends what the stream started.** A connection that
+never sent `stream_start` cannot end a session an operator began by hand,
+which is the situation a physical test lives in.
+
+Consequence for iOS: open the workspace, subscribe, and stream. Counts
+appear a second or two later, once the detector has loaded. There is no
+"start" button to build unless you want one — and if you do, it is
+`POST /scene/start`.
+
+### 2.3 The lifecycle state machine
 
 ```
                     POST /scene/start
@@ -131,7 +160,7 @@ against that rather than hard-coding it.
 different `session_id` came from different tracking sessions and must not
 be compared or accumulated.**
 
-### 2.3 Stop discards the scene, and you must not re-add it
+### 2.4 Stop discards the scene, and you must not re-add it
 
 After `POST /scene/stop` the payload carries `scene_available: false`,
 `counts: null`, `people: null`, `where: null`. The Tower has thrown the
@@ -142,16 +171,16 @@ end of a session is a claim about a room the wearer has left. iOS's own
 `SceneUnderstandingState` distinguishes `observing` from `lastKnown`; a
 stopped session is neither, and the right rendering is the reason string.
 
-### 2.4 What you get, and what you asked for and did not get
+### 2.5 What you get, and what you asked for and did not get
 
 | `IOS-to-Tower.md` | Served? |
 |---|---|
-| §4.1 anonymous track handle | **NO.** Refused. See below. |
+| §4.1 anonymous track handle | **NO.** Refused, and the refusal is on the wire: `tracks: null`, `tracks_absent_reason`, `refused_entity_fields`. See below. |
 | §4.1 person vs object | Yes — `people` is separate from `counts` |
 | §4.1 object class label | Yes — `counts` keyed on `reported_classes` |
-| §4.1 confidence per track | **NO.** Only `score_threshold`, a floor, not a per-entity confidence |
+| §4.1 confidence per track | **NO**, and said so: `confidence: null` with `confidence_absent_reason`. There are no tracks for one to attach to |
 | §4.2 orientation, `unknown`/`towardCamera`/… | **Aggregate only** — `people.facing_wearer` is a COUNT or null |
-| §4.3 bearing, signed | **NO.** `where` gives side counts for non-person labels only |
+| §4.3 bearing, signed | **NO.** `where` gives side counts for non-person labels only — but it states its convention in `side_convention`, because a left and a right with no stated side is the silent presumption §4.3 warns about |
 | §4.3 distance, unit, scale semantics | **NO.** Nothing here knows a distance |
 | §4.4 counts | Yes, and every one is a declared lower bound |
 | §4.5 no "behind you" | Honoured — there is no bearing at all |
@@ -173,7 +202,11 @@ cannot render "Person 1 / Person 2" rows.** If the product needs those
 rows, say so and it becomes a contract change with a new identifier — not
 a field quietly populated later.
 
-### 2.5 Three things that will bite
+Decode `tracks_absent_reason` and `refused_entity_fields` and render them
+somewhere. A client that shows an empty entity list is saying "nobody is
+here"; a client that shows the reason is saying what is true.
+
+### 2.6 Three things that will bite
 
 1. **`people.facing_wearer` is `null`, not `0`, when unmeasured.**
    Orientation is off by default (956 ms per call on CPU). Render null as
@@ -190,7 +223,7 @@ a field quietly populated later.
    Every `person` box in this platform's only real corpus is the wearer's
    own torso. "2 people" may mean "you, and one other" or "you, twice".
 
-### 2.6 Control routes
+### 2.7 Control routes
 
 | Route | Method | 404 when |
 |---|---|---|
@@ -289,6 +322,27 @@ both.
 
 ### 3.5 Session lifecycle
 
+**Document Memory does NOT follow the stream by default**, unlike Scene
+Understanding, and the asymmetry is deliberate: this cartridge writes to
+disk, and a session that persists what a wearer read gets an explicit
+start. `TOWER_DOCUMENT_AUTOSTART=true` changes it.
+`session.follows_stream` reports which.
+
+The half of this cartridge a phone actually reaches is the library, over
+HTTP, and that works whether or not anything is recording.
+
+**The five session routes carry the full envelope**, not a bare status —
+`contract`, `claim`, `recording_limitations`, the imagery fields, with
+the lifecycle under `session`. A client that polls the session and never
+calls a listing would otherwise never learn that an empty library is the
+expected result here.
+
+**The session block keeps its shape.** When no session exists every field
+is present and `null`, `state` is `"unavailable"`, and `states` carries
+the full vocabulary including that value. Decode it strictly.
+
+### 3.6 Session counters
+
 Identical shape to Scene Understanding's, plus `in_dwell`,
 `pages_detected`, `documents_recorded`, `last_document_id`,
 `retention_days`, `documents_pruned`, `retention_incomplete`,
@@ -301,7 +355,7 @@ dwell in progress is flushed rather than dropped.
 locked file, most often. Surface it: a retention promise that quietly
 failed looks exactly like one that was kept.
 
-### 3.6 What is refused
+### 3.7 What is refused
 
 | `IOS-to-Tower.md` | Served? |
 |---|---|
@@ -377,6 +431,14 @@ snapshot and not a stronger claim than the Tower made. Specifically:
 - `answer: "no_observation"` with `documents: []` must not become
   `.notFound`.
 - an unknown `lifecycle.state` must fail rather than downgrade.
+- `tracks: null` must not decode to an empty entity array. It is a
+  refusal, and an empty array reads as "nobody is here".
+- `imagery_treatment` is `none-retained` or `raw-persisted`; neither is
+  one of iOS's three states, which is why `imagery_ios_state` is carried
+  beside it and is always `rawEphemeral`. Map from that field, never from
+  the first.
+- `library.document_count_unfiltered` and `session.library_count` are
+  different quantities. Do not render them as one number.
 
 ---
 
@@ -441,8 +503,15 @@ single most valuable hour anybody could spend on this cartridge.
    takes about 5 s to construct).
 3. Connect the glasses. **Hold a printed page square-on at reading
    distance for 10 seconds**, well lit, filling most of the view.
-4. `GET /documents-session` — did `pages_detected` move? Did `in_dwell`
-   go true?
+4. `GET /documents-session` — did `session.pages_detected` move? Did
+   `session.in_dwell` go true?
+
+   **Expect zero.** Fed 5,204 real corpus frames through the live path,
+   this session detected **0 pages and recorded 0 documents** — which is
+   what the gate re-derivation predicts and is now confirmed end to end
+   rather than only in a sweep. If your printed page moves either
+   counter, that is the first positive this cartridge has ever seen and
+   is worth writing down.
 5. `GET /documents` — is there a document? Is its
    `text_availability.state` `extracted` or `not_readable`?
 6. Repeat tilted, at arm's length, and in poor light.
@@ -464,6 +533,25 @@ watch `frames_skipped` on both, plus the Tower's own frame-path latency.
 A scene session was measured at **1.03 cores with
 `TOWER_SCENE_TORCH_THREADS=2`, and 4.12 cores without it**, at identical
 throughput. Set it.
+
+**And expect to lose frames.** Over 5,204 real corpus frames fed at the
+delivered 12.0 fps, on a host that was fully loaded by other work, the
+scene session observed 3,437 and skipped 1,767 — **34%**, at 7.91 fps.
+Read that as a floor rather than an estimate: the machine was contended.
+But the contention is not the whole story, because on the SAME host at
+the SAME load Document Memory's cheap path kept up completely — 5,203 of
+5,204 frames, 11.97 fps, 0.185 cores. The difference is the detector, not
+the box.
+
+What that costs you: the tracker's `max_misses` is a FRAME count derived
+from a 1.0 s absence at 12 fps, so a session that is skewing skips
+stretches what "1 second of absence" means. Watch `frames_skipped`. The
+payload publishes it for exactly this reason.
+
+Resident memory over the same seven-minute run grew **7.8 MB** for Scene
+and **12.2 MB** for Document Memory, and flattened — model warm-up, not a
+leak. `offer_frame`, which runs on the event loop, cost **0.0099 ms at
+the median and 0.035 ms at p95**. The frame path is untouched.
 
 ---
 
