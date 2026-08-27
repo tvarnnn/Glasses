@@ -36,6 +36,7 @@ protect.
 import logging
 import os
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -169,6 +170,21 @@ class CaptureWorkerSupervisor:
     and `detach` take one -- so names must be unique, and the constructor
     refuses a duplicate rather than letting one cartridge's Pause stop
     another cartridge's producer.
+
+    SERIALISED. `capture_opened` runs on the event loop, from the
+    connection that just received `stream_start`; `attach` and `detach`
+    run in FastAPI's threadpool, from a session control request. Those
+    are genuinely concurrent, and unserialised they raced: a Start
+    pressed as a capture opened ran the "is anything already following
+    this lineage" check twice, both times seeing nothing, and spawned two
+    producers on one capture. The second overwrote the first in the
+    registry, so the orphan was invisible to `reap`, `detach`,
+    `shutdown` and `/health` -- and two producers appending to one JSONL
+    store lose each other's writes, because `update_sighting` rewrites
+    the whole file. A reviewer reproduced both the lost write and a
+    duplicate record with a colliding `observation_id`.
+
+    Re-entrant, because `capture_opened` and `attach` both call `reap`.
     """
 
     def __init__(self, specs=None, *, spawn=None, clock=time.monotonic):
@@ -193,6 +209,9 @@ class CaptureWorkerSupervisor:
 
         self._spawn = spawn if spawn is not None else subprocess.Popen
         self._clock = clock
+        # Re-entrant: `capture_opened` and `attach` both call `reap`, and
+        # `shutdown` and `detach` both call `_stop_worker`.
+        self._lock = threading.RLock()
         self._registries: dict[str, _SpecRegistry] = {
             spec.name: _SpecRegistry(spec) for spec in specs
         }
@@ -237,18 +256,19 @@ class CaptureWorkerSupervisor:
         if not self._registries:
             return
 
-        self.reap()
+        with self._lock:
+            self.reap()
 
-        for registry in self._registries.values():
-            if not self._gate_open(registry.spec):
-                continue
-            self._attach_to_registry(
-                registry,
-                capture_id,
-                capture_dir,
-                continues=continues,
-                attach_mode=ATTACH_MODE_FROM_START,
-            )
+            for registry in self._registries.values():
+                if not self._gate_open(registry.spec):
+                    continue
+                self._attach_to_registry(
+                    registry,
+                    capture_id,
+                    capture_dir,
+                    continues=continues,
+                    attach_mode=ATTACH_MODE_FROM_START,
+                )
 
     def attach(self, name: str, capture_id: str, capture_dir) -> bool:
         """Start ONE named spec against a capture that is already open.
@@ -266,47 +286,51 @@ class CaptureWorkerSupervisor:
         an error, and an instruction repeated twice must not put two
         producers on one store.
         """
-        registry = self._registries.get(name)
-        if registry is None:
-            logger.warning(
-                "[Tower][Worker] asked to attach unknown worker %r; nothing "
-                "will follow capture %s for it",
-                name,
+        with self._lock:
+            registry = self._registries.get(name)
+            if registry is None:
+                logger.warning(
+                    "[Tower][Worker] asked to attach unknown worker %r; "
+                    "nothing will follow capture %s for it",
+                    name,
+                    capture_id,
+                )
+                return False
+            self.reap()
+            return self._attach_to_registry(
+                registry,
                 capture_id,
+                capture_dir,
+                continues=None,
+                attach_mode=ATTACH_MODE_FROM_NOW,
             )
-            return False
-        self.reap()
-        return self._attach_to_registry(
-            registry,
-            capture_id,
-            capture_dir,
-            continues=None,
-            attach_mode=ATTACH_MODE_FROM_NOW,
-        )
 
     def detach(self, name: str, grace_seconds: float = DEFAULT_GRACE_SECONDS) -> int:
         """Stop every worker belonging to ONE spec. Returns how many.
 
-        Let it finish first, then insist -- the same order `shutdown`
-        uses, and for a sharper reason here: a producer terminated
-        mid-append leaves a partial line in a JSONL store, which every
-        later read skips as corruption. Whoever asked for this has not
-        asked to lose the record that was being written when they did.
+        `grace_seconds` is how long a worker gets to exit on its own
+        first. The caller chooses it and the caller should usually choose
+        ZERO: nothing here SIGNALS a worker, and a follower tailing a
+        journal that is still being written has no reason to stop. Waiting
+        on one measures the full grace every time and then terminates it
+        anyway. `shutdown` is the case where waiting is right, because
+        there the capture has closed and the follower really will finish.
 
         Detaching does NOT disable the spec. The gate is the one source
         of truth for whether a spec should be running; a latch in here
         would be a second one, and the two would disagree the first time
         either changed.
         """
-        registry = self._registries.get(name)
-        if registry is None:
-            return 0
-        stopped = 0
-        for root, worker in list(registry.workers.items()):
-            self._stop_worker(worker, grace_seconds)
-            registry.forget(root)
-            stopped += 1
-        return stopped
+        with self._lock:
+            registry = self._registries.get(name)
+            if registry is None:
+                return 0
+            stopped = 0
+            for root, worker in list(registry.workers.items()):
+                self._stop_worker(worker, grace_seconds)
+                registry.forget(root)
+                stopped += 1
+            return stopped
 
     def capture_closed(self, capture_id: str) -> None:
         """A recording has ended.
@@ -334,6 +358,10 @@ class CaptureWorkerSupervisor:
 
     def reap(self) -> None:
         """Notice workers that have exited, and say how they went."""
+        with self._lock:
+            self._reap_locked()
+
+    def _reap_locked(self) -> None:
         for registry in self._registries.values():
             for root, worker in list(registry.workers.items()):
                 code = worker.process.poll()
@@ -371,16 +399,21 @@ class CaptureWorkerSupervisor:
 
     def shutdown(self, grace_seconds: float = DEFAULT_GRACE_SECONDS) -> None:
         """Let every worker finish, then insist."""
-        for registry in self._registries.values():
-            for root, worker in list(registry.workers.items()):
-                self._stop_worker(worker, grace_seconds)
-                registry.forget(root)
+        with self._lock:
+            for registry in self._registries.values():
+                for root, worker in list(registry.workers.items()):
+                    self._stop_worker(worker, grace_seconds)
+                    registry.forget(root)
 
     # -- reporting ----------------------------------------------------
 
     def status(self) -> list[dict]:
         """One row per live worker. Safe to call from /health."""
-        self.reap()
+        with self._lock:
+            self._reap_locked()
+            return self._status_locked()
+
+    def _status_locked(self) -> list[dict]:
         return [
             {
                 # Which spec this row belongs to. Without it two rows for
@@ -400,11 +433,12 @@ class CaptureWorkerSupervisor:
 
     def following(self, name: str) -> list[str]:
         """The capture ids one named spec currently has a live worker on."""
-        registry = self._registries.get(name)
-        if registry is None:
-            return []
-        self.reap()
-        return [worker.capture_id for worker in registry.workers.values()]
+        with self._lock:
+            registry = self._registries.get(name)
+            if registry is None:
+                return []
+            self._reap_locked()
+            return [worker.capture_id for worker in registry.workers.values()]
 
     # -- internals ----------------------------------------------------
 

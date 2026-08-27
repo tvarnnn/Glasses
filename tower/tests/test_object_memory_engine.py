@@ -576,3 +576,56 @@ class TestLateVerdicts:
 
         assert store.all_observations() == []
         assert engine._awaiting_verdict == []
+
+
+class TestPartsAtTheEndOfASighting:
+    """The suppression must survive the sighting it applies to.
+
+    `_settle` runs AFTER the sighting has been removed from the tracker,
+    and so has everything that was open beside it -- so a live check at
+    that moment saw an empty set, the part-of rule evaporated, and the
+    duplicate it exists to prevent was written at the end of every
+    sighting. A reviewer reproduced it.
+    """
+
+    def _agreed(self, engine):
+        for sighting in engine._tracker.open_sightings.values():
+            sighting.verdict = {"agrees": True, "model": "scripted"}
+
+    def test_a_keyboard_seen_only_with_a_laptop_is_not_written_at_the_end(
+        self, tmp_path
+    ):
+        store, engine = _engine(
+            tmp_path,
+            [[_detection(label="laptop"), _detection(label="keyboard", score=0.9)]],
+            policy=RelevancePolicy(verification_available=True),
+        )
+
+        _walk(engine, 5)
+        # Pre-agreed, so verification is not what is under test here.
+        self._agreed(engine)
+        _walk(engine, 2, start=900.5)
+        engine.finish()
+
+        assert [o.object_class for o in store.all_observations()] == ["laptop"]
+
+    def test_a_keyboard_seen_on_its_own_is_still_written_at_the_end(
+        self, tmp_path
+    ):
+        """The reason the rule is concurrent rather than blanket.
+
+        A lit mechanical keyboard at a desk with no laptop near it is a
+        real thing to go looking for, and the corpus has one.
+        """
+        store, engine = _engine(
+            tmp_path,
+            [[_detection(label="keyboard", score=0.9)]],
+            policy=RelevancePolicy(verification_available=True),
+        )
+
+        _walk(engine, 5)
+        self._agreed(engine)
+        _walk(engine, 2, start=900.5)
+        engine.finish()
+
+        assert [o.object_class for o in store.all_observations()] == ["keyboard"]

@@ -15,17 +15,23 @@ and was the actual product gap.
 
 THE FUNNEL, AND WHERE EACH STAGE'S COST GOES.
 
-    every frame        decode + detector          ~68 ms, CPU, measured
+    every frame        decode + detector          46.9 ms, CPU, measured
     every detection    four deterministic gates   microseconds
     every sighting     one record, once           an append
     some sightings     a semantic second opinion  off the frame path
 
-The physical run produced 4,287 detections in 150 seconds. The stage that
-costs real money is asked ONCE PER SIGHTING and only for classes the
-detector cannot be trusted to name -- 53 times across the whole
-18,821-frame corpus, one call per 355 frames. Every one of those figures
-is counted at runtime and printed, because a funnel whose narrowing is
-not measured is a funnel that has quietly stopped narrowing.
+The validated capture is 186 seconds long and produced 4,287 detections.
+The stage that costs real money is asked ONCE PER SIGHTING and only for
+classes the detector cannot be trusted to name -- 53 times across the
+whole 18,821-frame corpus, one call per 355 frames, and four times on
+that one capture. Every one of those figures is counted at runtime and
+printed, because a funnel whose narrowing is not measured is a funnel
+that has quietly stopped narrowing.
+
+Every millisecond above was measured on an IDLE host, one run at a time.
+An earlier draft of this docstring said 68 ms and an earlier comment in
+`config.py` said 75; both were read off runs that were competing with a
+test suite, and both were wrong by a third.
 
 WHY A RECORD IS WRITTEN EARLY AND UPDATED LATER.
 

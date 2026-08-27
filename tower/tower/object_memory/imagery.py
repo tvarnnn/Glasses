@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -173,6 +174,31 @@ class FaceFilter:
     Constructed once and reused. Holds one detector; a frame-size change
     re-targets it rather than rebuilding it, because a capture's
     resolution can change mid-stream.
+
+    SERIALISED, AND THAT IS NOT A PERFORMANCE CHOICE.
+
+    One instance lives on `app.state` and the routes that use it are
+    declared sync `def` -- deliberately, so a blocking read stays off the
+    event loop -- which means FastAPI runs them CONCURRENTLY in its
+    threadpool. `cv2.FaceDetectorYN` holds mutable inference state and is
+    not thread-safe, and `_size` here is mutable too.
+
+    Measured, over HTTP, against the real app: eight concurrent clients
+    asking for the same frame, and **171 of 200 responses came back
+    200 OK reporting `regions_filled: 0`** on a frame that serially
+    always yields one filled region. Others reported 106, 24 and 23
+    regions -- another request's detections, painted onto this one's
+    image. Nothing raised. It failed OPEN: those responses were
+    unfiltered first-person frames with a label saying they had been
+    filtered.
+
+    The constants in this file were copied from
+    `tower/world_builder/redaction.py`, which builds one redactor per
+    session on one thread. The code came across; the concurrency context
+    did not. A lock costs ~27 ms of serialisation on a request that is
+    already doing a JPEG decode, a detection and a re-encode, and it is
+    the only thing standing between a shared detector and a wearer's
+    unfiltered frame.
     """
 
     def __init__(self, path=None) -> None:
@@ -180,9 +206,23 @@ class FaceFilter:
         # default. Trusting it produced a redactor that reported itself
         # AVAILABLE and then failed on every frame, in the module this
         # one is copied from.
-        candidate = Path(path) if path is not None else model_path()
+        #
+        # A BLANK path means "no model", explicitly. `Path("")` is
+        # `Path(".")`, and `Path(".").exists()` is True -- so a filter
+        # constructed with `path=""` to be deliberately unavailable
+        # reported itself AVAILABLE, and only refused because
+        # `cv2.FaceDetectorYN.create(".")` happened to raise. A refusal
+        # that works by accident is a refusal that stops working when the
+        # accident does.
+        if path is not None and not str(path).strip():
+            candidate = None
+        else:
+            candidate = Path(path) if path is not None else model_path()
         if candidate is not None and not candidate.exists():
             candidate = None
+        # Non-reentrant: `apply` is the only public method that touches
+        # the detector, and it never calls itself.
+        self._lock = threading.Lock()
         self._path = candidate
         self._detector = None
         self._size = None
@@ -224,7 +264,8 @@ class FaceFilter:
         a useful crop into a black rectangle, and that has to be
         reportable.
         """
-        boxes = self._detect(image)
+        with self._lock:
+            boxes = self._detect(image)
         if not boxes:
             return image, []
         height, width = image.shape[:2]

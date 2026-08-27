@@ -16,6 +16,7 @@ fails loudly without it:
 import threading
 import time
 
+import numpy as np
 import pytest
 
 from tower.object_memory.sightings import (
@@ -323,3 +324,196 @@ class TestQueue:
         queue.stop(timeout=5.0)
 
         assert Tracked.released is True
+
+
+class TestWaitIdleOrdering:
+    def test_a_verdict_is_published_before_the_queue_reports_itself_idle(self):
+        """`wait_idle` then `drain` must never miss an answer already paid for.
+
+        The in-flight count used to drop in a `finally` block that ran
+        BEFORE the verdict reached the done queue, so there was a window
+        in which nothing was queued, nothing was in flight, and the
+        verdict had not been published. A caller that waited and then
+        drained discarded it.
+
+        Fifty rounds, because the window was small.
+        """
+        queue = VerificationQueue(
+            ScriptedVerifier({"remote"}, delay_seconds=0.001), workers=1
+        )
+        queue.start()
+        try:
+            for _ in range(50):
+                queue.submit(_Sighting(), crop=None)
+                assert queue.wait_idle(timeout=5.0)
+                assert len(queue.drain()) == 1
+        finally:
+            queue.stop(timeout=5.0)
+
+
+class TestOwlV2Verifier:
+    """The only verifier this build actually offers, and it had no tests.
+
+    None of these loads a model. What is under test is the DECISION,
+    which is where a verifier can be wrong in a way that reaches a
+    wearer's memory -- and which is exactly the part that does not need
+    600 MB of weights to exercise.
+    """
+
+    def _verifier(self, ranking, *, min_score=0.45):
+        """An OwlV2Verifier with its two model calls replaced by a script.
+
+        The processor and the model are substituted, not the verifier, so
+        the scoring, the ranking and the threshold are the shipped code
+        paths.
+        """
+        from tower.object_memory.verification import OwlV2Verifier
+
+        vocabulary = tuple(ranking)
+
+        class Column(list):
+            def tolist(self):
+                return list(self)
+
+        class FakeProcessor:
+            def __call__(self, text=None, images=None, return_tensors=None):
+                class Batch(dict):
+                    def to(self, device):
+                        return self
+
+                return Batch()
+
+            def post_process_grounded_object_detection(
+                self, outputs, threshold=0.0, target_sizes=None
+            ):
+                return [
+                    {
+                        "labels": Column(range(len(vocabulary))),
+                        "scores": Column(ranking[name] for name in vocabulary),
+                    }
+                ]
+
+        verifier = OwlV2Verifier(
+            device="cpu",
+            min_score=min_score,
+            vocabulary=vocabulary,
+            prompt_for=lambda name: {"remote": "remote control"}.get(name, name),
+        )
+        verifier._processor = FakeProcessor()
+        verifier._model = lambda **kwargs: None
+        return verifier
+
+    def _crop(self):
+        return np.full((64, 64, 3), 120, np.uint8)
+
+    def test_it_agrees_when_the_proposed_label_ranks_first_and_scores_enough(
+        self,
+    ):
+        verifier = self._verifier(
+            {"remote control": 0.8, "computer keyboard": 0.2, "laptop": 0.1}
+        )
+
+        verdict = verifier.verify(self._crop(), "remote")
+
+        assert verdict.agrees is True
+        assert verdict.label == "remote control"
+        assert verdict.reason == "ranked-first"
+        assert verdict.model == "owlv2-base-patch16-ensemble"
+
+    def test_it_refuses_when_something_else_ranks_first(self):
+        """The measured failure this exists for.
+
+        The three highest-scoring `remote` sightings in the real corpus
+        are all laptop keyboards.
+        """
+        verifier = self._verifier(
+            {"remote control": 0.3, "computer keyboard": 0.7, "laptop": 0.1}
+        )
+
+        verdict = verifier.verify(self._crop(), "remote")
+
+        assert verdict.agrees is False
+        assert verdict.label == "computer keyboard"
+        assert verdict.reason == "outranked"
+
+    def test_it_refuses_a_first_place_that_is_too_weak(self):
+        """Every false reject in the benchmark was a small crop scoring
+        low even when it was right. The threshold is what keeps those out
+        rather than in."""
+        verifier = self._verifier(
+            {"remote control": 0.3, "computer keyboard": 0.1, "laptop": 0.05}
+        )
+
+        verdict = verifier.verify(self._crop(), "remote")
+
+        assert verdict.agrees is False
+        assert verdict.reason == "below-threshold"
+
+    def test_the_threshold_is_the_swept_one(self):
+        from tower.object_memory.verification import OWLV2_MIN_SCORE
+
+        assert OWLV2_MIN_SCORE == 0.45
+
+    def test_a_class_the_vocabulary_cannot_express_is_refused(self):
+        """The shape a policy change would take if it added a class and
+        forgot the prompt. Refusing is the only honest answer, and also
+        the safe one."""
+        verifier = self._verifier({"laptop": 0.9})
+
+        verdict = verifier.verify(self._crop(), "harmonica")
+
+        assert verdict.agrees is False
+        assert verdict.reason == "not-in-verifier-vocabulary"
+
+    def test_the_verdict_records_what_it_would_have_called_it(self):
+        """Recorded and NOT used to relabel: relabelling would let a model
+        move a record between classes the tables gate separately."""
+        verifier = self._verifier(
+            {"remote control": 0.2, "computer keyboard": 0.9, "laptop": 0.1}
+        )
+
+        verdict = verifier.verify(self._crop(), "remote")
+
+        assert verdict.proposed == "remote"
+        assert verdict.label == "computer keyboard"
+
+    def test_the_shipped_vocabulary_can_express_every_persistable_class(self):
+        """A verify-tier class with no prompt can never be confirmed,
+        however good the model is."""
+        from tower.object_memory.classes import (
+            PERSISTABLE_CLASSES,
+            prompt_for,
+            verifier_vocabulary,
+        )
+
+        vocabulary = set(verifier_vocabulary())
+        missing = [
+            name
+            for name in PERSISTABLE_CLASSES
+            if prompt_for(name) not in vocabulary
+        ]
+
+        assert missing == []
+
+    def test_the_shipped_vocabulary_offers_the_measured_confusers(self):
+        """A verifier given only the proposed name says yes; there is
+        nothing else to say. The alternatives are what make the answer
+        mean something, and these are the ones the detector was measured
+        confusing."""
+        from tower.object_memory.classes import verifier_vocabulary
+
+        vocabulary = set(verifier_vocabulary())
+
+        for confuser in ("ceiling fan", "door", "computer keyboard", "human hand"):
+            assert confuser in vocabulary, confuser
+
+    def test_the_vocabulary_never_offers_person(self):
+        """`human hand` is a distractor; `person` is an exclusion.
+
+        The class table's exclusion is not something a prompt list should
+        be able to work around, and no score against any prompt here is
+        ever stored.
+        """
+        from tower.object_memory.classes import verifier_vocabulary
+
+        assert "person" not in verifier_vocabulary()

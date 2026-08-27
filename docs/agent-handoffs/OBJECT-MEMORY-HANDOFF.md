@@ -10,9 +10,10 @@ lane needs to do.
 | Branch | `object-memory/lifecycle-and-semantics-v1` |
 | Worktree | `C:\Users\tvllo\Projects\Glasses-object-memory` (isolated; the primary tree stays on `integration/world-builder-lifecycle-v1`) |
 | Starting commit | `6e325f8` — *measure: the shipped detector is blind below 2% of the frame* |
-| Commits | `d5000b7` lifecycle · `f489da5` policy · `5b329ad` semantics · plus the documentation commit that carries this file |
+| Commits | `d5000b7` lifecycle · `f489da5` policy · `5b329ad` semantics · `f90eb2c` contract and evidence · `943861b` late verdicts · plus the review-response commit that carries this file |
 | Push status | pushed to `origin/object-memory/lifecycle-and-semantics-v1` |
-| Tests | **1650 passed, 64 skipped** (was 1513 / 64 at the starting commit) |
+| Tests | **1681 passed, 64 skipped** (was 1513 / 64 at the starting commit) |
+| Known flake | `test_result_channel_hostile.py::test_the_channel_survives_the_world_vanishing_mid_subscription` failed once in five full runs with a Windows `WinError 32` on an unlink, and passed alone. This is the sharing-violation flake `LANE-OWNERSHIP.md` §3 already documents and rules to the World Builder lane; nothing in this branch touches it. |
 | Never touched | `ios/**`, `tower/tower/world_builder/**`, `main` |
 
 ---
@@ -164,20 +165,24 @@ against `llmdet_tiny` over 94 human-labelled crops:
 
 | model | accepts correct | rejects wrong | median ms | peak VRAM |
 |---|---|---|---|---|
-| **owlv2-base** | **0.949** | 0.857 | **128** | 842 MB |
-| llmdet-tiny | 0.407 | 1.000 | 3,508 | 1,648 MB |
+| **owlv2-base** | **0.949** | 0.857 | **126** | 842 MB |
+| llmdet-tiny | 0.407 | 1.000 | 3,091 | 1,643 MB |
 
 Asked once per sighting: **53 verify-tier sightings across 18,821
-frames**, one call per 355. On the validated capture, one run at a time:
+frames**, one call per 355. On the validated capture, one run at a time
+on an idle host:
 
-| | observations | ms/frame | verifier calls | model time |
-|---|---|---|---|---|
-| `--verifier none` | 8 | 69.262 | — | — |
-| `--verifier owlv2` | 13 | 69.487 | 7 | 1.50 s |
-| `owlv2` + part-of rule | **12** | — | **5** | 1.05 s |
+| | observations | seconds | ms/frame | verifier calls | model time |
+|---|---|---|---|---|---|
+| `--verifier none` | 8 | 103.3 | 46.886 | — | — |
+| `--verifier owlv2` | **11** | 112.1 | 50.879 | **4** | 1.00 s |
 
-**+0.225 ms/frame — 0.3% — for five more memories.** Queue peak depth 0,
-zero backlog drops.
+Of the 8.8 extra seconds, **1.0 is inference** and the rest is the
+one-off model load — **+0.45 ms/frame excluding the load, for three more
+memories**. Queue peak depth 0, zero backlog drops. The part-of rule
+suppressed 96 detections on this capture and removed the `keyboard`
+record entirely: in this walk the keyboard is never in view without the
+laptop it belongs to.
 
 **The picture.** `/object-memory/observations/{id}/{imagery,frame,crop}`.
 The handle is **derived**, so the 64 records already on disk are
@@ -216,33 +221,48 @@ than a leaderboard reading.
 
 Host: RTX 5070 (Blackwell, sm_120) 12 GB, driver 596.21, torch
 2.13.0+cu132, Windows 11, 20 logical cores. Corpus: 34 captures, 18,821
-frames, 360×640.
+frames, **1,942 seconds** of recording, 360×640.
+
+**Every latency figure below was re-measured on an IDLE host, one run at
+a time.** The first set was not, and an audit found every one of them
+wrong by about a third. §4.1 is the retraction that mattered most.
 
 | what | figure |
 |---|---|
 | detections ≥0.15 / ≥0.4 / ≥0.5 / ≥0.7 | 78,546 / 30,727 / 24,028 / 14,613 |
 | sightings (≥0.5, gap 3 s) | 763; 499 at ≥3 frames; 404 excluding `person` |
 | sightings by tier (≥3 frames) | 158 `remembered`, 53 `verify`, 158 `context` |
-| detector, CPU, validated capture | 152.6 s / 2,203 frames = **69.262 ms/frame**, 4,287 detections |
-| detector, CUDA, same | 221.3 s = 100.436 ms/frame, 4,285 detections |
+| memories per unit of walking | 211 recordable sightings over 1,942 s = **one every 9.2 s**, about 380 an hour |
+| detector, CPU, validated capture | 103.3 s / 2,203 frames = **46.886 ms/frame**, 4,287 detections |
+| detector, CUDA, same | 107.4 s = 48.757 ms/frame, 4,285 detections |
+| CPU against CUDA | **within noise.** An independent audit measured the ordering the other way at a similar margin; run-to-run variance on this host is 16–25% |
 | read + JPEG decode | 1.06 ms/frame, 46 MB RSS |
 | producer steady-state RSS | **704 MB** (CPU) / 1,442 MB (CUDA) |
-| long-session drift, 6,000 frames | **none** — window-median ratio 0.968 (CUDA), 0.808 (CPU); CUDA reserved plateaus at 436 MB |
-| verifier, CUDA | **128 ms** median / 141 p95 per crop; 620 MB resident, 842 MB peak; 5.7 s cold load |
+| long-session drift, 6,000–10,000 frames | **none** — window-median ratios 0.968 (CUDA), 0.808 (CPU), 1.041 (independent audit); CUDA reserve plateaus at 436 MB |
+| verifier, CUDA | **126 ms** median / 129 p95 per crop; 620 MB resident, 842 MB peak; ~7 s cold load |
 | verifier, CPU | 2,473 ms per crop, +796 MB RSS — **19× slower** |
-| verifier accuracy (94 labelled crops) | accept 0.932 / reject 0.943 at min score 0.45 |
-| end-to-end cost of the verifier | **+0.225 ms/frame (0.3%)**, 7 calls, peak queue depth 0 |
+| verifier accuracy (94 labelled crops) | accept **~93%** / reject **~94%** at min score 0.45 |
+| end-to-end cost of the verifier | **+0.45 ms/frame** excluding a one-off ~7 s load; 4 calls, peak queue depth 0 |
 | face filter firing rate on real frames | **40.2%** of 1,845 frames; median region 12.5% of frame; of 36 inspected, **4 real faces, 32 not** |
-| face filter cost | 27.5 ms/frame |
+| face filter cost | 21.8 ms/frame |
 
 ### 4.1 One retraction
 
 A first pass reported that the detector gets monotonically slower over a
 long session (49.5 → 87.8 ms across 18,821 frames). **That was wrong.**
-It was a *cumulative mean* read off a run competing with a test suite and
-a render. Measured directly in windows, one job at a time, there is no
-trend and no leak. The claim is retracted in
-`scripts/research/detector_long_session.py` and in the research doc.
+
+It was a *cumulative* mean, printed as a progress line, from a run
+competing with a test suite and a render — and **a cumulative mean rises
+monotonically whenever the underlying series steps up even once, and can
+never come back down.** De-cumulated, the same log shows a step at frames
+3,000–6,000 where the competing work started, then a plateau. Measured
+directly in windows, one job at a time, there is no trend and no leak.
+
+Retracted in `scripts/research/detector_long_session.py`'s own docstring
+and in §5.2 of the research doc. The transferable finding is the one in
+the retraction: **on this host, a benchmark that shares the box reports
+numbers 30–50% high, and a cumulative mean of such a run looks like a
+trend.**
 
 ---
 
@@ -433,7 +453,10 @@ person rather than accepted from here:
    a laptop in a bedroom. `laptop` at 24/24 is a strong statement about
    this laptop in this room. No kitchen, no car, no office, no bystander,
    and no set of keys was ever recorded. Every precision figure is a
-   lower bound on how wrong a class can be.
+   lower bound on how wrong a class can be. And the labels behind those
+   figures are one human pass over contact sheets: 81% of the benchmark's
+   positives are two block assertions, robust under relabelling but not
+   to three significant figures.
 2. **The size floor is not fixed; it moved.** Every verifier false reject
    is a crop of ≤5.3% of the frame — including three real remotes at
    3.7–3.9%. On 360×640 source imagery that is a property of the pixels.
@@ -444,8 +467,12 @@ person rather than accepted from here:
 4. **The face filter fires on 40% of real frames and is mostly wrong when
    it does.** Handled here by reporting `subject_obscured`; it matters
    more to World Builder (§9).
-5. **`keyboard` largely duplicates `laptop`** even with the part-of rule,
-   because the rule only fires while both are concurrently in view.
+5. **`keyboard` largely duplicates `laptop`.** The part-of rule catches
+   it whenever both are concurrently in view — which on the validated
+   capture is always, so no `keyboard` record survives there at all. A
+   keyboard genuinely seen alone still becomes a memory, which is the
+   intent, but the rule cannot help with a keyboard seen alone that
+   belongs to a laptop somewhere else in the room.
 6. **`update_sighting` rewrites the whole JSONL file.** Bounded by the
    rate limiter to a handful of writes per sighting (62 over a 2,203-frame
    replay), and the store's own docstring already names SQLite as the
@@ -556,13 +583,170 @@ and a person. None of it is reachable from a test.
 
 ## 12. Adversarial review
 
-Two independent reviewers were commissioned specifically to find
-"looks successful but does nothing", stale state, duplicate memories,
-privacy regressions, lifecycle races, unbounded compute, producer/API
-disagreement, tests that only validate mocks, and unsupported numeric
-claims.
+Two independent reviewers were commissioned: one to find defects, one to
+audit every numeric claim against the artifacts. Both found real things.
+**Everything below marked FIXED has a regression test that was verified
+to fail against the code as it stood before the fix.**
 
-<!-- REVIEW FINDINGS -->
+### 12.1 Three critical defects, all failing OPEN
+
+Every one was reproduced against the running code, and every one had the
+same root: the routes are declared sync `def` on purpose so a blocking
+call stays off the event loop, which means **FastAPI runs them
+concurrently in its threadpool** — and three pieces of state that looked
+single-threaded were not.
+
+**C1 — the shared face filter served unfiltered first-person frames.**
+FIXED. Eight concurrent clients, 200 requests: **171 came back 200 OK
+reporting `regions_filled: 0`** on a frame that serially always yields
+one filled region. Others reported 106, 24 and 23 — another request's
+detections painted onto this one's image. Nothing raised. One
+`FaceFilter` on `app.state`, a mutable `cv2.FaceDetectorYN`, no lock. A
+thumbnail grid triggers it. The constants were copied from
+`world_builder/redaction.py`, which builds one redactor per session on
+one thread; the code came across and the concurrency context did not.
+Fixed with a lock. `test_concurrent_requests_do_not_serve_an_unfiltered_frame`.
+
+**C2 — Stop racing Start left the cartridge `stopped` with a producer
+still recording, and a second Stop could not fix it.** FIXED.
+`_go_active` set ACTIVE and *then* attached; `stop()` detached and *then*
+set STOPPED; and `stop()` from `stopped` returned early **without
+detaching**. Reproduced: `state=stopped`, `following=['cap-1']`, live
+pid. The one control a wearer has over being remembered failed open, and
+the early return made the state unrecoverable. Fixed with a lock held
+across the whole action, and by making Stop always detach.
+`test_a_stop_during_a_start_does_not_leave_a_producer_running`,
+`test_stop_from_stopped_still_detaches`.
+
+**C3 — two concurrent attaches spawned two producers on one capture.**
+FIXED. `capture_opened` runs on the event loop; `attach` runs in the
+threadpool. Press Start as `stream_start` lands and both ran the "is
+anything already following this lineage" check, both saw nothing, and
+both spawned. The second overwrote the first in the registry, so the
+orphan was invisible to `reap`, `detach`, `shutdown` and `/health` — and
+two producers on one JSONL store lose each other's writes, because
+`update_sighting` rewrites the whole file. The reviewer reproduced both a
+lost write and a duplicate record with a colliding `observation_id`.
+Fixed with a re-entrant lock on the supervisor.
+`test_a_capture_opening_as_start_is_pressed_spawns_one_producer`,
+`test_every_spawned_worker_is_reachable_by_detach`.
+
+### 12.2 Major defects
+
+**M1 — every Pause and Stop blocked for a measured 5.01 s and then
+killed the process anyway.** FIXED. Nothing *signals* the producer: it is
+a follower tailing a journal that is still being written, so it has no
+reason to exit and never did. The grace bought exactly nothing, and a
+Start arriving inside the window returned 200 `active` and then found
+itself paused. `DETACH_GRACE_SECONDS` is now 0; `shutdown` keeps its own
+longer grace, because there the capture has closed and the follower
+really will finish. `test_detaching_does_not_wait_on_a_process_nobody_asked_to_stop`.
+
+**M2 — the part-of rule evaporated at the end of every sighting.** FIXED.
+`_settle` re-decided with an **empty** set of open classes, because by
+then the sighting had been removed from the tracker and so had everything
+open beside it. The duplicate keyboard record the `PART_OF` table exists
+to prevent was written anyway. The suppression is now latched onto the
+sighting when it first fires — it is a fact about what happened, and it
+does not stop being true when the whole leaves the frame.
+`test_a_keyboard_seen_only_with_a_laptop_is_not_written_at_the_end`.
+
+**M3 — `wait_idle` could return before a verdict was published.** FIXED.
+The in-flight count dropped in a `finally` that ran before `_done.put`,
+so there was a window in which nothing was queued, nothing was in flight,
+and the verdict had not been published — and a caller that waited then
+drained discarded an answer it had paid for. The verdict is now published
+first. `test_a_verdict_is_published_before_the_queue_reports_itself_idle`.
+
+**M4 — `TOWER_OBSERVATION_VERIFIER` had two validation rules.** FIXED.
+`config.py` accepted any string and read "not none" as "a verifier
+exists", so a transposition like `owvl2` told the read routes that
+fourteen classes were recordable **and** handed the producer a name it
+refuses, killing it at spawn. A Tower advertising twelve classes it had
+just made unrecordable. Config now validates against `KNOWN_VERIFIERS`,
+falls back to `none` (the narrowing direction), and logs loudly.
+`test_the_settings_and_the_producer_agree_about_verifier_names`.
+
+**M5 — the refusing stand-in filter was not refusing.** FIXED.
+`FaceFilter(path="")` reported itself **available**, because `Path("")`
+is `Path(".")` and `Path(".").exists()` is True. It refused only because
+`cv2.FaceDetectorYN.create(".")` happened to raise. Every route test that
+asserted a refusal through it was passing for that reason rather than the
+intended one. A blank path now means "no model", explicitly.
+
+### 12.3 Tests that validated nothing
+
+**Fifteen route tests passed with `FaceFilter.apply` replaced by a
+no-op**, because none of them ever served a frame containing a face.
+`test_the_filter_actually_runs_on_the_route` now serves a real
+photograph and asserts against the **pixels**. And `OwlV2Verifier` — the
+only verifier this build offers — **had zero tests**; it now has nine,
+none of which loads a model, because what needs testing is the decision.
+
+### 12.4 Numeric claims — what the audit found
+
+Every count derived from the corpus reproduced **exactly**: 78,546
+detections, 763 / 499 / 404 sightings, 264 flickers, all 29 per-class
+counts, and the whole verifier benchmark to three decimals. The
+validated run's 4,287 detections reproduce bit-for-bit.
+
+**Every latency figure was measured on a contended host and none
+survived a clean re-run.** All are corrected in place:
+
+| claim | was | is |
+|---|---|---|
+| CUDA corpus mean | "75 ms/frame" | 87.8 — and 75.0 was a *running average printed at frame 10,000*, reported as a mean |
+| "CUDA is worse than CPU", the stated reason for `observation_device="cpu"` | asserted | **within noise.** Clean replays: CPU 46.9, CUDA 48.8. An independent audit measured the ordering the other way. The default is now justified on **contention**, not speed |
+| producer cost | "~68 ms/frame" | **46.9** on an idle host |
+| memory rate | "one per 45 seconds" | **one per 9.2 s** for the recordable tiers (211 sightings over 1,942 s). The old figure came from misreading 18,821/404 = 46.6 *frames* as seconds |
+| validated capture length | "150 seconds" | **186 s** — 150 was the *replay's* wall clock |
+| long-session latency | "climbed monotonically 49.5 → 87.8" | **retracted.** A cumulative mean rises monotonically whenever the series steps up once. De-cumulated: a step at frames 3–6k where a test suite started competing, then a plateau. Clean runs show drift ratios of 0.968, 0.808 and 1.041 |
+| verifier rate | "about sixty, one per 300 frames, one every 25 s" | **53, one per 355 frames, one every 33 s** |
+| "twenty at a score of exactly 1.00" | — | **22 of 24 round to 1.00; none is exactly 1.00** (max 0.9991) |
+| cell phone median area | "8.5%" | **8.7%** at the 0.5 threshold the table uses |
+| person median area | "35.4%" | **38.7%** at ≥0.5 (35.4% is the ≥0.15 figure) |
+| dining table | "four detections" | 422 above 0.15, **four above 0.4, none above 0.5** |
+| 0.40–0.50 | "a plateau" | a shoulder with its peak at 0.45 |
+| three frames | "a quarter of a second" | **170–210 ms** |
+
+**And one methodological error the audit caught in the benchmark
+itself:** the verifier bench ran a **34-word vocabulary while the shipped
+`verifier_vocabulary()` returns 31**, so its accuracy figures described a
+configuration that does not ship. The bench now **imports** the shipped
+list — removing the class of error rather than this instance of it — and
+adds only what the labelled set needs (`necktie`), reported in the
+output. Re-run: **identical result**, accept 0.932 / reject 0.943 at
+0.45.
+
+### 12.5 What the reviewers could not break
+
+- **No path persists or serves `person` data.** Confirmed by both.
+- **Retention cannot be widened or bypassed** via the new
+  `observation_id` handle; an expired record is unreachable by its own id.
+- **No contract breakage.** Added keys only; `spatial_ref`, `claim`,
+  `identity` and `absence_means` all unchanged; `ios/` untouched.
+- **The `id(sighting)` concern was REFUTED** — 4,000 adversarially-timed
+  frames leaked zero entries from `_last_written`.
+
+### 12.6 What is left unfixed, deliberately
+
+- **`bed` (24 read, 20 right) and `chair` (6 read, 5 right) have no
+  machine-readable record.** They were read off contact sheets that
+  regenerate, but the per-tile verdicts were only recorded for the
+  classes that went into the benchmark's `GOLDEN` dict. `ClassEvidence`
+  now says so in its own docstring. Both are `context`-tier and neither
+  is written, so nothing depends on them; re-reading them is cheap if
+  anyone wants the record.
+- **The `GOLDEN` labels are 81% block assertions** — `[True]*24` for
+  laptop and for cell phone. The audit tested their robustness: any
+  single flip moves balanced accuracy by ≤0.015, and it takes seven
+  adversarial flips (7.4% of the set) to drop below 0.90. Under every
+  plausible group relabelling OWLv2 stays 0.89–0.97 and **0.45 remains
+  the optimal threshold in every scenario**. The quoted figures are
+  reported as ~93% / ~94% rather than to three decimals.
+- **The session lock serialises Pause behind a process stop.** With the
+  grace at zero that is milliseconds, so it is not worth the complexity
+  of releasing the lock across the detach.
 
 ---
 

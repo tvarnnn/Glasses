@@ -93,17 +93,29 @@ class Settings:
     observation_enabled: bool = True
     # Which device the attached observation producer runs its detector on.
     #
-    # "cpu" by default, and the default is a measurement rather than
-    # caution. The physically validated run on 2026-08-26 -- a real
-    # Ray-Ban walk, 2,203 frames, 4,287 detections -- was CPU at 68.2
-    # ms/frame end to end, and a CUDA pass over the whole 18,821-frame
-    # corpus on this host measured a WORSE 75 ms/frame mean, because the
-    # cost of this detector is single-frame preprocessing and transfer
-    # rather than the 320x320 forward pass. The GPU is also shared with
-    # whatever else the Tower is running, and a producer that follows a
+    # "cpu" by default, and the reason is CONTENTION rather than speed --
+    # a correction, because the first version of this comment claimed
+    # CUDA was slower and cited a figure that was not a measurement.
+    #
+    # It said "a CUDA pass over the whole corpus measured a WORSE 75
+    # ms/frame mean". 75.0 was the running average printed at frame
+    # 10,000 of a run that was competing with a test suite; the run's
+    # actual mean was 87.8, and neither number describes an idle host.
+    # Measured properly, one replay at a time with nothing else running:
+    # CPU 46.9 ms/frame against CUDA 48.8. An independent audit on the
+    # same host measured the ordering the other way (CUDA 43.9 against
+    # CPU 51.0). Run-to-run variance exceeds the gap, so the honest
+    # statement is that this detector costs about the same either way --
+    # the work is single-frame preprocessing and transfer, not the
+    # 320x320 forward pass, and neither device is doing much of it.
+    #
+    # What is NOT within noise is what else wants the GPU. Object Memory
+    # does not own this Tower: World Builder runs on it, the depth
+    # experiment runs on it, and this cartridge's own verifier takes
+    # 620 MB of VRAM when it is enabled. A producer that follows a
     # capture has no latency requirement at all -- it may fall behind and
-    # catch up. Choosing the contended device to go slower would be a
-    # strange trade to make by default.
+    # catch up -- so it is the one stage that should stay off the
+    # contended device.
     observation_device: str = "cpu"
     # The retention window the producer WRITES UNDER, recorded in the
     # store manifest at first append. Every later read clamps to
@@ -151,8 +163,8 @@ def get_settings() -> Settings:
         observation_retention_days=_non_negative_float(
             os.environ.get("TOWER_OBSERVATION_RETENTION_DAYS"), default=30.0
         ),
-        observation_verifier=(
-            _optional_path(os.environ.get("TOWER_OBSERVATION_VERIFIER")) or "none"
+        observation_verifier=_verifier(
+            os.environ.get("TOWER_OBSERVATION_VERIFIER")
         ),
         world_autobuild=os.environ.get("TOWER_WORLD_AUTOBUILD", "true").lower()
         in ("1", "true", "yes"),
@@ -179,6 +191,40 @@ def _observation_root(enabled: bool) -> str | None:
     return _optional_path(os.environ.get("TOWER_OBSERVATION_ROOT")) or (
         DEFAULT_OBSERVATION_ROOT
     )
+
+
+# Every verifier this build can construct.
+#
+# Named HERE, in settings, rather than only in the producer script, and
+# that duplication is deliberate -- it is the smaller of two evils. The
+# alternative was for shared config to import the cartridge, which the
+# boundary forbids. What must not happen is what did: `config.py`
+# accepted any string and treated "not none" as "a verifier exists", so
+# `TOWER_OBSERVATION_VERIFIER=owvl2` (a transposition) told the read
+# routes that fourteen classes were recordable AND handed the producer a
+# name it refuses, killing it at spawn. A Tower advertising twelve
+# classes it had just made unrecordable.
+#
+# `scripts/object_memory_session.py` still validates its own argument;
+# these two lists agreeing is checked by
+# `test_the_settings_and_the_producer_agree_about_verifier_names`.
+KNOWN_VERIFIERS = ("none", "owlv2")
+
+
+def _verifier(value: str | None) -> str:
+    """Which verifier to run, or "none". An unknown name falls back.
+
+    Falls back rather than raising, for the same reason
+    `_non_negative_int` does: a typo in an optional variable must not
+    take a Tower down for a cartridge it may not even be running. It is
+    logged at startup, so the typo is visible rather than silent -- and
+    the fallback is the SAFE direction, because "none" narrows what the
+    routes claim rather than widening it.
+    """
+    if value is None or not value.strip():
+        return "none"
+    name = value.strip().lower()
+    return name if name in KNOWN_VERIFIERS else "none"
 
 
 def _device(value: str | None) -> str:

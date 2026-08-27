@@ -58,70 +58,33 @@ from scripts.research.sighting_contact_sheet import (  # noqa: E402
     sheet,
     sightings_of,
 )
+from tower.object_memory.classes import prompt_for  # noqa: E402
 
-# The vocabulary every model is given, every time.
+# THE VOCABULARY IS THE SHIPPED ONE, imported rather than restated.
 #
-# Fixed rather than per-crop, and that is deliberate: a verifier handed
-# only the proposed name and asked "is it this?" will say yes, because
-# there is nothing else to say. Giving it the alternatives -- including
-# the ones the shipped detector actually confuses -- is what makes the
-# answer mean something.
+# It was restated once, and the two drifted: the benchmark ran a 34-word
+# list while `verifier_vocabulary()` returns 31, so the accuracy figures
+# in the code described a configuration that does not ship. A reviewer
+# caught it. Importing removes the class of error rather than fixing this
+# instance of it.
 #
-# The last five have no COCO class at all. They are here because they are
-# what people actually lose, and because a model that cannot name them is
-# a model that cannot fix the gap this cartridge has.
-VOCABULARY = [
-    "laptop",
-    "cell phone",
-    "computer keyboard",
-    "computer mouse",
-    "remote control",
-    "ceiling fan",
-    # Present because a verifier that cannot even CONSIDER the proposed
-    # label rejects it for free, and a rejection rate measured that way
-    # would be a measurement of the vocabulary rather than the model.
-    "airplane",
-    "door",
-    "wall",
-    "television screen",
-    "computer monitor",
-    "refrigerator",
-    "microwave oven",
-    "scissors",
-    "book",
-    "backpack",
-    "handbag",
-    "suitcase",
-    "bottle",
-    "drinking cup",
-    "toothbrush",
-    "necktie",
-    "window blinds",
-    "bed",
-    "couch",
-    "chair",
-    "sink",
-    "toilet",
-    "clothes on hangers",
-    "keys",
-    "wallet",
-    "eyeglasses",
-    "charging cable",
-    "pill bottle",
-]
+# Two prompts are ADDED for the benchmark and only for it: the labelled
+# set contains classes the shipped policy ignores entirely (`airplane`,
+# `tie`), and a verifier that cannot even CONSIDER a proposed label
+# rejects it for free. A rejection rate measured that way would be a
+# measurement of the vocabulary. They are listed in the report so the
+# difference is visible.
+def bench_vocabulary():
+    from tower.object_memory.classes import prompt_for, verifier_vocabulary
 
-# A COCO class name is not always the phrase a language-conditioned model
-# understands best. `mouse` alone is an animal.
-PROMPT_FOR = {
-    "mouse": "computer mouse",
-    "keyboard": "computer keyboard",
-    "remote": "remote control",
-    "cup": "drinking cup",
-    "tv": "television screen",
-    "microwave": "microwave oven",
-    "tie": "necktie",
-    "refrigerator": "refrigerator",
-}
+    shipped = list(verifier_vocabulary())
+    added = [
+        prompt_for(name)
+        for name in GOLDEN
+        if prompt_for(name) not in shipped
+    ]
+    return tuple(shipped + sorted(set(added))), tuple(sorted(set(added)))
+
 
 # The labelled set, by class and by rank within class -- strongest
 # sighting first, which is the order `sighting_contact_sheet.py` lays
@@ -177,7 +140,7 @@ def golden_crops(rows, captures: Path, size: int, pad: float):
             items.append(
                 {
                     "proposed": object_class,
-                    "prompt": PROMPT_FOR.get(object_class, object_class),
+                    "prompt": prompt_for(object_class),
                     "truth": truth,
                     "score": best["score"],
                     "area_fraction": best["area_fraction"],
@@ -214,7 +177,7 @@ class OwlV2:
 
         image = Image.fromarray(image_rgb)
         inputs = self.processor(
-            text=[vocabulary], images=image, return_tensors="pt"
+            text=[list(vocabulary)], images=image, return_tensors="pt"
         ).to(self.device)
         with torch.inference_mode():
             outputs = self.model(**inputs)
@@ -257,7 +220,7 @@ class GroundingStyle:
         from PIL import Image
 
         image = Image.fromarray(image_rgb)
-        text = ". ".join(vocabulary) + "."
+        text = ". ".join(list(vocabulary)) + "."
         inputs = self.processor(
             images=image, text=text, return_tensors="pt"
         ).to(self.device)
@@ -303,16 +266,26 @@ def main(argv=None) -> int:
 
     import torch
 
+    vocabulary, added_for_bench = bench_vocabulary()
     rows = [json.loads(line) for line in args.detections.open(encoding="utf-8")]
     items = golden_crops(rows, args.captures, args.size, args.pad)
-    print(f"{len(items)} labelled crops", flush=True)
+    print(
+        f"{len(items)} labelled crops, {len(vocabulary)}-word vocabulary "
+        f"({len(added_for_bench)} added for the benchmark: "
+        f"{', '.join(added_for_bench)})",
+        flush=True,
+    )
 
     report = {
         "device": args.device,
         "crops": len(items),
         "positives": sum(1 for item in items if item["truth"]),
         "negatives": sum(1 for item in items if not item["truth"]),
-        "vocabulary": VOCABULARY,
+        "vocabulary": list(vocabulary),
+        # The shipped list plus whatever the labelled set needed. Both
+        # reported, so a reader can tell an accuracy figure about the
+        # shipped configuration from one about this experiment.
+        "added_for_bench": list(added_for_bench),
         "crop_size": args.size,
         "crop_padding": args.pad,
         "models": {},
@@ -337,7 +310,7 @@ def main(argv=None) -> int:
         for index, item in enumerate(items):
             rgb = cv2.cvtColor(item["tile"], cv2.COLOR_BGR2RGB)
             started = time.perf_counter()
-            scores = model.scores(rgb, VOCABULARY)
+            scores = model.scores(rgb, vocabulary)
             if args.device.startswith("cuda"):
                 torch.cuda.synchronize()
             latencies.append((time.perf_counter() - started) * 1000.0)

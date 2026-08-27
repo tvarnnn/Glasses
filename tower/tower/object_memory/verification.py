@@ -17,23 +17,24 @@ whole of this module.
 
 THE RATE, WHICH IS THE POINT.
 
-The physical run produced 4,287 detections in 150 seconds. Nothing here
-runs on any of them. Verification is asked ONCE PER SIGHTING, when the
-sighting matures -- and across the whole 18,821-frame corpus there are
-499 sightings of at least three frames, of which the `verify` tier
-accounts for **53**. That is one call per 355 frames, or one every
-30 seconds of delivered video, against a detector that runs 12 times a
-second.
+The validated capture is 186 seconds long and produced 4,287
+detections. Nothing here runs on any of them. Verification is asked ONCE
+PER SIGHTING, when the sighting matures -- and across the whole
+18,821-frame corpus there are 499 sightings of at least three frames, of
+which the `verify` tier accounts for **53**. That is one call per 355
+frames, or one every 33 seconds of recording, against a detector that
+runs about ten times a second.
 
-Measured end to end rather than projected. Replaying the physically
-validated capture, one run at a time:
+Measured end to end rather than projected, one run at a time on an idle
+host, replaying that capture:
 
-    verifier none    8 observations   152.6 s   69.262 ms/frame
-    verifier owlv2  13 observations   153.1 s   69.487 ms/frame
-                                      7 calls in 1.5 s of model time
+    verifier none    8 observations   103.3 s   46.886 ms/frame
+    verifier owlv2  11 observations   112.1 s   50.879 ms/frame
+                                      4 calls in 1.0 s of model time
 
-**+0.225 ms/frame, 0.3%**, for five more memories -- and the queue never
-queued: peak depth 0, zero backlog drops.
+Of the 8.8 extra seconds, **1.0 is inference** and the rest is the
+one-off model load. Excluding the load that is +0.45 ms/frame, for three
+more memories. The queue never queued: peak depth 0, zero backlog drops.
 
 Every one of those numbers is counted at runtime rather than assumed:
 `VerificationQueue` reports submissions, completions, refusals, drops and
@@ -73,8 +74,8 @@ logger = logging.getLogger(__name__)
 # How many sightings may be waiting for a verdict at once.
 #
 # Small on purpose. At the measured rate -- roughly one `verify`-tier
-# sighting every 25 seconds of walking -- a backlog of eight means the
-# verifier has fallen more than three minutes behind, and at that point
+# sighting every 33 seconds of recording -- a backlog of eight means the
+# verifier has fallen more than four minutes behind, and at that point
 # the honest thing is to drop rather than to keep a queue that will never
 # catch up. If this is ever seen to fill in the field, the finding is
 # that the model is too slow for this host, not that the queue is too
@@ -411,18 +412,22 @@ class VerificationQueue:
                 model=getattr(self._verifier, "name", "unknown"),
                 reason="verifier-failed",
             )
-        finally:
-            elapsed = self._clock() - started
-            with self._lock:
-                self._in_flight -= 1
-            self.verify_seconds += elapsed
-
+        self.verify_seconds += self._clock() - started
         self.completed += 1
         if verdict.agrees:
             self.agreed += 1
         else:
             self.refused += 1
+
+        # PUBLISHED BEFORE the in-flight count drops, and the order is
+        # the whole point. `wait_idle` returns when nothing is queued and
+        # nothing is in flight; decrementing first opened a window in
+        # which both were true and the verdict had not yet been
+        # published, so a caller that waited and then drained would
+        # discard an answer it had already paid for.
         self._done.put((job.sighting, verdict))
+        with self._lock:
+            self._in_flight -= 1
 
 
 # --- the verifier this build actually offers ----------------------------
@@ -441,8 +446,13 @@ class VerificationQueue:
 # (`scripts/research/open_vocab_verifier_bench.py`):
 #
 #     model         accept correct  reject wrong  median ms  peak VRAM
-#     owlv2-base            0.949         0.857        128       842 MB
-#     llmdet-tiny           0.407         1.000      3,508     1,648 MB
+#     owlv2-base            0.949         0.857        126       842 MB
+#     llmdet-tiny           0.407         1.000      3,091     1,643 MB
+#
+# Both over the SHIPPED vocabulary. An earlier run of this benchmark used
+# a hand-copied 34-word list while `verifier_vocabulary()` returned 31,
+# so its figures described a configuration that does not ship; the bench
+# now imports the list. Re-running changed nothing but llmdet's latency.
 #
 # The gap is architectural rather than incidental. OWLv2 embeds each
 # prompt SEPARATELY and scores it against the image's object queries, so
@@ -451,7 +461,7 @@ class VerificationQueue:
 # phrase grounding: the vocabulary is joined into one sentence and what
 # comes back is TEXT SPANS -- "a set", "a pair", "a" -- which have to be
 # mapped back onto class names by string matching. It also pays for that
-# sentence, at 3.5 seconds a crop against 128 milliseconds, because
+# sentence, at 3.1 seconds a crop against 126 milliseconds, because
 # cross-attention scales with text length.
 #
 # A model that answers a different question well is not the better model
@@ -461,19 +471,29 @@ class VerificationQueue:
 # of the frame or smaller -- three real remotes at 3.7-3.9%, called
 # `computer mouse` and `cell phone`. The size floor the shipped detector
 # has is not removed by a second opinion; it moves one stage later. On
-# 360x640 source imagery that is a property of the pixels.
+# 360x640 source imagery that is a property of the pixels, and the fixes
+# are upstream: a higher capture resolution, or tiled detection on the
+# async path.
 OWLV2_REPO = "google/owlv2-base-patch16-ensemble"
 
 # Accept only if the proposed label ranks FIRST and scores at least this.
 #
-# Swept over the 94 labelled crops. 0.40 to 0.50 is a plateau and the
-# peak is 0.45: balanced 0.938, accepting 93.2% of correct labels and
-# rejecting 94.3% of wrong ones, with two false accepts. Above 0.55
+# Swept over the 94 labelled crops. 0.40 to 0.50 is a shoulder with its
+# peak at 0.45: balanced 0.938, accepting ~93% of correct labels and
+# rejecting ~94% of wrong ones, with two false accepts. Above 0.55
 # acceptance collapses -- 0.576 at 0.60 -- because the small crops score
 # low even when they are right.
 #
-# It is a threshold fitted to 94 crops from ONE home, and it should be
-# re-measured against any corpus with a different camera, a different
+# ~93% and ~94% rather than 93.2% and 94.3%, deliberately. 81% of the
+# positives in that set are two block assertions -- `[True] * 24` for
+# laptop and the same for cell phone -- so three significant figures
+# would be more precision than the labels carry. An audit found the
+# conclusion robust to relabelling: any single flip moves balanced
+# accuracy by at most 0.015, it takes seven adversarial flips to drop
+# below 0.90, and 0.45 stays optimal under every scenario tried.
+#
+# It is still a threshold fitted to 94 crops from ONE home, and it should
+# be re-measured against any corpus with a different camera, a different
 # room, or a bystander in it.
 OWLV2_MIN_SCORE = 0.45
 

@@ -1,31 +1,45 @@
 #!/usr/bin/env python
 """Does the detector get slower the longer a walk lasts?
 
-Asked because a corpus dump answered it accidentally. Running
-`ssdlite320_mobilenet_v3_large` on CUDA across all 18,821 real frames,
-the CUMULATIVE mean per-frame inference time climbed monotonically:
+**No, and the question exists because a first pass said yes.** That
+answer was wrong, and the way it was wrong is worth keeping.
 
-    1,000 frames   49.5 ms
-    5,000 frames   ~63 ms
-   10,000 frames   75.0 ms
-   15,000 frames   84.0 ms
-   18,821 frames   87.8 ms
+Running `ssdlite320_mobilenet_v3_large` on CUDA across all 18,821 real
+frames, the CUMULATIVE mean per-frame inference time printed by
+`object_memory_corpus_dump.py` rose at every checkpoint -- 49.5 ms at
+1,000 frames, 75.0 at 10,000, 87.8 at the end. Read as a trend that is
+alarming: a producer following a fifteen-minute walk is ~10,800 frames,
+squarely inside the range.
 
-A cumulative mean rising like that means the WINDOWED cost roughly
-doubled: the last thousand frames cost about 106 ms each against 49 ms
-for the first thousand. That is not a curiosity for a cartridge that
-follows a fifteen-minute walk. At 12 delivered frames a second a walk is
-~10,800 frames, which is squarely inside the range where the effect was
-measured.
+It is not a trend. **A cumulative mean rises monotonically whenever the
+underlying series steps up even once**, and it can never come back down.
+De-cumulating the same log gives windows of
 
-This script measures the thing directly instead of inferring it from a
-cumulative average: per-frame latency reported in WINDOWS, alongside
-process RSS and, on CUDA, the allocator's own figures. It runs the same
-detector the cartridge runs, through the same shared class, so a number
-here is a number about the shipped code.
+    49.5  47.5  46.1  55.7  74.2 100.8  99.4  95.6  91.8
+    89.4  92.6 100.6 108.5 101.9 106.4  98.4  88.3 106.7
+
+-- a step at frames 3,000-6,000 and then a flat plateau. The step is
+where a test suite and a contact-sheet render started competing for the
+same cores.
+
+Measured directly, one job at a time, on an idle host, this script
+reports **no drift**: window-median ratios of 0.968 (CUDA, 6,000 frames)
+and 0.808 (CPU), an independently-run 10,000-frame CUDA pass at 1.041,
+flat RSS, and a CUDA allocator reserve that plateaus at 436 MB. There is
+no leak and no degradation.
+
+So this script exists for two reasons: to have measured that, and to
+measure it again cheaply if anything here changes. It reports per-frame
+latency in WINDOWS -- never a cumulative mean -- alongside process RSS
+and, on CUDA, the allocator's own figures. It runs the same detector the
+cartridge runs, through the same shared class, so a number here is a
+number about the shipped code.
 
     python scripts/research/detector_long_session.py --frames 6000 --device cuda
     python scripts/research/detector_long_session.py --frames 6000 --device cpu
+
+RUN IT ALONE. That is the finding, not a caveat: every wrong latency
+figure this cartridge has published came from a contended host.
 
 It reads the corpus and writes only the JSON it prints.
 """

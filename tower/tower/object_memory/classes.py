@@ -49,8 +49,10 @@ different kind of entry, in a different constant, checked first, and it
 is the one thing no model may overturn. Whether Object Memory may
 persist a record per detected bystander is a genuinely open ruling. The
 corpus reframes it without answering it: `person` boxes on this footage
-have a median area of 35.4% of the frame and are usually the wearer's own
-torso seen while looking down, so a `person` record here would mostly be
+have a median area of 38.7% of the frame at the 0.5 threshold this file
+uses (35.4% if every detection down to 0.15 is counted) and are usually
+the wearer's own torso seen while looking down, so a `person` record
+here would mostly be
 the wearer -- simultaneously less sensitive than feared and far less
 useful than hoped. Real bystanders will appear eventually and the ruling
 will still be needed. Leaving `person` out is what lets this cartridge
@@ -115,10 +117,22 @@ EXCLUDED_CLASSES = frozenset({"person"})
 class ClassEvidence:
     """What was measured about one class, and what follows from it.
 
-    `sightings` and `inspected`/`correct` are counts over the whole
-    18,821-frame corpus at score >= 0.5 with at least 3 frames. They are
-    carried as data rather than as prose so a later corpus can be
-    compared against them, and so a reviewer can see the sample size
+    `sightings` is a count over the whole 18,821-frame corpus at score
+    >= 0.5 with at least 3 frames, and it regenerates exactly from
+    `scripts/research/object_memory_corpus_dump.py`.
+
+    `inspected` and `correct` are a HUMAN READING, and their provenance
+    is weaker in a way worth stating. They come from one pass over the
+    contact sheets `scripts/research/sighting_contact_sheet.py` renders,
+    read strongest-first. The sheets regenerate; the per-tile verdicts
+    were only recorded individually for the classes that went into
+    `scripts/research/open_vocab_verifier_bench.py`'s `GOLDEN` dict, so
+    for `bed` (24 read, 20 right) and `chair` (6 read, 5 right) the
+    counts here are the only record and cannot be re-derived without
+    someone looking again.
+
+    They are carried as data rather than as prose so a later corpus can
+    be compared against them, and so a reviewer can see the sample size
     behind a tier instead of trusting the tier.
     """
 
@@ -166,12 +180,14 @@ CLASS_EVIDENCE: dict[str, ClassEvidence] = {
         inspected=24,
         correct=24,
         note=(
-            "24 of 24 strongest crops were phones, twenty of them at a "
-            "score of exactly 1.00. Median best score 0.979 across 27 "
-            "captures. Small boxes -- a median 8.5% of the frame, five of "
-            "the inspected crops under 7% -- and still reliable, which is "
-            "unusual here: a lit screen is a strong, distinctive signal, "
-            "and it is the one small object this detector is good at."
+            "24 of 24 strongest crops were phones. Twenty-two of the 24 "
+            "round to 1.00 at two decimals; none is exactly 1.00 and the "
+            "highest is 0.9991. Median best score 0.979 across 27 "
+            "captures. Small boxes -- a median 8.7% of the frame at the "
+            "0.5 threshold this table uses -- and still reliable, which "
+            "is unusual here: a lit screen is a strong, distinctive "
+            "signal, and it is the one small object this detector is "
+            "good at."
         ),
     ),
     # -- worth finding, and not trustworthy without a second opinion --
@@ -324,7 +340,17 @@ CLASS_EVIDENCE: dict[str, ClassEvidence] = {
             "written either way."
         ),
     ),
-    "dining table": ClassEvidence(CONTEXT, 0, 0, 0, "Four detections in 18,821 frames."),
+    "dining table": ClassEvidence(
+        CONTEXT,
+        sightings=0,
+        inspected=0,
+        correct=0,
+        note=(
+            "422 detections above 0.15, four above 0.4, and NONE above "
+            "the 0.5 this cartridge requires. It is in this table so the "
+            "absence is recorded rather than looked up again."
+        ),
+    ),
     "microwave": ClassEvidence(
         CONTEXT,
         sightings=2,
@@ -438,9 +464,12 @@ VERIFIER_DISTRACTORS = (
 # Measured rather than assumed: `keyboard` produced 24 sightings across
 # 12 captures over the real corpus, and every one of those captures also
 # had a laptop in view. A replay of the validated capture with the
-# verifier on wrote two `keyboard` records, and inspection showed one of
-# them to be the keyboard of a laptop that already had its own record --
-# the same object, remembered twice under two names.
+# verifier on -- run BEFORE this table existed -- wrote two `keyboard`
+# records, and inspection showed one of them to be the keyboard of a
+# laptop that already had its own record: the same object, remembered
+# twice under two names. With the rule, the same replay writes neither,
+# because in that capture the keyboard is never in view without the
+# laptop.
 #
 # Suppression is CONCURRENT, not blanket, and the distinction is the
 # whole reason this is a table rather than a tier change. The other

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -9,7 +10,7 @@ from fastapi import FastAPI
 from tower.capture import CaptureRecorder
 from tower.capture_workers import CaptureWorkerSupervisor, WorkerSpec
 from tower.cartridge_session import CartridgeSession
-from tower.config import TOWER_ROOT, Settings, get_settings
+from tower.config import KNOWN_VERIFIERS, TOWER_ROOT, Settings, get_settings
 from tower.experiments import ExperimentSettings
 from tower.logging_config import configure_logging
 from tower.modules.base import Module
@@ -261,11 +262,28 @@ def _log_effective_configuration(
         logger.info(
             "[Tower][Config] observation root %s (one path for the producer "
             "AND the read routes; the web process never writes or deletes "
-            "observations). Producer device %s, retention %s days.",
+            "observations). Producer device %s, retention %s days, verifier "
+            "%s -- recording %s.",
             settings.observation_root,
             settings.observation_device,
             settings.observation_retention_days,
+            settings.observation_verifier,
+            ", ".join(_recorded_classes(settings)),
         )
+        raw_verifier = os.environ.get("TOWER_OBSERVATION_VERIFIER", "")
+        if raw_verifier.strip() and raw_verifier.strip().lower() != (
+            settings.observation_verifier
+        ):
+            # Loud, because the alternative is a Tower that quietly
+            # records less than the operator asked for.
+            logger.warning(
+                "[Tower][Config] TOWER_OBSERVATION_VERIFIER=%r is not a "
+                "verifier this build has; running with %r instead. Known: "
+                "%s",
+                raw_verifier,
+                settings.observation_verifier,
+                ", ".join(KNOWN_VERIFIERS),
+            )
 
     attached = supervisor.worker_names()
     if WORLD_BUILD_WORKER in attached:

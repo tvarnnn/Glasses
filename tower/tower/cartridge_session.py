@@ -28,9 +28,25 @@ machine lives here, knows no cartridge, and is handed a worker NAME.
 `paused`. There is no `starting`: attaching is a `Popen` and a dict
 update, and a transient state that no client can ever observe is a state
 that only exists to be got wrong.
+
+**SERIALISED, because the transport is concurrent.** The routes are sync
+`def` so a five-second detach stays off the event loop, which means
+FastAPI runs them in its threadpool and two actions can be in flight at
+once. Unserialised, a Stop arriving while a Start was between "set
+ACTIVE" and "attach" left the session `stopped` with a producer running
+-- and `stop()` from `stopped` returned early without detaching, so a
+second Stop could not recover it. The one control a wearer has over being
+remembered failed OPEN. A reviewer reproduced it: `state=stopped`,
+`following=['cap-1']`, live pid.
+
+Every action holds the lock for its whole duration, including the
+attach and the detach. That makes a Pause take as long as stopping a
+process takes and makes a concurrent Start wait for it, which is correct:
+these are a person pressing buttons, not a hot path.
 """
 
 import logging
+import threading
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -48,11 +64,27 @@ STOP = "stop"
 
 ACTIONS = (START, PAUSE, RESUME, STOP)
 
-# How long a producer gets to finish its current record before it is
-# terminated on Pause or Stop. Shorter than the supervisor's shutdown
-# grace, and deliberately: at shutdown a builder may be inside a whole
-# rebuild, whereas here the worst case is one JSONL append.
-DETACH_GRACE_SECONDS = 5.0
+# How long a producer gets to exit on its own before Pause or Stop
+# terminates it.
+#
+# ZERO, and the five seconds it used to be were worse than useless.
+# Nothing SIGNALS the producer: it is a follower tailing a journal that
+# is still being written, so it has no reason to stop and never does.
+# The wait measured 5.01 seconds every single time, and then the process
+# was terminated anyway -- so the grace bought exactly nothing and cost a
+# wearer five seconds of a control whose whole purpose is to stop
+# recording NOW. Worse, a Start arriving inside that window used to
+# return 200 `active` and then find itself paused.
+#
+# What the grace was supposed to protect is a half-written JSONL line.
+# The store already tolerates one: `_read_raw_records` skips a line that
+# is not valid JSON, and `prune_expired` rewrites it out. Losing at most
+# the record being appended at the instant of a Pause is the right trade
+# against a Pause that takes five seconds to be obeyed.
+#
+# `shutdown` keeps its own, longer grace, because there the capture has
+# CLOSED and the follower really will finish and exit by itself.
+DETACH_GRACE_SECONDS = 0.0
 
 
 class SessionRefused(Exception):
@@ -98,6 +130,10 @@ class CartridgeSession:
         self._clock = clock
         self._detach_grace_seconds = detach_grace_seconds
 
+        # Held for the whole of every action, attach and detach
+        # included. See the module docstring: the transport is concurrent
+        # and the failure was open.
+        self._lock = threading.RLock()
         self._state = STOPPED
         self._session_id: str | None = None
         self._started_at: float | None = None
@@ -170,26 +206,28 @@ class CartridgeSession:
         whereas Resume is a claim about continuing something and should
         not quietly invent a session that was never started.
         """
-        self._require_supported()
-        if self._state == ACTIVE:
-            return self._result(changed=False)
-        if self._state == STOPPED:
-            self._session_id = uuid.uuid4().hex
-            self._started_at = self._clock()
-            self._captures = []
-        return self._go_active()
+        with self._lock:
+            self._require_supported()
+            if self._state == ACTIVE:
+                return self._result(changed=False)
+            if self._state == STOPPED:
+                self._session_id = uuid.uuid4().hex
+                self._started_at = self._clock()
+                self._captures = []
+            return self._go_active()
 
     def resume(self) -> dict:
-        self._require_supported()
-        if self._state == ACTIVE:
-            return self._result(changed=False)
-        if self._state != PAUSED:
-            raise SessionRefused(
-                "not-paused",
-                "there is no paused session to resume; this cartridge is "
-                f"{self._state}",
-            )
-        return self._go_active()
+        with self._lock:
+            self._require_supported()
+            if self._state == ACTIVE:
+                return self._result(changed=False)
+            if self._state != PAUSED:
+                raise SessionRefused(
+                    "not-paused",
+                    "there is no paused session to resume; this cartridge is "
+                    f"{self._state}",
+                )
+            return self._go_active()
 
     def pause(self) -> dict:
         """Stop remembering, keep the session.
@@ -203,24 +241,30 @@ class CartridgeSession:
         observable in the process table, costs one model load to undo,
         and cannot go stale.
 
+        It is also PROMPT. See DETACH_GRACE_SECONDS: the producer is not
+        signalled and has no reason to exit on its own, so waiting for it
+        bought nothing and cost a wearer five seconds of a control whose
+        whole purpose is to stop recording now.
+
         What that costs is the producer's in-memory state -- which track
         was open, which class was last recorded. Losing it errs towards
         one extra honest observation after a resume, never towards a
         suppressed real one, which is the direction this cartridge
         already errs on restart.
         """
-        self._require_supported()
-        if self._state == PAUSED:
-            return self._result(changed=False)
-        if self._state != ACTIVE:
-            raise SessionRefused(
-                "not-active",
-                f"there is nothing to pause; this cartridge is {self._state}",
-            )
-        self._detach()
-        self._state = PAUSED
-        self._changed_at = self._clock()
-        return self._result(changed=True)
+        with self._lock:
+            self._require_supported()
+            if self._state == PAUSED:
+                return self._result(changed=False)
+            if self._state != ACTIVE:
+                raise SessionRefused(
+                    "not-active",
+                    f"there is nothing to pause; this cartridge is {self._state}",
+                )
+            self._detach()
+            self._state = PAUSED
+            self._changed_at = self._clock()
+            return self._result(changed=True)
 
     def stop(self) -> dict:
         """End the session. Never refused, from any state.
@@ -231,15 +275,24 @@ class CartridgeSession:
 
         Observations already written are untouched. Stopping ends the
         producing, not the memory.
+
+        IT ALWAYS DETACHES, EVEN FROM `stopped`. This used to return
+        early when the state was already `stopped`, on the reasonable
+        view that there was nothing to do -- and that made the one
+        recoverable state unrecoverable. Stop means "end up with nothing
+        recording", and the only way to keep that promise is to check.
+        Detaching when nothing is attached costs a dictionary lookup.
         """
-        if self._state == STOPPED:
-            return self._result(changed=False)
-        self._detach()
-        self._state = STOPPED
-        self._session_id = None
-        self._started_at = None
-        self._changed_at = self._clock()
-        return self._result(changed=True)
+        with self._lock:
+            already_stopped = self._state == STOPPED
+            self._detach()
+            self._state = STOPPED
+            self._session_id = None
+            self._started_at = None
+            if already_stopped:
+                return self._result(changed=False)
+            self._changed_at = self._clock()
+            return self._result(changed=True)
 
     # -- reporting -----------------------------------------------------
 

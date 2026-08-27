@@ -98,10 +98,10 @@ class RelevancePolicy:
     """Thresholds for turning detections into stored observations.
 
     `min_score` stays at 0.5. It was a starting point and the corpus
-    supports keeping it: 78,546 detections at 0.15 fall to ~31,000 at
-    0.4, and below 0.5 the sighting structure is dominated by one- and
-    two-frame flickers. It is still not a probability, and raising it
-    would not make it one -- a ceiling fan scores 0.99.
+    supports keeping it: 78,546 detections at 0.15 fall to 30,727 at 0.4
+    and 24,028 at 0.5, and below 0.5 the sighting structure is dominated
+    by one- and two-frame flickers. It is still not a probability, and
+    raising it would not make it one -- a ceiling fan scores 0.99.
 
     `gap_seconds` and `min_frames` come from `sightings.py` and are the
     two numbers that were chosen from a measured distribution.
@@ -201,7 +201,15 @@ class RelevanceFilter:
         # against what is open RIGHT NOW rather than against the class
         # table, so a keyboard on a desk with no laptop near it is still
         # a memory and a laptop's own keyboard is not a second one.
+        #
+        # LATCHED onto the sighting once it fires. A settled sighting has
+        # already been removed from the tracker, and so has everything
+        # that was open beside it, so a live check at that moment sees an
+        # empty set and lets the duplicate through -- which is what it
+        # did until a reviewer reproduced it.
         if any(whole in open_classes for whole in wholes_of(sighting.object_class)):
+            sighting.suppressed_as_part = True
+        if sighting.suppressed_as_part:
             return PART_OF_ANOTHER
         if tier_of(sighting.object_class) == VERIFY:
             agreed = sighting.verdict is not None and sighting.verdict.get("agrees")

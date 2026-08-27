@@ -159,10 +159,16 @@ _IMAGERY_STATUS = {
 # Never cached. Sensitive first-person imagery on a LAN-local origin.
 _NO_STORE = {"Cache-Control": "no-store"}
 
-# A filter constructed with a path that cannot exist, so it reports
-# itself unavailable and every route refuses. Used when an app was built
-# without one -- which is most of this repository's tests. The failure
-# has to be a REFUSAL, never an AttributeError and never a raw frame.
+# The stand-in for an app that was built without a filter -- which is
+# most of this repository's tests. The failure has to be a REFUSAL, never
+# an AttributeError and never a raw frame.
+#
+# `path=""` means "no model", explicitly, since `imagery.FaceFilter` grew
+# a blank check. It did not always: `Path("")` is `Path(".")` and
+# `Path(".").exists()` is True, so this reported itself AVAILABLE and
+# refused only because `cv2.FaceDetectorYN.create(".")` happened to
+# raise. Every test that asserted a refusal here was passing for that
+# reason rather than for this one.
 _REFUSING_FILTER = build_face_filter(path="")
 
 

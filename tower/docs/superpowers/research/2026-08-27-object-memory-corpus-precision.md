@@ -1,13 +1,22 @@
 # Object Memory — what the detector actually sees, and what it gets wrong
 
 **Date:** 2026-08-27
-**Corpus:** `tower/data/captures/` — 34 captures, **18,821 frames**, all
-360×640 portrait, 0 undecodable. Real Ray-Ban Meta footage relayed through
-an iPhone.
+**Corpus:** `tower/data/captures/` — 34 captures, **18,821 frames**,
+**1,942 seconds** of recording, all 360×640 portrait, 0 undecodable. Real
+Ray-Ban Meta footage relayed through an iPhone.
+
 **Harnesses:** `tower/scripts/research/object_memory_corpus_dump.py`,
 `sighting_contact_sheet.py`, `open_vocab_verifier_bench.py`,
 `detector_long_session.py`, `face_filter_false_positives.py`. Every figure
 below is reproducible from those five commands.
+
+> **Corrected in place, 2026-08-27, after an independent audit.** Every
+> count derived from the corpus survived unchanged. **No latency figure
+> did**: all were first measured on a host that was simultaneously
+> running a test suite, and all are re-measured here on an idle one. §5.2
+> retracts a claim outright, and §4.2 records a methodological error in
+> the benchmark itself. Corrections are folded into the sections they
+> belong to rather than appended, with the old figure named each time.
 
 ---
 
@@ -49,8 +58,8 @@ At ≥ 0.5, by detection count:
 | class | ≥0.5 | ≥0.7 | median score | median area | captures |
 |---|---|---|---|---|---|
 | laptop | 8,218 | 6,811 | 0.664 | 21.5% | 32 |
-| person | 6,899 | 2,940 | 0.300 | 35.4% | 32 |
-| cell phone | 3,613 | 2,814 | 0.604 | 8.5% | 27 |
+| person | 6,899 | 2,940 | 0.300 | 38.7% | 32 |
+| cell phone | 3,613 | 2,814 | 0.604 | 8.7% | 27 |
 | bed | 1,314 | 295 | 0.307 | 49.7% | 21 |
 | keyboard | 1,086 | 695 | 0.295 | 10.5% | 19 |
 | tv | 1,085 | 437 | 0.276 | 16.0% | 23 |
@@ -58,10 +67,13 @@ At ≥ 0.5, by detection count:
 | sink | 310 | 166 | 0.243 | 17.0% | 8 |
 | chair | 171 | 63 | 0.197 | 9.0% | 15 |
 
-`person` has a median box area of **35.4% of the frame**. On head-mounted
-footage that is the wearer's own torso and arms seen while looking down,
-which is the same finding the 2026-08-26 pass made on the smaller corpus
-and it survives at double the sample.
+`person` has a median box area of **38.7% of the frame** at the ≥0.5
+threshold this table uses (35.4% if every detection down to 0.15 is
+counted — an earlier draft quoted that figure against a table of ≥0.5
+rows, which was an apples-to-oranges slip an audit caught). On
+head-mounted footage that is the wearer's own torso and arms seen while
+looking down, which is the same finding the 2026-08-26 pass made on the
+smaller corpus, and it survives at double the sample.
 
 ---
 
@@ -83,15 +95,21 @@ Of the 499, the tiers now split them: **158 `remembered`**, **53
 
 Two consequences.
 
-**The 3-frame floor is not taste.** A third of all sightings are one or
-two frames — a class that fired once and never again. Writing them would
-make a third of the memory noise. Three frames costs a quarter of a
-second at the measured ~12 fps delivered rate.
+**The 3-frame floor is not taste.** 264 of 763 — 35% — are one or two
+frames, a class that fired once and never again. Writing them would make
+a third of the memory noise. Three frames costs two inter-frame gaps:
+**167 ms** at the repo's measured 83.5 ms delivered interval, **206 ms**
+against the corpus's own 9.7 frames a second averaged across whole
+captures.
 
-**404 memories over 26 minutes of walking is a scrollable list.** The
-30-second resample window could not produce a number with any relationship
-to what the camera did: an object glanced at twice in a second gave one
-record and an object watched for four minutes gave eight.
+**One memory every 9.2 seconds is a scrollable list.** The 211
+`remembered`- and `verify`-tier sightings over 1,942 seconds work out at
+about 380 an hour. (An earlier draft said "one per 45 seconds", which
+came from reading 18,821 ÷ 404 = 46.6 *frames* as seconds. Corrected.)
+The 30-second resample window could not produce a number with any
+relationship to what the camera did at all: an object glanced at twice in
+a second gave one record and an object watched for four minutes gave
+eight.
 
 ---
 
@@ -105,7 +123,7 @@ inspected.
 | class | sightings | inspected | correct | what the wrong ones actually were |
 |---|---|---|---|---|
 | laptop | 78 | 24 | **24** | — |
-| cell phone | 80 | 24 | **24** | — twenty of the twenty-four scored exactly 1.00 |
+| cell phone | 80 | 24 | **24** | — 22 of the 24 round to 1.00 at two decimals; none is exactly 1.00 and the highest is 0.9991 |
 | bed | 66 | 24 | 20 | bedding at very close range |
 | chair | 11 | 6 | 5 | a phone held in a hand, at **0.94** |
 | mouse | 4 | 4 | 3 | an AirPods case, at 0.79 |
@@ -122,6 +140,17 @@ inspected.
 | backpack | 1 | 1 | **0** | a closet of hanging clothes |
 | toothbrush | 1 | 1 | **0** | a boxed tube of toothpaste |
 | tv, couch, sink, toilet, cat, dog, keyboard | — | **0** | — | not inspected; recorded as unknown, never as 0 |
+
+**Provenance, stated because it is weaker than the sighting counts.** The
+sighting counts regenerate exactly from
+`object_memory_corpus_dump.py`. The `inspected`/`correct` columns are one
+human pass over contact sheets read strongest-first. The **sheets**
+regenerate; the **per-tile verdicts** were only written down for the
+classes that went into the benchmark's `GOLDEN` dict (§4.2). For `bed`
+(24 read, 20 right) and `chair` (6 read, 5 right) the counts in this
+table are the only record and cannot be re-derived without someone
+looking again. Both are `context`-tier and neither is ever written, so
+nothing downstream depends on them.
 
 ### 3.1 The two findings that follow
 
@@ -167,12 +196,34 @@ because they are the two that matter and the two that are mixed. 59
 positives, 35 negatives. The labels are hard-coded in
 `open_vocab_verifier_bench.py`'s `GOLDEN` dict so they can be argued with.
 
+**They are 81% block assertions** — `[True] * 24` for laptop and the same
+for cell phone — and an audit tested how much that matters. Any single
+flip moves balanced accuracy by **at most 0.015**; it takes **seven
+adversarial flips (7.4% of the set)** to drop below 0.90; and under every
+plausible group relabelling tried (`suitcase` → True, the AirPods case →
+True, `remote` all-False, `remote` all-True, four of the 48 laptop and
+phone crops wrong) OWLv2 stays between 0.89 and 0.97 and **0.45 remains
+the optimal threshold in every scenario**. The conclusion is robust; the
+third significant figure is not, which is why §4.3 reports ~93% and ~94%.
+
+**The vocabulary is the shipped one.** It was restated once and the two
+drifted — the benchmark ran 34 words while `verifier_vocabulary()`
+returned 31, so its figures described a configuration that does not ship.
+The harness now imports the list and adds only what the labelled set
+needs (`necktie`, for a class the shipped policy ignores entirely),
+reported in its output. Re-running against the shipped list changed
+nothing.
+
 ### 4.3 The result
 
 | model | accepts correct | rejects wrong | balanced | median ms | peak VRAM | license |
 |---|---|---|---|---|---|---|
-| **owlv2-base-patch16-ensemble** | **0.949** | 0.857 | **0.903** | **128** | 842 MB | Apache-2.0 |
-| llmdet-tiny | 0.407 | 1.000 | 0.703 | 3,508 | 1,648 MB | Apache-2.0 |
+| **owlv2-base-patch16-ensemble** | **0.949** | 0.857 | **0.903** | **126** | 842 MB | Apache-2.0 |
+| llmdet-tiny | 0.407 | 1.000 | 0.703 | 3,091 | 1,643 MB | Apache-2.0 |
+
+At rank-1 with no score threshold, over the shipped 31-word vocabulary
+plus `necktie`. Resident VRAM: 620 MB (OWLv2) against 692 MB (LLMDet);
+cold load 7.0 s against 6.6 s.
 
 LLMDet is the stronger model on LVIS rare-class AP and is what a survey
 of the literature picks. It loses here for an architectural reason, not a
@@ -186,8 +237,8 @@ quality one:
   that must be mapped back onto class names by string matching. It scored
   0 of 24 on `cell phone`, 0 of 3 on `cup` and 0 of 2 on `bottle` under
   that mapping.
-* It also pays for the sentence. **3.5 seconds a crop against 128
-  milliseconds**, twenty-seven times slower, because cross-attention
+* It also pays for the sentence. **3.1 seconds a crop against 126
+  milliseconds**, twenty-five times slower, because cross-attention
   scales with text length.
 
 A model that answers a different question well is not the better model
@@ -201,13 +252,15 @@ ranks first **and** scores at least the threshold:
 | min score | accepts | rejects | balanced | false accepts | false rejects |
 |---|---|---|---|---|---|
 | 0.00 | 0.949 | 0.857 | 0.903 | 5 | 3 |
+| 0.35 | 0.932 | 0.857 | 0.895 | 5 | 4 |
 | 0.40 | 0.932 | 0.886 | 0.909 | 4 | 4 |
 | **0.45** | **0.932** | **0.943** | **0.938** | **2** | **4** |
 | 0.50 | 0.915 | 0.943 | 0.929 | 2 | 5 |
 | 0.55 | 0.814 | 0.943 | 0.878 | 2 | 11 |
 | 0.60 | 0.576 | 0.943 | 0.760 | 2 | 25 |
 
-0.40–0.50 is a plateau and **0.45** is its peak. Above 0.55 acceptance
+0.40–0.50 is a **shoulder with its peak at 0.45** — not a plateau; the
+balanced figures are 0.909, 0.938 and 0.929. Above 0.55 acceptance
 collapses, because the small crops score low even when they are right.
 
 **This threshold is fitted to 94 crops from one home.** It should be
@@ -242,41 +295,72 @@ tiled detection on the async path. Neither is this wave's.
 RTX 5070 (Blackwell, sm_120), 12 GB, driver 596.21; torch 2.13.0+cu132;
 Windows 11; 20 logical cores.
 
+**Every figure in this section was re-measured on an IDLE host, one run
+at a time.** The first set was not, and every one of them was wrong by
+about a third. That is the most transferable finding here: on this
+machine, a benchmark that shares the box with a test suite reports
+numbers 30–50% high, and a *cumulative* mean of such a run looks like a
+trend (§5.2).
+
 ### 5.1 The detector
 
-Replaying the physically validated capture (2,203 frames), one run at a
-time:
+Replaying the physically validated capture (2,203 frames, 186 s of
+recording), one run at a time:
 
-| device | seconds | ms/frame | detections |
-|---|---|---|---|
-| **CPU** | 152.6 | **69.262** | 4,287 |
-| CUDA | 221.3 | 100.436 | 4,285 |
+| device | seconds | ms/frame | detections | observations |
+|---|---|---|---|---|
+| **CPU** | 103.3 | **46.886** | 4,287 | 8 |
+| CUDA | 107.4 | 48.757 | 4,285 | 8 |
 
-**CPU is ~30% faster than CUDA for this detector on this host**, because
-the cost is per-frame preprocessing and transfer rather than the 320×320
-forward pass. The CPU figure also reproduces the physically validated
-run's 68.176 ms/frame and its detection count **exactly**; CUDA differs
-by two detections at the threshold, which is ordinary numeric drift.
+**The two are within noise of each other**, and an earlier draft of this
+document claimed CPU was ~30% faster on the strength of contended runs.
+An independent audit on the same host measured the ordering the other way
+(CUDA 43.9 against CPU 51.0) at a similar margin; run-to-run variance on
+this machine is 16–25%, which is larger than the gap. The honest
+statement is that this detector costs about the same either way, because
+the work is single-frame preprocessing and transfer rather than the
+320×320 forward pass.
 
-That is why `observation_device` defaults to `cpu`.
+The CPU run reproduces the physically validated run's detection count
+**exactly** (4,287). CUDA differs by two detections at the threshold,
+which is ordinary numeric drift.
 
-Reading and decoding the corpus costs **1.06 ms/frame** with 46 MB of
-RSS, so essentially none of the above is I/O.
+**So `observation_device` defaults to `cpu` for a different reason than
+speed:** the GPU is shared — World Builder, the depth experiment, and
+this cartridge's own verifier at 620 MB — and a producer that follows a
+capture has no latency requirement at all. It may fall behind and catch
+up. It is the one stage that should stay off the contended device.
+
+Reading and decoding the corpus costs about **1.06 ms/frame** with 46 MB
+of RSS (3,000 frames in 3.19 s), so essentially none of the above is I/O.
 
 ### 5.2 Long-session behaviour — a retraction
 
 A first pass reported a monotonic climb in per-frame cost (49.5 →
-87.8 ms over 18,821 frames) and it was **wrong**. That figure was a
-*cumulative mean* read off a run that was competing with a test suite and
-a contact-sheet render. Measured directly, in windows, one job at a time:
+87.8 ms over 18,821 frames) and it was **wrong**.
 
-| device | window medians (500 frames each) | drift ratio | peak RSS |
+The figure was a *cumulative* mean, printed as a progress line, from a
+run competing with a test suite and a contact-sheet render. **A
+cumulative mean rises monotonically whenever the underlying series steps
+up even once, and can never come back down.** De-cumulating the same log
+gives per-1,000-frame windows of
+
+    49.5  47.5  46.1  55.7  74.2 100.8  99.4  95.6  91.8
+    89.4  92.6 100.6 108.5 101.9 106.4  98.4  88.3 106.7
+
+— a step at frames 3,000–6,000, where the competing work started, and
+then a plateau. Not a climb.
+
+Measured directly, in windows, one job at a time:
+
+| run | window medians (500 frames each) | drift ratio | peak RSS |
 |---|---|---|---|
-| CUDA | 120, 114, 100, 85, 96, 101, 124, 123, 99, 112, 101, 117 | **0.968** | 1,442 MB |
-| CPU | 154, 142, 165, 98, 97, 94, 115, 134, 99, 115, 93, 125 | **0.808** | **704 MB** |
+| CUDA, 6,000 frames | 120, 114, 100, 85, 96, 101, 124, 123, 99, 112, 101, 117 | **0.968** | 1,442 MB |
+| CPU, 6,000 frames | 154, 142, 165, 98, 97, 94, 115, 134, 99, 115, 93, 125 | **0.808** | **704 MB** |
+| CUDA, 10,000 frames (independent audit) | 46.6 → 60.2 → 43.0 → 48.5 | **1.041** | flat |
 
-No trend, no leak: CUDA allocator reserved plateaus at 436 MB and RSS is
-flat. `torch.cuda.empty_cache()` every 200 frames made no reliable
+No trend, no leak. The CUDA allocator's reserve plateaus at 436 MB and
+RSS is flat. `torch.cuda.empty_cache()` every 200 frames made no reliable
 difference — the run with it measured lower, but by less than the spread
 between windows.
 
@@ -286,31 +370,39 @@ between windows.
 
 | | |
 |---|---|
-| CUDA | **128 ms** median / 141 ms p95 per crop, 620 MB resident, 842 MB peak |
+| CUDA | **126 ms** median / 129 ms p95 per crop; 620 MB resident, 842 MB peak |
 | CPU | **2,473 ms** median per crop, +796 MB RSS |
-| load | 5.7 s cold, ~600 MB of weights downloaded once |
+| load | ~7 s cold, ~600 MB of weights downloaded once |
 
-CPU is 19× slower. Since the detector is faster on CPU and the verifier
-is faster on CUDA, the two stages default to **different devices**, which
-is also what keeps a 2.5-second burst off the cores the detector is
-using.
+CPU is 19× slower. Since the detector costs about the same on either
+device and the verifier does not, the two stages default to **different
+devices** — which also keeps a 2.5-second burst off the cores the
+detector is using.
 
 ### 5.4 End to end, on the validated capture
 
+One run at a time, idle host:
+
 | | observations | seconds | ms/frame | verifier calls | model time |
 |---|---|---|---|---|---|
-| verifier `none` | 8 | 152.6 | 69.262 | — | — |
-| verifier `owlv2` | 13 | 153.1 | 69.487 | 7 | 1.50 s |
-| `owlv2` + part-of rule | **12** | — | — | **5** | 1.05 s |
+| `--verifier none` | 8 | 103.3 | 46.886 | — | — |
+| `--verifier owlv2` | **11** | 112.1 | 50.879 | **4** | 1.00 s |
 
-**+0.225 ms/frame — 0.3% — for five more memories.** Seven calls across
-2,203 frames is one per 315. Queue peak depth **0**; backlog drops **0**.
+Of the 8.8 extra seconds, **1.0 is inference** and the remainder is the
+one-off model load. Excluding the load, that is **+0.45 ms/frame for
+three more memories** (2 `bottle`, 1 `mouse`). Queue peak depth **0**;
+backlog drops **0**; 250 ms per call end to end, against the 126 ms of
+pure inference in §5.3 — the difference is the colour conversion, the
+PIL round-trip and the processor.
+
+Four calls across 2,203 frames is **one per 551**, which is sparser than
+the corpus-wide 1-in-355 because this particular capture is dominated by
+a laptop and a phone.
 
 The part-of rule (a `keyboard` sighting is suppressed while a `laptop`
-sighting is open) removed one duplicate record, suppressed 36 detections,
-and saved two model calls: the funnel narrowing itself.
-
----
+sighting is open) suppressed 96 detections on this capture and removed
+the `keyboard` record entirely — in this walk the keyboard is never in
+view without the laptop it belongs to.
 
 ## 6. A defect in the face filter, found by using it
 
@@ -330,7 +422,7 @@ Measured across 1,845 evenly-spaced corpus frames:
 | regions filled | 976 |
 | median region area | **12.5% of the frame** |
 | largest region | 84.2% of the frame |
-| cost | 27.5 ms/frame |
+| cost | 21.8 ms/frame |
 
 Of 36 firings inspected by eye: **4 were a real face** — the wearer
 reflected in a mirror — and **32 were not**: hands on a keyboard (the

@@ -11,9 +11,13 @@ the measurement now exists.
 Grouping the same corpus into temporally contiguous runs instead --
 18,821 frames, every detection at score >= 0.5, a run broken by a gap of
 more than 3 seconds -- gives **763 sightings, 499 of them at least three
-frames long, 404 of those excluding `person`**. That is roughly one
-memory per 45 seconds of delivered video, over 28 classes rather than
-two, and it is a shape a wearer could actually scroll.
+frames long, 404 of those excluding `person`**, over 28 classes rather
+than two.
+
+Of those 499, the classes this cartridge may actually write account for
+**211**. The corpus is 1,942 seconds of recording, so that is **one
+memory every 9.2 seconds of walking** -- about 380 an hour, which is a
+shape a wearer could scroll and a store that stays small for months.
 
 The 30-second window cannot express any of that. It is an interval with
 no relationship to what the camera did: an object glanced at twice in one
@@ -24,11 +28,13 @@ across 29 frames" -- and every field on it is something that happened.
 
 WHY THREE FRAMES.
 
-Of the 763 sightings, 264 are one or two frames long. Those are flickers:
-a class that fired once and never again. Writing them would make a third
-of the memory noise. Requiring three frames costs a quarter of a second
-at the measured ~12 fps delivered rate, and it is the only threshold here
-that was chosen from the distribution rather than from taste.
+Of the 763 sightings, 264 are one or two frames long -- 35%. Those are
+flickers: a class that fired once and never again. Writing them would
+make a third of the memory noise. Requiring three frames costs two
+inter-frame gaps, about **170-210 ms** depending on whether the
+denominator is the measured 83.5 ms delivered interval or the corpus's
+own 9.7 frames a second averaged across whole captures. It is the only
+threshold here chosen from a distribution rather than from taste.
 
 The record is still stamped with the FIRST frame of the sighting, so
 `observed_at` still means "when it came into view" and a session killed
@@ -46,8 +52,8 @@ implying otherwise without any of the evidence that would justify it.
 from dataclasses import dataclass, field, replace
 
 # A sighting survives this long a dropout before it is treated as
-# finished. Three seconds is ~36 delivered frames at the measured rate,
-# which covers a head turn away and back -- the commonest reason a class
+# finished. Three seconds is roughly thirty delivered frames, which
+# covers a head turn away and back -- the commonest reason a class
 # vanishes for a moment on head-mounted footage. Shorter, and one glance
 # aside becomes two memories; longer, and two genuinely separate visits
 # to the same object merge into one.
@@ -110,6 +116,20 @@ class Sighting:
     # keep working when no verifier exists, and typing an absence is how
     # a null becomes a required field.
     verdict: dict | None = field(default=None)
+    # Whether this sighting was ever seen while a class it is a PART of
+    # was also in view.
+    #
+    # Recorded on the sighting rather than recomputed, because by the
+    # time a sighting is settled it has been removed from the tracker and
+    # so has everything that was open alongside it -- so the check would
+    # run against an empty set and the suppression would evaporate at the
+    # end of every sighting, writing the duplicate it exists to prevent.
+    # A reviewer reproduced exactly that.
+    #
+    # A latch, not a live check: "this was only in view because its whole
+    # was" is a fact about what happened, and it does not stop being true
+    # when the whole leaves the frame.
+    suppressed_as_part: bool = False
     # Whether a second opinion has already been ASKED FOR. Distinct from
     # `verdict`, which is whether one has arrived: between the two the
     # sighting is in flight, and without this flag every frame in that
