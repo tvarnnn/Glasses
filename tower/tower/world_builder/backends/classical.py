@@ -64,6 +64,42 @@ from tower.world_builder.schema import (
 MIN_PNP_CORRESPONDENCES = 12
 PNP_REPROJECTION_ERROR_PX = 3.0
 
+# How many ACCEPTED keyframes back this backend will look for further
+# sightings of landmarks it already has. 1 restores the historical
+# behaviour exactly -- match the previous keyframe and nothing else --
+# and is the control the benchmark neutralises to.
+#
+# WHY THIS EXISTS. 66.1% of landmarks were seen by exactly two views
+# (measured on the previous engine; the HEAD figure is Stage 0's job). A
+# two-view landmark is exactly determined -- two rays, one intersection
+# -- so it constrains nothing, which is why a bundle adjuster measured
+# 0.00% improvement here: two-thirds of the map was invisible to it by
+# construction, not by any failure of the solver.
+#
+# WHY 3. Per pair asked, the useful-edge yield falls off a cliff after
+# about three keyframes of separation -- roughly 58% at gap 1, 49% at
+# gaps 2-5, 30% at 6-20 -- and this pipeline's own gate accepts 50.4 /
+# 49.5 / 47.8% at gaps 1 / 2 / 3 before decaying. Gaps 1-3 are flat and
+# cheap. Past that the right instrument is retrieval, not a wider sweep.
+#
+# WHAT IT COSTS. It is NOT pose-neutral, and an earlier draft of this
+# comment claiming otherwise was wrong. Guided associations are merged
+# into `observed`, which the next keyframe's PnP draws correspondences
+# from, so later poses can move. Withholding them keeps poses frozen and
+# publishes a support table naming one image point as two landmarks --
+# measured at 2 such rows at DEPTH=1 against 147 at DEPTH=3 -- which is
+# worse, because that table is what cross-segment registration solves
+# against. See _reobserve_against_pose.
+#
+# MEASURED, 30 real segments, DEPTH 1 -> 3: >=3-view share rose on 18
+# segments and fell on ZERO (median +3.46 points); poses_solved was
+# unchanged on 27, better on 2, worse on 1; the point count FELL on 13,
+# and on every one of those 13 observations-per-landmark ROSE. That is
+# duplicate landmarks being merged, not structure being lost -- the same
+# reuse `_extend` already performs over a one-frame window, extended to
+# DEPTH frames.
+EXTEND_REFERENCE_DEPTH = 3
+
 # Rows of PointBlock.support_views: [frame index, feature index, landmark
 # index]. int32, not int64: ORB is capped at a few thousand features per
 # frame and a segment holds tens of thousands of landmarks, so every
@@ -271,6 +307,13 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 landmarks,
                 observed,
                 window[current].keyframe_id,
+                extra_references=[
+                    (index, features[index])
+                    for index in range(
+                        previous - 1, current - 1 - EXTEND_REFERENCE_DEPTH, -1
+                    )
+                    if index >= 0 and index in absolute
+                ],
             )
             self._add_discards(tally, extend_discards, len(new_points))
             poses.append(estimate)
@@ -424,6 +467,11 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 chain.landmarks,
                 chain.observed,
                 frame.keyframe_id,
+                extra_references=[
+                    (older_index, older)
+                    for older_index, older in chain.older_features
+                    if older_index in chain.absolute
+                ],
             )
             self._add_discards(
                 chain.discarded, extend_discards, len(triangulated)
@@ -461,6 +509,12 @@ class ClassicalTwoViewBackend(GeometryBackend):
 
         chain.poses.append(pose)
         chain.count += 1
+        if chain.previous_features is not None:
+            # The frame that WAS `previous` becomes an older reference.
+            # Bounded to DEPTH - 1 because `previous_features` is the
+            # first of the DEPTH references.
+            chain.older_features.insert(0, (index - 1, chain.previous_features))
+            del chain.older_features[EXTEND_REFERENCE_DEPTH - 1 :]
         chain.previous_features = features
         if chain.broken is None:
             chain.forget_before(index)
@@ -717,6 +771,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
         landmarks,
         observed,
         keyframe_id,
+        extra_references=(),
     ):
         keypoints_previous, descriptors_previous = features_previous
         keypoints_current, descriptors_current = features_current
@@ -841,6 +896,48 @@ class ClassicalTwoViewBackend(GeometryBackend):
             if 0 <= index < len(reobserved_keys)
         }
 
+        # Further sightings from older keyframes, admitted only if they
+        # reproject through the pose just solved. This runs after the
+        # solve and cannot change it -- see _reobserve_against_pose.
+        # Published on the same terms as the inliers above, because it
+        # passed the same reprojection bar those inliers were selected by.
+        guided = self._reobserve_against_pose(
+            extra_references,
+            keypoints_current,
+            descriptors_current,
+            current_index,
+            rotation,
+            translation,
+            landmarks,
+            observed,
+            claimed,
+        )
+        # Merged into `reobserved`, and so into the caller's `observed`,
+        # and NOT only into the published support.
+        #
+        # The pose-neutral variant was built first and measured, because
+        # it looked strictly safer: keep guided rows out of `observed`
+        # and no later pose can move. It produces an INCONSISTENT support
+        # table. `observed` is what the next keyframe consults to decide
+        # whether a feature already has a landmark; a guided row withheld
+        # from it means the next step finds nothing, triangulates the
+        # same physical point a second time, and publishes a support row
+        # binding that same (frame, feature) to a different landmark.
+        # Measured on the synthetic walk: 2 such rows at DEPTH=1 -- the
+        # documented seed-pair case -- against 147 at DEPTH=3.
+        #
+        # A feature naming two landmarks is not a cosmetic duplicate.
+        # `support.json` is what cross-segment registration solves PnP
+        # against, so one of those two rows is feeding a wrong 3-D point
+        # to the thing that decides where a segment sits in the world.
+        #
+        # So the association goes where associations go. The cost is that
+        # a guided row becomes a correspondence for the NEXT pose solve,
+        # which means this change is no longer provably pose-neutral and
+        # has to be measured across the corpus rather than argued.
+        reobserved.update(guided)
+        published_reobserved.update(guided)
+
         # Re-observations index into the EXISTING landmark list, so they
         # must not be shifted by the caller's `base` offset the way newly
         # triangulated points are. Returned separately for that reason.
@@ -862,6 +959,107 @@ class ClassicalTwoViewBackend(GeometryBackend):
             new_quality,
             published_reobserved,
         )
+
+    def _reobserve_against_pose(
+        self,
+        extra_references,
+        keypoints_current,
+        descriptors_current,
+        current_index,
+        rotation,
+        translation,
+        landmarks,
+        observed,
+        already_claimed,
+    ):
+        """Further sightings of landmarks we already hold, from keyframes
+        older than the one the pose was solved against.
+
+        WHAT THIS IS, AND WHAT IT DELIBERATELY IS NOT
+
+        The obvious way to widen this backend is to feed several
+        references' correspondences into ONE PnP. That is a different and
+        larger change: it alters the pose directly, and pricing it
+        honestly means measuring it across the corpus. It is a reasonable
+        eventual move and it is not this.
+
+        This runs AFTER the pose is solved, so it does not participate in
+        solving THIS keyframe. It does, however, affect LATER ones: what
+        it admits is merged into `observed`, and `observed` is where the
+        next keyframe finds its correspondences. That is a deliberate
+        choice and the alternative was measured and rejected -- see the
+        comment at the call site. What it buys is how many views each
+        landmark is known to have been seen from, which is the quantity a
+        pose graph and a bundle adjuster actually consume, and the
+        quantity cross-segment
+        registration PnPs against.
+
+        WHY A REPROJECTION TEST AND NOT A MATCHER SCORE
+
+        A descriptor match is a claim about appearance. Appearance is
+        exactly what fails on repeated indoor texture -- two identical
+        chair legs match happily -- and `support.json` is consumed by
+        registration, which solves against it. So an association is
+        admitted here only if the landmark, projected through the pose we
+        just solved, lands within PNP_REPROJECTION_ERROR_PX of the
+        feature that claims it.
+
+        That threshold is deliberately not a new number. It is the same
+        one `solvePnPRansac` used to decide what counted as an inlier for
+        this very pose, so an admitted re-observation is one the pose
+        solve itself would have accepted had it been offered. Inventing a
+        looser threshold here would be inventing evidence.
+
+        Cheirality is checked too: a landmark behind the camera is
+        refused before its pixel distance is even considered, because a
+        negative depth can still reproject onto a plausible pixel.
+
+        A current feature already bound by the pose solve is never
+        rebound, and the first extra reference to claim a free feature
+        keeps it -- references are visited nearest-first, so the claim
+        order is fixed and the output does not depend on dict iteration.
+        """
+        if not extra_references:
+            return {}
+
+        projection = self._camera_matrix @ np.hstack(
+            [rotation, translation.reshape(3, 1)]
+        )
+        limit_squared = PNP_REPROJECTION_ERROR_PX * PNP_REPROJECTION_ERROR_PX
+        admitted: dict[tuple[int, int], int] = {}
+        claimed = set(already_claimed)
+
+        for ref_index, (_keypoints_ref, descriptors_ref) in extra_references:
+            for index_ref, index_current in match_indices(
+                descriptors_ref, descriptors_current
+            ):
+                if index_current in claimed:
+                    continue
+                landmark = observed.get((ref_index, index_ref))
+                if landmark is None:
+                    # Nothing triangulated from that feature, so there is
+                    # no landmark to re-observe. Triangulating one here
+                    # would be new structure, which is the pose-changing
+                    # path this method exists to stay out of.
+                    continue
+                point = landmarks[landmark]
+                projected = projection @ np.array(
+                    [point[0], point[1], point[2], 1.0], dtype=np.float64
+                )
+                depth = projected[2]
+                if not np.isfinite(depth) or depth <= 0:
+                    continue
+                u = projected[0] / depth
+                v = projected[1] / depth
+                x, y = keypoints_current[index_current].pt
+                du = u - x
+                dv = v - y
+                if du * du + dv * dv > limit_squared:
+                    continue
+                claimed.add(index_current)
+                admitted[(current_index, index_current)] = landmark
+
+        return admitted
 
     def _triangulate_new(
         self,
@@ -1026,6 +1224,7 @@ class _Chain:
         "landmark_ok",
         "landmarks",
         "observed",
+        "older_features",
         "poses",
         "previous_features",
         "support",
@@ -1034,6 +1233,13 @@ class _Chain:
     def __init__(self) -> None:
         self.count = 0
         self.previous_features = None
+        # (frame index, features) for the keyframes BEFORE
+        # `previous_features`, nearest first, at most
+        # EXTEND_REFERENCE_DEPTH - 1 of them. Bounded, so this is a
+        # constant, not growth -- which is the property
+        # test_retained_state_does_not_grow_with_the_number_of_keyframes
+        # asserts and which a deque of every past frame would break.
+        self.older_features: list = []
         self.landmark_ok = []
         # Discards accumulate for the LIFE of the chain, so the snapshot
         # reports the whole segment rather than the last window.
@@ -1062,11 +1268,22 @@ class _Chain:
     def forget_before(self, index: int) -> None:
         """Drop observations no later step can reach.
 
-        _extend() reads exactly one key shape, `observed[(previous, f)]`,
-        so once frame `index` is solved nothing will ever look up a frame
-        older than it. estimate_window() keeps them all because it is
-        over in one call. A live solve is not over, and unpruned this
-        dict grows by roughly two entries per ORB match per keyframe.
+        _extend() reads `observed[(reference, f)]` for the previous
+        keyframe AND for the EXTEND_REFERENCE_DEPTH - 1 keyframes before
+        it (see _reobserve_against_pose), so once frame `index` is solved
+        nothing will ever look up a frame older than
+        `index - (EXTEND_REFERENCE_DEPTH - 1)`. estimate_window() keeps
+        them all because it is over in one call. A live solve is not
+        over, and unpruned this dict grows by roughly two entries per ORB
+        match per keyframe.
+
+        The retained window was one frame when this backend matched only
+        its immediate predecessor. It is now DEPTH frames, so the
+        constant below is DEPTH times larger -- still a constant, which
+        is the property that matters and the one
+        test_retained_state_does_not_grow_with_the_number_of_keyframes
+        asserts. At DEPTH = 3 that is ~0.45 MB against the ~0.15 MB the
+        measurement below records, and it does not grow with the walk.
 
         `support` is deliberately NOT pruned here. It holds the same
         association and is the reason this backend records anything at
@@ -1083,6 +1300,7 @@ class _Chain:
         equivalence test exists to check, not one it is asked to
         tolerate.
         """
+        oldest = index - (EXTEND_REFERENCE_DEPTH - 1)
         self.observed = {
-            key: value for key, value in self.observed.items() if key[0] == index
+            key: value for key, value in self.observed.items() if key[0] >= oldest
         }
