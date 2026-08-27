@@ -43,6 +43,7 @@ from tower.storage import (
 )
 
 from tower.world_builder.records import (
+    SegmentPlacement,
     Keyframe,
     KeyframeEdge,
     Session,
@@ -440,6 +441,61 @@ class WorldStore:
         except (json.JSONDecodeError, KeyError):
             logger.warning("world builder: derived output unreadable for %s", world_id)
             return None
+
+    def write_placements(self, world_id: str, session_id: str, placements) -> None:
+        """Persist where each segment sits, or why it does not sit anywhere.
+
+        Its own file, for the same reason `support` has one: geometry is
+        immutable once solved and PLACEMENT is not, so a later registration
+        pass must be able to change where a segment sits without rewriting
+        the points that decide its content hash. Folding placement into
+        points.json would couple the two and make every re-placement look
+        like new geometry.
+        """
+        with self._lock:
+            derived = self.derived_dir(world_id) / session_id
+            write_json_atomic(
+                derived / "placements.json",
+                {"placements": [p.to_json_dict() for p in placements]},
+            )
+
+    def read_placements(self, world_id: str, session_id: str):
+        """The placements, or None. Never raises, never refuses a read.
+
+        Absent and unreadable are the same answer, exactly as for
+        `support`: every world built before placements existed has no such
+        file, and a reconstruction is complete without one. Refusing a
+        world over a truncated index beside it would turn an optional file
+        into a hard dependency by the back door.
+
+        A row that fails its own invariants is dropped rather than
+        poisoning the rest -- a placement that cannot be represented is
+        one that must not be drawn, and the others are still good.
+        """
+        path = self.derived_dir(world_id) / session_id / "placements.json"
+        if not path.exists():
+            return None
+        try:
+            rows = read_json_closed(path)["placements"]
+        except (json.JSONDecodeError, KeyError):
+            logger.warning(
+                "world builder: placements unreadable at %s; treating as "
+                "absent",
+                path,
+            )
+            return None
+        kept = []
+        for row in rows:
+            try:
+                kept.append(SegmentPlacement.from_json_dict(row))
+            except (ValueError, KeyError, TypeError):
+                logger.warning(
+                    "world builder: dropping unrepresentable placement in "
+                    "%s: %r",
+                    path,
+                    row,
+                )
+        return kept
 
     def _read_support(self, derived: Path):
         """The association, or None. Never raises, never refuses a read.

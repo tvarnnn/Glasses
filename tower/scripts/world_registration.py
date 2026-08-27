@@ -1377,11 +1377,63 @@ def _quaternion_wxyz_to_rotation(quaternion) -> np.ndarray:
 # -- cli -------------------------------------------------------------------
 
 
+def placements_from_report(report: dict):
+    """Turn a registration report into records the store can hold.
+
+    Every segment the report mentions gets a row, registered or refused,
+    because "refused, and here is why" is a different and more useful fact
+    than the absence of a row -- and absence would be indistinguishable
+    from "this pass never looked at that segment".
+    """
+    from tower.world_builder.records import SegmentPlacement
+
+    reference = report.get("reference_segment")
+    rows = []
+    for entry in report.get("segments", []):
+        transform = entry.get("transform_to_world")
+        if entry.get("registered") and transform:
+            rows.append(
+                SegmentPlacement(
+                    segment_index=int(entry["segment_index"]),
+                    state="registered",
+                    rotation_wxyz=tuple(transform["rotation_wxyz"]),
+                    translation=tuple(transform["translation"]),
+                    scale=float(transform["scale"]),
+                    reference_segment=reference,
+                    refusal_reason=None,
+                    evidence={
+                        key: entry[key]
+                        for key in ("points", "cameras", "span_over_depth")
+                        if key in entry
+                    },
+                )
+            )
+        else:
+            rows.append(
+                SegmentPlacement(
+                    segment_index=int(entry["segment_index"]),
+                    state="refused",
+                    rotation_wxyz=None,
+                    translation=None,
+                    scale=None,
+                    reference_segment=None,
+                    refusal_reason=entry.get("reason"),
+                    evidence={
+                        key: entry[key]
+                        for key in ("points", "cameras", "span_over_depth")
+                        if key in entry
+                    },
+                )
+            )
+    return rows
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Estimate a per-segment Sim3 for a saved world. Analysis only: "
-            "reads a world, writes nothing into it."
+            "Estimate a per-segment Sim3 for a saved world. Reads a world "
+            "and prints the result; writes placements back only with "
+            "--write, and never touches poses, points or support."
         )
     )
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
@@ -1391,6 +1443,17 @@ def main(argv=None) -> int:
         help="Session id. Defaults to the world's only session.",
     )
     parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument(
+        "--write",
+        action="store_true",
+        help=(
+            "Persist the result as derived/<session>/placements.json. "
+            "Off by default: registration is an expensive pass whose "
+            "verdicts change with its thresholds, and a run made to "
+            "explore a threshold must not silently become what the world "
+            "serves."
+        ),
+    )
     parser.add_argument(
         "--max-reciprocity-error", type=float,
         default=Thresholds.max_reciprocity_error,
@@ -1432,6 +1495,17 @@ def main(argv=None) -> int:
     except SupportMissingError as error:
         print(str(error), file=sys.stderr)
         return 1
+
+    if args.write:
+        placements = placements_from_report(report_to_json(report))
+        store.write_placements(args.world, session_id, placements)
+        registered = sum(1 for p in placements if p.state == "registered")
+        print(
+            f"wrote {len(placements)} placements "
+            f"({registered} registered) to derived/{session_id}/"
+            "placements.json",
+            file=sys.stderr,
+        )
 
     if args.format == "json":
         print(json.dumps(report_to_json(report), indent=2))

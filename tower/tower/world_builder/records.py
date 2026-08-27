@@ -13,6 +13,7 @@ importing a frozen enum is not promoting data to a shared service. Revisit
 a tower/confidence.py only when a third consumer appears.
 """
 
+import math
 from dataclasses import dataclass, field, replace
 
 from tower.confidence import Confidence
@@ -256,6 +257,120 @@ def camera_intrinsics_from_json_dict(data: dict) -> CameraIntrinsics:
             "scales_linearly_across_resolutions"
         ],
     )
+
+
+PLACEMENT_REGISTERED = "registered"
+PLACEMENT_REFUSED = "refused"
+PLACEMENT_STATES = (PLACEMENT_REGISTERED, PLACEMENT_REFUSED)
+
+
+@dataclass(frozen=True)
+class SegmentPlacement:
+    """Where one segment sits in a shared world frame, or why it does not.
+
+    Segment geometry is immutable once solved; WHERE a segment sits is
+    not, and a later pass may place a segment that an earlier one could
+    not. Keeping placement in its own record is what lets a placement
+    change without the geometry changing -- and lets a refusal carry its
+    reason instead of being indistinguishable from "nobody tried".
+
+    `refused` is a first-class state for that reason. `registered: false`
+    alone conflated "we tried and the two independent solves disagreed"
+    with "no attempt has been made", and the refusal is the more
+    interesting fact: on the real corpus most pairs are refused because
+    the wearer stood still, which is a message about how to walk, not
+    about the software.
+
+    The invariants below are enforced rather than documented because each
+    represents geometry that would be DRAWN. A refusal carrying a
+    transform gets rendered; a registered placement missing its scale gets
+    a default from somewhere, and that somewhere is wrong; a zero or
+    non-finite scale collapses a segment to a dot at another's origin,
+    which the registration research records as invisible in every
+    aggregate metric.
+    """
+
+    segment_index: int
+    state: str
+    rotation_wxyz: tuple | None
+    translation: tuple | None
+    scale: float | None
+    reference_segment: int | None
+    refusal_reason: str | None
+    evidence: dict
+    # Which gauge this Sim3 is expressed in. A coordinate stamped with one
+    # frame revision may not be silently reinterpreted under another.
+    frame_revision: int = 1
+    schema_version: int = SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.state not in PLACEMENT_STATES:
+            raise ValueError(
+                f"unknown placement state {self.state!r}; the set is closed "
+                f"because consumers switch on it: {PLACEMENT_STATES}"
+            )
+        has_transform = (
+            self.rotation_wxyz is not None
+            or self.translation is not None
+            or self.scale is not None
+        )
+        if self.state == PLACEMENT_REFUSED and has_transform:
+            raise ValueError(
+                "a refused placement must not carry a transform: anything "
+                "with a transform gets drawn"
+            )
+        if self.state == PLACEMENT_REGISTERED:
+            if (
+                self.rotation_wxyz is None
+                or self.translation is None
+                or self.scale is None
+            ):
+                raise ValueError(
+                    "a registered placement needs a complete Sim3; half a "
+                    "transform means a default supplies the rest, and the "
+                    "default is wrong"
+                )
+            if not math.isfinite(self.scale) or self.scale <= 0:
+                raise ValueError(
+                    f"scale must be finite and positive, got {self.scale!r}; "
+                    "a zero scale collapses the segment to a dot at the "
+                    "reference's origin and is invisible in every aggregate"
+                )
+
+    def to_json_dict(self) -> dict:
+        return {
+            "schema_version": self.schema_version,
+            "segment_index": self.segment_index,
+            "state": self.state,
+            "rotation_wxyz": (
+                list(self.rotation_wxyz) if self.rotation_wxyz else None
+            ),
+            "translation": (
+                list(self.translation) if self.translation else None
+            ),
+            "scale": self.scale,
+            "reference_segment": self.reference_segment,
+            "refusal_reason": self.refusal_reason,
+            "evidence": dict(self.evidence),
+            "frame_revision": self.frame_revision,
+        }
+
+    @classmethod
+    def from_json_dict(cls, row: dict) -> "SegmentPlacement":
+        rotation = row.get("rotation_wxyz")
+        translation = row.get("translation")
+        return cls(
+            segment_index=int(row["segment_index"]),
+            state=row["state"],
+            rotation_wxyz=tuple(rotation) if rotation else None,
+            translation=tuple(translation) if translation else None,
+            scale=row.get("scale"),
+            reference_segment=row.get("reference_segment"),
+            refusal_reason=row.get("refusal_reason"),
+            evidence=dict(row.get("evidence") or {}),
+            frame_revision=int(row.get("frame_revision", 1)),
+            schema_version=int(row.get("schema_version", SCHEMA_VERSION)),
+        )
 
 
 @dataclass(frozen=True)
