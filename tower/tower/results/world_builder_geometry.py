@@ -17,10 +17,13 @@ life of the world. Only the open segment churns.
 
 import hashlib
 import json
+import logging
 from collections import Counter
 
-from tower.world_builder.records import World
+from tower.world_builder.records import PLACEMENT_REGISTERED, World
 from tower.world_builder.schema import POSE_CONVENTION
+logger = logging.getLogger(__name__)
+
 from tower.world_builder.store import (
     WorldStore,
     WorldStoreError,
@@ -154,6 +157,68 @@ def _read(store, world_id: str, session_id: str):
     return world, derived, _grouped(derived), current
 
 
+def usable_placements(store, world_id: str, session_id: str) -> dict:
+    """Placements that may be served, keyed by segment index.
+
+    Two ways a stored placement is refused here rather than shipped.
+
+    **It was solved against different geometry.** `write_derived` rewrites
+    poses and points wholesale and never touches placements.json, so a
+    Sim3 outlives the reconstruction it was fitted to. Without this check
+    it is served against points that no longer exist, still flagged
+    registered -- and the cache guarantee does not help, because
+    content_hash moves, the client refetches exactly as it should, and is
+    handed the stale transform. A placement whose `input_digest` does not
+    match the build being served is not current evidence, and a placement
+    with no digest cannot be checked at all.
+
+    **Its reference is not itself placed.** The contract says segments
+    sharing a `reference_segment` are in one space and may be drawn
+    together. A registered row pointing at a segment that is absent,
+    dropped as unrepresentable, or itself refused invites a client to
+    composite geometry into a frame nothing defines. A cluster missing its
+    origin is worse than no cluster.
+    """
+    stored = store.read_placements(world_id, session_id) or []
+    if not stored:
+        return {}
+
+    manifest = store.read_derived_manifest(world_id) or {}
+    digest = manifest.get("input_digest")
+    fresh = {}
+    for placement in stored:
+        if digest is None or placement.input_digest != digest:
+            logger.warning(
+                "world builder: placement for segment %s was solved against "
+                "a different build (%r, current %r); serving it as unplaced",
+                placement.segment_index,
+                placement.input_digest,
+                digest,
+            )
+            continue
+        fresh[placement.segment_index] = placement
+
+    registered = {
+        index for index, p in fresh.items() if p.state == PLACEMENT_REGISTERED
+    }
+    usable = {}
+    for index, placement in fresh.items():
+        if (
+            placement.state == PLACEMENT_REGISTERED
+            and placement.reference_segment not in registered
+        ):
+            logger.warning(
+                "world builder: segment %s is placed against reference %s, "
+                "which is not itself placed; refusing the placement rather "
+                "than inviting a composite into an undefined frame",
+                index,
+                placement.reference_segment,
+            )
+            continue
+        usable[index] = placement
+    return usable
+
+
 def placement_hash(placement) -> str:
     """A hash over WHERE a segment sits, separate from what it contains.
 
@@ -183,6 +248,12 @@ def placement_hash(placement) -> str:
             "scale": placement.scale,
             "reference_segment": placement.reference_segment,
             "frame_revision": placement.frame_revision,
+            # Served, therefore hashed. It was omitted, and on the real
+            # corpus 26 of 29 segments are refused and shared ONE
+            # placement_hash -- so a re-registration that changed every
+            # refusal reason moved no hash a client is told to key on,
+            # and a conforming client showed stale reason text forever.
+            "refusal_reason": placement.refusal_reason,
         }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
@@ -230,10 +301,7 @@ def build_manifest(store, world_id: str, session_id: str) -> dict | None:
     if read is None:
         return None
     world, _, grouped, current = read
-    placements = {
-        p.segment_index: p
-        for p in (store.read_placements(world_id, session_id) or [])
-    }
+    placements = usable_placements(store, world_id, session_id)
 
     segments = []
     for index in sorted(grouped):
@@ -298,11 +366,9 @@ def build_segment(
     if read is None:
         return None
     _, _, grouped, current = read
-    placements = {
-        p.segment_index: p
-        for p in (store.read_placements(world_id, session_id) or [])
-    }
-    placement = placements.get(segment_index)
+    placement = usable_placements(store, world_id, session_id).get(
+        segment_index
+    )
     if segment_index not in grouped:
         return None
 

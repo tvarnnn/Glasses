@@ -89,7 +89,7 @@ journal. See §4.
 | `world_id` | string | Echoed |
 | `session_id` | string | Echoed |
 | `current` | bool | Whether this geometry reflects **every keyframe accepted so far**. `false` is normal during a live walk — see §4 |
-| `geometry_revision` | string | Opaque rollup over every segment's `content_hash`. Equality only |
+| `geometry_revision` | string | Opaque rollup over every segment's `content_hash` AND `placement_hash`, so a placement-only change moves it. See §7. Equality only |
 | `pose_convention` | object | Nine keys; see §5 rule 1 |
 | `scale` | object | `{state, meters_per_unit}`. `meters_per_unit` is `null` unless the state is metric, which is unreachable on this hardware |
 | `segment_count` | int | Length of `segments` |

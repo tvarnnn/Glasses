@@ -333,6 +333,20 @@ class SegmentPlacement:
     reference_segment: int | None
     refusal_reason: str | None
     evidence: dict
+    # The build this placement was solved against.
+    #
+    # A placement is a statement about SPECIFIC points. Rewriting
+    # poses.json and points.json does not touch placements.json, so
+    # without this a Sim3 survives a full rebuild and is served against
+    # geometry that no longer exists -- still flagged registered. The
+    # cache guarantee does not rescue that: content_hash moves, the
+    # client dutifully refetches, and is handed a transform solved
+    # against points that are gone.
+    #
+    # None means "not bound", which cannot be verified and is therefore
+    # not served. An unverifiable transform is the failure this exists to
+    # prevent.
+    input_digest: str | None = None
     # Which gauge this Sim3 is expressed in. A coordinate stamped with one
     # frame revision may not be silently reinterpreted under another.
     frame_revision: int = 1
@@ -395,6 +409,28 @@ class SegmentPlacement:
                 f"segment_index must be a non-negative int, got "
                 f"{self.segment_index!r}"
             )
+        if (
+            isinstance(self.frame_revision, bool)
+            or not isinstance(self.frame_revision, int)
+            or self.frame_revision < 1
+        ):
+            raise ValueError(
+                f"frame_revision must be an int >= 1, got "
+                f"{self.frame_revision!r}; the contract calls a revision "
+                "mismatch a refuse-to-draw condition, so an impossible "
+                "revision must not reach a client"
+            )
+        if self.state == PLACEMENT_REGISTERED:
+            if (
+                isinstance(self.reference_segment, bool)
+                or not isinstance(self.reference_segment, int)
+                or self.reference_segment < 0
+            ):
+                raise ValueError(
+                    f"a registered placement needs a real reference_segment, "
+                    f"got {self.reference_segment!r}; the composition rule is "
+                    "defined only relative to one"
+                )
 
     def to_json_dict(self) -> dict:
         return {
@@ -412,6 +448,7 @@ class SegmentPlacement:
             "refusal_reason": self.refusal_reason,
             "evidence": dict(self.evidence),
             "frame_revision": self.frame_revision,
+            "input_digest": self.input_digest,
         }
 
     @classmethod
@@ -428,6 +465,7 @@ class SegmentPlacement:
             refusal_reason=row.get("refusal_reason"),
             evidence=dict(row.get("evidence") or {}),
             frame_revision=int(row.get("frame_revision", 1)),
+            input_digest=row.get("input_digest"),
             schema_version=int(row.get("schema_version", SCHEMA_VERSION)),
         )
 

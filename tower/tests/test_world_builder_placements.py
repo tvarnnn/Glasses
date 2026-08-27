@@ -35,6 +35,7 @@ def _placement(**over):
         reference_segment=0,
         refusal_reason=None,
         evidence={"reciprocity": 0.97},
+        input_digest="x",
     )
     base.update(over)
     return SegmentPlacement(**base)
@@ -221,8 +222,12 @@ def test_a_registered_segment_serves_its_transform(tmp_path):
 
     store = WorldStore(tmp_path)
     world_id, session_id = _tiny_world(store)
+    # The reference registers ITSELF with identity, as the real writer
+    # does. A registered row whose reference is not itself placed is
+    # refused -- a cluster missing its origin is worse than no cluster.
     store.write_placements(world_id, session_id, [
         _placement(segment_index=0, scale=2.5, reference_segment=1),
+        _placement(segment_index=1, scale=1.0, reference_segment=1),
     ])
 
     row = adapter.build_manifest(store, world_id, session_id)["segments"][0]
@@ -447,3 +452,274 @@ def test_placements_written_by_the_registration_writer_read_back(tmp_path):
     assert read[0].state == "registered"
     assert read[0].scale == pytest.approx(1.75)
     assert read[1].state == "refused"
+
+
+# ---------------------------------------------------------------------------
+# placement_hash field coverage.
+#
+# An adversarial review deleted EVERY field from the hash payload in turn
+# -- rotation, translation, scale, reference_segment, frame_revision,
+# state -- and the suite stayed green on all six.
+#
+# The cause was that the only cache test made one transition, unplaced ->
+# registered. The payload goes from a one-key dict to a six-key dict, so
+# ANY hash function distinguishes them. It proved the hash is not a
+# constant and nothing else, while §7 of the contract asks a client to
+# stake its cache on the hash covering everything that renders.
+#
+# These move ONE field at a time, registered -> registered'.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "field,changed",
+    [
+        ("rotation_wxyz", (0.0, 1.0, 0.0, 0.0)),
+        ("translation", (9.0, 9.0, 9.0)),
+        ("scale", 3.25),
+        ("reference_segment", 1),
+        ("frame_revision", 2),
+    ],
+)
+def test_every_rendering_field_moves_the_placement_hash(field, changed):
+    """One field, one transition. A hash that omits any of these lets a
+    conforming client draw a segment in the wrong place forever."""
+    from tower.results.world_builder_geometry import placement_hash
+
+    before = placement_hash(_placement())
+    after = placement_hash(_placement(**{field: changed}))
+    assert before != after, (
+        f"changing {field} left placement_hash unmoved; a client keyed on "
+        f"it would never refetch"
+    )
+
+
+def test_the_refusal_reason_moves_the_placement_hash():
+    """It is SERVED, so it must be hashed.
+
+    It was omitted. On the real corpus 26 of 29 segments are refused and
+    shared a single placement_hash, so a re-registration that changed
+    every refusal reason moved nothing a client keys on -- and the reason
+    is the one actionable string on the wire ("the wearer stood still" is
+    a message about how to walk).
+    """
+    from tower.results.world_builder_geometry import placement_hash
+
+    refused = dict(
+        state="refused", rotation_wxyz=None, translation=None, scale=None,
+        reference_segment=None,
+    )
+    before = placement_hash(_placement(refusal_reason="stood still", **refused))
+    after = placement_hash(_placement(refusal_reason="no geometry", **refused))
+    assert before != after
+
+
+def test_the_state_moves_the_placement_hash():
+    """HONEST NOTE, verified by mutation: dropping `state` from the hash
+    payload is an EQUIVALENT mutation, and this test does not kill it.
+
+    `state` is implied by the transform fields -- the record forbids a
+    refused row from carrying a transform and a registered row from
+    missing one -- so two placements identical in the other six fields
+    cannot differ in state. Likewise, changing the unplaced sentinel's
+    state string cannot collide with a real placement, because the
+    sentinel hashes a one-key payload and a real placement hashes seven.
+    Both are pinned by outcome below rather than by a test that would only
+    pretend to kill them.
+    """
+    from tower.results.world_builder_geometry import placement_hash
+
+    registered = placement_hash(_placement())
+    refused = placement_hash(
+        _placement(
+            state="refused", rotation_wxyz=None, translation=None,
+            scale=None, reference_segment=None, refusal_reason="stood still",
+        )
+    )
+    assert registered != refused
+
+
+def test_the_unplaced_sentinel_is_distinct_from_every_real_placement():
+    """`None` must not collide with a stored row, or an unplaced segment
+    and a placed one would share a cache key."""
+    from tower.results.world_builder_geometry import placement_hash
+
+    unplaced = placement_hash(None)
+    assert unplaced != placement_hash(_placement())
+    assert unplaced != placement_hash(
+        _placement(
+            state="refused", rotation_wxyz=None, translation=None,
+            scale=None, reference_segment=None, refusal_reason="x",
+        )
+    )
+
+
+def test_a_dropped_row_does_not_take_its_neighbours_with_it(tmp_path):
+    """The commit claims a bad row is dropped and its neighbours are still
+    good. That claim was untested -- a mutant discarding the neighbours
+    too passed."""
+    import json as _json
+
+    from tower.results import world_builder_geometry as adapter
+
+    store = WorldStore(tmp_path)
+    world_id, session_id = _tiny_world(store)
+    store.write_placements(world_id, session_id, [
+        _placement(segment_index=0, scale=2.5, reference_segment=0),
+    ])
+    path = store.derived_dir(world_id) / session_id / "placements.json"
+    document = _json.loads(path.read_text(encoding="utf-8"))
+    document["placements"].append({"segment_index": 1, "state": "nonsense"})
+    path.write_text(_json.dumps(document), encoding="utf-8")
+
+    rows = store.read_placements(world_id, session_id)
+    assert [r.segment_index for r in rows] == [0], (
+        "the good row must survive its bad neighbour"
+    )
+    served = adapter.build_manifest(store, world_id, session_id)["segments"][0]
+    assert served["registered"] is True
+
+
+# ---------------------------------------------------------------------------
+# Staleness, corruption, and reference consistency.
+# ---------------------------------------------------------------------------
+
+
+def test_a_placement_from_a_different_build_is_not_served(tmp_path):
+    """THE WORST DEFECT THIS CLOSES.
+
+    write_derived rewrites poses and points wholesale and never touches
+    placements.json, so a Sim3 outlives the reconstruction it was fitted
+    to. Measured before the fix: after a full rebuild with completely
+    different points and a new input_digest, the SAME transform was still
+    served as `registered: true`.
+
+    The cache guarantee does not rescue it -- content_hash moves, the
+    client refetches exactly as it should, and is handed a transform
+    solved against points that no longer exist.
+    """
+    from tower.results import world_builder_geometry as adapter
+
+    store = WorldStore(tmp_path)
+    world_id, session_id = _tiny_world(store)
+    store.write_placements(world_id, session_id, [
+        _placement(segment_index=0, scale=7.5, reference_segment=0),
+    ])
+    assert adapter.build_manifest(
+        store, world_id, session_id
+    )["segments"][0]["registered"] is True
+
+    # A full rebuild: different points, different digest.
+    store.write_derived(
+        world_id, session_id,
+        poses=[{"keyframe_id": "k0", "segment_index": 0, "status": "anchor",
+                "degeneracy": "", "rotation": None, "translation": None}],
+        points=[{"segment_index": 0, "xyz": [42.0, -17.0, 999.0]}],
+        manifest={"session_id": session_id, "input_digest": "a-new-build"},
+    )
+
+    row = adapter.build_manifest(store, world_id, session_id)["segments"][0]
+    assert row["registered"] is False, (
+        "a transform solved against points that no longer exist must not "
+        "be served as a placement"
+    )
+    assert row["registration_state"] == "unplaced"
+    assert row["transform_to_world"] is None
+
+
+def test_a_placement_with_no_digest_cannot_be_verified_so_is_not_served(
+    tmp_path,
+):
+    """Unbound is unverifiable, and an unverifiable transform is the
+    failure this whole mechanism exists to prevent."""
+    from tower.results import world_builder_geometry as adapter
+
+    store = WorldStore(tmp_path)
+    world_id, session_id = _tiny_world(store)
+    store.write_placements(world_id, session_id, [
+        _placement(segment_index=0, reference_segment=0, input_digest=None),
+    ])
+    row = adapter.build_manifest(store, world_id, session_id)["segments"][0]
+    assert row["registered"] is False
+    assert row["registration_state"] == "unplaced"
+
+
+def test_a_registered_row_whose_reference_is_unplaced_is_refused(tmp_path):
+    """A cluster missing its origin is worse than no cluster.
+
+    The contract says segments sharing a reference_segment are in one
+    space and may be drawn together. A registered row pointing at a
+    segment that is absent, dropped, or itself refused invites a client to
+    composite geometry into a frame nothing defines.
+    """
+    from tower.results import world_builder_geometry as adapter
+
+    store = WorldStore(tmp_path)
+    world_id, session_id = _tiny_world(store)
+    store.write_placements(world_id, session_id, [
+        _placement(segment_index=0, scale=2.5, reference_segment=1),
+        # segment 1, the reference, is REFUSED rather than registered
+        _placement(
+            segment_index=1, state="refused", rotation_wxyz=None,
+            translation=None, scale=None, reference_segment=None,
+            refusal_reason="the wearer stood still",
+        ),
+    ])
+    rows = adapter.build_manifest(store, world_id, session_id)["segments"]
+    assert rows[0]["registered"] is False, (
+        "a segment placed against an unplaced reference must not claim a "
+        "shared frame"
+    )
+
+
+@pytest.mark.parametrize(
+    "label,body",
+    [
+        ("truncated json", "{ this is not json"),
+        ("placements is null", '{"placements": null}'),
+        ("top-level list", "[]"),
+        ("placements is a string", '{"placements": "oops"}'),
+        ("a row is null", '{"placements": [null]}'),
+        ("missing key", '{"other": 1}'),
+    ],
+)
+def test_no_corruption_shape_can_break_the_geometry_channel(
+    tmp_path, label, body
+):
+    """`read_placements` promises it never raises. It caught only invalid
+    JSON syntax; four structurally-VALID shapes raised straight through
+    build_manifest into an HTTP 500, taking poses and points that were
+    perfectly good down with an optional index beside them.
+
+    The original test used the single shape that happened to work.
+    """
+    from tower.results import world_builder_geometry as adapter
+
+    store = WorldStore(tmp_path)
+    world_id, session_id = _tiny_world(store)
+    store.write_placements(world_id, session_id, [
+        _placement(segment_index=0, reference_segment=0),
+    ])
+    path = store.derived_dir(world_id) / session_id / "placements.json"
+    path.write_text(body, encoding="utf-8")
+
+    manifest = adapter.build_manifest(store, world_id, session_id)
+    assert manifest is not None and manifest["segment_count"] == 2, (
+        f"{label} broke the geometry channel"
+    )
+    chunk = adapter.build_segment(store, world_id, session_id, 0)
+    assert chunk is not None
+
+
+def test_non_standard_json_never_reaches_disk(tmp_path):
+    """Python writes NaN and Infinity as bare tokens that JSON.parse,
+    Swift's JSONSerialization and Go's encoding/json all reject. A file
+    only this runtime can read is not a wire artifact."""
+    store = WorldStore(tmp_path)
+    world_id, session_id = "w" * 32, "s" * 32
+    with pytest.raises(ValueError):
+        store.write_placements(world_id, session_id, [
+            _placement(evidence={"reciprocity": float("nan")}),
+        ])
+    path = store.derived_dir(world_id) / session_id / "placements.json"
+    assert not path.exists(), "a refused write must leave no file"

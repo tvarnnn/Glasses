@@ -1431,7 +1431,7 @@ def _quaternion_wxyz_to_rotation(quaternion) -> np.ndarray:
 # -- cli -------------------------------------------------------------------
 
 
-def placements_from_report(report: dict):
+def placements_from_report(report: dict, input_digest=None):
     """Turn a registration report into records the store can hold.
 
     Every segment the report mentions gets a row, registered or refused,
@@ -1443,6 +1443,10 @@ def placements_from_report(report: dict):
 
     reference = report.get("reference_segment")
     rows = []
+    # Every row carries the digest of the build it was solved against. A
+    # placement is a statement about SPECIFIC points; without this it
+    # outlives the reconstruction it was fitted to and is served against
+    # geometry that no longer exists.
     for entry in report.get("segments", []):
         transform = entry.get("transform_to_world")
         if entry.get("registered") and transform:
@@ -1455,6 +1459,7 @@ def placements_from_report(report: dict):
                     scale=float(transform["scale"]),
                     reference_segment=reference,
                     refusal_reason=None,
+                    input_digest=input_digest,
                     evidence={
                         key: entry[key]
                         for key in ("points", "cameras", "span_over_depth")
@@ -1472,6 +1477,7 @@ def placements_from_report(report: dict):
                     scale=None,
                     reference_segment=None,
                     refusal_reason=entry.get("reason"),
+                    input_digest=input_digest,
                     evidence={
                         key: entry[key]
                         for key in ("points", "cameras", "span_over_depth")
@@ -1555,7 +1561,10 @@ def main(argv=None) -> int:
         # display, and a transform that will be applied must not be
         # rounded. Five decimal places puts a quaternion 1.9e-6 off
         # unit, which is invisible until a validator refuses it.
-        placements = placements_from_report(report)
+        manifest = store.read_derived_manifest(args.world) or {}
+        placements = placements_from_report(
+            report, input_digest=manifest.get("input_digest")
+        )
         store.write_placements(args.world, session_id, placements)
         registered = sum(1 for p in placements if p.state == "registered")
         print(

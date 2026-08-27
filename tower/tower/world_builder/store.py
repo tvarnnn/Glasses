@@ -454,10 +454,14 @@ class WorldStore:
         """
         with self._lock:
             derived = self.derived_dir(world_id) / session_id
-            write_json_atomic(
-                derived / "placements.json",
-                {"placements": [p.to_json_dict() for p in placements]},
-            )
+            payload = {"placements": [p.to_json_dict() for p in placements]}
+            # allow_nan=False: Python writes NaN and Infinity as bare
+            # tokens that JSON.parse, Swift's JSONSerialization and Go's
+            # encoding/json all reject. A file only this runtime can read
+            # is not a wire artifact. Raising here leaves no file, because
+            # the write is atomic.
+            json.dumps(payload, allow_nan=False)
+            write_json_atomic(derived / "placements.json", payload)
 
     def read_placements(self, world_id: str, session_id: str):
         """The placements, or None. Never raises, never refuses a read.
@@ -475,9 +479,20 @@ class WorldStore:
         path = self.derived_dir(world_id) / session_id / "placements.json"
         if not path.exists():
             return None
+        # Broad on purpose. An earlier version caught only JSONDecodeError
+        # and KeyError, which covers a truncated file and nothing else --
+        # `{"placements": null}`, a top-level list, a string, or a null row
+        # are all VALID JSON and each raised straight through
+        # build_manifest into an HTTP 500, taking poses and points that
+        # were perfectly good down with an optional index beside them.
+        # That is exactly what this method's contract exists to prevent,
+        # so the contract is enforced rather than described.
         try:
-            rows = read_json_closed(path)["placements"]
-        except (json.JSONDecodeError, KeyError):
+            document = read_json_closed(path)
+            rows = document["placements"]
+            if not isinstance(rows, list):
+                raise TypeError(f"placements must be a list, got {type(rows)}")
+        except Exception:
             logger.warning(
                 "world builder: placements unreadable at %s; treating as "
                 "absent",
@@ -488,7 +503,7 @@ class WorldStore:
         for row in rows:
             try:
                 kept.append(SegmentPlacement.from_json_dict(row))
-            except (ValueError, KeyError, TypeError):
+            except Exception:
                 logger.warning(
                     "world builder: dropping unrepresentable placement in "
                     "%s: %r",
