@@ -1497,7 +1497,11 @@ def main(argv=None) -> int:
         return 1
 
     if args.write:
-        placements = placements_from_report(report_to_json(report))
+        # The RAW report, not report_to_json(): that rounds for
+        # display, and a transform that will be applied must not be
+        # rounded. Five decimal places puts a quaternion 1.9e-6 off
+        # unit, which is invisible until a validator refuses it.
+        placements = placements_from_report(report)
         store.write_placements(args.world, session_id, placements)
         registered = sum(1 for p in placements if p.state == "registered")
         print(

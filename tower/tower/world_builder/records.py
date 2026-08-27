@@ -259,6 +259,41 @@ def camera_intrinsics_from_json_dict(data: dict) -> CameraIntrinsics:
     )
 
 
+def _check_vector(values, length: int, name: str) -> None:
+    """A transform component that is the wrong shape, or carries a NaN, is
+    still applied by a renderer -- it just puts the geometry nowhere in
+    particular. Checked here because this record is the last place that
+    can refuse it before it reaches a screen."""
+    if values is None or len(values) != length:
+        raise ValueError(
+            f"{name} must have {length} components, got "
+            f"{None if values is None else len(values)}"
+        )
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be numbers, got {value!r}")
+        if not math.isfinite(value):
+            raise ValueError(
+                f"{name} must be finite, got {value!r}; a non-finite "
+                "transform is applied all the same and places the geometry "
+                "nowhere in particular"
+            )
+
+
+# How far a stored quaternion may drift from unit length.
+#
+# A norm off by t scales the geometry it rotates by t, on top of `scale`,
+# so this is a bound on silent scale error: 1e-3 is 0.1%, below anything
+# the reconstruction can resolve.
+#
+# NOT tighter than that. A first attempt used 1e-6 and rejected real
+# placements read back from disk: a quaternion serialised at five decimal
+# places lands 1.9e-6 off unit, so the bar was tighter than the precision
+# of the data it was judging. A validator that refuses its own valid
+# output is worse than no validator, because it fails silently -- the
+# rows are dropped and the world reads as unregistered.
+QUATERNION_NORM_TOLERANCE = 1e-3
+
 PLACEMENT_REGISTERED = "registered"
 PLACEMENT_REFUSED = "refused"
 PLACEMENT_STATES = (PLACEMENT_REGISTERED, PLACEMENT_REFUSED)
@@ -330,12 +365,36 @@ class SegmentPlacement:
                     "transform means a default supplies the rest, and the "
                     "default is wrong"
                 )
+            _check_vector(self.rotation_wxyz, 4, "rotation_wxyz")
+            _check_vector(self.translation, 3, "translation")
+            norm = math.sqrt(sum(v * v for v in self.rotation_wxyz))
+            if abs(norm - 1.0) > QUATERNION_NORM_TOLERANCE:
+                raise ValueError(
+                    f"rotation_wxyz must be a unit quaternion, got norm "
+                    f"{norm!r}; a non-unit quaternion scales the geometry it "
+                    "rotates, silently and on top of `scale`"
+                )
+            if isinstance(self.scale, bool) or not isinstance(
+                self.scale, (int, float)
+            ):
+                raise ValueError(
+                    f"scale must be a real number, got {self.scale!r}"
+                )
             if not math.isfinite(self.scale) or self.scale <= 0:
                 raise ValueError(
                     f"scale must be finite and positive, got {self.scale!r}; "
                     "a zero scale collapses the segment to a dot at the "
                     "reference's origin and is invisible in every aggregate"
                 )
+        if (
+            isinstance(self.segment_index, bool)
+            or not isinstance(self.segment_index, int)
+            or self.segment_index < 0
+        ):
+            raise ValueError(
+                f"segment_index must be a non-negative int, got "
+                f"{self.segment_index!r}"
+            )
 
     def to_json_dict(self) -> dict:
         return {

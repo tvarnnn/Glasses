@@ -288,3 +288,162 @@ def test_the_rollup_still_moves_when_only_geometry_changes(tmp_path):
     )
     after = adapter.build_manifest(store, world_id, session_id)
     assert before["geometry_revision"] != after["geometry_revision"]
+
+
+# ---------------------------------------------------------------------------
+# Transform shape and finiteness.
+#
+# The only value originally checked was `scale`. Seven distinct malformed
+# placements reached disk and would have been served and drawn -- a
+# renderer applies a NaN translation just as readily as a real one, it
+# simply puts the geometry nowhere in particular. This record is the last
+# place that can refuse them before they reach a screen.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "label,override",
+    [
+        ("nan in translation", {"translation": (float("nan"), 0.0, 0.0)}),
+        ("inf in rotation", {"rotation_wxyz": (float("inf"), 0.0, 0.0, 0.0)}),
+        ("non-unit quaternion", {"rotation_wxyz": (5.0, 5.0, 5.0, 5.0)}),
+        ("rotation of length 3", {"rotation_wxyz": (1.0, 0.0, 0.0)}),
+        ("translation of length 2", {"translation": (0.0, 0.0)}),
+        ("scale is a bool", {"scale": True}),
+        ("negative segment index", {"segment_index": -5}),
+    ],
+)
+def test_a_malformed_transform_cannot_be_stored(label, override):
+    with pytest.raises(ValueError):
+        _placement(**override)
+
+
+def test_a_valid_transform_is_unaffected():
+    """The control. Every rejection above must be specific, not a gate that
+    happens to refuse everything."""
+    placement = _placement(
+        rotation_wxyz=(1.0, 0.0, 0.0, 0.0),
+        translation=(1.0, 2.0, 3.0),
+        scale=2.5,
+        reference_segment=1,
+    )
+    assert placement.scale == 2.5
+    assert placement.translation == (1.0, 2.0, 3.0)
+
+
+def test_a_rotated_unit_quaternion_is_accepted():
+    """A real rotation, not just the identity -- otherwise the norm check
+    could be satisfied by only ever testing (1,0,0,0)."""
+    import math as _math
+
+    half = _math.radians(30.0) / 2.0
+    placement = _placement(
+        rotation_wxyz=(_math.cos(half), 0.0, _math.sin(half), 0.0)
+    )
+    assert placement.state == "registered"
+
+
+def test_a_refused_placement_needs_no_transform_shape():
+    """The shape checks must apply only where a transform exists, or a
+    refusal could never be stored at all."""
+    placement = _placement(
+        state="refused",
+        rotation_wxyz=None,
+        translation=None,
+        scale=None,
+        reference_segment=None,
+        refusal_reason="the wearer stood still",
+    )
+    assert placement.state == "refused"
+
+
+def test_a_quaternion_at_serialised_precision_survives():
+    """REGRESSION. The tolerance must not be tighter than the precision of
+    the data it judges.
+
+    The report serialiser rounds floats to five decimal places, which puts
+    a unit quaternion about 1.9e-6 off unit. A first version of the norm
+    check used 1e-6 and therefore rejected real placements read back from
+    disk -- silently, because unrepresentable rows are dropped, so a
+    registered world simply read as unregistered.
+    """
+    import math as _math
+
+    from tower.world_builder.records import QUATERNION_NORM_TOLERANCE
+
+    # A real rotation, rounded exactly as the writer rounds it.
+    half = _math.radians(37.0) / 2.0
+    exact = (_math.cos(half), 0.1, _math.sin(half), 0.03)
+    norm = _math.sqrt(sum(v * v for v in exact))
+    unit = tuple(v / norm for v in exact)
+    rounded = tuple(round(v, 5) for v in unit)
+
+    drift = abs(_math.sqrt(sum(v * v for v in rounded)) - 1.0)
+    assert drift > 0, "the fixture must actually be perturbed by rounding"
+    assert drift < QUATERNION_NORM_TOLERANCE, (
+        f"serialised precision drifts {drift:.2e}, which the tolerance "
+        f"{QUATERNION_NORM_TOLERANCE:.0e} must accommodate"
+    )
+    assert _placement(rotation_wxyz=rounded).state == "registered"
+
+
+def test_the_tolerance_still_refuses_a_meaningfully_wrong_quaternion():
+    """The other side: accommodating rounding must not accommodate a
+    quaternion that would visibly rescale the geometry it rotates."""
+    with pytest.raises(ValueError, match="unit quaternion"):
+        _placement(rotation_wxyz=(1.02, 0.0, 0.0, 0.0))
+
+
+def test_placements_written_by_the_registration_writer_read_back(tmp_path):
+    """End to end through the real writer, which is where the rounding
+    lived. Every row written must be readable; a dropped row is a
+    registered world silently reading as unregistered."""
+    import importlib.util
+    from pathlib import Path as _Path
+
+    spec = importlib.util.spec_from_file_location(
+        "world_registration",
+        _Path(__file__).resolve().parents[1] / "scripts" / "world_registration.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    import math as _math
+
+    half = _math.radians(41.0) / 2.0
+    report = {
+        "reference_segment": 3,
+        "segments": [
+            {
+                "segment_index": 3,
+                "registered": True,
+                "transform_to_world": {
+                    "rotation_wxyz": [_math.cos(half), 0.0, _math.sin(half), 0.0],
+                    "translation": [0.5, -1.25, 2.0],
+                    "scale": 1.75,
+                },
+                "points": 500,
+            },
+            {
+                "segment_index": 4,
+                "registered": False,
+                "reason": "the wearer stood still",
+                "points": 12,
+            },
+        ],
+    }
+    rows = module.placements_from_report(report)
+    assert len(rows) == 2
+
+    store = WorldStore(tmp_path)
+    world_id, session_id = "w" * 32, "s" * 32
+    store.write_placements(world_id, session_id, rows)
+    read = store.read_placements(world_id, session_id)
+
+    assert read is not None and len(read) == 2, (
+        "every written placement must read back; a dropped row makes a "
+        "registered world read as unregistered"
+    )
+    assert read[0].state == "registered"
+    assert read[0].scale == pytest.approx(1.75)
+    assert read[1].state == "refused"
