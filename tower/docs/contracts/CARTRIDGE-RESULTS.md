@@ -1390,7 +1390,7 @@ carried beside it.
 | Field | Type | Meaning |
 |---|---|---|
 | `contract` | string | `document_memory.library/2026-08-27` |
-| `claim` | `"a-document-was-in-view-and-was-read"` | |
+| `claim` | `"a-page-was-in-view-and-was-ocred"` | The wire value, pinned as `DOCUMENT_CLAIM` in `tower/results/document_memory.py`. Until the 2026-08-27 unification this table quoted an older spelling that said a document "was read" — a claim the camera cannot establish, five keys above the note saying so. The code had been corrected and the doc had not. `test_the_contract_quotes_the_values_the_wire_actually_carries` now pins the two together, and asserts the retired spelling appears nowhere in this file |
 | `identity` | `"no-document-identity-across-sightings"` | reading the same page twice yields two unrelated records |
 | `absence_means` | `"not-recorded-by-this-cartridge"` | |
 | `time_basis` | `"tower-receipt"` | |
@@ -1520,9 +1520,15 @@ not be rendered identically to a measured one.
 | `sufficient_evidence` | bool | whether the memory held enough to answer at all. `false` with `answer: "no_observation"` is an empty memory; `false` with `not_found` is a query whose terms nothing contained |
 
 Each matched document additionally carries `score` (rounded to 4 places),
-`matched_terms`, and `snippet` — 160 characters around the first matched
-term, **so an answer is always traceable back to text that was actually
-captured** rather than to a number a client has to trust.
+`matched_terms`, and `snippet` — `snippet_max_chars` characters around the
+first matched term, **so an answer is always traceable back to text that
+was actually captured** rather than to a number a client has to trust.
+
+`snippet_max_chars` is **48**, and it is on the envelope so a client reads
+the bound rather than assuming one. This paragraph said 160 until the
+2026-08-27 unification, which contradicted both the value in
+`tower/results/document_memory.py` (`SNIPPET_MAX_CHARS = 48`) and §15.3
+four hundred lines above it. Read the field, not the prose.
 
 **One document carries pages, and pages carry these**
 

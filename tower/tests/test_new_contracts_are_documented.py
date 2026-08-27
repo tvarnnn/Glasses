@@ -317,3 +317,53 @@ def test_nothing_on_these_wires_is_a_bare_int_pretending_to_be_a_bool(
     walk(payload)
     assert suspicious == [], f"integers in boolean-shaped fields: {suspicious}"
     assert '"true"' not in encoded and '"false"' not in encoded
+
+
+# -- documented VALUES, not just documented keys ------------------------
+
+
+def test_the_contract_quotes_the_values_the_wire_actually_carries():
+    """A key can be documented and still be documented WRONG.
+
+    The tests above hold that every key on these wires is named in the
+    contract. They cannot see the other half: whether the value the
+    contract quotes beside that key is the value a client will actually
+    receive. Two had drifted by the 2026-08-27 unification, both in the
+    direction that matters -- the document was stale and the code was
+    right, so a Mac client built from the prose would have compared
+    against a string that never arrives:
+
+        claim              doc said "a-document-was-in-view-and-was-read"
+                           wire says "a-page-was-in-view-and-was-ocred"
+        snippet_max_chars  one paragraph said 160, the code says 48, and
+                           another section of the same file said 48
+
+    These are the load-bearing constants -- the ones a client compares for
+    EQUALITY or sizes a buffer against. A value a client merely displays
+    is not worth pinning here; a value it branches on is.
+    """
+    from tower.results.document_memory import DOCUMENT_CLAIM, SNIPPET_MAX_CHARS
+    from tower.results.scene_understanding import SCENE_CLAIM
+
+    document = DOCUMENT.read_text(encoding="utf-8")
+
+    pinned = {
+        "Document Memory's claim": DOCUMENT_CLAIM,
+        "Scene Understanding's claim": SCENE_CLAIM,
+        "the snippet bound": str(SNIPPET_MAX_CHARS),
+    }
+
+    missing = [
+        f"{name}: the wire carries {value!r} and the contract never quotes it"
+        for name, value in pinned.items()
+        if value not in document
+    ]
+    assert missing == [], "\n".join(missing)
+
+    # And the superseded spelling must be GONE, or the contract quotes
+    # both and a reader picks the wrong one.
+    retired = ("a-document-was-in-view-and-was-read",)
+    still_present = [text for text in retired if text in document]
+    assert (
+        still_present == []
+    ), f"the contract still quotes a value nothing serves: {still_present}"
