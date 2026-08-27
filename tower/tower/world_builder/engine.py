@@ -275,10 +275,36 @@ class WorldBuilderEngine:
             # redact() hands back the very object it was given whenever
             # it changed nothing, which is the overwhelmingly common case
             # and makes this free.
-            self._live.extend(
+            chain_broke = self._live.extend(
                 keyframe.keyframe_id,
                 gray if image_bytes is raw_bytes else decode_gray(image_bytes),
             )
+            if chain_broke:
+                # The solve chain failed on this keyframe. Everything
+                # after it shares no coordinate frame with what came
+                # before -- which is precisely what a segment boundary
+                # means here, and what the comment on the tracking-loss
+                # increment above already says.
+                #
+                # Without this, `chain.broken` latches and every later
+                # keyframe in the segment is refused WITHOUT ORB
+                # detection, matching, or any geometry attempted.
+                # Measured on capture 22e9d428: 354 refusals from 26
+                # decisions, 328 cascade, 0 of 26 segments ever
+                # recovering. classical.py has claimed for a long time
+                # that "the engine turns this into a new segment"; it did
+                # not, and this makes the claim true.
+                #
+                # The TRACKER IS NOT RESET. Tracking is healthy; the
+                # solve failed. Resetting would manufacture a tracking
+                # loss out of a geometry failure and throw away a
+                # perfectly good reference frame.
+                self._segment_index += 1
+                self._live.close_segment(self._segment_index)
+                self._events.append(
+                    "solve_chain_broken",
+                    {"segment_index": self._segment_index},
+                )
 
         self._tracker.set_reference(gray)
         self._selector.note_accepted()
@@ -895,17 +921,24 @@ class _LiveSolve:
         self._open: list[str] = []
         self._frozen: dict[int, tuple[tuple[str, ...], object]] = {}
 
-    def extend(self, keyframe_id: str, gray) -> None:
+    def extend(self, keyframe_id: str, gray) -> bool:
+        """Extend the open solve. True if THIS keyframe broke the chain.
+
+        The return value was previously discarded. It is the signal that
+        lets the engine split a segment when the solve fails, instead of
+        refusing every later keyframe in it without looking.
+        """
         if not self.usable:
-            return
+            return False
         try:
-            self.backend.extend(
+            step = self.backend.extend(
                 KeyframeInput(keyframe_id=keyframe_id, image_gray=gray)
             )
         except Exception:
             self._give_up("extending")
-            return
+            return False
         self._open.append(keyframe_id)
+        return bool(getattr(step, "chain_broken", False))
 
     def close_segment(self, segment_index: int) -> None:
         if not self.usable:

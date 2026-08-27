@@ -287,6 +287,38 @@ def _core_band(values: np.ndarray) -> tuple[float, float]:
     return float(lo), float(hi)
 
 
+def coherence(points_by_segment: dict) -> dict:
+    """How CONCENTRATED the reconstruction is, not how much of it there is.
+
+    poses_solved and points say how much geometry was recovered. They say
+    nothing about whether it shares a coordinate frame, and segments do
+    not share one. A change that doubles the points while scattering them
+    across four times as many frames has not built more world -- it has
+    built more islands.
+
+    This gap is not hypothetical: it let a change that raised solved poses
+    346 -> 863 and points 47k -> 107k, while taking segments 127 -> 470
+    with a median of 2 keyframes each, look like an unambiguous win.
+
+    `largest_share` is the fraction of all published points sitting in the
+    single biggest segment -- the closest thing available to "how much of
+    this world is in one piece".
+    """
+    totals = sorted(points_by_segment.values(), reverse=True)
+    total = sum(totals)
+    if not total:
+        return {
+            "segments_with_geometry": 0,
+            "largest_segment_points": 0,
+            "largest_share": None,
+        }
+    return {
+        "segments_with_geometry": sum(1 for v in totals if v > 0),
+        "largest_segment_points": totals[0],
+        "largest_share": totals[0] / total,
+    }
+
+
 def bbox_blowup(xyz: np.ndarray) -> float | None:
     """How far the full bounding box overruns the p2-p98 core.
 
@@ -524,6 +556,10 @@ def run_capture(
         else np.empty((0, 3), dtype=float)
     )
     drawable, legible = fragment_counts(points)
+    points_by_segment: dict = {}
+    for row in points:
+        key = row["segment_index"]
+        points_by_segment[key] = points_by_segment.get(key, 0) + 1
 
     return {
         "prefix": prefix,
@@ -541,6 +577,7 @@ def run_capture(
         "points_discarded": read_points_discarded(manifest),
         "bbox_blowup": bbox_blowup(xyz),
         "legible_fragments": legible,
+        **coherence(points_by_segment),
         "drawable_fragments": drawable,
         "wall_seconds": round(time.perf_counter() - started, 3),
         "backend_id": result.backend_id,
@@ -570,6 +607,18 @@ def totals_of(captures: list[dict]) -> dict:
         "points": sum(c["points"] for c in captures),
         "points_discarded": discarded,
         "legible_fragments": sum(c["legible_fragments"] for c in captures),
+        "segments_with_geometry": sum(
+            c["segments_with_geometry"] for c in captures
+        ),
+        # Corpus-wide, the mean over captures that HAVE geometry. A share
+        # is not additive, and summing it would be meaningless.
+        "mean_largest_share": (
+            sum(
+                c["largest_share"] for c in captures
+                if c["largest_share"] is not None
+            )
+            / max(sum(1 for c in captures if c["largest_share"] is not None), 1)
+        ),
         "drawable_fragments": sum(c["drawable_fragments"] for c in captures),
         "wall_seconds": round(sum(c["wall_seconds"] for c in captures), 3),
         # Not averaged. A mean over a ratio whose denominator differs per
@@ -841,6 +890,12 @@ def do_compare(paths, expect_tracking_change: bool = False) -> int:
     print(
         f"corpus poses_solved {lt['poses_solved']} -> {rt['poses_solved']} "
         f"({d_solved:+d}), points {lt['points']} -> {rt['points']} ({d_points:+d})"
+    )
+    print(
+        f"corpus coherence: segments_with_geometry "
+        f"{lt['segments_with_geometry']} -> {rt['segments_with_geometry']}, "
+        f"mean largest-segment share of points "
+        f"{lt['mean_largest_share']:.3f} -> {rt['mean_largest_share']:.3f}"
     )
     print(
         f"corpus legible_fragments {lt['legible_fragments']} -> "

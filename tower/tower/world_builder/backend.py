@@ -154,6 +154,11 @@ class Extension:
 
     pose: PoseEstimate
     new_points: PointBlock | None = None
+    # True ONLY on the keyframe whose failure broke the solve chain -- an
+    # edge, not a level. If it stayed true afterwards the engine would
+    # start a new segment per frame, turning one failure into dozens of
+    # one-frame segments, which is worse than the cascade it replaces.
+    chain_broken: bool = False
 
 
 @dataclass(frozen=True)
