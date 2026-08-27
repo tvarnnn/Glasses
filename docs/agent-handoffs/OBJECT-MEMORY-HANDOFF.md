@@ -450,9 +450,14 @@ person rather than accepted from here:
    rate limiter to a handful of writes per sighting (62 over a 2,203-frame
    replay), and the store's own docstring already names SQLite as the
    move when the file stops being small.
-7. **`transformers` is a new dependency**, installed only into this
-   worktree's venv for the run (`--target`, so the primary tree's venv is
-   untouched). It is **not yet in `pyproject.toml`** — see §11.
+7. **`transformers` is a new optional dependency.** Declared as the
+   `semantic` extra in `tower/pyproject.toml`, floored at `>=5.16,<6`
+   because the 5.x model-class surface is load-bearing. For this run it
+   was installed with `pip --target` into the worktree's venv **only**,
+   so the primary tree's venv — which the World Builder lane is using —
+   is untouched and still has no `transformers`. Anyone merging this
+   branch installs it with `pip install -e ".[semantic]"`; anyone who
+   does not, gets a Tower that behaves exactly as before.
 8. **The session is in-process state with no lock.** FastAPI runs sync
    handlers in a threadpool, so two concurrent `POST`s are possible. The
    actions are idempotent and the worst case is a redundant attach the
@@ -539,13 +544,13 @@ and a person. None of it is reachable from a test.
 
 **Repository work.**
 
-8. **`transformers` is not in `pyproject.toml`.** It was installed into
-   this worktree's venv with `--target` so the primary tree's venv stayed
-   untouched. Before this branch merges, add it to a new optional extra
-   (`semantic`, alongside `ml` and `ocr`), pin it, and record that the
-   resolve adds only `tokenizers`, `regex`, `typer`, `rich`,
-   `markdown-it-py`, `mdurl` and `shellingham` — nothing already
-   installed is upgraded.
+8. **Install the `semantic` extra where the verifier will run.**
+   `pip install -e ".[semantic]"` from `tower/`. A dry-run before
+   installing confirmed the resolve adds only `tokenizers`, `regex`,
+   `typer`, `rich`, `markdown-it-py`, `mdurl` and `shellingham` — all
+   pure Python — and reports every existing package already satisfied:
+   nothing touches torch, torchvision, numpy or cv2. Re-check that after
+   any change to the extra.
 
 ---
 

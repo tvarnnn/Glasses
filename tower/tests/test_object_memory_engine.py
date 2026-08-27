@@ -504,3 +504,75 @@ class TestFailure:
 
         assert engine.write_failures == 1
         assert len(store.all_observations()) == 1
+
+
+class TestLateVerdicts:
+    """A verdict that lands after its sighting ended must still count.
+
+    It cannot happen at the measured rate -- 128 ms verdicts against a
+    three-second gap window -- but a verifier on CPU measures 2.5 seconds
+    a crop, and that is a supported configuration. "Supported but
+    silently lossy" is not a state worth shipping.
+    """
+
+    def _threaded(self, tmp_path, delay):
+        verifier = ScriptedVerifier({"remote"}, delay_seconds=delay)
+        store = ObservationStore(tmp_path, retention_seconds=None)
+        engine = ObjectMemoryEngine(
+            store,
+            FixedDetector([[_detection(label="remote", score=0.9)]]),
+            policy=RelevancePolicy(verification_available=True),
+            verification=VerificationQueue(verifier, workers=1),
+            clock=lambda: 1000.0,
+        )
+        engine.load()
+        return store, engine
+
+    def test_a_sighting_that_ends_mid_verification_is_not_lost(self, tmp_path):
+        store, engine = self._threaded(tmp_path, delay=0.4)
+
+        # Three frames to mature it and request a verdict, then a jump
+        # past the gap window so the sighting closes while the verifier
+        # is still working.
+        _walk(engine, 3, start=900.0, step=0.1)
+        engine.observe(_frame(), received_at=910.0, source_seq=99)
+        engine.finish()
+
+        assert [o.object_class for o in store.all_observations()] == ["remote"]
+
+    def test_a_verdict_that_never_arrives_still_settles_the_sighting(
+        self, tmp_path
+    ):
+        """Parked is not the same as leaked.
+
+        A sighting whose verdict was dropped by a full queue must end up
+        refused and counted, not held forever.
+        """
+
+        class SilentVerifier:
+            name = "silent"
+
+            def load(self):
+                return None
+
+            def verify(self, crop, proposed_class):
+                raise RuntimeError("never answers")
+
+            def release(self):
+                return None
+
+        store = ObservationStore(tmp_path, retention_seconds=None)
+        engine = ObjectMemoryEngine(
+            store,
+            FixedDetector([[_detection(label="remote", score=0.9)]]),
+            policy=RelevancePolicy(verification_available=True),
+            verification=VerificationQueue(SilentVerifier(), workers=0),
+            clock=lambda: 1000.0,
+        )
+        engine.load()
+
+        _walk(engine, 5)
+        engine.finish()
+
+        assert store.all_observations() == []
+        assert engine._awaiting_verdict == []

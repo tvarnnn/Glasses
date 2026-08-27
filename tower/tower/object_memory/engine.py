@@ -127,6 +127,24 @@ class ObjectMemoryEngine:
         # because it is bookkeeping about the STORE and a sighting is a
         # record of what the camera did.
         self._last_written: dict[int, tuple[float, float]] = {}
+        # Sightings that ENDED while a verdict was still in flight.
+        #
+        # Without this they are lost in silence. `_collect_verdicts` runs
+        # at the top of every frame and a verdict that arrives between
+        # frames reaches its sighting -- but a sighting whose class has
+        # been out of view for longer than the gap window is closed and
+        # dropped from the tracker, and a verdict arriving after that
+        # lands on an object nothing looks at again.
+        #
+        # It cannot happen at the measured rate: verdicts take 128 ms on
+        # CUDA and the gap window is three seconds. It CAN happen on a
+        # verifier running on CPU at 2.5 seconds a crop with a queue in
+        # front of it, which is a supported configuration, and "supported
+        # but silently lossy" is not a state worth shipping.
+        #
+        # Bounded by the queue's own backlog limit, because nothing gets
+        # in here that was not submitted.
+        self._awaiting_verdict: list = []
 
         self.frames_observed = 0
         self.frames_undecodable = 0
@@ -181,6 +199,13 @@ class ObjectMemoryEngine:
             self._collect_verdicts()
         for sighting in self._tracker.close_all():
             self.sightings_closed += 1
+            self._settle(sighting)
+        # Anything still parked never got its verdict -- the queue
+        # dropped it, or the verifier hung past `wait_idle`. Settled
+        # anyway, so it is refused for a reason the counters record
+        # rather than vanishing from the accounting entirely.
+        for sighting in list(self._awaiting_verdict):
+            self._awaiting_verdict.remove(sighting)
             self._settle(sighting)
 
     # -- the frame path ------------------------------------------------
@@ -312,10 +337,20 @@ class ObjectMemoryEngine:
         self._verification.submit(sighting, sighting.best_crop)
 
     def _collect_verdicts(self) -> None:
+        """Attach arrived verdicts, and settle anything that was waiting.
+
+        A sighting still open is reconsidered on its next frame, as
+        usual. A sighting that ENDED while its verdict was in flight has
+        no next frame, so it is settled here -- which is the whole reason
+        `_awaiting_verdict` exists.
+        """
         if self._verification is None:
             return
         for sighting, verdict in self._verification.drain():
             sighting.verdict = verdict.to_json_dict()
+            if sighting in self._awaiting_verdict:
+                self._awaiting_verdict.remove(sighting)
+                self._settle(sighting)
 
     # -- writing -------------------------------------------------------
 
@@ -384,7 +419,21 @@ class ObjectMemoryEngine:
             self.sighting_updates += 1
 
     def _settle(self, sighting) -> None:
-        """A sighting has ended. Write it if it earned it, then let it go."""
+        """A sighting has ended. Write it if it earned it, then let it go.
+
+        Unless it is still waiting for a verdict it has already paid for,
+        in which case it is parked until the verdict arrives and settled
+        then. Deciding now would refuse it for `unverified` when the
+        answer is already in flight.
+        """
+        if (
+            sighting.verification_requested
+            and sighting.verdict is None
+            and self._verification is not None
+            and sighting not in self._awaiting_verdict
+        ):
+            self._awaiting_verdict.append(sighting)
+            return
         if self._relevance.decide_sighting(sighting, self._open_classes()) == RECORD:
             self._write(sighting)
         if sighting.recorded:
