@@ -102,8 +102,11 @@ journal. See §4.
 | `segment_index` | int | Identity within the session |
 | `content_hash` | string | 16 hex chars over the segment's *whole* poses and points. The client's cache key. Opaque |
 | `frame_id` | string | `"segment:{index}"`. Two segments never share a frame today |
-| `registered` | bool | `false` for every segment today. See §5 rule 3 |
-| `transform_to_world` | object\|null | `null` today. A Sim3 `{rotation_wxyz, translation, scale}` when registration lands |
+| `registered` | bool | `true` once a segment is placed. See §5 rule 3 |
+| `registration_state` | string | `unplaced` \| `registered` \| `refused`. Distinguishes "we tried and the solves disagreed" from "nobody looked" — `registered: false` alone could not |
+| `registration_refusal_reason` | string\|null | why this segment is not placed. Usually "the wearer stood still", which is a message to the wearer, not a fault |
+| `placement_hash` | string | 16 hex over WHERE the segment sits. **A cache key** — see §7 |
+| `transform_to_world` | object\|null | `null` unless registered. `{rotation_wxyz[4], translation[3], scale, reference_segment, frame_revision}` — maps this segment's frame into `reference_segment`'s |
 | `resolution_state` | `resolved`\|`unresolved` | `resolved` iff `point_count > 0` |
 | `dominant_degeneracy` | string\|null | Most frequent non-empty `degeneracy` among this segment's refused rows; `null` when none was refused. Present on resolved segments too — a segment can solve some poses and refuse others |
 | `keyframe_count` | int | Pose rows for this segment. Exactly one per keyframe, so also the length of the chunk's `poses` |
@@ -134,8 +137,11 @@ absent. **200** otherwise, behind-the-journal included.
 | `segment_index` | int | Echoed |
 | `content_hash` | string | Identical to the manifest's for this segment, and identical whether or not the cloud was sampled: the hash identifies the **segment**, not the transfer |
 | `frame_id` | string | `"segment:{index}"` |
-| `registered` | bool | `false` today |
-| `transform_to_world` | object\|null | `null` today |
+| `registered` | bool | as the manifest |
+| `registration_state` | string | as the manifest |
+| `registration_refusal_reason` | string\|null | as the manifest |
+| `transform_to_world` | object\|null | as the manifest |
+| `placement_hash` | string | as the manifest |
 | `poses` | array | `{keyframe_id, status, degeneracy, rotation, translation}`, in `poses.json` order, which is index-aligned to `keyframes.jsonl` (457/457 on the real world) |
 | `points` | array | Bare `[x,y,z]` triples. Not tagged rows: the chunk already names its segment |
 | `points_sent` | int | Points in `points` |
@@ -222,7 +228,7 @@ fact is zero". The distinction is the whole reason the transport exists at all.
 | `bounds` | the segment resolved to nothing, so it has no extent | a zero-size box at the origin |
 | `translation` / `rotation` | the pose was **refused**; the degeneracy says why | the camera was at the origin |
 | `dominant_degeneracy` | nothing in this segment was refused | no reason is known |
-| `transform_to_world` | this segment is not registered into any shared frame | an identity transform |
+| `transform_to_world` | this segment is not registered into any shared frame | an identity transform, which would silently place it at the reference origin |
 | `scale.meters_per_unit` | no metric scale was ever established | 1.0 |
 
 Two consequences that a renderer must honour:
@@ -246,8 +252,24 @@ a property of the wire — `up_axis` is `"unknown"` today, so a 3D view would
 have to guess which way is up. A future 3D renderer consumes the same payload
 with **no wire change**.
 
-Registration is designed as a layer **above** frozen segments: geometry
-immutable, placements mutable. `registered` flips to `true` and
-`transform_to_world` carries a Sim3; segment-local geometry is unchanged, so
-every cached `content_hash` stays valid across a registration pass, and loop
-closure moves placements rather than points.
+Registration is a layer **above** frozen segments: geometry immutable,
+placements mutable. `registered` flips to `true` and `transform_to_world`
+carries a Sim3; segment-local geometry is unchanged, so every cached
+`content_hash` stays valid across a registration pass, and loop closure moves
+placements rather than points.
+
+**That is safe only because `placement_hash` changes instead.** A client MUST
+key its per-segment cache on `(content_hash, placement_hash)`. Keyed on
+`content_hash` alone it will never refetch a re-placed segment, and will draw an
+unplaced version of a segment the world knows how to place — a failure that
+looks like nothing at all, because the fragment simply sits in the wrong place
+forever. `geometry_revision` rolls up both hashes, so the change signal fires;
+the risk is entirely in the per-chunk cache.
+
+**Composition rule.** `transform_to_world` maps a segment's own frame into the
+frame of its `reference_segment`. Segments sharing a `reference_segment` are in
+one space and may be drawn together. Segments with **different** reference
+segments are not, and must not be composited. `frame_revision` stamps the gauge
+the Sim3 is expressed in; a coordinate stamped with one revision may not be
+reinterpreted under another, and a mismatch is a refuse-to-draw condition rather
+than something to guess past.
