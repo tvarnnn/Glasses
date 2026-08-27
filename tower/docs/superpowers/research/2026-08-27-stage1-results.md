@@ -192,8 +192,67 @@ why the corpus-level A/B matters more than the segment-level one. A
 per-segment harness that hands the backend a segment's keyframes cannot
 observe an effect that only appears when the map has to grow itself.
 
-Full-corpus DEPTH=1 vs DEPTH=3 over all 8 pinned captures is running; the
-verdict below is provisional until it lands.
+## 5b. THE CORPUS A/B — the deciding measurement, and it reverses §5a
+
+Full replay of all 8 pinned captures through the real engine, twice,
+toggling only `EXTEND_REFERENCE_DEPTH`. MEASURED:
+
+| metric | DEPTH=1 | DEPTH=3 | delta |
+|---|---|---|---|
+| segments | 230 | 232 | +2 |
+| keyframes | 1,712 | 1,712 | 0 |
+| **poses_solved** | 591 | **620** | **+29** |
+| poses_refused | 891 | 860 | **−31** |
+| points | 75,369 | 71,122 | −4,247 |
+| **support rows** | 186,778 | **195,752** | **+8,974** |
+| exactly-2-view | 70.38% | **61.70%** | **−8.68 pp** |
+| ≥3-view | 29.62% | **38.30%** | **+8.68 pp** |
+| obs/landmark | 2.478 | 2.752 | +0.27 |
+
+Per capture, `poses_solved`:
+
+| capture | 1 → 3 | points | segments |
+|---|---|---|---|
+| `e1c52b9f` | 145 → **147** | 22520 → 19872 | 10 → 9 |
+| `22e9d428` | 112 → **131** | 11503 → **12347** | 64 → 68 |
+| `b35d8ab8` | 114 → **115** | 11375 → 11364 | 76 → 76 |
+| `20ce3c23` | 75 → **85** | 10259 → 9308 | 22 → 22 |
+| `2e6cffa2` | 52 → **54** | 4317 → 4138 | 29 → 28 |
+| `fe744b68` | 30 → 30 | 6224 → 5846 | 16 → 16 |
+| `64f48114` | 53 → 53 | 8641 → 7821 | 9 → 9 |
+| **`4fea31e2`** | **10 → 5** | 530 → 426 | 4 → 4 |
+
+**Rose on 5, unchanged on 2, fell on exactly one — the smallest capture
+in the corpus.** The §5a alarm was a real result on a real capture and it
+does not generalise.
+
+**And it settles the merging-versus-loss question the ratio argument in
+§3 could only suggest.** Points fall 5.6% while support rows RISE 4.8%
+and `poses_solved` RISES by 29. Structure loss cannot raise the number of
+cameras that solve — fewer landmarks would starve PnP, which is exactly
+the mechanism §5a proposed. The corpus says the opposite happens: the map
+holds fewer, better-observed landmarks and MORE cameras resolve against
+them.
+
+**VERDICT: KEEP.** With one recorded exception, `4fea31e2`, which is
+queued as physical test PT-3.
+
+### What is still not known
+
+A spatial comparison of segment 19 at the two depths shows the solved
+camera path spanning **87.03** units at DEPTH=1 against **8.77** at
+DEPTH=3, with the seed-pair baseline pinned at 1 unit in both — so the
+two trajectories differ by roughly 10× in their own gauge, not merely in
+point count. Relative to their own camera paths the maps are similar in
+shape (point extent / camera span 4.65 vs 6.68).
+
+DEPTH=3's ~0.4 units of camera travel per keyframe is more consistent
+with a seed baseline of 1 than DEPTH=1's ~2.7, which would ordinarily be
+read as less scale drift — **but there is no ground truth on this corpus
+and that reading is not established.** It is recorded because it is the
+largest unexplained difference found, not because it supports the
+verdict. The verdict rests on `poses_solved`, support rows and
+multiplicity, all of which are directly measured.
 
 ## 6. What is weak here, stated plainly
 
