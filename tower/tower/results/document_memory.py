@@ -255,7 +255,25 @@ def _summary_view(document) -> dict:
 
     `title` may be null and a client must render that as a description of
     the RECORD -- "Untitled document" -- never as an invented name for
-    the thing. `summary` is model output and travels with its caveat.
+    the thing. It is one line, lifted from the document's own first text
+    region, and iOS asks for it in the list knowing that.
+
+    `summary` IS NOT HERE, and its absence is the point.
+
+    `DocumentMemoryEngine._summarise` is the document's first forty words
+    verbatim. That is an excerpt, not a summary, and forty words per
+    document across a list is exactly the bulk transfer of contents that
+    `IOS-to-Tower.md` 3.2 exists to prevent -- "a list of documents is
+    not also a bulk transfer of every document's contents onto the
+    phone". Serving it here would have honoured the letter of "the list
+    carries a character count, not the text" while breaking it in fact,
+    and the failure would have been invisible: the field is small, and
+    nobody reviewing one response would notice that a hundred of them
+    add up to the library.
+
+    So the list says a summary EXISTS and where to get it, and
+    `/documents/{document_id}` carries it beside the pages it came from.
+    A caller that wanted it wanted the document.
     """
     return {
         "document_id": document.document_id,
@@ -263,8 +281,13 @@ def _summary_view(document) -> dict:
         "identity": IDENTITY_SCOPE,
         "title": document.title,
         "title_is_derived": True,
-        "summary": document.summary or None,
-        "summary_is_model_output": True,
+        "summary_available": bool(document.summary),
+        "summary_withheld_reason": (
+            "the stored summary is the document's first forty words "
+            "verbatim -- an excerpt, not a paraphrase. It is served with "
+            "the document, never in a list, so a listing cannot become a "
+            "bulk transfer of what a wearer read"
+        ),
         "confidence": document.confidence.value,
         "confidence_basis": "the weakest page read in this document",
         "observed_at": document.observed_at,
@@ -460,6 +483,11 @@ def one_document(store, document_id: str, *, requested_days=None) -> dict | None
     payload["no_observation_note"] = None
     payload["document"] = dict(
         _summary_view(document),
+        # The two things a list may not carry, carried here where a
+        # person has asked for this document specifically.
+        summary=document.summary or None,
+        summary_is_model_output=True,
+        summary_is_verbatim_excerpt=True,
         pages=[_page_view(page) for page in document.pages],
         word_count=document.word_count,
     )

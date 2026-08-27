@@ -121,6 +121,46 @@ def _resolve_device(requested: str) -> str:
     return requested
 
 
+def _cap_torch_threads(settings) -> None:
+    """Bound torch's thread pool, or say why it was not bounded.
+
+    PROCESS-GLOBAL, and that is why it is opt-in rather than a default:
+    `torch.set_num_threads` has no per-model scope, so a value chosen for
+    the scene detector also applies to the Experimental CV Lab.
+
+    Silence would be the wrong default here. Measured over 829 real
+    corpus frames at the delivered 12.0 fps
+    (`scripts/cartridge_live_benchmark.py`), torch's own default cost
+    **4.12 cores** and capping it at 2 cost **1.03**, with throughput
+    identical to within 0.3%. An operator who never learns that is paying
+    three cores for nothing, and a log line is the cheapest way to tell
+    them.
+    """
+    if settings.scene_torch_threads <= 0:
+        logger.info(
+            "[Tower][Config] TOWER_SCENE_TORCH_THREADS is unset: torch will "
+            "use one thread per core. Measured at 4.12 cores for one scene "
+            "session against 1.03 when capped at 2, with the same "
+            "throughput -- set it if this Tower shares its CPU"
+        )
+        return
+    try:
+        import torch
+
+        torch.set_num_threads(settings.scene_torch_threads)
+    except Exception:
+        logger.exception(
+            "[Tower][Config] TOWER_SCENE_TORCH_THREADS could not be applied"
+        )
+        return
+    logger.info(
+        "[Tower][Config] torch intra-op threads capped at %s. This is "
+        "PROCESS-GLOBAL and applies to every torch consumer here, not only "
+        "Scene Understanding",
+        settings.scene_torch_threads,
+    )
+
+
 def _scene_session(settings):
     """A Scene Understanding session, not yet started.
 
@@ -139,6 +179,7 @@ def _scene_session(settings):
     from tower.scene.live import SceneLive
 
     device = _resolve_device(settings.scene_device)
+    _cap_torch_threads(settings)
 
     def make_engine():
         pose = None

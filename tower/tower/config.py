@@ -44,14 +44,21 @@ class Settings:
     # Whether Scene Understanding may run at all on this Tower.
     #
     # OFF by default, and the default is a resource decision rather than
-    # caution. A running session costs one detection per delivered frame
-    # -- 32.9 ms on CPU against an 83.5 ms interval, so roughly 40% of a
-    # core, continuously, for as long as a phone is streaming. That is
-    # affordable and it is not free, and a Tower that started doing it
-    # because someone upgraded is a Tower whose other cartridges got
-    # slower for no reason anybody chose.
+    # caution -- MEASURED, and the measurement is worse than the estimate
+    # that first stood here.
     #
-    # Off here means `/cartridges` declares the contract and reports it
+    # `scripts/cartridge_live_benchmark.py`, 829 real corpus frames fed at
+    # the delivered 12.0 fps, CPU: the session consumed **4.1 cores'
+    # worth of CPU** and still skipped 17.6% of frames. The 32.9 ms
+    # per-detection figure in `tower/scene/detect.py` is not wrong; it
+    # excludes JPEG decode, and it was taken on an idle host. A live
+    # session on a busy one is a different number and this is it.
+    #
+    # See `scene_torch_threads` below: capping torch's pool to 2 cut that
+    # to 1.03 cores at IDENTICAL throughput, which is the single most
+    # valuable thing an operator can do here.
+    #
+    # Off means `/cartridges` declares the contract and reports it
     # unavailable, naming this variable. It never means the Tower is
     # silent about the cartridge.
     scene_understanding: bool = False
@@ -73,6 +80,24 @@ class Settings:
     # convert the cartridge from "cheap and honest" into "wrong and
     # slow".
     scene_orientation: bool = False
+    # Cap torch's intra-op thread pool, or 0 to leave its default.
+    #
+    # PROCESS-GLOBAL. `torch.set_num_threads` has no per-model scope, so
+    # this affects the Experimental CV Lab too. That is the only reason
+    # it is not on by default, because the measurement is one-sided:
+    #
+    #   torch default (20 threads on this host)   4.12 cores, 9.85 fps
+    #   capped at 2                               1.03 cores, 9.88 fps
+    #
+    # Four times the CPU for no throughput at all, which is exactly what
+    # `docs/superpowers/research/2026-08-26-scene-understanding-
+    # measurements.md` predicts: ssdlite320 at an internal 320 px is
+    # bound by kernel-launch overhead, not arithmetic, so more threads
+    # buy nothing and cost a core each.
+    #
+    # An operator on a machine that is not a 20-core workstation should
+    # set this. A startup log line says so when it is unset.
+    scene_torch_threads: int = 0
     # Where a document session writes what it read, and where the
     # document routes read it back.
     #
@@ -125,6 +150,9 @@ def get_settings() -> Settings:
         scene_understanding=_flag("TOWER_SCENE_UNDERSTANDING", default=False),
         scene_device=os.environ.get("TOWER_SCENE_DEVICE", "cpu"),
         scene_orientation=_flag("TOWER_SCENE_ORIENTATION", default=False),
+        scene_torch_threads=_non_negative_int(
+            os.environ.get("TOWER_SCENE_TORCH_THREADS"), default=0
+        ),
         document_root=_optional_path(os.environ.get("TOWER_DOCUMENT_ROOT")),
         document_capture=_flag("TOWER_DOCUMENT_CAPTURE", default=False),
     )
