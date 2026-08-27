@@ -610,6 +610,13 @@ def totals_of(captures: list[dict]) -> dict:
         "segments_with_geometry": sum(
             c["segments_with_geometry"] for c in captures
         ),
+        # The ABSOLUTE size of the biggest coherent piece, summed over
+        # captures. Reported because the share below is a ratio and was
+        # once misread as a coherence regression when the largest piece
+        # had in fact grown -- new geometry had appeared beside it.
+        "largest_segment_points": sum(
+            c["largest_segment_points"] for c in captures
+        ),
         # Corpus-wide, the mean over captures that HAVE geometry. A share
         # is not additive, and summing it would be meaningless.
         "mean_largest_share": (
@@ -892,10 +899,13 @@ def do_compare(paths, expect_tracking_change: bool = False) -> int:
         f"({d_solved:+d}), points {lt['points']} -> {rt['points']} ({d_points:+d})"
     )
     print(
-        f"corpus coherence: segments_with_geometry "
-        f"{lt['segments_with_geometry']} -> {rt['segments_with_geometry']}, "
-        f"mean largest-segment share of points "
-        f"{lt['mean_largest_share']:.3f} -> {rt['mean_largest_share']:.3f}"
+        f"corpus coherence: largest-segment points (ABSOLUTE, the one to "
+        f"read) {lt['largest_segment_points']} -> "
+        f"{rt['largest_segment_points']}; segments_with_geometry "
+        f"{lt['segments_with_geometry']} -> {rt['segments_with_geometry']}; "
+        f"mean largest-segment SHARE {lt['mean_largest_share']:.3f} -> "
+        f"{rt['mean_largest_share']:.3f} (a ratio -- it falls whenever new "
+        f"geometry appears beside the largest piece, which is not a loss)"
     )
     print(
         f"corpus legible_fragments {lt['legible_fragments']} -> "

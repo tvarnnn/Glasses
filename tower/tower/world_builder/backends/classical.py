@@ -367,7 +367,6 @@ class ClassicalTwoViewBackend(GeometryBackend):
             chain.count += 1
             return Extension(pose=pose)
 
-        was_broken = chain.broken is not None
         features = detect_and_describe(frame.image_gray)
         new_points: list = []
         # Publishability for THIS delta, index-aligned with new_points.
@@ -470,7 +469,12 @@ class ClassicalTwoViewBackend(GeometryBackend):
         # an invariant the incremental suite asserts directly.
         return Extension(
             pose=pose,
-            chain_broken=(chain.broken is not None and not was_broken),
+            # An EDGE. extend() returns early above when the chain is
+            # already broken, so reaching here with chain.broken set
+            # means THIS keyframe broke it. A `not was_broken` guard
+            # used to sit here and was dead code -- it was evaluated
+            # after that early return, so it was always False.
+            chain_broken=chain.broken is not None,
             new_points=_publishable_block(
                 new_points, new_points_ok, [_support_block(delta_support)]
             ),

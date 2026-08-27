@@ -109,23 +109,61 @@ class BuildResult:
     diagnostics: dict = field(default_factory=dict)
 
 
-# How much a solve chain must have achieved before a break is allowed to
-# start a new segment.
+# How many consecutive segments may produce NOTHING before a solve break
+# stops being allowed to start another one.
 #
-# Splitting on EVERY break was measured and refused. It recovers a great
-# deal of geometry -- solved poses 346 -> 863, points 47k -> 107k across
-# the pinned eight -- but shatters the world: segments 127 -> 470, median
-# 2 keyframes each, and the mean largest-segment share of points falls
-# 0.549 -> 0.295. Twice the geometry in a third of the coherence is not
-# progress toward one recognisable room.
+# Two earlier rules were measured and refused, both for the same reason.
 #
-# The shatter comes from regions that break immediately after seeding,
-# over and over, turning genuinely unmappable footage into dozens of
-# two-frame islands. Requiring the broken chain to have solved at least
-# two poses -- i.e. to have built a real multi-view reconstruction rather
-# than a lone seed pair -- restarts the segments that earned it and lets
-# the unmappable ones stay one honestly-refused segment.
-MIN_SOLVED_BEFORE_RESTART = 2
+# `MIN_SOLVED_BEFORE_RESTART = 2` (restart only if the broken chain had
+# solved two poses) leaves the cascade fully intact for the case that
+# matters most: when the SEED PAIR fails the chain has solved nothing --
+# the anchor is not a solved pose -- so no threshold >= 1 is ever met.
+# Measured on capture 4fea31e2, one seed-pair failure stranded 48 of 50
+# keyframes.
+#
+# `MIN_KEYFRAMES_BEFORE_RESTART` (wait for N keyframes) fails for a
+# subtler reason: `chain_broken` is an EDGE. Decline the restart at that
+# instant and no second opportunity ever arrives, however many keyframes
+# accumulate. Swept at 3, 4, 6 and 8 it reproduced the solved-pose
+# numbers exactly and never recovered 4fea31e2.
+#
+# Delay is the wrong axis anyway. Once a chain is broken every further
+# keyframe in that segment is refused without geometry, so waiting buys
+# nothing -- the only real question is whether restarting is worth it.
+#
+# It is worth it unless the region has already proven unmappable. A
+# segment that ends having solved NOTHING is that evidence. At 1, a
+# restart is allowed unless the segment immediately before it produced
+# nothing -- so a region that is building geometry restarts freely, and
+# genuinely untrackable footage stops after one wasted attempt instead of
+# shattering into dozens of two-keyframe shards.
+#
+# THE VALUE IS CHOSEN ON MARGINAL EFFICIENCY, measured over the pinned
+# eight. Every larger cap buys more geometry and costs more fragments,
+# monotonically, with no knee -- so the question is what each added
+# fragment card is worth:
+#
+#   cap   segments   solved   points   poses per ADDED segment
+#     -        127      346    47429   (baseline)
+#     1        230      591    75369   2.38
+#     2        306      695    86230   1.95
+#     3        360      749    91130   1.73
+#  none        470      863   107005   1.51
+#
+# The return declines monotonically, so 1 is where a fragment card buys
+# the most reconstruction.
+#
+# What settled it against a larger cap: REGISTRATION IS INVARIANT across
+# the whole range. On e1c52b9f, caps of 1, 2 and none all produce exactly
+# the same registered cluster -- 3 segments, 5603 points, the same two
+# admitted pairs. The extra fragments buy raw geometry, not cross-segment
+# coherence, so paying more fragment cards for them is a bad trade while
+# the viewer cannot rank or collapse them.
+#
+# The larger caps remain available and are worth revisiting the moment
+# fragments can be ranked: the uncapped variant is +517 solved poses over
+# baseline and grows the largest single coherent piece 28656 -> 32756.
+MAX_BARREN_SEGMENTS = 1
 
 class WorldBuilderEngine:
     def __init__(
@@ -156,6 +194,8 @@ class WorldBuilderEngine:
         self._events: EventLog | None = None
         self._segment_index = 0
         self._segment_solved = 0
+        self._barren_segments = 0
+        self._segments_used: set[int] = set()
         self._rejected: dict[str, int] = {}
         # Survives stop_session() on purpose: the usual order is
         # observe... stop_session() build(), and throwing the solve away
@@ -219,6 +259,12 @@ class WorldBuilderEngine:
             self._store, world_id, session.session_id, clock=self._clock
         )
         self._segment_index = 0
+        # Reset with its sibling. start_session resets every other piece
+        # of per-session state; leaving this one behind let a new
+        # session inherit a restart budget the previous one earned.
+        self._segment_solved = 0
+        self._barren_segments = 0
+        self._segments_used: set[int] = set()
         self._rejected = {}
         self._events.append("session_started", {"frame_source": frame_source})
         self._open_live_solve(session)
@@ -266,6 +312,10 @@ class WorldBuilderEngine:
             # restart budget would be inherited from the segment that
             # just died.
             self._segment_solved = 0
+            # A tracking loss is not evidence that the region is
+            # unmappable -- the wearer moved too fast, that is all. It
+            # must not spend the restart budget.
+            self._barren_segments = 0
             if self._live is not None:
                 self._live.close_segment(self._segment_index)
             self._note_rejected(decision.reason)
@@ -289,6 +339,7 @@ class WorldBuilderEngine:
             motion=motion,
             reason=decision.reason,
         )
+        chain_broke_pending = False
         if self._live is not None:
             # The REDACTED bytes, because those are what landed on disk
             # and therefore what build() decodes. Feeding `gray` here
@@ -307,7 +358,7 @@ class WorldBuilderEngine:
             if (
                 step is not None
                 and step.chain_broken
-                and self._segment_solved >= MIN_SOLVED_BEFORE_RESTART
+                and self._barren_segments < MAX_BARREN_SEGMENTS
             ):
                 # The solve chain failed on this keyframe. Everything
                 # after it shares no coordinate frame with what came
@@ -324,24 +375,47 @@ class WorldBuilderEngine:
                 # that "the engine turns this into a new segment"; it did
                 # not, and this makes the claim true.
                 #
-                # The TRACKER IS NOT RESET. Tracking is healthy; the
-                # solve failed. Resetting would manufacture a tracking
-                # loss out of a geometry failure and throw away a
-                # perfectly good reference frame.
+                # The tracker keeps its reference. Tracking is healthy;
+                # only the solve failed, and discarding the reference
+                # would manufacture a tracking loss out of a geometry
+                # failure -- measured at 424 -> 389 solved poses when the
+                # reference is genuinely lost here.
+                #
+                # Honest note: inserting a reset at THIS line is an
+                # equivalent mutation, because set_reference() below runs
+                # unconditionally and re-establishes it. The invariant is
+                # real and worth stating; this position does not enforce
+                # it. The test asserts the outcome (the tracker still has
+                # a reference), not this line.
+                # A segment that ends having solved nothing is evidence
+                # the region is unmappable; a run of them stops further
+                # restarts. One that produced geometry clears the count.
+                self._barren_segments = (
+                    self._barren_segments + 1 if self._segment_solved == 0 else 0
+                )
                 self._segment_index += 1
                 self._segment_solved = 0
                 self._live.close_segment(self._segment_index)
-                self._events.append(
-                    "solve_chain_broken",
-                    {"segment_index": self._segment_index},
-                )
+                chain_broke_pending = True
 
+        self._segments_used.add(keyframe.segment_index)
         self._tracker.set_reference(gray)
         self._selector.note_accepted()
         self._session = replace(
             self._session,
             keyframes_accepted=self._session.keyframes_accepted + 1,
         )
+        if chain_broke_pending:
+            # AFTER the keyframe it belongs to. `tracking_lost` always
+            # precedes the keyframes of the segment it announces, because
+            # that branch returns before persisting. This one cannot: the
+            # breaker was already stamped with the OLD index. Emitting it
+            # first inverted the convention, so a consumer rebuilding
+            # segmentation from the journal misattributed exactly one
+            # keyframe per break.
+            self._events.append(
+                "solve_chain_broken", {"segment_index": self._segment_index}
+            )
         self._events.append(
             "keyframe_accepted",
             {
@@ -373,7 +447,10 @@ class WorldBuilderEngine:
             frames_observed=session.frames_observed,
             keyframes_accepted=session.keyframes_accepted,
             rejected_by_reason=dict(self._rejected),
-            segments=self._segment_index + 1,
+            # Distinct indices that received a keyframe, NOT the
+            # high-water mark -- see _segments_used. This is the same
+            # quantity build() reports, so the two cannot disagree.
+            segments=len(self._segments_used),
             end_reason=reason,
         )
         self._session = None
