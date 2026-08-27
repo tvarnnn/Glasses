@@ -536,6 +536,108 @@ def test_an_absolute_session_id_cannot_replace_the_world_root(
     assert response.status_code == 404
 
 
+def _make_world_in(root, world_id, session_id):
+    """A second, complete world, deliberately under a DIFFERENT root."""
+    from tower.world_builder.store import WorldStore, compute_input_digest
+    from tower.world_builder.records import Keyframe
+
+    store = WorldStore(root)
+    store.write_world(World(world_id=world_id, created_at=1.0, updated_at=2.0,
+                            session_ids=(session_id,)))
+    store.write_session(Session(session_id=session_id, world_id=world_id,
+                                started_at=1.0, ended_at=2.0))
+    for seq in (1, 2):
+        store.append_keyframe(world_id, Keyframe(
+            keyframe_id=f"{session_id}:{seq:08d}", session_id=session_id,
+            source_seq=seq, received_at=1000.0 + seq,
+            image_relpath=f"images/{seq:08d}.jpg", width=360, height=640,
+            byte_count=1234, segment_index=0))
+    _plant_derived_tree(store.derived_dir(world_id) / session_id)
+    (store.derived_dir(world_id) / session_id / "manifest.json").write_text(
+        json.dumps({
+            "schema_version": 1,
+            "input_digest": compute_input_digest(
+                store.read_keyframes(world_id, session_id)
+            ),
+            "built_at": 3.0, "backend_id": "classical-sfm",
+            "session_id": session_id, "keyframes": 2, "poses_solved": 0,
+            "poses_refused": 0, "poses_anchor": 1, "poses_positioned": 1,
+            "points": 1, "segments": 1, "scale_state": "unknown",
+        }),
+        encoding="utf-8",
+    )
+    return store
+
+
+@pytest.mark.parametrize("form", ["relative", "percent_encoded", "absolute"])
+def test_a_traversing_world_id_cannot_escape_the_configured_root(
+    derived_world, tmp_path, form
+):
+    """`world_id` is the OTHER half, and the session guard cannot see it.
+
+    Containment for `session_id` is anchored on `derived_dir(world_id)`.
+    An escaped `world_id` moves that anchor, so `parent == base` still
+    holds relative to the escaped base and the check passes -- the first
+    version of this fix closed one hole and left its twin open.
+
+    `world_id` is a PATH parameter, so Starlette's `[^/]+` stops a forward
+    slash. On Windows a BACKSLASH is also a separator and is not excluded,
+    and `%5C` is decoded before routing, so both reach the store. (`%2F`
+    does not match the route and is not a vector.) Windows is the only
+    platform this Tower ships on.
+
+    REPRODUCED before the fix: all three forms answered 200 and served a
+    complete world planted outside the configured root.
+    """
+    store, _, _ = derived_world
+    outside = tmp_path / "outside"
+    _make_world_in(outside, "victim", "vs")
+
+    escape = os.path.relpath(outside / "worlds" / "victim",
+                             store.root / "worlds")
+    if form == "percent_encoded":
+        escape = escape.replace("\\", "%5C")
+    elif form == "absolute":
+        escape = str(outside / "worlds" / "victim")
+
+    response = _client(store).get(
+        f"/worlds/{escape}/geometry/manifest", params={"session_id": "vs"}
+    )
+
+    assert response.status_code == 404, response.text[:200]
+
+
+def test_a_session_directory_that_is_a_junction_is_still_served(
+    derived_world, tmp_path
+):
+    """Containment must not refuse a legitimate reparse point.
+
+    `resolve()` resolves the LEAF too, so a session directory that is a
+    junction resolved to its target and compared unequal against the
+    derived root -- refusing real geometry. Resolving the PARENT keeps the
+    guard exactly as tight (an escaping value still moves the parent)
+    without following the last component.
+    """
+    import subprocess
+
+    store, world_id, session_id = derived_world
+    real = tmp_path / "elsewhere" / "linked_session"
+    _plant_derived_tree(real)
+    link = store.derived_dir(world_id) / "junctioned"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(real)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:  # pragma: no cover - needs the privilege
+        pytest.skip(f"could not create a junction: {result.stderr.strip()}")
+
+    from tower.results.world_builder_geometry import _read
+
+    assert _read(store, world_id, "junctioned") is not None, (
+        "a junctioned session directory was refused as if it had escaped"
+    )
+
+
 def test_one_worlds_geometry_cannot_be_served_under_another_worlds_identity(
     derived_world,
 ):

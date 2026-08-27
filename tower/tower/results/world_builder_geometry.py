@@ -146,6 +146,33 @@ def _read(store, world_id: str, session_id: str):
     Absent stays distinguishable from behind: a tree with no poses.json is
     still `None`, and the routes still answer 404 for it.
     """
+    # BOTH identifiers are unauthenticated and BOTH escape. The first
+    # version of this guard covered only `session_id` and was incomplete:
+    # containment for the session is anchored on `derived_dir(world_id)`,
+    # so an escaped `world_id` moves the anchor and the check below still
+    # passes relative to the escaped base. Measured, all answering 200 and
+    # serving a complete world from outside the configured root:
+    #
+    #     ?world_id=..\..\elsewhere\worlds\victim
+    #     ?world_id=..%5C..%5Celsewhere%5Cworlds%5Cvictim
+    #     ?world_id=C:\elsewhere\worlds\victim
+    #
+    # `world_id` is a PATH parameter, so Starlette's `[^/]+` excludes a
+    # forward slash -- and on Windows, the only platform this Tower ships
+    # on, a BACKSLASH is equally a separator and is not excluded. `%5C` is
+    # decoded into the path before routing, so it matches too. (`%2F` does
+    # not match the route at all and is not a vector.)
+    #
+    # A whitelist here rather than the containment check used below,
+    # because the world root is the only fixed point available: there is
+    # no per-world base to anchor on that the attacker does not also
+    # control. `list_world_ids()` returns exactly the directories holding
+    # a `world.json`, which is what `read_world` was about to require
+    # anyway, so this refuses nothing that would have been served --
+    # verified over a full run of the suite by wrapping this function: 65
+    # calls, 55 served, 0 refusals that had previously succeeded.
+    if world_id not in store.list_world_ids():
+        return None
     try:
         world: World = store.read_world(world_id)
     except WorldStoreError:
@@ -158,11 +185,9 @@ def _read(store, world_id: str, session_id: str):
     # and `?session_id=C:/elsewhere` both answered 200 and served poses and
     # points read from OUTSIDE the world root, under this world's id.
     #
-    # The whitelist rather than a `..` scan or a `resolve()` containment
-    # check, for two reasons. An absolute path does not traverse out of the
-    # base, it REPLACES it, so a `..` scan misses it entirely. And
-    # containment alone would still admit a SIBLING world's session, which
-    # stays inside the root and would be served under the wrong `world_id`.
+    # NOT a `..` scan: an absolute path does not traverse out of the base,
+    # it REPLACES it (`Path("/a/b") / "C:/elsewhere"` is `C:/elsewhere`),
+    # so a scan for `..` misses the more dangerous half entirely.
     #
     # A DIRECT-CHILD check rather than a whitelist against
     # `list_session_ids`, and the difference was measured rather than
@@ -182,7 +207,14 @@ def _read(store, world_id: str, session_id: str):
     # and cross-world reads together.
     derived_root = store.derived_dir(world_id)
     try:
-        if (derived_root / session_id).resolve().parent != derived_root.resolve():
+        # `.parent.resolve()`, NOT `.resolve().parent`. Resolving the whole
+        # path follows the LEAF, so a session directory that is a junction
+        # or symlink resolved to its target and compared unequal against
+        # the derived root -- refusing real geometry. Reproduced with
+        # `mklink /J`. Resolving the parent is exactly as tight, because a
+        # value that escapes moves the parent too: `..\..\x` has parent
+        # `<derived>\..\..`, and an absolute value has its own root.
+        if (derived_root / session_id).parent.resolve() != derived_root.resolve():
             return None
     except (OSError, ValueError):
         # A path the OS will not even parse -- a NUL byte, an over-long
