@@ -205,6 +205,14 @@ async def lifespan(app: FastAPI):
     supervisor = getattr(app.state, "capture_workers", None)
     if supervisor is not None:
         await asyncio.to_thread(supervisor.shutdown)
+    # Before the container, and awaited. An experiment may be mid-load in
+    # a background task; `ModuleContainer.shutdown()` would release the
+    # Lab synchronously and leave that task to be cancelled by a loop
+    # that is about to close. This is the one place with both a running
+    # loop and the authority to wait for it.
+    lab = getattr(app.state, "cv_lab", None)
+    if lab is not None:
+        await lab.shutdown()
     await app.state.module_container.shutdown()
 
 

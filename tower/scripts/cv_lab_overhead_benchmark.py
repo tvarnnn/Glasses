@@ -92,17 +92,42 @@ def _timed(call, repeat: int) -> dict:
 
 
 def measure_frame_overhead(repeat: int) -> dict:
-    """One frame through the Lab, against the same frame through the bare
-    experiment. The difference is what productization costs per frame."""
+    """What the Lab's per-frame bookkeeping costs, measured DIRECTLY.
+
+    Not by subtracting two end-to-end timings. That was the first version
+    of this function and it was worthless: the effect is tens of
+    microseconds and the two measurements it differenced were 2 ms and
+    12 ms with several percent of run-to-run spread, so it reported a
+    NEGATIVE overhead for `baseline` on a loaded machine. A difference
+    smaller than the noise in either term is not a measurement.
+
+    So the bookkeeping is timed on its own, against a pre-computed
+    result: `record_result` folds one frame into the run's accumulators,
+    and `_provenance` builds the attribution block that travels on
+    `frame_result`. Those two ARE the per-frame cost of productization --
+    everything else on the frame path was there before.
+
+    The end-to-end comparison is kept beside it, honestly labelled, so
+    the direct number can be sanity-checked against a total rather than
+    trusted alone.
+    """
     payload = _frame()
     rows = {}
     for experiment_id in (CHEAPEST, BUSIEST):
+        lab = asyncio.run(_armed(experiment_id))
+        result = lab.process(payload)
+        lab.frame_provenance()
+        run = lab._run
+
+        bookkeeping = _timed(lambda: run.record_result(result, 1.0), repeat * 20)
+        attribution = _timed(
+            lambda: lab._provenance(run, result, 1, 1.0), repeat * 20
+        )
+
         bare = EXPERIMENTS[experiment_id]()
         bare.load(ExperimentSettings())
         direct = _timed(lambda: bare.run(payload), repeat)
         bare.release()
-
-        lab = asyncio.run(_armed(experiment_id))
 
         def through_lab():
             lab.process(payload)
@@ -111,12 +136,19 @@ def measure_frame_overhead(repeat: int) -> dict:
         wrapped = _timed(through_lab, repeat)
         lab.release()
 
-        overhead = wrapped["mean_ms"] - direct["mean_ms"]
+        added = bookkeeping["mean_ms"] + attribution["mean_ms"]
         rows[experiment_id] = {
+            "record_result_ms": bookkeeping,
+            "provenance_ms": attribution,
+            "added_per_frame_ms": round(added, 5),
+            "added_percent_of_experiment": round(
+                100 * added / direct["mean_ms"], 3
+            ),
+            # Kept for scale, NOT for the overhead figure. On a machine
+            # running other work these two differ by more than the
+            # quantity above.
             "experiment_ms": direct,
             "through_lab_ms": wrapped,
-            "overhead_ms": round(overhead, 5),
-            "overhead_percent": round(100 * overhead / direct["mean_ms"], 2),
         }
     return rows
 
@@ -175,6 +207,20 @@ def measure_channel_cost(repeat: int) -> dict:
         hub = client.app.state.result_hub
         hub._poll_seconds = 3600.0
         hub._heartbeat_seconds = 0.0
+        # Count the snapshot BUILDS, not just the wall clock. The hub's
+        # whole claim is that N subscribers watching one thing cost one
+        # computation, and a timing that grows with N cannot tell "we
+        # built it N times" from "we sent it N times". Only one of those
+        # is a defect.
+        builds = {"count": 0}
+        real_snapshot_for = hub._snapshot_for
+
+        def counting_snapshot_for(*args, **kwargs):
+            builds["count"] += 1
+            return real_snapshot_for(*args, **kwargs)
+
+        hub._snapshot_for = counting_snapshot_for
+
         rows = {}
         sockets = []
         try:
@@ -193,9 +239,14 @@ def measure_channel_cost(repeat: int) -> dict:
                 async def poll():
                     await hub.poll_once()
 
-                rows[f"subscribers_{count}"] = _timed(
-                    lambda: client.portal.call(poll), repeat
+                builds["count"] = 0
+                measured = _timed(lambda: client.portal.call(poll), repeat)
+                # `_timed` runs one warm-up call plus `repeat` timed ones.
+                measured["snapshot_builds_per_poll"] = round(
+                    builds["count"] / (repeat + 1), 3
                 )
+                measured["subscribers"] = count
+                rows[f"subscribers_{count}"] = measured
         finally:
             for ws in sockets:
                 try:
@@ -219,30 +270,56 @@ def measure_memory(frames: int) -> dict:
     process = psutil.Process()
     payload = _frame()
     lab = asyncio.run(_armed(BUSIEST))
-    for _ in range(200):
-        lab.process(payload)
-        lab.frame_provenance()
-    gc.collect()
-    before = process.memory_info().rss
 
-    start = time.perf_counter()
-    for _ in range(frames):
+    # A long warm-up before the first reading. Without it the measurement
+    # is dominated by one-off allocation -- OpenCV's own buffers, the
+    # logging machinery, the arena the interpreter grows once -- and
+    # publishes it as per-frame growth.
+    for _ in range(500):
         lab.process(payload)
         lab.frame_provenance()
-    elapsed = time.perf_counter() - start
     gc.collect()
-    after = process.memory_info().rss
+
+    # Several checkpoints, not two. Two readings cannot tell steady
+    # allocator noise from linear growth, and linear growth is the only
+    # thing worth reporting: a run is open for as long as the Tower is
+    # up.
+    checkpoints = []
+    baseline_rss = process.memory_info().rss
+    step = max(1, frames // 5)
+    processed = 0
+    start = time.perf_counter()
+    for _ in range(5):
+        for _ in range(step):
+            lab.process(payload)
+            lab.frame_provenance()
+        processed += step
+        gc.collect()
+        checkpoints.append(
+            {
+                "frames": processed,
+                "rss_bytes": process.memory_info().rss,
+                "growth_bytes": process.memory_info().rss - baseline_rss,
+            }
+        )
+    elapsed = time.perf_counter() - start
 
     document = lab.status()
     lab.release()
+    growth = checkpoints[-1]["growth_bytes"]
+    # Growth between the FIRST and LAST checkpoint, both taken after the
+    # warm-up. If the Lab leaked per frame this would track the frame
+    # count; if it is allocator noise it stays flat and may go negative.
+    steady = checkpoints[-1]["rss_bytes"] - checkpoints[0]["rss_bytes"]
+    steady_frames = checkpoints[-1]["frames"] - checkpoints[0]["frames"]
     return {
-        "frames": frames,
-        "rss_before_bytes": before,
-        "rss_after_bytes": after,
-        "rss_growth_bytes": after - before,
-        "rss_growth_bytes_per_frame": round((after - before) / frames, 4),
+        "frames": processed,
+        "checkpoints": checkpoints,
+        "rss_growth_bytes": growth,
+        "steady_growth_bytes": steady,
+        "steady_growth_bytes_per_frame": round(steady / max(steady_frames, 1), 4),
         "wall_s": round(elapsed, 3),
-        "frames_per_second": round(frames / elapsed, 1),
+        "frames_per_second": round(processed / elapsed, 1),
         "document_bytes": len(json.dumps(document)),
         "tracked_metrics": len(document["run"]["metrics"]),
     }
@@ -257,10 +334,20 @@ def _render(report: dict) -> str:
     ]
     for name, row in report["frame"].items():
         lines.append(
+            f"  {name:16s} record {row['record_result_ms']['mean_ms']:7.5f} ms"
+            f"  + attribute {row['provenance_ms']['mean_ms']:7.5f} ms"
+            f"  = {row['added_per_frame_ms']:7.5f} ms"
+            f"  ({row['added_percent_of_experiment']:.3f}% of the experiment"
+            f" at {row['experiment_ms']['mean_ms']:.2f} ms)"
+        )
+    lines.append(
+        "  (end-to-end, for scale only -- on a loaded machine these differ"
+        " by more than the figure above)"
+    )
+    for name, row in report["frame"].items():
+        lines.append(
             f"  {name:16s} experiment {row['experiment_ms']['mean_ms']:8.4f} ms"
             f"   through Lab {row['through_lab_ms']['mean_ms']:8.4f} ms"
-            f"   overhead {row['overhead_ms']:+.4f} ms"
-            f" ({row['overhead_percent']:+.1f}%)"
         )
     lines += ["", "-- status document ------------------------------------------"]
     for name, row in report["status"].items():
@@ -272,15 +359,27 @@ def _render(report: dict) -> str:
         )
     lines += ["", "-- one poll pass, by subscriber count ------------------------"]
     for name, row in report["channel"].items():
-        lines.append(f"  {name:16s} {row['mean_ms']:8.4f} ms  p95 {row['p95_ms']:8.4f} ms")
+        lines.append(
+            f"  {name:16s} {row['mean_ms']:8.4f} ms  p95 {row['p95_ms']:8.4f} ms"
+            f"   {row['snapshot_builds_per_poll']:.2f} snapshot builds per poll"
+        )
     memory = report["memory"]
     lines += [
         "",
         "-- memory over a long run -----------------------------------",
         f"  {memory['frames']} frames in {memory['wall_s']} s"
-        f" ({memory['frames_per_second']} fps)",
-        f"  RSS growth {memory['rss_growth_bytes']:+d} B"
-        f" ({memory['rss_growth_bytes_per_frame']:+.4f} B/frame)",
+        f" ({memory['frames_per_second']} fps), after a 500-frame warm-up",
+    ]
+    for checkpoint in memory["checkpoints"]:
+        lines.append(
+            f"    {checkpoint['frames']:6d} frames  RSS"
+            f" {checkpoint['rss_bytes'] / 1048576:8.2f} MB"
+            f"  ({checkpoint['growth_bytes']:+d} B since warm-up)"
+        )
+    lines += [
+        f"  first -> last checkpoint: {memory['steady_growth_bytes']:+d} B over"
+        f" {memory['frames'] - memory['checkpoints'][0]['frames']} frames"
+        f" ({memory['steady_growth_bytes_per_frame']:+.4f} B/frame)",
         f"  document still {memory['document_bytes']} B with"
         f" {memory['tracked_metrics']} metrics",
     ]

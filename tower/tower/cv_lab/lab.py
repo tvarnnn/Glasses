@@ -261,6 +261,41 @@ class CVLab:
             self._set_state_locked(STATE_RUNNING)
             self._record_runtime_locked(experiment)
 
+    async def shutdown(self, reason: str = "the Tower is shutting down") -> None:
+        """Release, and WAIT for an in-flight arm to unwind.
+
+        `release()` cannot wait -- it is reachable from `mark_failed()`,
+        which the frame path can reach, with no loop to await against. So
+        it cancels the arm task and moves on, which is right for a
+        failure and wrong for a clean shutdown: cancellation is delivered
+        at the next await point, and if the loop closes first the task
+        never reaches the `except CancelledError` clause that releases
+        what it built. On CUDA that is resident GPU memory with no owner,
+        and the process is exiting anyway -- but a shutdown that leaves
+        "Task was destroyed but it is pending" in the log is a shutdown
+        nobody can read.
+
+        Called from `lifespan`, which is the one place that has both a
+        running loop and the authority to wait.
+        """
+        task = self._arm_task
+        self.release(reason)
+        if task is None:
+            return
+        try:
+            await task
+        except asyncio.CancelledError:
+            # The task we just cancelled, not this one. Swallowing our own
+            # cancellation would strand the shutdown that requested it.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling() > 0:
+                raise
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[Tower][CVLab] the arm task ended badly during shutdown",
+                exc_info=True,
+            )
+
     def release(self, reason: str = "the Lab was released") -> None:
         """Free whatever the current experiment holds, and stop serving.
 
