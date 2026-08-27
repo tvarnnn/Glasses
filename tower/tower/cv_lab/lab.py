@@ -66,6 +66,7 @@ import time
 import uuid
 
 from tower.cv_lab import catalog
+from tower.logging_config import client_safe_reason
 from tower.cv_lab.contracts import (
     CONTROL_CONTRACT,
     ERR_EXPERIMENT_UNAVAILABLE,
@@ -633,7 +634,7 @@ class CVLab:
             # for the same reason there is no reply to a reply.
             self._fail_arm(
                 run_id,
-                f"{experiment_id} could not be armed: {type(exc).__name__}: {exc}",
+                f"{experiment_id} could not be armed: {client_safe_reason(exc)}",
             )
             logger.exception(
                 "[Tower][CVLab] arming %s failed; the Lab stays available "

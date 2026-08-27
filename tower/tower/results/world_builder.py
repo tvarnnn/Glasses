@@ -37,6 +37,7 @@ import logging
 import math
 from pathlib import Path
 
+from tower.logging_config import client_safe_reason
 from tower.results.contracts import TIME_BASIS
 from tower.storage import read_raw_jsonl
 from tower.results.envelope import Snapshot, compute_revision
@@ -357,7 +358,9 @@ class WorldBuilderStatusProducer:
             # documented behaviour and it must survive to the wire rather
             # than becoming a dropped subscription.
             logger.warning("result channel: world %s unreadable: %s", world_id, exc)
-            return self._unavailable(f"world could not be read: {exc}")
+            return self._unavailable(
+                f"world could not be read: {client_safe_reason(exc)}"
+            )
 
     def _unavailable(self, reason: str, *, supported: bool = True) -> Snapshot:
         """Nothing to report, and whether that is a Tower limitation.

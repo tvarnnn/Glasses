@@ -367,3 +367,125 @@ def test_the_contract_quotes_the_values_the_wire_actually_carries():
     assert (
         still_present == []
     ), f"the contract still quotes a value nothing serves: {still_present}"
+
+
+def test_the_contract_does_not_document_fields_that_no_longer_ship():
+    """The mirror of the test above: a key NAMED but never SENT.
+
+    Both directions break a strict decoder, and this one is the quieter
+    of the two. `test_every_payload_key_is_documented` walks the wire and
+    checks the document; nothing walked the DOCUMENT and checked the
+    wire, so five per-record fields that had been hoisted onto the
+    envelope went on being listed as per-record for weeks.
+
+    A Swift `Decodable` with a non-optional property for any of them
+    throws `keyNotFound` on every document -- the whole library fails to
+    decode, not one field.
+
+    Only the hoisted-away spellings are pinned. The note explaining the
+    hoist names them deliberately, so this checks the FIELD TABLES rather
+    than the whole file: a key is "documented as shipping" when it appears
+    in a backticked list of record fields, not when prose mentions its
+    history.
+    """
+    from tower.results.document_memory import RECORD_NOTES
+
+    document = DOCUMENT.read_text(encoding="utf-8")
+
+    # These four were folded into `record_notes` under shorter names. The
+    # long spellings are gone from the wire.
+    retired = (
+        "summary_withheld_reason",
+        "observed_seconds_note",
+        "imagery_retention_note",
+        "joinable_note",
+    )
+    # The paragraph that explains the hoist is allowed to name them; the
+    # field tables are not. Anything inside a blockquote is explanation.
+    field_lines = [
+        line
+        for line in document.splitlines()
+        if not line.lstrip().startswith(">")
+    ]
+    body = "\n".join(field_lines)
+
+    still_listed = [name for name in retired if f"`{name}`" in body]
+    assert still_listed == [], (
+        "the contract lists per-record fields that were hoisted onto the "
+        f"envelope and no longer ship: {still_listed}. They live in "
+        f"`record_notes` now, whose keys are {sorted(RECORD_NOTES)}."
+    )
+
+
+def test_the_contract_quotes_the_publisher_bounds_the_code_enforces():
+    """A client budgets timeouts against these numbers.
+
+    They read 2 s / 2 s / 5 s in the contract until 2026-08-27, with a
+    justification for a value that had already changed. A client
+    budgeting against 5 s gets `consumer_too_slow` and a closed
+    subscription at 1 s, re-subscribes, and loops.
+    """
+    from tower.results.publisher import (
+        LOCK_TIMEOUT_S,
+        SEND_TIMEOUT_S,
+        TOTAL_SEND_TIMEOUT_S,
+    )
+
+    document = DOCUMENT.read_text(encoding="utf-8")
+    lines = document.splitlines()
+
+    for name, value in (
+        ("SEND_TIMEOUT_S", SEND_TIMEOUT_S),
+        ("LOCK_TIMEOUT_S", LOCK_TIMEOUT_S),
+        ("TOTAL_SEND_TIMEOUT_S", TOTAL_SEND_TIMEOUT_S),
+    ):
+        # ROW-SCOPED on purpose. An earlier draft asked whether the value
+        # appeared anywhere in the file, and passed against a mutation of
+        # the very row it exists to protect -- because the same number
+        # appeared on the row below. The constant's name and its value
+        # have to be on ONE line.
+        rows = [line for line in lines if f"`{name}`" in line]
+        assert rows, (
+            f"the contract does not name {name}, so a reader cannot check "
+            "the number against the constant"
+        )
+        rendered = f"**{value:g} s**"
+        assert any(rendered in row for row in rows), (
+            f"{name} is {value:g} s; the contract's row for it says "
+            f"{rows[0].strip()!r}"
+        )
+
+
+def test_scene_count_limitations_are_documented_exactly(monkeypatch, tmp_path):
+    """Every slug the payload ships, and no invented ones.
+
+    The row for this field listed three of five slugs, omitted
+    `noise-classes` entirely, and called `departure-lag` conditional when
+    there is no branch. A client rendering a fixed set of disclosures
+    silently drops the two it was never told about -- and these are the
+    fields that stop an undercount looking like a quiet room.
+    """
+    from tower.results.scene_understanding import COUNT_LIMITATIONS
+
+    document = DOCUMENT.read_text(encoding="utf-8")
+    slugs = [entry["limitation"] for entry in COUNT_LIMITATIONS]
+
+    # ROW-SCOPED, for the same reason as the bounds test above: every one
+    # of these slugs also appears in the catch-all table at the end of the
+    # file, which lists Document Memory's too. A global search is
+    # satisfied by that table no matter what the Scene row says, and an
+    # earlier draft passed against a mutation that dropped a slug from the
+    # row a client actually reads.
+    rows = [
+        line
+        for line in document.splitlines()
+        if "`count_limitations`" in line and "|" in line
+    ]
+    assert rows, "the contract has no field row for count_limitations"
+
+    row = rows[0]
+    missing = [slug for slug in slugs if f"`{slug}`" not in row]
+    assert missing == [], (
+        f"the payload ships count_limitations {missing} that the "
+        f"contract's own row for the field does not name: {row.strip()!r}"
+    )

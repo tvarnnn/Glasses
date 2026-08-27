@@ -674,7 +674,8 @@ in `tower/docs/agent-handoffs/2026-08-27-TOWER-UNIFIED-INTEGRATION.md`.
 1. `/cartridges` now offers **four** cartridges; `not_offered` is empty.
 2. `document_memory.library` appears under a new **`http_contracts`**
    block. Two other HTTP contracts are still undeclared.
-3. `declare()` is keyword-only behind `declaration_inputs`; **HTTP and
+3. Everything past `world_root` in `declare()` is keyword-only, behind
+   `declaration_inputs`; **HTTP and
    socket declarations are byte-identical** and a test holds it.
 4. Object Memory's session control at `/cartridges/{cartridge}/session` is
    **generic** — the next cartridge that needs a button gets one free.

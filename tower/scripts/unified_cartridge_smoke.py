@@ -37,6 +37,7 @@ import base64
 import io
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -126,7 +127,7 @@ def _post(base: str, path: str, timeout: float = 60.0):
 # -- the server ---------------------------------------------------------
 
 
-def start_tower(port: int, roots: dict) -> subprocess.Popen:
+def start_tower(port: int, roots: dict, log_path: Path) -> subprocess.Popen:
     """A real uvicorn, with every cartridge switched on.
 
     Started from TOWER_ROOT with PYTHONPATH set to it, because the venv
@@ -156,9 +157,19 @@ def start_tower(port: int, roots: dict) -> subprocess.Popen:
     # impossible to tell a session it began from one the stream did.
     env["TOWER_SCENE_AUTOSTART"] = "false"
     env["TOWER_DOCUMENT_AUTOSTART"] = "false"
-    # No builder attached: this smoke asserts the DECLARATION and the
-    # lifecycle, and a real world build would add minutes and a GPU.
-    env["TOWER_WORLD_AUTOBUILD"] = "false"
+    # ON, which is the SHIPPED DEFAULT, so a real world-build worker
+    # attaches when a capture opens and the shutdown check at the end has
+    # something to be about.
+    #
+    # This was `false` in the first version of this script, and a reviewer
+    # showed what that cost: with no autobuild and the object-memory
+    # session stopped before the only capture opened, ZERO capture workers
+    # ever existed -- so "no child process outlives the Tower", the one
+    # check that would catch a leaked producer, passed because there was
+    # nothing to leak. A green check that cannot fail is worse than no
+    # check, and this script is the gate the Mac handoff tells people to
+    # trust.
+    env["TOWER_WORLD_AUTOBUILD"] = "true"
 
     return subprocess.Popen(
         [
@@ -175,19 +186,35 @@ def start_tower(port: int, roots: dict) -> subprocess.Popen:
         ],
         cwd=str(TOWER_ROOT),
         env=env,
-        stdout=subprocess.PIPE,
+        # To a FILE, never a pipe. The world-build worker is a CHILD of
+        # this Tower and inherits its stdout, and it logs per keyframe.
+        # With `subprocess.PIPE` and nobody reading, the OS buffer fills
+        # at around 64 KB and the WORKER blocks on write -- so the Tower
+        # blocks detaching it, and the whole thing wedges. That is not a
+        # Tower defect; it is this script holding the other end of a pipe
+        # it never reads. It only became reachable when autobuild was
+        # switched on, which is the point of switching it on.
+        stdout=log_path.open("w", encoding="utf-8", errors="replace"),
         stderr=subprocess.STDOUT,
-        text=True,
+        # Its own process group, so CTRL_BREAK_EVENT can be delivered to
+        # it alone at shutdown. Without this the only way to stop it on
+        # Windows is TerminateProcess, which runs no lifespan and orphans
+        # every capture worker. See `check_worker_lifecycle_and_shutdown`.
+        creationflags=(
+            subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+        ),
     )
 
 
-def wait_for_health(base: str, process: subprocess.Popen, timeout_s: float = 120.0):
+def wait_for_health(
+    base: str, process: subprocess.Popen, log_path: Path, timeout_s: float = 120.0
+):
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            output = process.stdout.read() if process.stdout else ""
             raise SystemExit(
-                f"Tower exited before serving (code {process.returncode}):\n{output}"
+                f"Tower exited before serving (code {process.returncode}); "
+                f"its log is at {log_path}"
             )
         try:
             status, body = _get(base, "/health", timeout=2.0)
@@ -540,39 +567,138 @@ async def check_socket(base_ws: str, http_declaration: dict, checks: Checks) -> 
 # -- teardown -----------------------------------------------------------
 
 
-def check_shutdown(process: subprocess.Popen, checks: Checks) -> None:
-    print("\n[8] shutdown leaves nothing behind")
+async def check_worker_lifecycle_and_shutdown(process, port: int, checks: Checks):
+    """Open a capture, prove a worker attached, then shut down and look.
+
+    THE POINT OF THIS FUNCTION IS THAT IT CAN FAIL.
+
+    The first version of this script asserted "no child process outlives
+    the Tower" after a run in which no capture worker had ever existed --
+    autobuild was off and the object-memory session was stopped before the
+    only capture opened. The assertion passed because there was nothing to
+    leak. A reviewer caught it, and it is the exact failure mode this
+    script exists to catch in others.
+
+    So: hold a stream open, wait for a real `world_build_session.py` child
+    to appear, and only then bring the Tower down -- with the connection
+    still open, which is the state a wearer walking out of range leaves it
+    in.
+
+    On Windows the shutdown signal matters as much as the check.
+    `Popen.terminate()` is `TerminateProcess`, which delivers nothing a
+    process can handle: uvicorn's lifespan never runs, so
+    `CaptureWorkerSupervisor.shutdown()` never runs, and every child is
+    orphaned. That is not a defect in the Tower -- the teardown is correct
+    and was measured killing a real child -- it is a defect in how the
+    smoke asked it to stop. CTRL_BREAK_EVENT is the signal uvicorn
+    installs a handler for, and it needs the process to have been started
+    in its own process group.
+    """
+    import websockets
+
     try:
         import psutil
     except ImportError:
         psutil = None
 
-    children = []
-    if psutil is not None:
-        try:
-            children = psutil.Process(process.pid).children(recursive=True)
-        except Exception:
-            children = []
+    print("\n[8] a capture worker attaches, and does not outlive the Tower")
 
-    process.terminate()
+    # Wait for the Tower to be answering again before opening a socket.
+    # The previous section's `stream_stop` detaches the world-build worker
+    # that section attached, and `detach` gives a follower a 10 s grace
+    # before terminating it -- which is exactly the "shutdown can cost ~24 s"
+    # behaviour the integration report records. A default 10 s handshake
+    # lands inside that window and times out on a Tower that is perfectly
+    # healthy, so this waits rather than accusing it.
+    base = f"http://127.0.0.1:{port}"
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        try:
+            if _get(base, "/health", timeout=2.0)[0] == 200:
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/ws",
+        max_size=8 * 1024 * 1024,
+        open_timeout=60,
+    ) as ws:
+        await ws.send(json.dumps({"type": "stream_start"}))
+
+        workers = []
+        if psutil is not None:
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                try:
+                    workers = [
+                        child
+                        for child in psutil.Process(process.pid).children(recursive=True)
+                        if "world_build_session" in " ".join(child.cmdline())
+                    ]
+                except Exception:
+                    workers = []
+                if workers:
+                    break
+                await asyncio.sleep(0.25)
+            checks.that(
+                bool(workers),
+                "a world-build worker attached to the open capture "
+                f"(found {[w.pid for w in workers]})",
+            )
+        else:
+            print("  skip  psutil is not installed; worker attachment not checked")
+
+        # Down it goes, with the capture still open and the socket still
+        # connected -- a wearer walking out of range, not a tidy stop.
+        exited = _signal_shutdown(process)
+        # Says only what it proves. Exiting is not evidence the lifespan
+        # ran -- `TerminateProcess` also makes a process exit, and runs
+        # nothing. The check below is the one that can tell the
+        # difference, because a lifespan that did not run leaves the
+        # workers behind.
+        checks.that(exited, "the Tower exits when asked, rather than needing a kill")
+
+        if psutil is not None and workers:
+            await asyncio.sleep(1.0)
+            alive = [w for w in workers if w.is_running()]
+            checks.that(
+                not alive,
+                "no capture worker outlives the Tower "
+                f"(still running: {[w.pid for w in alive]})",
+            )
+
+
+def _signal_shutdown(process) -> bool:
+    """Ask the Tower to stop in a way its lifespan will actually see."""
+    if sys.platform == "win32":
+        try:
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        except Exception:
+            process.terminate()
+    else:
+        process.terminate()
     try:
-        process.wait(timeout=60)
-        exited = True
+        process.wait(timeout=90)
+        return True
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait(timeout=30)
-        exited = False
-    checks.that(exited, "the Tower exits on SIGTERM rather than needing a kill")
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        return False
 
-    if psutil is not None:
-        time.sleep(1.0)
-        alive = [c for c in children if c.is_running()]
-        checks.that(
-            not alive,
-            f"no child process outlives the Tower (found {[c.pid for c in alive]})",
-        )
-    else:
-        print("  skip  psutil is not installed; child-process check not run")
+
+def reap(process) -> None:
+    """Last resort, in the `finally`. Never asserts."""
+    if process.poll() is None:
+        try:
+            process.kill()
+            process.wait(timeout=30)
+        except Exception:
+            pass
 
 
 def main(argv=None) -> int:
@@ -598,9 +724,10 @@ def main(argv=None) -> int:
     port = _free_port()
     base = f"http://127.0.0.1:{port}"
     checks = Checks()
-    process = start_tower(port, roots)
+    log_path = workdir / "tower.log"
+    process = start_tower(port, roots, log_path)
     try:
-        health = wait_for_health(base, process)
+        health = wait_for_health(base, process, log_path)
         print(f"Tower up on {base} (health: {json.dumps(health)[:120]}...)")
 
         declaration = check_declaration(base, checks)
@@ -612,14 +739,18 @@ def main(argv=None) -> int:
         else:
             print("\n[5,6] Scene and Document sessions SKIPPED (--with-models to run)")
         asyncio.run(check_socket(f"ws://127.0.0.1:{port}/ws", declaration, checks))
+        asyncio.run(check_worker_lifecycle_and_shutdown(process, port, checks))
     finally:
-        check_shutdown(process, checks)
-        if not args.keep_roots:
-            import shutil
+        reap(process)
 
-            shutil.rmtree(workdir, ignore_errors=True)
+    code = checks.report()
+    if code != 0 or args.keep_roots:
+        print(f"\nthe Tower's log: {log_path}")
+    elif not args.keep_roots:
+        import shutil
 
-    return checks.report()
+        shutil.rmtree(workdir, ignore_errors=True)
+    return code
 
 
 if __name__ == "__main__":

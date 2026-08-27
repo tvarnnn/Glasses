@@ -351,8 +351,16 @@ phone. This is additive; the six existing message types never trigger it.
 | Subscriptions per connection | **8** | a remote party must not grow a server-side dict at will |
 | Pending snapshots per subscription | **1** | there is no queue. A new snapshot replaces the pending one |
 | Snapshot size | fixed arity, measured **< 8 KB** | a test asserts the payload contains no unbounded list |
-| Send timeout | **2 s** | a consumer that does not accept a result within this has its subscription closed. It is also the longest a `frame_result` can queue behind a result send, because both take the connection's send lock — which is why it is 2 and not 5 |
-| Lock wait | **2 s** | bounded separately from the send, so a slow frame send cannot consume a result's budget and cause a spurious drop |
+| Send timeout | **1 s** (`SEND_TIMEOUT_S`) | a consumer that does not accept a result within this has its subscription closed. It is also the longest a `frame_result` can queue behind a result send, because both take the connection's send lock |
+| Lock wait | **1 s** (`LOCK_TIMEOUT_S`) | bounded separately from the send, so a slow frame send cannot consume a result's budget and cause a spurious drop |
+| Lock wait **+** send, together | **2 s** (`TOTAL_SEND_TIMEOUT_S`) | the ceiling a client should budget against |
+
+> These three read **2 s / 2 s / 5 s** in this table until 2026-08-27,
+> along with a justification ("which is why it is 2 and not 5") for a
+> value that had already changed. A client budgeting against 5 s gets
+> `consumer_too_slow` and a closed subscription at 1 s, re-subscribes,
+> and loops. Read the constants in `tower/results/publisher.py`.
+
 | Poll interval | **0.5 s** | how often the Tower re-reads disk |
 | Heartbeat | **2 s** | how often an unchanged snapshot is re-sent |
 
@@ -1137,7 +1145,15 @@ any large display. The list is fixed at build time and is what keeps
 | `counts` | `{label: int}` or null | one entry per `reported_classes`, present at `0` rather than omitted |
 | `count_basis` | `"confirmed-tracks"` | counts come from the tracker, never from raw detections |
 | `count_is_lower_bound` | bool, always `true` | see §14.4 |
-| `count_limitations` | list of `{limitation, detail}` | `size-floor`, `recall`, `field-of-view` |
+| `count_limitations` | list of `{limitation, detail}` | `size-floor`, `recall`, `noise-classes`, `departure-lag`, `field-of-view` |
+
+> **All five ship, unconditionally.** This row listed three until
+> 2026-08-27, omitted the noise-class disclosure entirely, and described
+> the departure-lag one as conditional -- there is no branch in
+> `tower/results/scene_understanding.py`, the tuple is a constant. A
+> client rendering a fixed set of disclosures silently dropped the two
+> it was never told about, and these are the fields that stop an
+> undercount looking like a quiet room.
 
 **`people`** — a count and an aggregate, never a list
 
@@ -1399,7 +1415,7 @@ carried beside it.
 | `retrieval_kinds` | list | `recent`, `text`, `observed_within` |
 | `semantic_retrieval` | bool, `false` | with `semantic_retrieval_unavailable_reason` |
 | `recording_limitations` | list of `{limitation, detail}` | §15.0 |
-| `imagery_treatment` | `"raw-ephemeral-not-served"` | no image is served; nothing here may be displayed as a picture |
+| `imagery_treatment` | `"none-retained"` | no image is served; nothing here may be displayed as a picture. `"raw-ephemeral-not-served"` was the spelling here until 2026-08-27 and the code names it retired; the wire has never carried it |
 | `retention` | object | `requested_days`, `writer_window_days` (**always null**), `writer_window_unavailable_reason`, `policy` |
 | `answer`, `no_observation_note`, `documents_in_memory`, `document_count`, `documents` | | |
 
@@ -1424,18 +1440,36 @@ learn the window its writer used. A `retention_days` query parameter
 **Per document, in a list**
 
 `document_id`, `claim`, `identity`, `title`, `title_is_derived`,
-`summary_available`, `summary_withheld_reason`, `confidence`,
-`confidence_basis`, `observed_at`, `recorded_at`, `observed_seconds`,
-`observed_seconds_note`, `pages_observed`, `text_availability`,
+`summary_available`, `confidence`, `confidence_basis`, `observed_at`,
+`recorded_at`, `observed_seconds`, `pages_observed`, `text_availability`,
 `end_reason`, `timing`, `provenance`, `retains_raw_imagery`,
 `redaction`, `imagery_treatment`, `privacy_tags`, `schema_version`.
+
+> **The prose fields are NOT here. They are on the envelope, once.**
+> `record_notes` carries five entries — `summary_withheld`,
+> `observed_seconds`, `timing`, `imagery_retention`, `joinable` — and a
+> record no longer repeats any of them. That hoist is described a few
+> paragraphs down; this list, and three other places in this file,
+> continued to name the per-record spellings (`summary_withheld_reason`,
+> `observed_seconds_note`, `imagery_retention_note`, `joinable_note`)
+> until 2026-08-27. **None of those keys has ever shipped since the
+> hoist**, so a non-optional Swift decode of any of them throws
+> `keyNotFound` on every document.
+>
+> The hoist was measured, not tidying: 68% of each record was constant
+> prose, 2,351 bytes repeated per record, and a 200-document listing was
+> 488 KB with ~313 KB of it the same five sentences two hundred times.
+> After: 249 KB, 1,218 bytes per record, **nothing dropped**. Caveats were
+> hoisted, never deleted — deleting one to save bytes is the one saving
+> this contract may not make.
 
 Three of those deserve a sentence:
 
 - **`observed_seconds`** is how long the region was in view. It is **not**
   a claim that the wearer looked at it, noticed it, or read it — the
   camera cannot establish any of those. Render it as "In view 45 s".
-  `observed_seconds_note` carries that qualification as data.
+  `record_notes.observed_seconds` carries that qualification as data,
+  on the envelope rather than on every record.
 - **`title`** is lifted from the document's own first text region.
   `title_is_derived: true`, and it is CLIPPED to `title_max_chars` (60)
   with an ellipsis. iOS asks for a title in the list knowing it comes
@@ -1485,8 +1519,8 @@ and it is what keeps a 50-result search from becoming a bulk transfer.
 capture still exists), `page_source_seqs` (the sequence number of each
 frame actually read, at most two per document), `pages_without_source_seq`,
 `frames_considered`, `frames_ocred`, `world_id`, `world_session_id`,
-`imagery_retention: "capture-side"` with `imagery_retention_note`
-defining it, and `joinable: true` with `joinable_note`.
+`imagery_retention: "capture-side"` and `joinable: true`, both
+defined by `record_notes` on the envelope.
 
 **That last pair is said out loud rather than left to be noticed.** This
 block IS joinable: a capture id, frame sequence numbers and a timestamp
@@ -1681,8 +1715,8 @@ that never appear here, and is `["person"]`.
 | Key | Meaning |
 |---|---|
 | `kind` | always `"frame-reference"`. A pointer into a recording, not a place |
-| `imagery_retention` | always `"capture-side"`, defined by `imagery_retention_note` |
-| `joinable` | always `true`, with `joinable_note`. This block locates a reading in a recording; the link is durable across sessions, unlike anything Scene Understanding publishes |
+| `imagery_retention` | always `"capture-side"`, defined by `record_notes.imagery_retention` |
+| `joinable` | always `true`, defined by `record_notes.joinable`. This block locates a reading in a recording; the link is durable across sessions, unlike anything Scene Understanding publishes |
 
 **Inside `query`**, which echoes what was asked so a response is
 self-describing:

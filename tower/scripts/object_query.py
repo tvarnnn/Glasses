@@ -44,19 +44,46 @@ which is not Object Memory's to give away or to promise.
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tower.config import DEFAULT_OBSERVATION_ROOT  # noqa: E402
 from tower.object_memory.relevance import PERSISTED_CLASSES  # noqa: E402
 from tower.object_memory.store import (  # noqa: E402
     DEFAULT_RETENTION_DAYS,
     ObservationStore,
 )
 
-DEFAULT_ROOT = Path("data/object_memory")
+# THE SAME CONSTANT the producer and the read routes use, resolved from
+# `tower/config.py` rather than spelled again here.
+#
+# This used to be `Path("data/object_memory")` -- relative, resolved
+# against whatever directory the operator happened to be standing in, and
+# never consulting TOWER_OBSERVATION_ROOT at all. `config.py` exists to
+# stop exactly that, and says why at length: on 2026-08-26 the producer
+# defaulted to one directory and the web process to another, and a real
+# 2,203-frame walk was remembered into a store every HTTP request
+# answered 404 about. "Two defaults for one directory is not a
+# configuration choice; it is a bug with a settings file in front of it."
+#
+# `object_memory_session.py` was fixed then. This file was not, and it is
+# the worse place to miss, because THIS is where deletion lives. A wearer
+# asks for their object memory to be erased; an operator runs
+# `--purge-all` from the tower root; `ObservationStore.purge()` on a
+# directory nothing ever wrote to removes nothing and reports success,
+# because `unlink(missing_ok=True)` cannot tell "already gone" from "never
+# here". Exit code 0, `observations_removed: 0`, and the records still on
+# disk and still being served.
+#
+# An explicit `--root` still wins, and `TOWER_OBSERVATION_ROOT` still wins
+# over the default, so an operator who chose a directory is obeyed.
+DEFAULT_ROOT = Path(
+    os.environ.get("TOWER_OBSERVATION_ROOT", "").strip() or DEFAULT_OBSERVATION_ROOT
+)
 
 
 def main(argv=None) -> int:

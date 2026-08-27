@@ -427,8 +427,45 @@ class ObservationStore:
         return raw_records, corrupt
 
     def _parse_observations(self, raw_records: list[dict]) -> list[ObjectObservation]:
+        """Every read path turns raw records into observations HERE.
+
+        Which is why the class guard is here as well as on `append`.
+        `append` refuses to persist a class this store may not hold, and
+        its message names the threat model exactly: "an `append()` from
+        anywhere else -- a script, a future consumer, a careless
+        refactor". That guard protects the file. It does not protect the
+        WIRE, and until 2026-08-27 nothing did.
+
+        A record that reached the file by any route other than `append`
+        -- a build from before the guard existed, an out-of-tree script, a
+        restored backup -- was parsed and served in full: `object_class:
+        "person"`, a normalised bounding box, and a `session_id` plus
+        `frame_seq` that resolve to the original first-person JPEG through
+        `/frame`. The payload said `recordable: false` while handing all of
+        it over.
+
+        `person` is not a tier and not a threshold. It is a separate
+        constant, checked first, that no model can reach past -- and a
+        refusal that only covers the writer is not that. Symmetric now:
+        what this store may not persist, it also may not serve.
+
+        Dropped silently rather than raised, for the same reason a schema
+        mismatch is: one bad record must not make the whole store
+        unreadable. Logged, because a record that had to be filtered here
+        means something wrote where it should not have.
+        """
         observations = []
         for raw in raw_records:
+            object_class = raw.get("object_class")
+            if object_class is not None and object_class not in self._allowed_classes:
+                logger.warning(
+                    "object memory: refusing to SERVE a record of class %r "
+                    "from %s -- this store may not persist that class, so "
+                    "something wrote it by a path that bypassed append()",
+                    object_class,
+                    self._path,
+                )
+                continue
             try:
                 observations.append(object_observation_from_json_dict(raw))
             except (KeyError, ValueError):

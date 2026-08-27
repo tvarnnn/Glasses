@@ -59,6 +59,7 @@ import threading
 import time
 
 from tower.loading import LoadInvalidation
+from tower.logging_config import client_safe_reason
 
 logger = logging.getLogger(__name__)
 
@@ -655,7 +656,7 @@ class LiveSession:
         try:
             engine = self._create()
         except Exception as exc:
-            reason = f"the engine could not be loaded: {type(exc).__name__}: {exc}"
+            reason = f"the engine could not be loaded: {client_safe_reason(exc)}"
             logger.exception("[Tower][%s] %s", self.name, reason)
             if engine is not None:
                 try:

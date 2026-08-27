@@ -417,8 +417,26 @@ that walk. **Render liveness from `following`.**
 | `supported` | boolean | Whether this Tower has a producer to start at all. `false` on a Tower with the cartridge switched off — a Start button that silently does nothing is worse than one that says why it cannot. |
 | `session_id` | string \| **null** | Minted at Start, kept across Pause, cleared at Stop. **Not** a capture id. |
 | `started_at` / `changed_at` | float \| **null** | Tower-receipt epoch seconds. |
-| `following` | array of string | Capture ids a producer is **alive** on, right now. |
-| `captures` | array of string | Every capture this session's producer has been seen following, in order first seen. |
+| `following` | array of string | Capture ids a producer is **alive** on, right now. See the caveat below — these are the SUPERVISOR's producers, not necessarily this session's. |
+| `captures` | array of string | Every capture a producer has been seen following since this session started, in order first seen. |
+
+> ⚠️ **`following` and `captures` are supervisor-scoped, not
+> session-scoped.** This table said "this session's producer" until
+> 2026-08-27; that was wrong and a reviewer reproduced it.
+>
+> A producer that ignored `terminate()` on a previous Pause or Stop stays
+> registered with the supervisor — which is the same condition that makes
+> a Pause able to report `changed: true` without stopping anything. Start
+> a **new** session and it will report the OLD session's capture under the
+> new `session_id`, having attached nothing.
+>
+> That matters more than it looks, because the rule everywhere else in
+> this contract is "render liveness from `following`, never from
+> `state`". Under this defect that rule produces a **false positive**: a
+> brand-new session that attached nothing renders as recording. Cross-check
+> `attached_capture_id` on the POST reply, which is honest, and treat a
+> `following` entry that does not match a capture this session opened as
+> unproven.
 | `accepted` | boolean | On `POST` only. |
 | `changed` | boolean | On `POST` only. `false` means the action was honoured and nothing moved — a double tap. |
 | `attached_capture_id` | string \| **null** | On `POST` only. The capture a producer was just started against, if any. |

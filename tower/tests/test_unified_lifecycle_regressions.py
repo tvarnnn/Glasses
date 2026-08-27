@@ -368,3 +368,179 @@ def test_an_unavailable_cv_module_does_not_stop_the_dataset_recorder(
         )
     finally:
         client.__exit__(None, None, None)
+
+
+# -- Final adversarial reviewer, finding 2 (CRITICAL) ------------------
+
+
+def _memory_record(object_class: str, *, frame_seq=None, session_id=None) -> dict:
+    """One observation, as a raw JSON dict, in the shape the store writes.
+
+    Built through the real `ObjectObservation.to_json_dict()` rather than
+    hand-rolled, so this test cannot pass by writing a record the parser
+    would have rejected anyway -- which is the failure mode that would
+    make a read-side guard look like it works.
+    """
+    from tower.object_memory.records import Confidence, ObjectObservation
+
+    return ObjectObservation(
+        object_class=object_class,
+        detector_score=0.9,
+        confidence=Confidence.HIGH,
+        observed_at=1787810000.0,
+        time_basis="tower-receipt",
+        recorded_at=1787810000.0,
+        source="glasses-camera",
+        module_id="object-memory",
+        session_id=session_id,
+        frame_seq=frame_seq,
+        bounding_box=(0.31, 0.12, 0.68, 0.94),
+        retention_tag="default",
+        privacy_tags=("derived-only",),
+        spatial_ref=None,
+        external_refs=(),
+    ).to_json_dict()
+
+
+def test_a_person_record_that_reached_the_store_is_never_served(tmp_path):
+    """The write guard protects the FILE. Nothing protected the WIRE.
+
+    `ObservationStore.append` refuses a class this store may not persist,
+    and its message names the threat model exactly: "an `append()` from
+    anywhere else -- a script, a future consumer, a careless refactor".
+    Every READ path was unguarded, so a record that reached the file by
+    any of those routes was parsed and served in full: `object_class:
+    "person"`, a normalised bounding box, and a session_id plus frame_seq
+    that resolve to the original first-person JPEG through `/frame`. The
+    payload said `recordable: false` while handing all of it over.
+
+    `person` is not a tier and not a threshold. It is a separate constant,
+    checked first, that no model can reach past -- and a refusal that only
+    covers the writer is not that.
+    """
+    import json
+
+    from tower.object_memory.store import OBSERVATIONS_FILENAME, ObservationStore
+
+    root = tmp_path / "mem"
+    root.mkdir()
+    store = ObservationStore(root, retention_seconds=None)
+
+    # Written the way the guard's own comment anticipates: by something
+    # that is not `append()`.
+    with (root / OBSERVATIONS_FILENAME).open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(_memory_record("laptop")) + "\n")
+        handle.write(
+            json.dumps(
+                _memory_record("person", frame_seq=3410, session_id="cap-abc123")
+            )
+            + "\n"
+        )
+
+    classes = {o.object_class for o in store.all_observations()}
+    assert classes == {"laptop"}, (
+        f"the read side served {classes}; a person record reached the wire"
+    )
+    assert store.last_seen("person") is None, (
+        "last_seen served a person record by name"
+    )
+
+
+def test_the_read_guard_does_not_drop_what_the_store_may_hold(tmp_path):
+    """The other half, so the fix cannot be "serve nothing"."""
+    import json
+
+    from tower.object_memory.store import OBSERVATIONS_FILENAME, ObservationStore
+
+    root = tmp_path / "mem"
+    root.mkdir()
+    store = ObservationStore(root, retention_seconds=None)
+    with (root / OBSERVATIONS_FILENAME).open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(_memory_record("laptop")) + "\n")
+        handle.write(json.dumps(_memory_record("cell phone")) + "\n")
+
+    classes = {o.object_class for o in store.all_observations()}
+    assert classes == {"laptop", "cell phone"}, classes
+    assert store.last_seen("laptop") is not None
+
+
+# -- Final adversarial reviewer, finding 4 (MAJOR) ---------------------
+
+
+def test_the_deletion_cli_defaults_to_the_root_the_producer_writes_to():
+    """A wearer asks for erasure and gets a silent no-op, exit code 0.
+
+    `scripts/object_query.py --purge-all` is the only deletion path this
+    cartridge has, and `config.py` names it as "where real deletion
+    lives". Its default root was `Path("data/object_memory")` -- relative,
+    resolved against whatever directory the operator stood in, and never
+    consulting TOWER_OBSERVATION_ROOT.
+
+    `config.py` exists to stop precisely this and says why at length: two
+    defaults for one directory is "a bug with a settings file in front of
+    it". `object_memory_session.py` was fixed then; this one was not, and
+    it is the worse place to miss, because `purge()` on a directory
+    nothing wrote to removes nothing and reports success --
+    `unlink(missing_ok=True)` cannot tell "already gone" from "never
+    here".
+
+    Every existing CLI test passes `--root` explicitly, which is why none
+    of them caught it.
+    """
+    import importlib
+    import sys
+    from pathlib import Path
+
+    from tower.config import DEFAULT_OBSERVATION_ROOT
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    object_query = importlib.import_module("object_query")
+    importlib.reload(object_query)
+
+    assert object_query.DEFAULT_ROOT.is_absolute(), (
+        f"the deletion CLI's default root is relative ({object_query.DEFAULT_ROOT}); "
+        "it resolves against the operator's working directory"
+    )
+    assert object_query.DEFAULT_ROOT == Path(DEFAULT_OBSERVATION_ROOT), (
+        f"the deletion CLI defaults to {object_query.DEFAULT_ROOT} while the "
+        f"producer and the read routes use {DEFAULT_OBSERVATION_ROOT}"
+    )
+
+
+# -- Final adversarial reviewer, finding 12 (MEDIUM) -------------------
+
+
+def test_a_failure_reason_on_the_wire_never_carries_a_filesystem_path():
+    """These strings reach an unauthenticated socket.
+
+    An OSError describes a failure by naming the PATH it happened on, so a
+    missing world, a missing model file or a torch.hub cache miss would
+    disclose the home directory -- and with it the OS username -- to
+    anyone who can open `/ws`.
+
+    The split is by KIND, not by caller: this repository's own exceptions
+    are written to be read by a person and pass through, because
+    "this build does not recognise that pose convention" is the contract
+    working. Blanket-suppressing the message was tried first and two
+    tests correctly refused it.
+    """
+    from tower.logging_config import client_safe_reason
+
+    leaky = FileNotFoundError(
+        2, "No such file or directory", r"C:\Users\someone\worlds\w\world.json"
+    )
+    text = client_safe_reason(leaky)
+    assert text == "FileNotFoundError", text
+    assert "someone" not in text and "world.json" not in text
+
+    class UnknownPoseConventionError(ValueError):
+        pass
+
+    explained = UnknownPoseConventionError(
+        "world declares a pose convention this build does not recognise"
+    )
+    text = client_safe_reason(explained)
+    assert "does not recognise" in text, (
+        "a domain exception's explanation was suppressed; the client is "
+        "left with a type name it cannot act on"
+    )

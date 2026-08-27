@@ -185,6 +185,17 @@ still alive and still recording. `state_means: "intent-not-liveness"` is
 the Tower saying so in the payload. **A Pause button keyed on `state` will
 tell a person they stopped being recorded when they did not.**
 
+> ⚠️ **But `following` has a false positive of its own.** It is
+> **supervisor-scoped, not session-scoped**: a producer that survived an
+> earlier Pause stays registered, so a **new** session reports the OLD
+> session's capture under the new `session_id`, having attached nothing.
+>
+> So the two fields fail in opposite directions — `state` can claim a stop
+> that did not happen, `following` can claim a start that did not happen.
+> Cross-check `attached_capture_id` on the POST reply, which is honest,
+> and treat a `following` entry that does not match a capture this
+> session opened as unproven.
+
 Transition rules worth memorising:
 
 - **`start` is idempotent** and works from `stopped` *and* `paused`. It
@@ -249,10 +260,23 @@ contract.**
 `stream_stop` or a disconnect ends it — which is the normal case for a
 wearable. The phone sends **nothing** to open a cartridge; a test asserts
 the wire stays silent. `lifecycle.follows_stream` reports whether that is
-on. A stop only ever ends what the stream started: ownership is a **set of
-connection tokens**, so a session an operator started by hand survives a
-phone disconnecting, and with two phones streaming the first to drop does
-not stop the session out from under the second. Document Memory's
+on. Ownership is a **set of connection tokens**, so with two phones
+streaming the first to drop does not stop the session out from under the
+second.
+
+> ⚠️ **It does NOT protect a session an operator started by hand.** An
+> earlier draft of this paragraph claimed it did; that was wrong, and a
+> reviewer reproduced the opposite on the shipped default. `stream_opened`
+> adds a connection to the owner set **whether or not it started
+> anything**, so a phone that sends `stream_start` is adopted as an owner
+> of an already-running session — and when it disconnects it is the last
+> owner out, and the operator's session stops.
+>
+> The protection covers only a connection that **never sent
+> `stream_start`**. During a physical test, drive Scene from the routes
+> and do not stream from a phone at the same time.
+
+Document Memory's
 `follows_stream` defaults **false** — that cartridge writes, and a session
 that persists what a wearer read gets an explicit start.
 
@@ -263,7 +287,19 @@ that persists what a wearer read gets an explicit start.
 Full contract: `docs/contracts/WORLD-BUILDER-GEOMETRY.md` and
 `docs/contracts/WORLD-BUILDER-IOS.md`.
 
-**Status** arrives on the result channel (`world_builder`/`status`).
+**Status** arrives on the result channel (`world_builder`/`status`). Four
+top-level keys, and these are the ones iOS actually decodes:
+
+| Key | Means |
+|---|---|
+| `lifecycle` | `state`, `evidence`, `reason`, `build_in_progress`, `build_in_progress_unavailable_reason` |
+| `model_state` | what to render. `"unsupported"` is the Tower saying it cannot do this at all, not that it is empty |
+| `model_state_reason` | why, as a sentence |
+| `world_snapshot` | the world, or `null`. **`null` is a real answer** and is not an empty world |
+
+`docs/contracts/WORLD-BUILDER-IOS.md` has the field-by-field detail;
+what is here is the shape a decoder needs to get right first.
+
 **Geometry** is HTTP, because it is bulk:
 
 ```
@@ -740,9 +776,27 @@ Both binary routes send **`Cache-Control: no-store`** — a proxy or browser
 holding a copy is a second store nobody chose and nobody's retention
 governs. **Do not cache these bytes.**
 
+> ### ⚠️ EVERY NON-200 BODY IS NESTED UNDER `detail`
+>
+> These routes raise FastAPI's `HTTPException(detail=<envelope>)` and no
+> custom handler unwraps it, so on **404, 409, 410 and 503** the envelope
+> below is one level down:
+>
+> ```json
+> { "detail": { "contract": "object_memory.imagery/2026-08-27",
+>               "reason": "imagery-no-longer-available",
+>               "memory_retained": true, "...": "..." } }
+> ```
+>
+> This applies to the session-control refusals in §4 as well. It matters
+> most here: **`memory_retained` is unreachable at the top level**, so a
+> client that reads it where this document used to say it was gets
+> `nil`, falls through to its error branch, and renders the broken image
+> that §12 forbids. Decode a non-200 body as `{"detail": <envelope>}`.
+
 | Code | `reason` | Means |
 |---|---|---|
-| 200 | `null` | a picture |
+| 200 | `null` | a picture — and the **only** case where the envelope is at the top level |
 | **410** | `imagery-no-longer-available` | **the pointer is intact and the picture is gone** |
 | 404 | `no-such-observation` | nothing matched **within retention** |
 | 404 | `record-has-no-frame-reference` | the record never had a pointer |
