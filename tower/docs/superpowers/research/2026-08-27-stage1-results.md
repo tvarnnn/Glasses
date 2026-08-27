@@ -372,6 +372,35 @@ largest unexplained difference found, not because it supports the
 verdict. The verdict rests on `poses_solved`, support rows and
 multiplicity, all of which are directly measured.
 
+## 5d. A side effect I did not report, found by the review
+
+`duplicate_view_support_rows` goes **0 → 1,002**: one landmark gains two
+support rows naming two DIFFERENT features in the SAME keyframe.
+
+This is inherent to guided re-observation. The pose solve may already
+have bound landmark L to feature *a* in frame N; the guided pass can then
+bind L to feature *b* in the same frame, because *b* also reprojects
+within the bar. Both rows are individually defensible and the pair is
+redundant.
+
+The review attacked it as potential poisoning of `support.json` and
+concluded it is **benign**: the two features are a **median 1.11 px
+apart, 99.9% within 6 px** — they are duplicate ORB detections of the
+same corner, not two different pieces of the world.
+
+**And it does not inflate the headline.** The multiplicity metric counts
+DISTINCT KEYFRAMES per landmark, not rows, so two rows in one keyframe
+still count as one view. The **+8.68 pp ≥3-view improvement is real and
+unaffected**.
+
+**Disclosed rather than fixed.** Consumers that count support ROWS rather
+than distinct views would double-count slightly; cross-segment
+registration PnPs against 3-D/2-D pairs and a 1.11 px duplicate is
+harmless there. Suppressing it is a one-line change (skip a landmark
+already claimed in this frame) and should be done — but it is a behaviour
+change to a persisted table, made at the end of a long run, and it is
+better recorded than rushed.
+
 ## 6. What is weak here, stated plainly
 
 - **The duplicate-merging reading of the falling point count is an
