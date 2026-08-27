@@ -167,6 +167,27 @@ class DocumentMemoryEngine:
     def in_dwell(self) -> bool:
         return self._tracker.in_dwell
 
+    @property
+    def capture_id(self) -> str | None:
+        return self._capture_id
+
+    def set_capture_id(self, capture_id: str | None) -> None:
+        """Adopt the lineage of the frames now arriving.
+
+        A capture id does not exist until a phone connects -- the
+        recording that mints it starts at `stream_start` -- so a
+        long-lived engine cannot be constructed holding one. This is how
+        it learns.
+
+        Takes effect on the NEXT document recorded, never retroactively,
+        and that is the point rather than a limitation: a dwell already in
+        progress was fed by frames from the previous lineage, and
+        restamping it would attach a reading to a recording it did not
+        come from. Provenance that can be rewritten after the fact is not
+        provenance.
+        """
+        self._capture_id = capture_id
+
     def observe(
         self,
         raw_bytes: bytes,

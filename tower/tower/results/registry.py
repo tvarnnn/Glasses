@@ -36,8 +36,11 @@ from tower.results.contracts import (
     CARTRIDGE_EXPERIMENTAL_CV,
     CARTRIDGE_SCENE_UNDERSTANDING,
     CARTRIDGE_WORLD_BUILDER,
+    DOCUMENT_MEMORY_STATUS_CONTRACT,
     ENVELOPE_CONTRACT,
+    RESULT_TYPE_LIVE,
     RESULT_TYPE_STATUS,
+    SCENE_LIVE_CONTRACT,
     WORLD_BUILDER_STATUS_CONTRACT,
 )
 
@@ -50,6 +53,15 @@ from tower.results.contracts import (
 # names are here so an operator can see the difference between "Tower
 # does not know what document_memory is" and "Tower knows and is not
 # serving it yet". iOS keys on `cartridges`; this list is for humans.
+#
+# Document Memory and Scene Understanding left this list on 2026-08-27.
+# They did not leave it because they got better -- Document Memory's
+# detector still fires on essentially nothing at the geometry the glasses
+# deliver. They left it because their limits became things the PAYLOAD
+# STATES, which is what an offer is for. `not_offered` is for a cartridge
+# that can say nothing at all; a cartridge that can say "I have observed
+# nothing, and here is precisely why" belongs in `cartridges`, available
+# or not.
 NOT_OFFERED = (
     {
         "cartridge": CARTRIDGE_EXPERIMENTAL_CV,
@@ -59,22 +71,24 @@ NOT_OFFERED = (
             "described in IOS-to-Tower.md 2.1-2.3"
         ),
     },
-    {
-        "cartridge": CARTRIDGE_DOCUMENT_MEMORY,
-        "reason": (
-            "implemented on Tower and queryable by CLI, but no typed "
-            "contract is offered yet; see IOS-to-Tower.md 3"
-        ),
-    },
-    {
-        "cartridge": CARTRIDGE_SCENE_UNDERSTANDING,
-        "reason": (
-            "implemented on Tower as a live in-process state with no "
-            "persistence; nothing in the web process observes it, so "
-            "there is no state for this channel to read. See "
-            "IOS-to-Tower.md 4"
-        ),
-    },
+)
+
+# Why an offer can be present and unavailable. Module-level constants
+# rather than inline strings, so a test can assert the exact wording a
+# person will be shown without copying it, and so `/cartridges` and a
+# refusal on the socket cannot drift into two different explanations of
+# one configuration.
+SCENE_DISABLED_REASON = (
+    "Scene Understanding is not enabled on this Tower "
+    "(TOWER_SCENE_UNDERSTANDING is unset or off), so no session can be "
+    "started and there is no live scene to read. This build implements "
+    "the contract"
+)
+
+DOCUMENT_DISABLED_REASON = (
+    "no document root is configured on this Tower (TOWER_DOCUMENT_ROOT "
+    "is unset), so there is nowhere to record a document and nothing to "
+    "read back. This build implements the contract"
 )
 
 
@@ -104,31 +118,67 @@ class CartridgeOffer:
         }
 
 
-def declare(world_root: str | None) -> dict:
+def declare(
+    world_root: str | None,
+    *,
+    document_root: str | None = None,
+    scene_enabled: bool = False,
+) -> dict:
     """The full capability declaration.
 
-    Takes the world root rather than reading configuration itself so the
-    declaration is a pure function of its inputs -- which is what lets one
-    test assert that the HTTP route and the WebSocket message produce
+    Takes its inputs rather than reading configuration itself so the
+    declaration is a pure function of them -- which is what lets one test
+    assert that the HTTP route and the WebSocket message produce
     byte-identical output.
+
+    The two newer arguments are keyword-only WITH DEFAULTS, and that is a
+    decision about what an omission should mean rather than a
+    convenience. A caller that has not been taught about a cartridge gets
+    that cartridge declared and UNAVAILABLE -- never silently offered as
+    working. So the failure mode of forgetting to thread a value through
+    is a Tower that under-promises, which iOS renders as "connect", and
+    not one that promises a channel it cannot serve.
+
+    Availability is about CONFIGURATION, never about current activity. A
+    Scene Understanding that is enabled but stopped is `available: true`
+    -- it can be started -- and its payload says `lifecycle.state:
+    "stopped"`. Folding "not running right now" into "unavailable" would
+    tell a person their Tower cannot do this when in fact nobody has
+    pressed Start, and those two call for opposite responses.
     """
     if world_root is None:
-        available = False
-        reason = (
+        world_available = False
+        world_reason = (
             "no world root is configured on this Tower (TOWER_WORLD_ROOT "
             "is unset), so there is no persisted world state to read"
         )
     else:
-        available = True
-        reason = None
+        world_available = True
+        world_reason = None
 
     offers = (
         CartridgeOffer(
             cartridge=CARTRIDGE_WORLD_BUILDER,
             result_type=RESULT_TYPE_STATUS,
             contract=WORLD_BUILDER_STATUS_CONTRACT,
-            available=available,
-            unavailable_reason=reason,
+            available=world_available,
+            unavailable_reason=world_reason,
+        ),
+        CartridgeOffer(
+            cartridge=CARTRIDGE_SCENE_UNDERSTANDING,
+            result_type=RESULT_TYPE_LIVE,
+            contract=SCENE_LIVE_CONTRACT,
+            available=bool(scene_enabled),
+            unavailable_reason=None if scene_enabled else SCENE_DISABLED_REASON,
+        ),
+        CartridgeOffer(
+            cartridge=CARTRIDGE_DOCUMENT_MEMORY,
+            result_type=RESULT_TYPE_STATUS,
+            contract=DOCUMENT_MEMORY_STATUS_CONTRACT,
+            available=document_root is not None,
+            unavailable_reason=(
+                None if document_root is not None else DOCUMENT_DISABLED_REASON
+            ),
         ),
     )
 
@@ -140,18 +190,61 @@ def declare(world_root: str | None) -> dict:
     }
 
 
-def find_offer(world_root: str | None, cartridge: str, result_type: str):
+def find_offer(
+    world_root: str | None,
+    cartridge: str,
+    result_type: str,
+    *,
+    document_root: str | None = None,
+    scene_enabled: bool = False,
+):
     """The offer matching a subscribe request, or None.
 
     None covers both "no such cartridge" and "no such result type on a
     cartridge that exists". The caller distinguishes them for the error
     message; this returns one thing so there is one lookup path.
     """
-    for entry in declare(world_root)["cartridges"]:
+    declaration = declare(
+        world_root, document_root=document_root, scene_enabled=scene_enabled
+    )
+    for entry in declaration["cartridges"]:
         if entry["cartridge"] == cartridge and entry["result_type"] == result_type:
             return entry
     return None
 
 
-def known_cartridges(world_root: str | None) -> set:
-    return {entry["cartridge"] for entry in declare(world_root)["cartridges"]}
+def known_cartridges(
+    world_root: str | None,
+    *,
+    document_root: str | None = None,
+    scene_enabled: bool = False,
+) -> set:
+    declaration = declare(
+        world_root, document_root=document_root, scene_enabled=scene_enabled
+    )
+    return {entry["cartridge"] for entry in declaration["cartridges"]}
+
+
+def declaration_inputs(app_state) -> dict:
+    """The configuration `declare` needs, read off one app state.
+
+    Separate from `declare` so that function stays a pure function of its
+    arguments -- which is what lets a test assert the HTTP route and the
+    WebSocket message are byte-identical rather than merely equal today.
+
+    One definition, used by both surfaces, for the same reason. Two
+    call sites each reaching for their own subset of `app.state` is
+    precisely how `/cartridges` over HTTP and `{"type": "cartridges"}` on
+    the socket would come to disagree, and the disagreement would be
+    invisible until a phone hit the one that was wrong.
+
+    `getattr` with a default throughout, because most tests in this
+    repository construct an app state by hand and set only what they care
+    about. A missing attribute means "not configured", which under-
+    promises -- see the note on defaults in `declare`.
+    """
+    return {
+        "world_root": getattr(app_state, "world_root", None),
+        "document_root": getattr(app_state, "document_root", None),
+        "scene_enabled": bool(getattr(app_state, "scene_enabled", False)),
+    }

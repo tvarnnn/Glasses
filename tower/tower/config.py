@@ -41,6 +41,60 @@ class Settings:
     # what a wearer's camera saw does not go on the network because a
     # process happened to start in a directory that has one.
     observation_root: str | None = None
+    # Whether Scene Understanding may run at all on this Tower.
+    #
+    # OFF by default, and the default is a resource decision rather than
+    # caution. A running session costs one detection per delivered frame
+    # -- 32.9 ms on CPU against an 83.5 ms interval, so roughly 40% of a
+    # core, continuously, for as long as a phone is streaming. That is
+    # affordable and it is not free, and a Tower that started doing it
+    # because someone upgraded is a Tower whose other cartridges got
+    # slower for no reason anybody chose.
+    #
+    # Off here means `/cartridges` declares the contract and reports it
+    # unavailable, naming this variable. It never means the Tower is
+    # silent about the cartridge.
+    scene_understanding: bool = False
+    # Which device the scene detector loads onto.
+    #
+    # "cpu" by default, unlike TOWER_CV_DEVICE's "auto", and measured
+    # rather than assumed: ssdlite320 is 30.4 ms on CUDA against 32.9 ms
+    # on CPU -- an 8% gain, because MobileNetV3 at an internal 320 px is
+    # bound by kernel-launch overhead and not arithmetic. Taking a GPU
+    # for 2.5 ms a frame while World Builder wants it would be a bad
+    # trade made silently.
+    scene_device: str = "cpu"
+    # Whether the session estimates coarse facing.
+    #
+    # OFF by default, and this one is not close. The pose model is 956.4
+    # ms per call on CPU -- 11.5x the delivered frame interval -- against
+    # 43.4 ms on CUDA. It is also entirely unvalidated: no ground truth
+    # for facing exists on this host. Enabling it on a CPU Tower would
+    # convert the cartridge from "cheap and honest" into "wrong and
+    # slow".
+    scene_orientation: bool = False
+    # Where a document session writes what it read, and where the
+    # document routes read it back.
+    #
+    # Named `document_root`, not `document_memory_root`, and the name is
+    # load-bearing rather than a preference:
+    # `test_document_memory_is_not_registered_as_a_production_module`
+    # asserts the substring "document_memory" appears nowhere in the raw
+    # text of `main.py`, which this value has to reach. Object Memory
+    # solved the same problem the same way with `observation_root`.
+    #
+    # None means the document routes answer 404 and `/cartridges` reports
+    # the cartridge unavailable -- a claim about configuration, never
+    # about what was ever read.
+    document_root: str | None = None
+    # Whether a live document session may attach to the stream.
+    #
+    # OFF by default and separately from the root, because the two
+    # answer different questions. A root with capture off is a Tower that
+    # will serve a library recorded elsewhere and record nothing itself,
+    # which is the right posture for a machine reprocessing captures
+    # offline -- and the same escape hatch `world_autobuild` provides.
+    document_capture: bool = False
     # Keyframes between mid-walk rebuilds in the attached builder.
     #
     # NOT the script's own default, which is 0 -- "build once, at the
@@ -68,7 +122,26 @@ def get_settings() -> Settings:
         world_rebuild_every=_non_negative_int(
             os.environ.get("TOWER_WORLD_REBUILD_EVERY"), default=4
         ),
+        scene_understanding=_flag("TOWER_SCENE_UNDERSTANDING", default=False),
+        scene_device=os.environ.get("TOWER_SCENE_DEVICE", "cpu"),
+        scene_orientation=_flag("TOWER_SCENE_ORIENTATION", default=False),
+        document_root=_optional_path(os.environ.get("TOWER_DOCUMENT_ROOT")),
+        document_capture=_flag("TOWER_DOCUMENT_CAPTURE", default=False),
     )
+
+
+def _flag(name: str, *, default: bool) -> bool:
+    """An on/off environment variable, read the same way every time.
+
+    `world_autobuild` parses its own inline and defaults ON; these three
+    default OFF, and each says why at its field. The shared helper exists
+    so a fourth flag cannot arrive with a fifth spelling of "true" -- the
+    accepted set is one list, here.
+    """
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _non_negative_int(value: str | None, *, default: int) -> int:

@@ -175,6 +175,7 @@ async def _handle_frame_message(
 
     # After the reply, never before: see _record_capture.
     _record_capture(websocket, frame)
+    _offer_to_cartridges(websocket, frame)
 
     if metrics is not None and metrics.should_log_summary():
         logger.info("[Tower][Session] summary: %s", metrics.snapshot())
@@ -189,6 +190,60 @@ def _frame_observers(websocket):
     either displace the first or patch this module again.
     """
     return getattr(websocket.app.state, "frame_observers", None) or []
+
+
+def _frame_consumers(websocket):
+    """Every live cartridge session that wants frames.
+
+    A SECOND list, and the separation from `frame_observers` is
+    deliberate rather than tidiness. That list is the dataset recorder's
+    and is shaped around capture lineage: `_start_capture` calls
+    `resumable_capture()`, `start()` and then `capture_dir()` -- the last
+    of those OUTSIDE the per-observer `try`, so an object without it ends
+    the connection -- and `/health` reports `capture: {armed: true}` for
+    anything in it, which would be a lie about recording for a cartridge
+    that counts frames and drops them.
+
+    A cartridge session implements one method, `offer_frame`, and cannot
+    be mistaken for a recorder.
+    """
+    return getattr(websocket.app.state, "frame_consumers", None) or []
+
+
+def _offer_to_cartridges(websocket, frame) -> None:
+    """Hand one frame to each live cartridge. After the reply, isolated.
+
+    `offer_frame` is required to be non-blocking and to never raise --
+    it replaces a slot and signals a worker thread, and everything
+    expensive happens over there. The `try` is here anyway, because "is
+    required to" is not "does", and a cartridge bug must not cost a
+    connection that is successfully answering frames.
+
+    Note what is NOT offered: the decoded array. Each cartridge decodes
+    for itself, off the loop, on its own thread. Sharing a decode here
+    would put a `cv2.imdecode` on the event loop for every connection
+    whether or not any cartridge was running.
+
+    No timestamp is passed, and that is the honest choice rather than a
+    gap. `tower/frames.py` carries no time field -- there is no capture
+    timestamp anywhere on this wire -- so the only clock available is
+    this Tower's, and the session stamps it on receipt. That is exactly
+    what `CaptureRecorder` does (`capture.py:250` writes `received_at`
+    at WRITE time), and matching it means one definition of
+    "tower-receipt" rather than two that differ by a few milliseconds
+    and by which code path was slower.
+    """
+    for consumer in _frame_consumers(websocket):
+        try:
+            consumer.offer_frame(
+                frame.raw_bytes, source_seq=frame.source_seq
+            )
+        except Exception:
+            logger.exception(
+                "[Tower][Cartridge] frame #%s was not offered to a live "
+                "session; the stream continues",
+                frame.seq,
+            )
 
 
 def _record_capture(websocket, frame) -> None:
@@ -321,6 +376,38 @@ def _start_capture(websocket, owner) -> None:
         _offer_capture_opened(
             supervisor, capture_id, observer.capture_dir(capture_id), continues
         )
+        _tell_cartridges_about_capture(websocket, capture_id, opened=True)
+
+
+def _tell_cartridges_about_capture(websocket, capture_id, *, opened: bool) -> None:
+    """Hand a live cartridge the lineage of the frames it is about to see.
+
+    A capture id is minted in this process, at `stream_start`, and does
+    not exist before a phone connects -- which is why nothing can be
+    constructed holding one and why this has to be a notification rather
+    than a lookup.
+
+    It matters to exactly one cartridge today. Document Memory stamps it
+    onto every document it records, and without it a stored memory says
+    only "some frames, some time" -- provenance that cannot be checked is
+    not provenance. Scene Understanding ignores it: it writes nothing, so
+    there is nothing for a capture id to be provenance FOR.
+
+    Isolated per consumer for the same reason `_record_capture` is: a
+    cartridge bug must not end a connection that is answering frames.
+    """
+    for consumer in _frame_consumers(websocket):
+        try:
+            if opened:
+                consumer.capture_started(capture_id)
+            else:
+                consumer.capture_stopped(capture_id)
+        except Exception:
+            logger.exception(
+                "[Tower][Cartridge] a live session did not accept the "
+                "capture lineage for %s; it will record without it",
+                capture_id,
+            )
 
 
 def _offer_capture_opened(supervisor, capture_id, capture_dir, continues) -> None:
@@ -367,6 +454,7 @@ def _stop_capture(websocket, reason: str = END_REASON_STOP, owner=None) -> None:
             logger.exception("[Tower][Capture] could not stop recording cleanly")
         if closed_id is None:
             continue
+        _tell_cartridges_about_capture(websocket, closed_id, opened=False)
         try:
             if supervisor is not None:
                 supervisor.capture_closed(closed_id)

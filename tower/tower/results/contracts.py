@@ -45,6 +45,21 @@ CARTRIDGE_SCENE_UNDERSTANDING = "scene_understanding"
 # names.
 RESULT_TYPE_STATUS = "status"
 
+# Scene Understanding's result type is `live`, not `status`, and the
+# difference is the payload rather than the cadence. World Builder's
+# `status` describes a BUILD -- how far it has got, what it has accepted.
+# Scene Understanding's payload IS the answer: the counts are the product,
+# not progress towards one. Naming it `status` would have invited a client
+# to render it in the place it renders "building...".
+RESULT_TYPE_LIVE = "live"
+
+# Document Memory's result type is `status` -- and there it is the right
+# word, because the payload really is progress: how long this Tower has
+# been watching for documents, how many it has recorded, whether it is
+# mid-dwell. The documents themselves do not travel here. They are bulk,
+# they are text, and a list of them belongs on HTTP for the same reason
+# World Builder's geometry does -- see `tower/routes/documents.py`.
+
 # The one contract that exists.
 #
 # Bumped from .../2026-08-23 because `trajectory.pose_count` changed
@@ -62,6 +77,27 @@ RESULT_TYPE_STATUS = "status"
 # alone would not have justified this; changing what an existing figure
 # counts does.
 WORLD_BUILDER_STATUS_CONTRACT = "world_builder.status/2026-08-25"
+
+# Scene Understanding's live scene.
+#
+# Dated 2026-08-27 rather than the 2026-08-26 of
+# `docs/superpowers/specs/2026-08-26-scene-understanding-wire-path-design.md`
+# because the payload that shipped is not byte-for-byte the payload that
+# was designed: `where` carries per-label SIDE COUNTS rather than one side
+# per label (one side cannot describe a chair on the left and a chair on
+# the right), and a `lifecycle` block was added because this cartridge has
+# a Start and a Stop that World Builder's file-reading status did not.
+#
+# Nothing had ever served the 2026-08-26 identifier -- the design was
+# explicitly "designed, not implemented" -- so no consumer is being broken.
+# Minting the date the agreement actually reached a wire is the whole
+# discipline these identifiers exist for.
+SCENE_LIVE_CONTRACT = "scene_understanding.live/2026-08-27"
+
+# Document Memory's session status. The library itself is not here; see
+# `DOCUMENT_LIBRARY_CONTRACT` in `tower/results/document_memory.py`, which
+# governs the HTTP surface.
+DOCUMENT_MEMORY_STATUS_CONTRACT = "document_memory.status/2026-08-27"
 
 # The channel's own envelope contract, distinct from any cartridge's.
 # A change here affects every cartridge at once, which is exactly why it
