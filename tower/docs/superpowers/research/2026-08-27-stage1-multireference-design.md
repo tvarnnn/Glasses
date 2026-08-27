@@ -151,6 +151,73 @@ than assumed.
 **K must be a named constant, not a literal**, so the sweep in §6 is a config
 change and not a code change.
 
+## 5a. CORRECTION (2026-08-27): the stop/go in §6 was unsafe, and why
+
+Two findings landed after this design was first written. Both change the
+measurement, not the mechanism.
+
+**(a) No persisted world on disk was built by this branch's engine. MEASURED.**
+
+`engine.py:775-784` writes `points_discarded`, `points_triangulated` and
+`poses_refused_root` **unconditionally**, and says why at `:773`:
+
+> Zero is written explicitly — absent would mean "this build predates the
+> counter", which is a different fact.
+
+That makes the manifest a designed discriminator. I checked all **19** derived
+manifests in the corpus, newest 2026-08-27 01:04: **zero contain any of those
+three keys.** Every persisted world predates this branch's engine —
+pre-landmark-gate, pre-restart-rule.
+
+Consequence: **the 66.1% / 67.2% two-view figures describe the OTHER branch's
+pipeline.** So does my own reproduction of 67.2%, and so does the registration
+measurement in `2026-08-27-registration-exists-and-is-never-called.md`. The
+landmark gate (`geometry.py:250-348`) filters on parallax and reprojection, both
+correlated with view count, so it moves this quantity directly.
+
+**Comparing a post-widening HEAD number against 66.1% would be exactly the
+population mismatch the adversarial review caught in the research package — the
+same error one level up.** The baseline must be a HEAD rebuild. That is Stage
+0's job and it is genuinely blocking.
+
+**(b) The ">50%" bar may already be met with no widening at all. MEASURED.**
+
+Across the 8 worlds carrying a support table (pooled 60,452 landmarks): 2-view
+**64.8%**, ≥3-view **35.2%**, ≥5-view 6.8%. But the per-world spread is
+**24.3% → 47.5%**, and world `4cae0b26` already sits at **47.5% ≥3-view with
+median covisibility degree 14** — no widening, old engine.
+
+**Capture content moves this quantity almost as much as an algorithm change
+would.** A single pooled number crossing 50% therefore proves nothing: it could
+be satisfied by which captures happened to be in the pool.
+
+### The corrected stop/go
+
+Replace "pooled ≥3-view share > 50%" with a **paired, per-capture** criterion
+over the pinned 8-capture corpus:
+
+1. **Per-capture delta, same capture before and after.** Require the ≥3-view
+   share to rise on **at least 6 of 8** pinned captures, and require the
+   **median per-capture delta to be positive and ≥ +8 percentage points**.
+   Pairing each capture with itself removes capture content as a variable
+   entirely, which a pooled number cannot do.
+2. **Mass must move 2→3→4, not just fatten the tail.** Report the full
+   histogram before and after. Today's tail is roughly geometric — past 4 views
+   each bucket is ~⅓ of the last. A widening that lengthens *tracks* moves mass
+   out of the 2-view bucket; one that merely finds a few heavily-observed
+   landmarks fattens the tail and leaves the 2-view share intact. **Only the
+   first un-starves an optimiser.** Require the exactly-2-view share to FALL.
+3. Median covisibility degree rises, measured per capture, against a re-derived
+   HEAD oracle ceiling — **not** against the 14.0 figure, which came from the
+   old engine on the old session.
+4. `poses_solved` and `points` do not fall on any capture.
+5. Bit-for-bit reproducibility survives.
+
+Note also, for anyone reaching for the research's "IMPLEMENTED, STARVED"
+description of local BA: **there is no bundle adjustment code on this branch.**
+Only prose citing a historical 0.00% measurement. Do not go looking for a file
+that is not there.
+
 ## 6. How this gets validated
 
 Per the run's testing philosophy — a mechanism that can be deleted while the

@@ -16,18 +16,47 @@ contract question.**
 
 ---
 
-## 1. `r_h` is a declared contract field — confirmed
+## 1. `r_h` is a *documented* field — but NOT shared protocol truth
 
-`docs/agent-handoffs/TOWER-TO-IOS.md:372-375` defines:
+**CORRECTED 2026-08-27, after the branch audit challenged this section and I
+re-checked. My first version of this note repeated the synthesis revision 2's
+error, and revision 2 over-corrected revision 1.**
+
+`tower/docs/agent-handoffs/TOWER-TO-IOS.md:372-375` does list it:
 
 > **`KeyframeEdge`** — `from_keyframe_id`, `to_keyframe_id`, `matches`,
 > `inliers`, `inlier_ratio`, `median_parallax_px`, `median_parallax_deg`,
 > `cheirality_fraction`, **`r_h`**, `rotation_dominant`, `pose_status`,
 > `degeneracy`, `quality`, `frame_revision`.
 
-Under `CLAUDE.md`, `docs/contracts/` and the handoffs are shared protocol truth.
-So the roadmap is right that this is not a deletion a Tower-side lane may make
-unilaterally.
+But `CLAUDE.md` draws a distinction this note missed:
+
+> Shared protocol truth lives under `docs/contracts/`.
+> Shared current-state handoffs live under `docs/agent-handoffs/`.
+
+`TOWER-TO-IOS.md` is a **handoff**, not a contract. The formal contracts are
+`docs/contracts/WORLD-BUILDER-IOS.md` and `WORLD-BUILDER-GEOMETRY.md`, and
+**MEASURED: both contain zero occurrences of `r_h`, `KeyframeEdge`, or
+`edges`.** Keyframe edges are not on the iOS wire at all.
+
+**And nothing consumes it.** MEASURED: the only reader of `edges.jsonl` in the
+entire tree is `inspect.py:83` (`store.read_edges(...)`), and the only use of
+the result is `len(edges)` at `:118`. No code anywhere reads the `r_h` field.
+
+So the ledger, stated plainly:
+
+| Claim | Verdict |
+|---|---|
+| rev 1: "`r_h` is computed and never consumed" | **CORRECT** — nothing reads it |
+| rev 2: "`r_h` is a persisted `KeyframeEdge` field" | correct, `records.py:772` |
+| rev 2: "…in the Tower→iOS contract, so removal is a cross-subsystem change" | **OVER-CORRECTED** — it is in a Tower-side handoff doc, not `docs/contracts/`, and has no consumer |
+| this note's v1, repeating rev 2 | **wrong, corrected here** |
+
+**Consequence: removal is cheaper than revision 2 priced it.** It remains a
+documentation change (the handoff doc must stop describing a field that is no
+longer emitted), but it is not a cross-subsystem contract negotiation with an
+iOS consumer, because there is no iOS consumer. Sections 2–4 below stand and
+are now belt-and-braces rather than load-bearing.
 
 ## 2. Emitting `null` is schema-legal — confirmed
 
