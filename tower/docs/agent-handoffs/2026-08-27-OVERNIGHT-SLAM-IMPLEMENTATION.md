@@ -194,7 +194,7 @@ captures): 230 segments · 1,712 keyframes · 591 solved · 891 refused ·
 | start of run | 1,628 passed, 64 skipped, 0 failed |
 | after Stage 1 | 1,634 passed, 64 skipped, 0 failed |
 | after r_H fix | 1,637 passed, 64 skipped, 0 failed |
-| final | _(pending)_ |
+| **final** | **1,637 passed, 64 skipped, 0 failed** (6m03s) |
 
 Nine tests added. Both new mechanisms were **neutralized and the suite
 re-run** to prove the tests notice their removal; both were then restored.
@@ -216,11 +216,23 @@ and key geometry caching on both content identity and placement identity.
 ## 11. Bugs discovered
 
 1. **`homography_ratio` uninitialised mask** — fixed, tested.
-2. **~90° pose error on synthetic `lateral seed=1006`** (median 84.22°,
-   worst 87.79°) — **identical at both depths, so pre-existing and NOT
-   caused by this run.** A near-perpendicular confidently-wrong pose on
-   the *easiest* motion type. Not investigated. **Recorded so it is not
-   lost; worth its own session.**
+2. **THE BIGGEST FINDING OF THE NIGHT, and it is pre-existing: roughly
+   2% of scenes reconstruct ~90° wrong, silently.** See
+   `2026-08-27-two-percent-reconstruct-perpendicular.md`. Status
+   `solved`, 865–925 matches, 527–870 inliers, deterministic, no gate
+   catches it. The two-view solve has a second self-consistent basin and
+   any tiny perturbation decides which one you land in — JPEG tips seed
+   1006 into it, RAW tips seed 2002 into it. `recoverPose` picks the
+   wrong decomposition of E. **Identical at both reference depths, so not
+   caused by this run.**
+
+   I published this first as *"JPEG flips a reconstruction"* and had to
+   correct the mechanism within the hour after running the sweep I had
+   myself listed as the next step. The headline correction is kept
+   visible at the top of that document.
+
+   **A clean discriminator exists on synthetic data and does not transfer
+   to real footage** — see §12.
 3. `test_world_registration.py`'s real-corpus class (10 tests) **silently
    skips** in this worktree because the corpus lives only in the main repo.
    Those are the only end-to-end checks that the registration gate does
@@ -235,6 +247,26 @@ and key geometry caching on both content identity and placement identity.
   threshold). Deliberately not done at this hour on one capture's
   evidence — this codebase has recorded threshold-tuning going wrong
   twice. **This is the top next implementation task.**
+- **A gate for the ~2% wrong-basin failure was found and NOT shipped.**
+  Both this run and the independent review converged on the same
+  statistic — **cheirality inliers / epipolar inliers** at the seed pair,
+  from values `classical.py:664-673` already computes and discards. On
+  synthetic data it separates perfectly (120 solves: RIGHT min 0.924,
+  WRONG 0.300; the epipolar ratio alone does NOT separate, 0.924 vs
+  0.900; `r_h` does not either).
+
+  **On real footage it does not hold.** Over all persisted `edges.jsonl`
+  (2,832 edges, 126 with both fields, 70 solved): median 0.982 but p5
+  0.204, min 0.069. **A gate at 0.5 would refuse 17.1% of currently-solved
+  edges**; at 0.7, 25.7%. That is right only if those edges are also
+  wrong, and this corpus has no ground truth to say. **Trading a measured
+  17% loss for an unmeasured 2.5% gain was refused.** This is the single
+  most valuable thing PT-1 footage would unlock.
+- **`duplicate_view_support_rows` 0 → 1,002** — a side effect of the
+  guided pass, found by the review, measured benign (two features a median
+  **1.11 px** apart, i.e. duplicate ORB detections of one corner).
+  Does NOT inflate the ≥3-view figure, which counts distinct keyframes.
+  Suppressing it is one line and is deliberately deferred.
 - **Registration hook** — declined (§6), gated on PT-1.
 - **Stages 3–4** (place recognition, pose graph) not attempted; Stage 4's
   solver question is closed (see below).
@@ -293,4 +325,45 @@ cannot move.
 
 ## 17. Adversarial review
 
-_(pending)_
+An independent reviewer was commissioned with instructions to assume the
+implementation is wrong. **Verdict: SAFE WITH SPECIFIED CORRECTIONS.**
+
+**What it reproduced.** It re-ran the corpus A/B independently, binding
+the depth in-process rather than editing the file — a cleaner method than
+mine, immune to the race it then identified — and validated its instrument
+against my single-capture numbers before trusting it. **My numbers
+reproduce exactly, on every field.** Determinism byte-identical across 3
+fresh processes; bounded state flat across walks of 10–60; pure rotation
+admitted 0 guided associations across 5 seeds; the neutralize check fails
+the right 3 tests; no production/research contamination; `points` falling
+reported honestly with no spin.
+
+**It closed my own stated weakness at 11× my sample** — 540 solved cameras
+against my 48, ATE after Umeyama alignment: DEPTH=3 better on 15 of 24,
+median 0.0884 → 0.0519, **sign test p = 0.31, not significant.** My
+NEUTRAL verdict holds and my retraction of the four-sample result was
+correct.
+
+**Three corrections, all applied in separate commits:**
+
+1. **A false claim I put in bold.** I wrote "no keyframe accepted at HEAD
+   is feature-starved" and called it conclusive by construction. **22 are**
+   (minimum zero features). The reasoning was unsound: the accept decision
+   precedes `_persist_keyframe`, so my gate inspected the PRE-redaction
+   frame while geometry consumes the REDACTED one. The removal decision
+   stands on better evidence (0 of 22 carry a pose or support row).
+2. **A misleading artifact.** The committed baseline recorded a "112 vs
+   131" repeat mismatch reading as a ±19-pose noise floor that would
+   swamp the +29. It is not noise — 112 is DEPTH 1 and 131 is DEPTH 3, and
+   the repeat check straddled my toggle. Harness fixed to hash the solver
+   sources and record git HEAD; repeats now compare against their parent
+   run rather than only each other.
+3. **`duplicate_view_support_rows`** — disclosed (§12).
+
+**It also refuted an intuition of mine**: I read 0.4 units/keyframe as
+more self-consistent than 2.7 against a unit seed baseline. Against ~1
+unit/keyframe, 0.4 undershoots 2.5× while 2.7 overshoots 2.7× —
+comparably wrong in opposite directions, evidence for neither.
+
+Report: `2026-08-27-overnight-adversarial-review.md` (457 lines), harnesses
+under `scripts/research/stage_adversarial/`.
