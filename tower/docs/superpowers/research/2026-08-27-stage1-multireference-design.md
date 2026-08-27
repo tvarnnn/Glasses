@@ -176,11 +176,38 @@ do not proceed to Stage 2 on a graph number alone.
 
 ## 7. Open questions carried into implementation
 
-- **Does `estimate_window()` share enough code with the live path** that one
-  edit widens both, or will they need parallel edits? If parallel, that is the
-  single most likely place for the two paths to silently diverge, and the
-  equivalence test is the only thing standing between that and a corrupt
-  `support.json`.
+- ~~**Does `estimate_window()` share enough code with the live path** that one
+  edit widens both?~~ **ANSWERED, from source, before implementation.**
+
+  The two paths share `_extend` and `_estimate_pair` — the **geometry** — and
+  **deliberately do not share the orchestration**. The seam comment at
+  `classical.py:331-338` states the reason outright: *"an oracle that delegates
+  to the thing it is checking checks nothing, and
+  tests/test_world_builder_incremental.py checks this one bit-for-bit."*
+
+  So this is by design, not by neglect, and the design is correct. Widening
+  therefore needs **one geometry change and two orchestration changes**:
+
+  1. `_extend` takes a sequence of references instead of one — the single
+     geometry chokepoint, so the two paths cannot drift in what they compute.
+  2. `estimate_window`'s loop (`:255-256`, `previous = current - 1`) builds a
+     reference *list*.
+  3. `extend`'s live path (`:419`) does the same from the `_Chain` deque.
+
+  **The insight that keeps this safe:** `_extend`'s RETURN SHAPE does not have
+  to change. It already returns `new_observed` keyed by `(frame, feature)` and
+  `published_reobserved` keyed the same way. Both orchestrations' `base +
+  offset` support bookkeeping (`:289-307` and its live-path twin) consumes
+  exactly those dicts and is indifferent to how many references produced them.
+  **If the return shape holds, the duplicated bookkeeping does not need to be
+  touched at all** — which removes the roadmap's single most-feared failure
+  mode (double-counting a re-observation into `support.json`).
+
+  The one genuinely structural change inside `_extend`: `matched_pairs` must
+  now carry **which reference each unmatched pair came from**, because
+  `_triangulate_new` triangulates against that reference's pose and emits
+  observations for both that frame and the current one. Today the reference is
+  implicit because there is only one.
 - **What is the real conflict rate?** Unknown until measured. If the §3 rule
   drops a large fraction of correspondences, the rule needs revisiting — the
   counter exists to answer this and should be reported in the benchmark, not
