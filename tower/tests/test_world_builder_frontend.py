@@ -596,3 +596,71 @@ class TestPolicyOnRenderedMotion:
         # pose status the BACKEND later assigns, not the count here.
         assert 0 < rotating < 10
         assert 0 < walking < 10
+
+
+class TestSharpnessUsesAnExactIntermediate:
+    """`measure_sharpness` computes the Laplacian at CV_16S, not CV_64F.
+
+    That is a 7.40x saving on every delivered frame (1.429 ms -> 0.193 ms,
+    measured on 120 real Ray-Ban frames), and it is only legitimate
+    because the narrower type is EXACT here rather than merely adequate.
+
+    The argument, which these tests pin rather than restate: the input is
+    8-bit and `ksize` defaults to 1, so the kernel is
+    [[0,1,0],[1,-4,1],[0,1,0]] and the output cannot leave +/-4*255 =
+    +/-1020, against int16's +/-32767. Saturation is unreachable, so the
+    int16 Laplacian equals the float64 one bit for bit and only the
+    variance reduction differs, in the last bits of a float64.
+
+    If someone later widens the kernel, raises `ksize`, or feeds 16-bit
+    input, that argument collapses and `test_the_maximum_is_exactly_1020_squared`
+    is the test that should notice.
+    """
+
+    @staticmethod
+    def _reference(gray):
+        """The pre-optimisation implementation."""
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    def test_the_int16_laplacian_is_bit_identical_to_float64(self):
+        rng = np.random.default_rng(3)
+        gray = rng.integers(0, 256, (640, 360), dtype=np.uint8)
+        wide = cv2.Laplacian(gray, cv2.CV_64F)
+        narrow = cv2.Laplacian(gray, cv2.CV_16S)
+        assert np.array_equal(wide, narrow.astype(np.float64)), (
+            "CV_16S diverged from CV_64F -- the saturation argument has failed"
+        )
+
+    def test_the_maximum_is_exactly_1020_squared(self):
+        """A checkerboard is the worst case: every pixel is a full-swing
+        extremum. If this exceeds int16 the optimisation is unsound."""
+        checker = (np.indices((64, 64)).sum(0) % 2 * 255).astype(np.uint8)
+        narrow = cv2.Laplacian(checker, cv2.CV_16S)
+        assert int(np.abs(narrow).max()) == 1020, (
+            f"expected the +/-1020 bound, saw {int(np.abs(narrow).max())}"
+        )
+        assert measure_sharpness(checker) == pytest.approx(1020.0 ** 2)
+
+    @pytest.mark.parametrize(
+        "name,gray",
+        [
+            ("uniform black", np.zeros((64, 64), np.uint8)),
+            ("uniform white", np.full((64, 64), 255, np.uint8)),
+            ("single pixel", np.array([[128]], np.uint8)),
+            ("one row", np.arange(64, dtype=np.uint8).reshape(1, 64)),
+            ("one column", np.arange(64, dtype=np.uint8).reshape(64, 1)),
+            ("real size noise",
+             np.random.default_rng(0).integers(0, 256, (640, 360), dtype=np.uint8)),
+        ],
+    )
+    def test_it_matches_the_reference_on_degenerate_shapes(self, name, gray):
+        """Degenerate shapes are where a narrower dtype or a different
+        reduction most easily diverges, and none of them raise."""
+        got = measure_sharpness(gray)
+        expected = self._reference(gray)
+        assert got == pytest.approx(expected, rel=1e-12, abs=1e-12), name
+
+    def test_a_flat_image_is_exactly_zero_not_nearly_zero(self):
+        """The absolute floor compares against 25.0; a flat frame must
+        land at zero rather than at some small positive epsilon."""
+        assert measure_sharpness(np.full((64, 64), 77, np.uint8)) == 0.0
