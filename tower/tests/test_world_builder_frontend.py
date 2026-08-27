@@ -664,3 +664,25 @@ class TestSharpnessUsesAnExactIntermediate:
         """The absolute floor compares against 25.0; a flat frame must
         land at zero rather than at some small positive epsilon."""
         assert measure_sharpness(np.full((64, 64), 77, np.uint8)) == 0.0
+
+    def test_the_decoder_still_produces_the_uint8_this_relies_on(self):
+        """`measure_sharpness` computing at CV_16S is only exact because
+        the input is 8-bit. That premise lives in `decode_gray`, not here,
+        so it is pinned here rather than assumed.
+
+        If the decoder ever returned float or 16-bit, `cv2.Laplacian(...,
+        CV_16S)` would silently TRUNCATE where the old CV_64F did not --
+        a quiet precision loss on every frame, with no exception to notice
+        it. This test is what should fail first.
+        """
+        rendered = np.random.default_rng(5).integers(
+            0, 256, (48, 64), dtype=np.uint8
+        )
+        ok, encoded = cv2.imencode(".jpg", rendered)
+        assert ok
+        decoded = decode_gray(encoded.tobytes())
+        assert decoded.dtype == np.uint8, (
+            f"decode_gray now returns {decoded.dtype}; measure_sharpness's "
+            "CV_16S intermediate is no longer provably exact"
+        )
+        assert decoded.ndim == 2, "a colour image would change the kernel"
