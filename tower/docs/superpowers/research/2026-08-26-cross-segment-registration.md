@@ -607,3 +607,49 @@ modules unmodified — `ClassicalTwoViewBackend._estimate_pair` and `._extend`,
 orchestration while retaining `observed`, and is validated by reproducing all 19
 segments' stored landmark counts exactly. Timings are on this host, CPU only,
 `cv2` 5.0.0 / `numpy` 2.5.2, no `scipy`.
+
+
+---
+
+## FOLLOW-UP (2026-08-26, `world-builder/next-generation`): a cycle appeared
+
+This note said "no cycles exist" and listed cycle-consistency checking as the
+thing to add the moment one did. One did.
+
+After the solve-chain segmentation change, capture `2e6cffa2` admits **(12,16),
+(12,19) and (16,19)** — a triangle. The mechanism is recorded separately: the
+refusal cascade was discarding the very cameras registration needs, so segments
+that saw plenty of the room had too few solved poses to support a Sim3 fit at
+all.
+
+**The first independent measurement this module has ever been able to make:**
+
+```
+composing 12 -> 16 -> 19  against the direct 12 -> 19
+   rotation   5.899 deg
+   scale      1.0599x
+```
+
+Every one of those three edges passed reciprocity on its own. The loop is the
+only thing that could have produced that number, and it is exactly the class of
+error §6.1 calls the dangerous one — a wrong Sim3 fits well and reads as a
+slightly odd floor plan rather than as an error.
+
+`cycle_residuals` and `cycle_refusal_for` now compute it on every run. Residuals
+are reported whether or not they refuse anything, because **a cluster whose
+loops close tightly is better evidence than one with no loops at all**, and
+nothing could previously tell those apart.
+
+Refusal is on the whole cluster, not the closing edge: the closure is not in the
+spanning tree, so dropping it would change no placement and leave the bad edge in
+place. A cycle proves an inconsistency exists without saying which edge carries
+it.
+
+**Bars:** 20 degrees and 2.0x, sitting between the 5.899 deg / 1.06x measured
+honest residual and the 31.9–166 deg / 3.2x documented failures. Deliberately
+looser than the single-edge bars, because a residual accumulates over a path
+while those judge one hop.
+
+**"What not to build yet" is unchanged.** Pose-graph optimisation still waits:
+this note's own sequencing says checking first, optimisation only once cycles are
+routine. One triangle in one capture is not routine.

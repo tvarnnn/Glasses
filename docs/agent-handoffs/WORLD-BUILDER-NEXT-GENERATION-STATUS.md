@@ -2,7 +2,7 @@
 
 **Branch:** `world-builder/next-generation`, based on
 `origin/integration/world-builder-lifecycle-v1` @ `25eb794`
-**Tower tests:** 502 passed, 10 skipped (`-k world`)
+**Tower tests:** 517 passed, 10 skipped (`-k world`)
 **Not merged.** Not force-pushed. The mega branch is untouched.
 
 ---
@@ -48,6 +48,13 @@ placement is bound to the `input_digest` of the build it was solved
 against, so it cannot outlive its geometry; one whose reference segment is
 not itself placed is refused rather than inviting a composite into a frame
 nothing defines.
+
+**Cycle consistency, the first independent check.** A cycle appeared for the
+first time — `2e6cffa2` admits a triangle — and composing round it disagrees
+with the direct estimate by 5.899 degrees and 1.06x, though every edge passed
+reciprocity alone. Residuals are reported on every run and a grossly open loop
+refuses the whole cluster, because a cycle proves an inconsistency exists
+without saying which edge carries it.
 
 **Registration got affordable.** Cross-segment matching samples 8 keyframes
 per segment instead of a full cross-product — measured as the smallest
@@ -111,10 +118,14 @@ which is the highest-leverage experiment available and needs a wearer.
   to 44 s and 20 s on the two registering worlds, which is comfortable at
   finalisation. It is not comfortable per rebuild — a walk rebuilds ~150 times.
   Live registration needs appearance-based retrieval, which does not exist here.
-- **The benchmark's zero-yield control is no longer a zero.** `4fea31e2` reads
-  zero under the shipped rule but produces real geometry under a more permissive
-  one — its zero was a cascade artifact. A control that is one algorithm change
-  from being non-zero is a weak control and needs replacing.
+- ~~The benchmark's zero-yield control is no longer a zero.~~ **Fixed.**
+  Replaced with two synthetic controls whose answers are logical rather than
+  empirical, so no algorithm change can move them: pure rotation must yield
+  nothing (no baseline, so nothing is triangulable at any depth) and a strafe
+  must yield something (or the negative control passes trivially in a pipeline
+  that has stopped working). Verified to fire: with the seed-pair degeneracy
+  gate removed, pure rotation produced 9 poses and 389 points and the control
+  caught it.
 - **The unrestricted split is worth +517 poses and is not shipped**, because 470
   fragment cards in an unranked grid is unusable. Registration is invariant
   across the whole range, so the extra fragments are raw geometry, not
