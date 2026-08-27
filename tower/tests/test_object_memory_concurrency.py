@@ -22,7 +22,6 @@ from fastapi.testclient import TestClient
 
 from tower.capture_workers import CaptureWorkerSupervisor, WorkerSpec
 from tower.cartridge_session import ACTIVE, STOPPED, CartridgeSession
-from tower.main import OBJECT_MEMORY_WORKER
 from tower.object_memory.imagery import FaceFilter
 from tower.object_memory.records import ObjectObservation, privacy_tags_for
 from tower.object_memory.store import ObservationStore
