@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from tower.capture import CaptureRecorder
+from tower.capture import DEFAULT_MAX_IDLE_POLLS, CaptureRecorder
 from tower.capture_workers import CaptureWorkerSupervisor, WorkerSpec
 from tower.cartridge_runtime import build_live_cartridges
 from tower.cartridge_session import CartridgeSession
@@ -130,6 +130,13 @@ def _world_build_spec(settings: Settings) -> WorkerSpec | None:
             settings.world_root,
             "--rebuild-every",
             str(settings.world_rebuild_every),
+            # So a producer whose Tower died without closing the manifest
+            # stops following instead of polling that directory forever.
+            # See DEFAULT_MAX_IDLE_POLLS: the bound has always existed and
+            # neither spec passed it, so the invariant `follow()`'s
+            # docstring promises was never actually armed in production.
+            "--max-idle-polls",
+            str(DEFAULT_MAX_IDLE_POLLS),
         ),
         cwd=str(TOWER_ROOT),
         name=WORLD_BUILD_WORKER,
@@ -174,6 +181,11 @@ def _observation_spec(settings: Settings, gate) -> WorkerSpec | None:
             settings.observation_verifier,
             "--verifier-device",
             settings.observation_verifier_device,
+            # Same bound, same reason as the builder's. This producer
+            # additionally writes an observation store, so an orphan that
+            # polls forever is holding a root a later session will reuse.
+            "--max-idle-polls",
+            str(DEFAULT_MAX_IDLE_POLLS),
         ),
         cwd=str(TOWER_ROOT),
         name=OBJECT_MEMORY_WORKER,

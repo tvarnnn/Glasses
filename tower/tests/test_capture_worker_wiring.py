@@ -307,6 +307,70 @@ def test_the_default_rebuild_cadence_is_live_not_batch(monkeypatch, tmp_path):
     )
 
 
+def test_both_worker_specs_bound_how_long_they_follow_a_dead_capture(
+    monkeypatch, tmp_path
+):
+    """`follow()` promises this bound and neither spec ever passed it.
+
+    Its docstring says "Bounded by construction (Rule 15): a capture whose
+    manifest never closes -- a crashed recorder -- ends the follow after
+    `max_idle_polls` quiet polls rather than waiting forever." The
+    parameter defaults to None, both specs omitted it, and the promise was
+    therefore never armed in production: a producer whose Tower died
+    without closing the manifest polled that directory forever.
+
+    On Windows that is the ORDINARY way a Tower dies. `terminate()` is
+    `TerminateProcess`, which runs no lifespan and closes no capture --
+    the unified smoke had to be rewritten around exactly that.
+
+    RED before the fix: neither argv contained the flag.
+    """
+    from tower.capture import DEFAULT_MAX_IDLE_POLLS
+    from tower.main import OBJECT_MEMORY_WORKER, create_app
+
+    monkeypatch.setenv("TOWER_CAPTURE_ROOT", str(tmp_path / "capture"))
+    monkeypatch.setenv("TOWER_WORLD_ROOT", str(tmp_path / "world"))
+    monkeypatch.setenv("TOWER_OBSERVATION_ROOT", str(tmp_path / "observations"))
+    app = create_app()
+
+    supervisor = app.state.capture_workers
+    for name in (WORLD_BUILD_WORKER, OBJECT_MEMORY_WORKER):
+        spec = supervisor.spec_for(name)
+        assert spec is not None, name
+        argv = list(spec.argv)
+        assert "--max-idle-polls" in argv, (
+            f"{name} follows a capture with no bound, so a Tower that dies "
+            f"without closing the manifest leaves it polling forever"
+        )
+        assert int(argv[argv.index("--max-idle-polls") + 1]) == (
+            DEFAULT_MAX_IDLE_POLLS
+        )
+
+
+def test_the_idle_bound_cannot_fire_during_a_live_walk(monkeypatch, tmp_path):
+    """The bound must be far above any silence a real capture can contain.
+
+    Firing early costs a wearer the rest of a mapped walk; firing late
+    costs an idle process a few minutes. The directions are asymmetric, so
+    this pins the margin rather than the number.
+
+    `RESUME_GRACE_SECONDS` is this file's own allowance for a walk that
+    goes quiet and comes back, and `CaptureRecorder.stop`'s docstring
+    records that uvicorn takes 20-40 s to notice a dead socket. The bound
+    must comfortably exceed both.
+    """
+    from tower.capture import (
+        DEFAULT_FOLLOW_POLL_SECONDS,
+        DEFAULT_MAX_IDLE_POLLS,
+        RESUME_GRACE_SECONDS,
+    )
+
+    tolerated_seconds = DEFAULT_MAX_IDLE_POLLS * DEFAULT_FOLLOW_POLL_SECONDS
+
+    assert tolerated_seconds >= 10 * RESUME_GRACE_SECONDS
+    assert tolerated_seconds >= 10 * 40.0
+
+
 def test_health_reports_whether_anything_is_building(monkeypatch, tmp_path):
     """"Why isn't World Builder changing?" should be answerable remotely.
 

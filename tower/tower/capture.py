@@ -59,6 +59,38 @@ END_REASON_BOUNDED_LIMIT = "bounded_limit"
 # stopped trying, so anything arriving later is genuinely a new walk.
 RESUME_GRACE_SECONDS = 90.0
 
+# How long a follower tolerates a capture whose manifest is still OPEN but
+# has stopped growing, expressed as polls at the default 0.25 s interval.
+#
+# `CaptureFollower.follow` has always accepted this bound and its docstring
+# has always promised it -- "Bounded by construction (Rule 15): a capture
+# whose manifest never closes -- a crashed recorder -- ends the follow after
+# `max_idle_polls` quiet polls rather than waiting forever". Neither worker
+# spec in `main.py` passed it, so the parameter defaulted to None and the
+# promise was never kept. A producer whose Tower died without closing the
+# manifest polled that directory forever. On Windows that is the ordinary
+# way a Tower dies: `terminate()` is `TerminateProcess`, which runs no
+# lifespan and closes nothing.
+#
+# 900 s, and the number is chosen against what a LEGITIMATE silence can be
+# rather than picked for roundness. Frames arrive at ~12 fps, so a live
+# capture is never quiet for long; every ordinary interruption CLOSES the
+# capture and is handled by the successor path instead. The longest
+# plausible silence with the manifest still open is the window in which the
+# phone has stopped sending and uvicorn has not yet noticed the dead
+# socket, which `stop()` records as 20-40 s. This is an order of magnitude
+# above that, and ten times `RESUME_GRACE_SECONDS`, which is this file's own
+# allowance for a walk that goes quiet and comes back.
+#
+# The failure directions are asymmetric and that is why the bound is
+# generous: firing early costs a wearer the rest of a mapped walk, while
+# firing late only costs an idle process a few more minutes.
+IDLE_FOLLOW_TIMEOUT_SECONDS = 900.0
+DEFAULT_FOLLOW_POLL_SECONDS = 0.25
+DEFAULT_MAX_IDLE_POLLS = int(
+    IDLE_FOLLOW_TIMEOUT_SECONDS / DEFAULT_FOLLOW_POLL_SECONDS
+)
+
 logger = logging.getLogger(__name__)
 
 CAPTURE_FILENAME = "capture.json"
@@ -490,7 +522,7 @@ class CaptureFollower:
         self,
         directory,
         *,
-        poll_seconds: float = 0.25,
+        poll_seconds: float = DEFAULT_FOLLOW_POLL_SECONDS,
         sleep=time.sleep,
         follow_reconnects: bool = True,
         resume_grace_seconds: float = RESUME_GRACE_SECONDS,
