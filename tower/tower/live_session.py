@@ -206,7 +206,7 @@ class LiveSession:
 
     # -- lifecycle -----------------------------------------------------
 
-    def start(self) -> dict:
+    def start(self, *, resume_paused: bool = True) -> dict:
         """Begin a session. Returns immediately; the engine loads off-thread.
 
         Idempotent in the direction the callers mean it. Both plausible
@@ -217,11 +217,22 @@ class LiveSession:
         Starting a FAILED one begins a fresh session, because a failure
         that can only be cleared by a stop nobody thought to call is a
         Tower that needs restarting.
+
+        `resume_paused=False` withholds ONLY the PAUSED -> RUNNING
+        promotion, and exists because one caller is not a person. See
+        `stream_opened`: a socket connecting must not undo a Pause a
+        wearer asked for. It is a keyword argument rather than a separate
+        method so the decision is made inside this lock -- a caller that
+        checked the state first and then called `start()` would have a
+        window in which a Pause landing between the two is silently
+        resumed, which is the bug in a smaller form.
         """
         with self._condition:
             if self._state in (STATE_RUNNING, STATE_STARTING):
                 return self._status_locked()
             if self._state == STATE_PAUSED:
+                if not resume_paused:
+                    return self._status_locked()
                 self._state = STATE_RUNNING
                 self._condition.notify_all()
                 return self._status_locked()
@@ -431,10 +442,28 @@ class LiveSession:
         `stream_start` does not restart anything -- but it does mark the
         session as the stream's, which is correct: from here on the
         stream is what keeps it alive.
+
+        A PAUSED SESSION IS NOT RESUMED HERE, and that is the one place
+        this hook departs from `start()`. `start()` promotes PAUSED ->
+        RUNNING on the stated grounds of "an operator pressing a button
+        twice" -- a deliberate human act. A `stream_start` is not that; it
+        is a socket connecting, and it can arrive from a reconnect, a
+        second phone, or a Mac running a physical test. Scene
+        Understanding detects people in a room and is on by default, so
+        the old behaviour meant a wearer who paused it had that pause
+        undone by any new connection, with nobody asking.
+
+        Object Memory reaches the same answer by construction: its gate is
+        re-asked at every `capture_opened`, so a paused session stays
+        paused across any number of new captures. This makes the two
+        cartridges agree.
+
+        Ownership is still recorded, so a later `stream_stop` is scoped
+        correctly whether or not this call started anything.
         """
         if not self._follow_stream:
             return
-        self.start()
+        self.start(resume_paused=False)
         with self._condition:
             self._stream_owners.add(owner)
 

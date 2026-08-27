@@ -156,6 +156,7 @@ async def _handle_frame_message(
         await _send_frame_error(
             sender, frame.seq, reason or "frame_skipped", str(exc)
         )
+        _fan_out_frame(websocket, frame)
         return
     except ModuleUnavailableError as exc:
         logger.warning(
@@ -166,6 +167,7 @@ async def _handle_frame_message(
         if metrics is not None:
             metrics.record_frame_rejected()
         await _send_frame_error(sender, frame.seq, "module_unavailable", str(exc))
+        _fan_out_frame(websocket, frame)
         return
 
     logger.info(
@@ -229,8 +231,7 @@ async def _handle_frame_message(
         raise
 
     # After the reply, never before: see _record_capture.
-    _record_capture(websocket, frame)
-    _offer_to_cartridges(websocket, frame)
+    _fan_out_frame(websocket, frame)
 
     if metrics is not None and metrics.should_log_summary():
         logger.info("[Tower][Session] summary: %s", metrics.snapshot())
@@ -296,6 +297,48 @@ def _frame_consumers(websocket):
     be mistaken for a recorder.
     """
     return getattr(websocket.app.state, "frame_consumers", None) or []
+
+
+def _fan_out_frame(websocket, frame) -> None:
+    """Give a DECODED frame to the recorder and to every live cartridge.
+
+    CALLED ON EVERY PATH THAT DECODED A FRAME, including the two where the
+    CV module refused it or was unavailable. That is the whole point of
+    this function existing, and it is worth saying why at length, because
+    the shape it replaces looked correct for a year.
+
+    The recorder and the live cartridges used to be reached only from the
+    success path, after a `frame_result` was sent. Before the 2026-08-27
+    unification that was defensible: the CV module had no refusal path, so
+    a `FrameSkippedError` meant something had genuinely gone wrong and
+    dropping the frame was of a piece with dropping the result.
+
+    The CV Lab lane changed that premise and nothing noticed. It added six
+    CLIENT-REACHABLE refusal states -- idle, starting, paused, stopped,
+    failed, unavailable -- and a refusal is not a failure. So an ordinary
+    `cv_lab_pause`, sendable from ANY connection with no ownership check,
+    stopped frames reaching the DATASET RECORDER, Scene Understanding and
+    Document Memory, while every one of them went on reporting itself
+    healthy: `/health` said `capture: armed`, the recorder said
+    `is_recording` with an open capture id, Scene said `running`, and zero
+    bytes were written and zero frames observed. The walk was lost, and
+    nothing in the logs said so. Worse with a terminal `module_unavailable`
+    -- a typo in TOWER_CV_EXPERIMENT -- which made the Tower record nothing
+    and feed no cartridge for the life of the process.
+
+    THE RULE: what the CV module thought of a frame is the CV module's
+    business. A frame that arrived and decoded is a real frame, and the
+    three consumers that are not the CV module have their own lifecycles
+    and their own Start and Stop. One experimental sandbox must not gate
+    the frame bus.
+
+    Still AFTER the reply on every path, never before, for the reason
+    `_record_capture` gives: recording does a durable fsync'd write, and
+    putting it ahead of the reply would charge every cartridge's latency
+    for a recording it did not ask for.
+    """
+    _record_capture(websocket, frame)
+    _offer_to_cartridges(websocket, frame)
 
 
 def _offer_to_cartridges(websocket, frame) -> None:
@@ -498,7 +541,7 @@ def _tell_cartridges_the_stream_closed(websocket, owner) -> None:
             )
 
 
-def _start_capture(websocket, owner) -> None:
+async def _start_capture(websocket, owner) -> None:
     """Bound a dataset recording to the existing stream window.
 
     Reuses stream_start/stream_stop rather than adding a message type:
@@ -534,8 +577,29 @@ def _start_capture(websocket, owner) -> None:
         except Exception:
             logger.exception("[Tower][Capture] could not start recording")
             continue
-        _offer_capture_opened(
-            supervisor, capture_id, observer.capture_dir(capture_id), continues
+        # OFF-THREAD, and only this call. `supervisor.capture_opened`
+        # takes the supervisor's lock, and since the supervisor became
+        # multi-spec that lock is contended by Pause and Stop -- whose
+        # `detach` holds it across a `terminate()` and a bounded
+        # `process.wait()`. A producer that ignores SIGTERM therefore
+        # blocked this line for up to the terminate timeout PER SPEC, and
+        # because this ran on the event loop the whole Tower answered no
+        # frames, no pings and no /health on every connection for that
+        # long. Measured at 1.95 s with one stubborn worker.
+        #
+        # It is the same rule `_close_cartridge_streams` already follows:
+        # a bounded join on the event loop is still a join on the event
+        # loop. Only this call moves; `observer.start()` above stays on
+        # the loop, so recorder starts remain serialised exactly as
+        # before. Two connections' `capture_opened` calls may now
+        # interleave in threads, which is precisely what the supervisor's
+        # RLock and its lineage bookkeeping exist to handle.
+        await asyncio.to_thread(
+            _offer_capture_opened,
+            supervisor,
+            capture_id,
+            observer.capture_dir(capture_id),
+            continues,
         )
         _tell_cartridges_about_capture(websocket, capture_id, opened=True)
 
@@ -699,7 +763,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 logger.info(
                     "[Tower][Session] stream_start: measurement window opened"
                 )
-                _start_capture(websocket, connection_token)
+                await _start_capture(websocket, connection_token)
                 # After the recorder, so a cartridge that wants the
                 # capture lineage has already been told what it is.
                 _tell_cartridges_the_stream_opened(
