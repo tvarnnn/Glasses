@@ -32,6 +32,68 @@ def detector():
     experiment.release()
 
 
+class TestAutoResolvesToTheFasterDeviceForThisModel:
+    """`auto` means CPU here, and CUDA for `depth`. Measured, not assumed.
+
+    `resolve_device("auto")` prefers CUDA wherever it exists, which is
+    right for `depth` and wrong for this model. At the delivered 360x640,
+    interleaved A/B with warm-up excluded: object_detection is 29.41 ms on
+    CPU against 38.17 ms on CUDA, losing every one of eight blocks; depth
+    is 20.03 against 10.41 the other way. Flipping `auto` globally would
+    fix one experiment by making the other about twice as slow, so the
+    preference belongs per experiment.
+
+    It matters more than the milliseconds suggest: the CV Lab's
+    `process()` runs synchronously on the event loop, so this is loop time
+    every connection shares. It also stops reserving 196 MB of VRAM to be
+    slower.
+    """
+
+    def test_auto_loads_this_model_onto_the_cpu(self):
+        experiment = EXPERIMENTS["object_detection"]()
+        experiment.load(ExperimentSettings(device="auto"))
+        try:
+            assert experiment._device.type == "cpu"
+        finally:
+            experiment.release()
+
+    def test_the_request_is_still_reported_as_auto(self):
+        """Provenance must say what was ASKED, not what was chosen.
+
+        A status that reported `cpu` as the request would hide the fact
+        that this Tower made a choice on the caller's behalf.
+        """
+        experiment = EXPERIMENTS["object_detection"]()
+        experiment.load(ExperimentSettings(device="auto"))
+        try:
+            assert experiment._requested_device == "auto"
+        finally:
+            experiment.release()
+
+    def test_an_explicit_cuda_request_is_still_honoured(self):
+        """This changes what `auto` means, not what is reachable."""
+        import torch
+
+        if not torch.cuda.is_available():
+            pytest.skip("no CUDA on this host")
+
+        experiment = EXPERIMENTS["object_detection"]()
+        experiment.load(ExperimentSettings(device="cuda"))
+        try:
+            assert experiment._device.type == "cuda"
+        finally:
+            experiment.release()
+
+    def test_the_shared_resolver_is_unchanged(self):
+        """The override is local. `depth` must still get CUDA from `auto`."""
+        import torch
+
+        from tower.experiments.depth import resolve_device
+
+        expected = "cuda" if torch.cuda.is_available() else "cpu"
+        assert resolve_device("auto") == expected
+
+
 def _jpeg(image: Image.Image) -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG", quality=95)

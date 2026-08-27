@@ -155,8 +155,10 @@ def _cap_torch_threads(settings) -> None:
         logger.info(
             "[Tower][Config] TOWER_SCENE_TORCH_THREADS is unset: torch will "
             "use one thread per core. Measured at 4.12 cores for one scene "
-            "session against 1.03 when capped at 2, with the same "
-            "throughput -- set it if this Tower shares its CPU"
+            "session against 1.03 when capped at 2, with the same scene "
+            "throughput -- but the cap is PROCESS-GLOBAL and costs the CV "
+            "Lab 39-179%% per frame ON THE EVENT LOOP (see config.py). "
+            "Prefer 4 to 2 if this Tower shares its CPU"
         )
         return
     try:

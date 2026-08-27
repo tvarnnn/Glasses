@@ -215,8 +215,34 @@ class Settings:
     # bound by kernel-launch overhead, not arithmetic, so more threads
     # buy nothing and cost a core each.
     #
-    # An operator on a machine that is not a 20-core workstation should
-    # set this. A startup log line says so when it is unset.
+    # WHAT THE ROW ABOVE DOES NOT SAY IS WHAT IT COSTS THE LAB, and the
+    # answer is large enough that "one-sided" is the wrong word for it.
+    # MEASURED at the delivered 360x640, 5 repeats x 200 frames per cell
+    # in separate processes, with a reversed-order control:
+    #
+    #                     default(20)      capped 4        capped 2
+    #   object_detection    26.91 ms     37.34 (+39%)    49.11 (+83%)
+    #   depth               19.73 ms     38.24 (+94%)    55.01 (+179%)
+    #
+    # The CV Lab's `process()` runs SYNCHRONOUSLY ON THE EVENT LOOP, so
+    # that is block time every connection shares. With a scene session
+    # observing concurrently -- the shipped default, since
+    # `scene_autostart` is on -- capping at 2 put 20% of depth frames and
+    # 8.5% of object_detection frames OVER the entire 83.3 ms delivery
+    # interval, where the default and a cap of 4 put none.
+    #
+    # So this remains 0 by default, and an operator who sets it should
+    # prefer 4 to 2 and should know they are buying CPU with latency on a
+    # path that cannot yield. It is a resource lever, not a free win.
+    #
+    # It is ALSO NOT A FIX for the per-session thread-pool growth someone
+    # will be tempted to point it at: each live session runs on a NEW OS
+    # thread and torch's intra-op pool is per-thread and never reclaimed,
+    # so RSS grows by roughly `get_num_threads() - 1` threads per
+    # Start/Stop cycle (measured +19 threads and +8.1 MB per cycle,
+    # linear, no plateau). Capping divides that rate; it does not stop it.
+    # The fix is to reuse one worker thread, measured to remove the growth
+    # entirely at no cost here.
     scene_torch_threads: int = 0
     # Whether `stream_start` starts a scene session and `stream_stop`
     # ends it.

@@ -94,6 +94,46 @@ class ObjectDetectionExperiment:
 
         requested = "auto" if settings is None else settings.device
         self._requested_device = requested
+        # "auto" resolves to CPU for THIS experiment, and only this one.
+        #
+        # `resolve_device("auto")` prefers CUDA whenever it exists, which
+        # is right for `depth` and wrong here. Measured at the delivered
+        # 360x640, same-process interleaved A/B, 480 timed frames per
+        # device, 30 warm-up frames each so CUDA context creation is
+        # excluded, block order alternated:
+        #
+        #     object_detection   cpu 29.41 ms   cuda 38.17 ms   CPU faster
+        #     depth              cpu 20.03 ms   cuda 10.41 ms   CUDA faster
+        #
+        # CUDA lost every one of eight blocks for object_detection and won
+        # every one for depth, so flipping `auto` globally would fix one
+        # experiment by making the other roughly twice as slow. The choice
+        # belongs per experiment. Confirmed in separate processes at 1,000
+        # frames per cell (cpu 26.91 vs cuda 34.78), and an independent
+        # audit measured the same direction and magnitude (28.39 vs
+        # 35.85).
+        #
+        # It also returns VRAM: this model reserved 196 MB of peak GPU
+        # memory to be slower.
+        #
+        # WHY: `config.py`'s `scene_device` comment explains it for the
+        # same model -- MobileNetV3 at an internal 320 px is bound by
+        # kernel-launch overhead, not arithmetic -- and it is worth more
+        # here than there, because the CV Lab's `process()` runs
+        # SYNCHRONOUSLY ON THE EVENT LOOP.
+        #
+        # AND IT CONTRADICTS THAT COMMENT'S NUMBERS, which say ssdlite320
+        # is 30.4 ms on CUDA against 32.9 ms on CPU -- CUDA faster by 8%.
+        # Two independent measurements now disagree with it in the same
+        # direction and by a larger margin. That older figure is left
+        # standing rather than edited, because it was taken on a different
+        # harness and this lane did not re-run ITS harness; a successor
+        # re-measuring `scene_device` should know both exist.
+        #
+        # An explicit `TOWER_CV_DEVICE=cuda` still forces CUDA. This
+        # changes what "auto" means, not what is reachable.
+        if requested == "auto":
+            requested = "cpu"
         device = resolve_device(requested)
         weights = SSDLite320_MobileNet_V3_Large_Weights.COCO_V1
         model = ssdlite320_mobilenet_v3_large(weights=weights)
