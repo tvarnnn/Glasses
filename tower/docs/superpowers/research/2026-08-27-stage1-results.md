@@ -237,6 +237,59 @@ them.
 **VERDICT: KEEP.** With one recorded exception, `4fea31e2`, which is
 queued as physical test PT-3.
 
+### 5b.1 Why `4fea31e2` regresses, diagnosed
+
+The refusal accounting says exactly what happened. MEASURED:
+
+| | DEPTH=1 | DEPTH=3 |
+|---|---|---|
+| keyframes / segments / rejection histogram | identical | identical |
+| **poses_refused_root** | **3** | **3** |
+| poses_refused_cascaded | 37 | **42** |
+| root degeneracies | pure_rotation 2, **no_correspondence 1** | pure_rotation 2, **low_parallax 1** |
+
+The number of ROOT refusals is unchanged. What moved is *where* the
+chain broke: one keyframe that previously refused for
+`no_correspondence` now has enough correspondences to reach PnP — the
+guided ones — and fails there on `low_parallax` instead, earlier in the
+chain, cascading five more keyframes into `unavailable`.
+
+**And the corpus explains when that happens.** Ranking every capture by
+how static it is (share of frame rejections that are
+`insufficient_motion`):
+
+| capture | insufficient_motion % | Δ poses_solved |
+|---|---|---|
+| `22e9d428` | **49.6%** | **+19** |
+| `b35d8ab8` | 51.1% | +1 |
+| `fe744b68` | 56.8% | 0 |
+| `20ce3c23` | **65.9%** | **+10** |
+| `2e6cffa2` | 78.1% | +2 |
+| `64f48114` | 85.6% | 0 |
+| `e1c52b9f` | 88.4% | +2 |
+| **`4fea31e2`** | **96.4%** | **−5** |
+
+The two largest gains are the two captures with the MOST motion. The only
+loss is the MOST STATIC capture in the corpus, at 96.4%.
+
+**Guided re-observation needs baseline to produce good correspondences.**
+Given translation it finds genuine further sightings and more cameras
+resolve. Given a near-stationary wearer it supplies additional
+low-parallax associations, and a marginal PnP that previously refused for
+lack of correspondences now refuses for lack of parallax — one step
+sooner in the chain, which is what costs the five poses.
+
+This is the same constraint that dominates everything else measured
+tonight: **135 of 141 registration refusals are `span_over_depth`, "the
+wearer stood still".** The mechanism is not misbehaving; it is inheriting
+the corpus's binding limitation.
+
+**The obvious mitigation — refuse guided associations whose reference
+offers insufficient parallax — is NOT implemented.** It is a real design
+improvement, it needs its own measurement, and inventing a parallax
+threshold at this hour on one capture's evidence is exactly the kind of
+tuning this codebase has already recorded going wrong twice.
+
 ## 5c. The only known-answer test in the programme — and it says NEUTRAL
 
 Every other number tonight is self-consistency. Synthetic scenes have
