@@ -135,8 +135,16 @@ all point-residuals in one pass via a gather and an `einsum`.
 available.** Memory unchanged. Output identical.
 
 The original loop is **kept as `_residuals`, the reference
-implementation**, still called at a non-hot site, and the two are checked
-against each other by 19 parity tests.
+implementation**, and the two are checked against each other by 19 parity
+tests.
+
+**It is not a fallback that will rot.** Instrumented over a real run, the
+reference is called **4 times** — once per directed fit, at the
+non-hot quality-report site — against **38,435** calls to the vectorised
+path. So it is live production code exercised on every registration, at
+negligible cost, rather than a dead branch nobody would notice breaking.
+That was a deliberate choice: an unexercised reference implementation is
+worse than none, because it invites trust it has not earned.
 
 ### 4.2 JSON write — 3.58×, byte-identical
 
