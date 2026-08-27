@@ -82,3 +82,41 @@ CODE is not.
 `--no-registration --no-reprojection --no-determinism` cuts a full run
 from roughly 12 minutes to about 4. Registration alone is 472 s against
 219 s for all replay-and-build.
+
+
+## The 10 registration tests that do not run here
+
+`tests/test_world_registration.py::TestTheRealWalk` — **10 tests, the only
+end-to-end checks that the registration gate does anything on real
+data** — skip in this worktree with *"world 3dd986b1... is not on this
+host"*. They resolve `REAL_ROOT = Path("data/world_builder")` **relative
+to cwd**, and `tower/data/` is gitignored, so the worktree's copy holds
+only 31 files of empty scratch worlds (0 MB) while the real corpus lives
+in the main-repo checkout.
+
+**The obvious workaround is WRONG and fails silently. I tested it.**
+Running pytest with cwd set to the main repo's `tower/` does make the
+relative data path resolve — and also puts the main repo FIRST on
+`sys.path`, so `import tower...` resolves to the **main repo's branch**,
+not this one. Verified: under that cwd,
+`tower.world_builder.backends.classical` has no `EXTEND_REFERENCE_DEPTH`
+attribute, i.e. it is a different branch's code. A run configured that way
+would report passing tests about the wrong pipeline and look entirely
+normal doing it.
+
+**The correct fix** makes the worktree's `data/` point at the real corpus,
+keeping cwd inside the worktree so the code stays right:
+
+    # from a developer-mode shell, in the worktree's tower/
+    Rename-Item data data.scratch
+    New-Item -ItemType Junction -Path data -Target <main-repo>\tower\data
+
+The `TestTheRealWalk` fixture is **read-only** — it calls `register(...)`,
+and `--write` is a CLI flag it never passes — so pointing at the shared
+corpus cannot mutate another lane's state. Any OTHER test that writes
+under `data/` relative to cwd would, so run that module alone.
+
+Deliberately NOT done during the overnight run: it manipulates a gitignored
+directory another lane may share, for a verification that was not on the
+critical path. It is a five-minute workspace change and it would un-skip
+the only real-data registration coverage that exists.
