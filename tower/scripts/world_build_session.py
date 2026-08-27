@@ -79,6 +79,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.capture import CaptureFollower  # noqa: E402
 from tower.world_builder.backends import (  # noqa: E402
     BACKEND_AUTO,
@@ -288,7 +289,9 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Run a World Builder mapping session over frames on disk."
     )
-    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument(
+        "--root", type=artifact_root_arg, default=str(DEFAULT_ROOT)
+    )
     parser.add_argument("--frames", type=Path, help="Directory of .jpg frames.")
     parser.add_argument(
         "--synthetic",

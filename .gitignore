@@ -1,5 +1,6 @@
 .DS_Store
 
+<<<<<<< HEAD
 # Benchmark scratch trees.
 #
 # Harnesses under tower/scripts/research/ take a --scratch root and write
@@ -18,3 +19,10 @@
 .Rhistory
 __pycache__/
 *.pyc
+=======
+# Quarantine for misplaced/disposable development artifacts. It normally
+# lives OUTSIDE this repository (Projects\Glasses-scratch), so this entry is
+# defensive: if anyone ever creates one inside a checkout, it must not be
+# committed. See the filesystem policy in CLAUDE.md.
+Glasses-scratch/
+>>>>>>> 2b7fb43 (chore: refuse the drive root as an artifact root, and say where things go)

@@ -27,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.document_memory.retrieval import DocumentMemory  # noqa: E402
 from tower.document_memory.store import DocumentStore  # noqa: E402
 
@@ -46,7 +47,9 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Query observed documents (read-only unless --purge)."
     )
-    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument(
+        "--root", type=artifact_root_arg, default=str(DEFAULT_ROOT)
+    )
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument("--recent", type=int, default=None, metavar="N")
     parser.add_argument("--text", default=None, help="Lexical search over OCR text.")
