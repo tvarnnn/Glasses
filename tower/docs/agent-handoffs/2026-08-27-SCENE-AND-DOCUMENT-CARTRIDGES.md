@@ -3,7 +3,7 @@
 **Date:** 2026-08-27
 **Lane:** Tower / cartridges
 **Started from:** `6e325f8` on `integration/world-builder-lifecycle-v1`
-**Ended at:** `8faf774` on `integration/document-scene-cartridges-v1`
+**Ended at:** `integration/document-scene-cartridges-v1`, six commits
 **Worktree:** `C:\Users\tvllo\Projects\Glasses-cartridges`
 **Pushed:** yes, to `origin/integration/document-scene-cartridges-v1`
 
@@ -401,6 +401,62 @@ load-bearing, not decorative.
   unusable. A high-resolution **still**, not a higher stream, is the
   remedy for recognition — and detection needs its gate re-derived at any
   new geometry, which nobody has done.
+
+---
+
+## 6.4 Verified against a real Tower, not a TestClient
+
+Every test in §9 runs through Starlette's in-process `TestClient`, which
+is the right tool and is not the same thing as a process. So the whole
+path was driven once more against `uvicorn` over TCP, with the real
+`ssdlite320` weights and real corpus frames.
+
+```
+GET /cartridges
+  world_builder        status  available=False
+  scene_understanding  live    available=True
+  document_memory      status  available=True
+  http_contracts: document_memory.library/2026-08-27 @/documents available=True
+
+GET /documents          answer=no_observation, 4 recording_limitations
+GET /documents-session  404  (capture off, library still served)
+
+POST /scene/start       state=starting, loading_seconds=0.0
+  ...                   state=running,  detector=ssdlite320
+GET /scene              scene_available=false
+                        "running but has not finished observing a frame yet"
+```
+
+Then 60 real 360x640 corpus frames over a real WebSocket, paced at the
+delivered 83.5 ms, after a `stream_start`:
+
+```
+frames offered  : 60      frames observed : 58      frames skipped : 0
+subscription    : seq 1, scene_understanding.live/2026-08-27
+state           : running        staleness : 0.086 s
+counts          : all zero -- an empty forward cone on those frames
+people          : count 0, facing_wearer NULL (never measured), not 0
+tracks          : null
+payload bytes   : 9,154            leak scan : clean
+```
+
+And a `stream_stop`:
+
+```
+state=stopped  scene_available=false  counts=null  session_id=2
+"the last scene was discarded rather than kept"
+```
+
+That is the first time this cartridge has produced a payload from real
+frames through the production path. The counts are zero because the
+frames it was given contain no COCO object -- the opening frames of each
+capture are largely walls and ceilings -- which is the correct answer and
+not an absence of one: `scene_available: true` with every count at zero
+says "I looked and saw nothing", and it is a different payload from the
+four silences.
+
+Document Memory's live half was exercised the same way in the
+5,204-frame soak (§4.2): 0 pages detected, 0 documents recorded.
 
 ---
 
