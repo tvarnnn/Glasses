@@ -10,6 +10,20 @@ adversarial reviewers plus a final one. What follows is per cartridge:
 what to build, what to decode, what will bite you, and what to test with
 your hands.
 
+**Every Tower-side identifier here was read off a running process on the
+merged tree**, not quoted from a lane document. The four claims this
+document makes about *your* side were checked against `ios/` as well,
+read-only, on 2026-08-27:
+
+| Claim | Verified |
+|---|---|
+| `transform_to_world` is never decoded | appears only in `GlassesTests/WorldGeometryTests.swift`, always as `null` — no production decoder reads it |
+| the geometry cache is keyed on `contentHash` alone | `WorldBuilderClient.swift:324,332` — `retainOnly(Set(…contentHash))` and `chunk(forHash:)` |
+| `TowerCapabilities.towerCartridgeNames` is the mapping you must extend | `Cartridges/Integration/CartridgeClient.swift:69` |
+| there is no `frame_error` case | no match for `frame_error` anywhere in `ios/**/*.swift` |
+
+`ios/` was **not modified** by this integration.
+
 ---
 
 ## 0. Start here — the five-minute pre-flight
