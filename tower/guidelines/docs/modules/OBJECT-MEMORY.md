@@ -2,6 +2,46 @@
 
 ## Status
 
+> ## CORRECTED AGAIN 2026-08-27 — it has a Start button, a policy and a picture
+>
+> Three of the gaps the 2026-08-26 note left open are closed, and one of
+> its own claims is corrected. Full record:
+> `docs/agent-handoffs/OBJECT-MEMORY-HANDOFF.md`. Evidence:
+> `docs/superpowers/research/2026-08-27-object-memory-corpus-precision.md`.
+>
+> - **The producer attaches itself.** `POST
+>   /cartridges/object_memory/session/{start,pause,resume,stop}` and a
+>   gated worker spec, so nobody copies a capture id into a second
+>   terminal. The observation root now has ONE default, handed to the
+>   producer and the read routes from the same settings object.
+> - **The two-class whitelist became a measured policy.** Every detection
+>   over all 18,821 real frames was dumped and the strongest crop of each
+>   sighting was READ BY EYE. A ceiling fan is `airplane` at 0.99 and
+>   `scissors` at 0.93; a white door is `refrigerator` at 0.95; the three
+>   highest-scoring `remote` sightings are all laptop keyboards. Score
+>   does not order correctness across classes, so the class list became
+>   tiers: written on the detector's word, written only if a second
+>   opinion agrees, context, or ignored. `person` is still excluded and
+>   still unreachable by any model.
+> - **The unit of memory is a SIGHTING**, not a 30-second timer.
+> - **The frame reference became a picture.**
+>   `/object-memory/observations/{id}/{imagery,frame,crop}`, face-filtered
+>   on read, refusing rather than degrading, and answering "the memory is
+>   kept and the picture is not" when capture-side retention has moved on.
+> - **Persistent identity is NOT "forbidden outright"** — a claim the
+>   contract document made and this brief does not. Limitation 6 of
+>   `07-PLATFORM-CONSTRAINTS.md` lists embeddings and
+>   confidence-scored association as MITIGATIONS. What this brief actually
+>   says is *"Do not claim unique-object identity unless the
+>   implementation actually supports it"*, which is a condition. It is
+>   still not claimed, now for a measured reason: best frozen embeddings
+>   get 26.4% Recall@1 on small mass-produced objects and tracking IDF1
+>   collapses to ~40% from identical distractors alone.
+> - **Still genuinely blocked:** the live in-process `Module` subclass and
+>   any WebSocket surface, on the lifecycle ruling below. The cartridge
+>   lifecycle added this run is a SESSION over an out-of-process producer;
+>   it does not touch that ruling and does not resolve it.
+
 > ## CORRECTED 2026-08-26 — the producer and the wire surface now exist
 >
 > This section said "Nothing currently produces an observation" and

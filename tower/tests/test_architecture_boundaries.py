@@ -125,6 +125,11 @@ def test_the_result_channel_core_is_cartridge_blind():
         TOWER / "results" / "contracts.py",
         TOWER / "routes" / "results_ws.py",
         TOWER / "routes" / "cartridges.py",
+        # The session control surface. Added to the CORE list rather
+        # than exempted: it is the first mutating route in this Tower and
+        # it addresses a cartridge by an id in the URL path, which is
+        # exactly the shape that invites an import "just to look one up".
+        TOWER / "routes" / "sessions.py",
     ]
     offenders = []
     for path in core:
@@ -591,6 +596,85 @@ def test_shared_code_does_not_import_document_memory():
                 offenders.append(f"{path} -> {name}")
 
     assert offenders == []
+
+
+# The two files that may know Object Memory's shapes, for the same
+# reason `_RESULT_CHANNEL_ADAPTERS` exists above: the result channel has
+# to import SOMETHING or there is nothing to report, and an adapter named
+# after its cartridge cannot leak that cartridge's assumptions into the
+# next one, because the next one gets its own file.
+#
+#   tower/results/object_memory.py   the adapter, and the only module
+#                                    outside the cartridge that may know
+#                                    its record shapes or its policy
+#   tower/routes/observations.py     the route, which imports only the
+#                                    adapter and never the cartridge
+_OBJECT_MEMORY_ADAPTERS = frozenset({TOWER / "results" / "object_memory.py"})
+
+
+def test_shared_code_does_not_import_object_memory():
+    """The rule that was missing while the other three cartridges had one.
+
+    Written after `main.py` acquired `from tower.object_memory.relevance
+    import recordable_classes` inside a function and no test noticed. The
+    wiring point knows the world builder as an argv and must know this
+    cartridge the same way; what it needs from the policy travels through
+    the adapter as a tuple of strings.
+
+    Function-level imports count. The AST walk sees them, and hiding an
+    import inside a function is the commonest way a boundary is crossed
+    while looking untouched at the top of the file.
+    """
+    offenders = []
+    for path in _modules_outside("object_memory"):
+        if path in _OBJECT_MEMORY_ADAPTERS:
+            continue
+        for name in _imports(path):
+            if "tower.object_memory" in name:
+                offenders.append(f"{path} -> {name}")
+
+    assert offenders == []
+
+
+def test_the_object_memory_route_reaches_only_its_adapter():
+    """`tower/routes/observations.py` is a route, not a second adapter.
+
+    Stricter than the rule above, and deliberately: this file is the one
+    most likely to acquire a "just to look up a class name" import,
+    because it is where the question is asked.
+    """
+    path = TOWER / "routes" / "observations.py"
+
+    for name in _imports(path):
+        assert "tower.object_memory" not in name, f"observations.py -> {name}"
+
+
+def test_the_evidence_behind_the_class_policy_travels_with_it():
+    """A tier is a claim, and a claim needs its sample size attached.
+
+    `PERSISTED_CLASSES` was once a bare two-name tuple justified by a
+    comment. Its replacement carries counts, so a later corpus can be
+    compared against it and a reviewer can see what a tier was decided
+    on rather than trusting that it was decided on something.
+    """
+    import sys
+
+    sys.path.insert(0, ".")
+    from tower.object_memory.classes import CLASS_EVIDENCE, REMEMBERED
+
+    remembered = [
+        name
+        for name, evidence in CLASS_EVIDENCE.items()
+        if evidence.tier == REMEMBERED
+    ]
+    assert remembered, "no class is remembered outright; the guard is vacuous"
+    for name in remembered:
+        evidence = CLASS_EVIDENCE[name]
+        assert evidence.inspected > 0, (
+            f"{name} is remembered on the detector's word alone with no "
+            "crop ever inspected"
+        )
+        assert evidence.precision == 1.0, name
 
 
 def test_scene_understanding_does_not_import_another_cartridge():

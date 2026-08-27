@@ -1,3 +1,4 @@
+import hashlib
 from dataclasses import dataclass
 
 # Confidence moved to tower/confidence.py when World Builder became a
@@ -32,6 +33,41 @@ from tower.confidence import (  # noqa: F401
 # not by ours.
 DERIVED_ONLY = "derived-only"
 FRAME_REFERENCED = "frame-referenced"
+
+
+def observation_id_for(
+    session_id: str | None, object_class: str, observed_at: float
+) -> str:
+    """A stable handle for one record, derived rather than minted.
+
+    Needed because a record has to be ADDRESSABLE: `GET
+    /object-memory/observations/{id}/frame` cannot exist without one, and
+    "the laptop record whose observed_at is 1787806912.4471" is not a URL.
+
+    DERIVED, not a uuid4, and that is the whole design. Sixty-four
+    observations are already on disk, written before this field existed.
+    A random id would have to be minted at read time -- so it would
+    change on every read, and a link to a record would stop working the
+    moment the Tower restarted -- or written back, which means rewriting
+    a wearer's memory to add a field. Deriving it from the three values
+    that already identify a sighting gives every existing record a
+    permanent id it never had, with no migration and no write.
+
+    The inputs are exactly the ones `ObservationStore.update_sighting`
+    matches on, so an id and an update can never disagree about which
+    record they mean.
+
+    Truncated to 16 hex characters. This is a handle within one store,
+    not a global identifier: 64 bits is far more than enough to keep a
+    few thousand records apart, and a shorter string is a friendlier URL.
+    """
+    # An explicit separator, so ("ab", "c") and ("a", "bc") cannot hash
+    # to the same handle. A pipe, because a capture id is hex and no
+    # COCO label contains one -- and because a printable separator
+    # survives being copied between a file, a diff and a terminal,
+    # which a control character does not.
+    material = " | ".join((session_id or "", object_class, repr(observed_at)))
+    return hashlib.blake2b(material.encode("utf-8"), digest_size=8).hexdigest()
 
 
 def privacy_tags_for(
@@ -102,10 +138,40 @@ class ObjectObservation:
     privacy_tags: tuple[str, ...]
     spatial_ref: None
     external_refs: tuple[()]
-    # Last, with a default, so every record persisted before this field
+    # Last, with defaults, so every record persisted before these fields
     # existed still constructs -- and so a reader of those records gets an
     # honest "not tracked" rather than an invented number.
     best_score: float | None = None
+    # WHEN THE SIGHTING ENDED, and how much of it there was.
+    #
+    # `observed_at` says when the category came into view and never
+    # moves. These two accumulate while it stays in view, and are what
+    # turn a record from "seen at 14:03" into "seen at 14:03, for 4.4
+    # seconds, across 29 frames" -- which is the difference between a
+    # detection and an observation. None means the record predates
+    # sighting tracking; never 0, which would claim a sighting of no
+    # duration.
+    last_seen_at: float | None = None
+    frame_count: int | None = None
+    # Which frame the representative crop comes from, and where in it.
+    #
+    # `frame_seq` and `bounding_box` describe the FIRST frame, because
+    # that is the frame `observed_at` is about and the record must stay
+    # auditable against it. This describes the BEST frame -- the
+    # strongest look during the sighting -- which is the one worth
+    # showing a person. They are usually different frames and the record
+    # needs both.
+    best_frame_seq: int | None = None
+    best_relpath: str | None = None
+    best_bounding_box: tuple[float, float, float, float] | None = None
+    # Which policy tier admitted this record, and what (if anything)
+    # agreed with the detector's label. `verification` is None when
+    # nothing was asked -- a REMEMBERED class on this Tower -- and a
+    # dict when something was. Never a bare bool: "a model agreed" is
+    # not a claim worth carrying without saying which model and how
+    # strongly.
+    tier: str | None = None
+    verification: dict | None = None
 
     def to_json_dict(self) -> dict:
         return {
@@ -127,7 +193,30 @@ class ObjectObservation:
             "spatial_ref": self.spatial_ref,
             "external_refs": list(self.external_refs),
             "best_score": self.best_score,
+            "last_seen_at": self.last_seen_at,
+            "frame_count": self.frame_count,
+            "best_frame_seq": self.best_frame_seq,
+            "best_relpath": self.best_relpath,
+            "best_bounding_box": (
+                list(self.best_bounding_box)
+                if self.best_bounding_box is not None
+                else None
+            ),
+            "tier": self.tier,
+            "verification": self.verification,
+            "observation_id": self.observation_id,
         }
+
+    @property
+    def observation_id(self) -> str:
+        """Derived on demand, never stored as a separate source of truth.
+
+        Written into `to_json_dict` so a reader that never calls this
+        still sees it, and recomputed on read rather than trusted -- a
+        record whose stored id disagreed with its own fields would be a
+        record two different lookups could reach differently.
+        """
+        return observation_id_for(self.session_id, self.object_class, self.observed_at)
 
 
 def object_observation_from_json_dict(data: dict) -> ObjectObservation:
@@ -155,6 +244,18 @@ def object_observation_from_json_dict(data: dict) -> ObjectObservation:
         # the records already on disk were written before best_score
         # existed. A required key would make _parse_observations treat
         # every one of them as a schema mismatch and skip it, deleting
-        # the wearer's memory to add a field.
+        # the wearer's memory to add a field. Every field added since
+        # follows the same rule, for the same reason.
         best_score=data.get("best_score"),
+        last_seen_at=data.get("last_seen_at"),
+        frame_count=data.get("frame_count"),
+        best_frame_seq=data.get("best_frame_seq"),
+        best_relpath=data.get("best_relpath"),
+        best_bounding_box=(
+            tuple(data["best_bounding_box"])
+            if data.get("best_bounding_box") is not None
+            else None
+        ),
+        tier=data.get("tier"),
+        verification=data.get("verification"),
     )

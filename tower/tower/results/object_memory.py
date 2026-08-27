@@ -41,8 +41,30 @@ like a version skew; a null is an answer.
 
 import time
 
-from tower.object_memory.relevance import PERSISTED_CLASSES
+from tower.object_memory import imagery
+from tower.object_memory.imagery import (  # noqa: F401
+    FILTER_UNAVAILABLE,
+    IMAGERY_EXPIRED,
+    NO_CAPTURE_ROOT,
+    NO_FRAME_REFERENCE,
+    NOT_FOUND,
+    UNREADABLE,
+)
+from tower.object_memory.relevance import recordable_classes
 from tower.object_memory.store import ObservationStore
+
+
+def recorded_classes_for(verifier: str) -> tuple[str, ...]:
+    """Which classes a Tower with this verifier will actually write.
+
+    Lives in the ADAPTER, not in `main.py`, and that placement is the
+    point. `main.py` is the wiring point and must not import a cartridge:
+    it knows the world builder as an argv and it knows object memory the
+    same way. This file is the one door -- it is already the only module
+    outside `tower/object_memory/` that imports the cartridge's policy --
+    so the answer travels through it as a tuple of strings.
+    """
+    return recordable_classes(verifier != "none")
 
 # Opaque and dated, in the style of `world_builder.geometry/2026-08-25`.
 # Compared for equality only: never parsed, never ordered, never used to
@@ -148,6 +170,11 @@ def _where(observation) -> dict:
 
 def _observation_view(observation) -> dict:
     return {
+        # The handle the imagery routes take. Derived from the three
+        # values that already identify a sighting, so the 64 records
+        # written before this field existed have one too, permanently,
+        # with no migration and no rewrite of a wearer's memory.
+        "observation_id": observation.observation_id,
         "object_class": observation.object_class,
         "claim": CATEGORY_CLAIM,
         "identity": IDENTITY_SCOPE,
@@ -165,6 +192,20 @@ def _observation_view(observation) -> dict:
         # tower-receipt time, never on-glasses capture time.
         "time_basis": observation.time_basis,
         "recorded_at": observation.recorded_at,
+        # WHEN IT LEFT, and how much of it there was. `observed_at` says
+        # when the category came into view and never moves; these two
+        # accumulate while it stays there, and are what make a record an
+        # observation rather than a detection. None on records written
+        # before sightings existed -- never 0, which would claim a
+        # sighting of no duration.
+        "last_seen_at": observation.last_seen_at,
+        "frame_count": observation.frame_count,
+        # Which policy tier admitted this record, and what -- if
+        # anything -- agreed with the detector about its label. Null
+        # `verification` means nothing was asked, which is the ordinary
+        # case for a class the detector can be trusted to name.
+        "tier": observation.tier,
+        "verification": observation.verification,
         "module_id": observation.module_id,
         "retention_tag": observation.retention_tag,
         "privacy_tags": list(observation.privacy_tags),
@@ -172,7 +213,27 @@ def _observation_view(observation) -> dict:
     }
 
 
-def _envelope(store: ObservationStore, requested_days: float | None) -> dict:
+def _recorded_classes(recorded_classes) -> list[str]:
+    """What this Tower will actually write, as the wire says it.
+
+    Passed IN rather than imported from the cartridge's default, because
+    the answer depends on configuration the adapter cannot see: a Tower
+    with a semantic verifier records a wider set than one without, and
+    naming a class here that nothing will ever write would turn "never
+    looked for" -- the weaker silence, which a client words differently
+    on purpose -- into "looked for and not seen".
+
+    `None` falls back to the no-verifier set, which is the smaller and
+    therefore the safer claim.
+    """
+    if recorded_classes is None:
+        return list(recordable_classes(False))
+    return list(recorded_classes)
+
+
+def _envelope(
+    store: ObservationStore, requested_days: float | None, recorded_classes=None
+) -> dict:
     return {
         "contract": OBSERVATIONS_CONTRACT,
         "claim": CATEGORY_CLAIM,
@@ -184,7 +245,13 @@ def _envelope(store: ObservationStore, requested_days: float | None) -> dict:
         # The universe of what could ever appear below. A class outside
         # this list has never been looked for, which is a different and
         # weaker kind of silence than "looked for and not seen".
-        "recorded_classes": list(PERSISTED_CLASSES),
+        "recorded_classes": _recorded_classes(recorded_classes),
+        # Where the pictures are, and what may be said about them. A
+        # DESCRIPTOR, not an availability claim: whether a particular
+        # record still has a picture is `.../imagery`'s answer, because
+        # it depends on capture-side retention this cartridge neither
+        # sets nor enforces.
+        "imagery": IMAGERY_ROUTES,
         "retention": _retention_view(store, requested_days),
     }
 
@@ -194,6 +261,7 @@ def build_observations(
     *,
     object_class: str | None = None,
     requested_retention_days: float | None = None,
+    recorded_classes=None,
 ) -> dict:
     """Every observation the store will still serve, newest first.
 
@@ -211,7 +279,7 @@ def build_observations(
     # bottom of a scroll.
     observations.sort(key=lambda o: o.observed_at, reverse=True)
 
-    payload = _envelope(store, requested_retention_days)
+    payload = _envelope(store, requested_retention_days, recorded_classes)
     payload["object_class"] = object_class
     payload["observation_count"] = len(observations)
     payload["observations"] = [_observation_view(o) for o in observations]
@@ -223,6 +291,7 @@ def build_last_seen(
     object_class: str,
     *,
     requested_retention_days: float | None = None,
+    recorded_classes=None,
 ) -> dict:
     """When a category was last in view, or an honest silence.
 
@@ -238,13 +307,14 @@ def build_last_seen(
     """
     observation = store.last_seen(object_class)
 
-    payload = _envelope(store, requested_retention_days)
+    payload = _envelope(store, requested_retention_days, recorded_classes)
     payload["object_class"] = object_class
-    # A class outside PERSISTED_CLASSES is never written by anything, so
-    # its absence carries no information at all. Widening that list is a
-    # decision about what the system is allowed to remember; reporting it
-    # is how a client can tell the two silences apart.
-    payload["recordable"] = bool(object_class in PERSISTED_CLASSES)
+    # A class this Tower never writes carries no information in its
+    # absence at all. Widening that list is a decision about what the
+    # system is allowed to remember AND about what it is able to read
+    # correctly; reporting it is how a client tells the two silences
+    # apart.
+    payload["recordable"] = bool(object_class in payload["recorded_classes"])
     payload["observed"] = bool(observation is not None)
     payload["observation"] = (
         _observation_view(observation) if observation is not None else None
@@ -253,3 +323,151 @@ def build_last_seen(
     # the question a client will actually bind to this response.
     payload["where"] = _where(observation) if observation is not None else None
     return payload
+
+
+# --- resolving a record back to the picture it came from -----------------
+#
+# The pointer was always on the record. What was missing is the step that
+# turns it into something a person can look at -- and the reason that is
+# worth building is measured rather than assumed: MemPal's last-seen
+# images showed the true location only 53% of the time and still moved
+# retrieval accuracy from 0.81 to 0.95, with people searching 1.1 rooms
+# instead of 1.9. A wrong-but-plausible picture plus a human beats a
+# confident sentence.
+#
+# Everything here refuses rather than degrades. There is no path that
+# serves an unfiltered first-person frame.
+#
+# The refusal REASONS are re-exported above rather than imported by the
+# route. `tower/routes/observations.py` reaches only this adapter, and
+# `test_the_object_memory_route_reaches_only_its_adapter` is what keeps
+# that true -- a route that imported the cartridge "just for a constant"
+# is how the boundary goes.
+
+IMAGERY_CONTRACT = "object_memory.imagery/2026-08-27"
+
+# What a served picture is, as a value a decoder can switch on. It is a
+# FRAME FROM A RECORDING, filtered on the way out. It is not evidence of
+# where anything is, and the box drawn on it is where in a picture, not
+# where in a room -- the same claim `where` already makes.
+IMAGERY_CLAIM = "frame-from-the-recording-this-record-was-derived-from"
+
+# And what the filter is NOT. `tower/world_builder/redaction.py` runs
+# before persistence and earns the name privacy transformation; this runs
+# on read, the raw frame stays exactly where it was, and saying so in the
+# payload is what stops a client calling the result anonymised.
+FILTER_MEANS = "applied-on-read-the-stored-frame-is-unchanged"
+
+# Templates rather than built URLs. The Tower does not know what host a
+# phone reached it on, and a client that already holds a base URL should
+# not be handed a second, possibly different one.
+IMAGERY_ROUTES = {
+    "contract": IMAGERY_CONTRACT,
+    "claim": IMAGERY_CLAIM,
+    "filter_means": FILTER_MEANS,
+    "view": "/object-memory/observations/{observation_id}/imagery",
+    "frame": "/object-memory/observations/{observation_id}/frame",
+    "crop": "/object-memory/observations/{observation_id}/crop",
+}
+
+
+def build_face_filter(path=None):
+    """The filter every served picture passes through.
+
+    Constructed at the wiring point and held on `app.state`, so the ONNX
+    session is built once rather than per request -- and constructed
+    through this adapter rather than imported there, because `main.py`
+    does not import a cartridge.
+    """
+    return imagery.FaceFilter(path)
+
+
+def find_observation(store: ObservationStore, observation_id: str):
+    """The record with this handle, within retention, or None.
+
+    A linear scan, and that is proportionate: the store is a JSONL file
+    whose class docstring already expects it to stay small, and every
+    read path here already parses all of it. An index would be the second
+    thing to add after SQLite, not before it.
+
+    Retention is NOT bypassed. `all_observations` filters to the clamped
+    window by default, so a handle to an expired record resolves to
+    nothing -- the same answer a listing gives about it, and the only one
+    that keeps retention a promise rather than a default.
+    """
+    for observation in store.all_observations():
+        if observation.observation_id == observation_id:
+            return observation
+    return None
+
+
+def build_imagery_view(observation, image, *, observation_id: str) -> dict:
+    """What a client needs to decide whether to show a picture, and what to say.
+
+    Deliberately answerable WITHOUT fetching the bytes. A phone deciding
+    between a thumbnail, a caption, and "the memory is kept and the
+    picture is not" should not have to download an image to find out
+    which -- and the third of those is a sentence a wearer needs to hear,
+    not an empty box.
+    """
+    box = None
+    if observation is not None:
+        box = observation.best_bounding_box or observation.bounding_box
+    return {
+        "contract": IMAGERY_CONTRACT,
+        "observation_id": observation_id,
+        "object_class": None if observation is None else observation.object_class,
+        "claim": IMAGERY_CLAIM,
+        "available": image.available,
+        # None when a picture was served. A value, never a sentence: the
+        # wording belongs to whoever is speaking to the wearer.
+        "reason": image.reason,
+        # The one thing this shape exists to be able to say. A record
+        # whose imagery has aged out is still a memory; it has simply
+        # stopped having a picture.
+        "memory_retained": observation is not None,
+        "filter": image.filter_label,
+        "filter_means": FILTER_MEANS,
+        # How many regions the filter actually filled in what was served.
+        # Zero means the detector found none, NOT that there were none --
+        # it has measured blind spots, and a reader must be able to tell
+        # "nothing detected" from "nothing there".
+        "regions_filled": image.regions_filled,
+        # How much of the record's own box the filter covered, 0.0 to
+        # 1.0. Non-zero means part of the SUBJECT is behind a fill, and a
+        # client should say so rather than show a black rectangle without
+        # comment. It is not always a face: on frame 2708 of the
+        # validated capture the filter fired twice on a desk with no
+        # person in it, and one of the fills landed on the mouse the
+        # record is about.
+        "subject_obscured": image.subject_obscured,
+        # Where in the picture, in fractions of the frame. The same box
+        # `where.bounding_box_normalized` carries, with the same caveat:
+        # it is where in a picture, never where in a room.
+        "bounding_box_normalized": list(box) if box is not None else None,
+        # This resolves into `data/captures/`, whose lifetime this
+        # cartridge neither sets nor enforces.
+        "imagery_retention": "capture-side",
+    }
+
+
+def render_imagery(
+    store: ObservationStore,
+    observation_id: str,
+    *,
+    capture_root,
+    face_filter,
+    crop: bool,
+):
+    """The observation and its picture, or the observation and the reason.
+
+    Returns `(observation, Imagery)`. `observation` is None only when the
+    handle matched nothing within retention, which is the one case a
+    caller answers differently from every other.
+    """
+    observation = find_observation(store, observation_id)
+    if observation is None:
+        return None, imagery.Imagery(None, NOT_FOUND)
+    return observation, imagery.render(
+        capture_root, observation, face_filter, crop=crop
+    )

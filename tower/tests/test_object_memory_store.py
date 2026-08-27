@@ -1,5 +1,5 @@
 import json
-
+import pathlib
 import pytest
 
 from tower.object_memory.records import Confidence, ObjectObservation
@@ -938,3 +938,111 @@ def test_an_upgrade_inside_one_bucket_does_not_invent_a_promotion(tmp_path):
 
     (observation,) = store.all_observations()
     assert observation.confidence is Confidence.MEDIUM
+
+
+class TestDamagedStores:
+    """A store on disk is a plain text file, and plain text files get hurt.
+
+    Both cases here were found by an adversarial review, and both were
+    reachable from a producer that was killed -- which Pause and Stop now
+    do promptly and deliberately.
+    """
+
+    def test_one_invalid_byte_does_not_brick_the_store(self, tmp_path):
+        """It used to raise `UnicodeDecodeError` out of EVERY read path.
+
+        Including `purge()`, so the one operation that could have cleaned
+        it up was the one that could not run, and the HTTP routes
+        answered 500 for as long as the byte was there.
+        """
+        store = _store(tmp_path, retention_seconds=None)
+        store.append(_observation(object_class="laptop", observed_at=1000.0))
+        path = tmp_path / OBSERVATIONS_FILENAME
+        path.write_bytes(path.read_bytes() + b"\xff\xfe not utf-8\n")
+        store.append(_observation(object_class="laptop", observed_at=2000.0))
+
+        observations = store.all_observations()
+
+        assert len(observations) == 2
+        assert store.purge() == 2
+
+    def test_a_damaged_line_is_pruned_away_rather_than_kept(self, tmp_path):
+        """`prune_expired` rewrites when there are corrupt lines, so
+        retention has to be SET for it to run at all -- an unbounded
+        store returns early and leaves the damage in place, which is a
+        pre-existing choice this case does not change."""
+        store = _store(
+            tmp_path,
+            retention_seconds=DEFAULT_RETENTION_SECONDS,
+            # A fixed clock, so the surviving record is inside the window
+            # rather than thirty years old relative to wall time.
+            clock=lambda: 1000.0,
+        )
+        store.append(_observation(object_class="laptop", observed_at=1000.0))
+        path = tmp_path / OBSERVATIONS_FILENAME
+        path.write_bytes(path.read_bytes() + b"\xff\xfe\n")
+
+        store.prune_expired(now=1000.0)
+
+        assert b"\xff" not in path.read_bytes()
+        assert len(store.all_observations()) == 1
+
+
+class TestTheManifestIsWrittenAtomically:
+    """A killed producer must not be able to WIDEN the retention promise.
+
+    `append()` rewrote the manifest with a bare `open("w")`. A process
+    killed between the truncate and the write leaves a zero-byte or
+    partial manifest, which is read as unreadable and falls back to the
+    30-day default -- so a store written under a 3-day promise silently
+    becomes a 30-day one, and the next append persists that. It is the
+    one direction retention must never move.
+    """
+
+    def test_a_truncated_manifest_would_widen_the_window(self, tmp_path):
+        """The failure this guards, demonstrated on the read path.
+
+        Not a bug in the reader: falling back to the default is the right
+        answer for a manifest nobody can read. It is why the WRITE must
+        not be able to produce one.
+        """
+        store = _store(tmp_path, retention_seconds=3 * 86400.0)
+        store.append(_observation(object_class="laptop", observed_at=1000.0))
+        assert store.effective_retention_seconds() == 3 * 86400.0
+
+        (tmp_path / MANIFEST_FILENAME).write_text("", encoding="utf-8")
+
+        widened = _store(tmp_path, retention_seconds=None)
+        assert widened.effective_retention_seconds() == DEFAULT_RETENTION_SECONDS
+
+    def test_the_manifest_is_never_written_in_place(self, tmp_path):
+        """Asserted against the file handles, not against the outcome.
+
+        An outcome test cannot tell an atomic write from a lucky one.
+        """
+        opened = []
+        real_open = pathlib.Path.open
+
+        def watching_open(self, mode="r", *args, **kwargs):
+            if self.name.startswith("manifest"):
+                opened.append((self.name, mode))
+            return real_open(self, mode, *args, **kwargs)
+
+        store = _store(tmp_path, retention_seconds=None)
+        import unittest.mock
+
+        with unittest.mock.patch.object(pathlib.Path, "open", watching_open):
+            store.append(_observation(object_class="laptop", observed_at=1000.0))
+
+        writes = [name for name, mode in opened if "w" in mode]
+        assert writes == ["manifest.json.tmp"], opened
+
+    def test_a_stale_manifest_temp_file_is_purged(self, tmp_path):
+        store = _store(tmp_path, retention_seconds=None)
+        store.append(_observation(object_class="laptop", observed_at=1000.0))
+        stale = tmp_path / "manifest.json.tmp"
+        stale.write_text("{}", encoding="utf-8")
+
+        store.purge()
+
+        assert not stale.exists()
