@@ -164,6 +164,69 @@ class UnclassifiedMetricError(LookupError):
     """
 
 
+# What a value on the wire is: a thing this Tower measured, or a thing a
+# model inferred. EXPERIMENTAL-CV.md is explicit that experiment output
+# "is model inference, not a measured sensor fact, unless the experiment
+# specifically validates against a ground-truth reference", and iOS makes
+# provenance a REQUIRED field on every metric rather than an optional one
+# -- so the party that decodes a reply has to answer it. There is no
+# third value and no default: an experiment declares one or it cannot be
+# registered.
+PROVENANCE_MEASURED = "measured"
+PROVENANCE_INFERRED = "inferred"
+
+
+@dataclass(frozen=True)
+class ExperimentMetadata:
+    """What the Lab can say about an experiment before it runs a frame.
+
+    Presentation, not internals. `METRIC_KINDS` lives beside the code that
+    produces the numbers because only that code knows how they combine;
+    this lives beside the registration because it is the WIRE surface --
+    the name a person reads, the unit a figure is rendered with, and
+    whether the figure was measured or inferred. Keeping it here is what
+    lets one test assert that every registered experiment has it.
+
+    `metric_units` is deliberately partial. `IOS-to-Tower.md` 0.5: iOS
+    "renders a figure with the unit the Tower names and BARE when it names
+    none -- a bare number being the honest rendering of an unlabelled
+    quantity". An ORB response and a relative inverse depth have no unit,
+    and inventing one for them would be worse than the bare number.
+
+    `annotation_metric` names the metric that is an annotation COUNT, if
+    the experiment produces one. Only `object_detection` does. A keypoint
+    is not an annotation and a fraction is not one either; naming one
+    would put a number in a field iOS renders as "things found in this
+    frame".
+    """
+
+    name: str
+    summary: str
+    provenance: str
+    stateful: bool
+    requires_model: bool
+    # The `result_label` this experiment will emit. Declared rather than
+    # discovered so the Lab can say what an experiment measures BEFORE
+    # anyone starts it, and pinned against the real thing by
+    # `test_the_declared_headline_is_the_one_the_experiment_emits`.
+    headline_label: str
+    # What actually does the work. `opencv` or `torch` today. Declared,
+    # not derived from `requires_model`: the two coincide for all eight
+    # registered experiments and there is no reason a future one could
+    # not be a model-free torch kernel or a model-backed OpenCV DNN.
+    backend: str
+    headline_unit: str | None = None
+    metric_units: Mapping[str, str] = field(default_factory=dict)
+    annotation_metric: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.provenance not in (PROVENANCE_MEASURED, PROVENANCE_INFERRED):
+            raise ValueError(
+                f"provenance must be {PROVENANCE_MEASURED!r} or "
+                f"{PROVENANCE_INFERRED!r}, got {self.provenance!r}"
+            )
+
+
 @runtime_checkable
 class Experiment(Protocol):
     """One CV experiment, stateful or not.
@@ -171,6 +234,17 @@ class Experiment(Protocol):
     `load()` may allocate. `release()` must free whatever it allocated and
     must be safe to call twice, and safe after a partial load -- it runs
     on the FAILED transition, which can be reached from anywhere.
+
+    There is a fourth method, `describe() -> dict`, which is **optional**
+    and deliberately not declared here. An experiment that holds a model
+    implements it to report what it actually loaded -- the resolved
+    device, the weights, the threshold -- because `TOWER_CV_DEVICE=auto`
+    is a request and `resolve_device` decides the answer, so a run
+    labelled "auto" has not said whether it used the GPU. An experiment
+    that holds nothing has nothing to describe, and the Lab reports
+    nothing rather than inventing a device it does not have. Adding it to
+    the protocol would make six experiments implement a method returning
+    an empty dict.
     """
 
     name: str
@@ -234,48 +308,262 @@ _DEPTH_METRIC_KINDS: dict[str, MetricKind] = {
 
 @dataclass(frozen=True)
 class ExperimentRegistration:
-    """A factory and, inseparably, what its numbers mean.
+    """A factory and, inseparably, what its numbers mean and are called.
 
-    One record rather than two parallel dicts, so that registering an
-    experiment without classifying its metrics is not a thing that can be
-    done and then forgotten -- it is a missing positional argument.
+    One record rather than three parallel dicts, so that registering an
+    experiment without classifying its metrics -- or without saying what
+    a person should call it and whether it measured or inferred -- is not
+    a thing that can be done and then forgotten. It is a missing
+    positional argument.
+
+    `metadata` joined `metric_kinds` when the Lab stopped being selected
+    by an environment variable. An experiment nobody can name is fine
+    when the only way to pick one is to type its registry key into a
+    shell; it is not fine when a phone lists them.
     """
 
     factory: Callable[[], Experiment]
     metric_kinds: Mapping[str, MetricKind]
+    metadata: ExperimentMetadata
 
 
 # name -> registration. A FACTORY, not an instance: constructing a
 # detector at import time would load model weights in any process that so
 # much as imports this module, including every unrelated test.
+# Units, stated once each. Named rather than repeated so that two
+# experiments reporting the same kind of quantity cannot drift into
+# calling it two different things on the wire.
+_FRACTION = "fraction"
+_PIXELS = "px"
+_LEVEL = "level"
+_KEYPOINTS = "keypoints"
+_SECONDS = "s"
+_DEGREES = "deg"
+
 _REGISTRY: dict[str, ExperimentRegistration] = {
     "baseline": ExperimentRegistration(
         lambda: StatelessExperiment("baseline", baseline.run),
         baseline.METRIC_KINDS,
+        ExperimentMetadata(
+            name="Baseline",
+            headline_label="mean_intensity",
+            backend="opencv",
+            summary=(
+                "Mean grayscale intensity of the frame. The cheapest thing "
+                "that proves the whole glasses -> phone -> Tower -> CV path "
+                "is alive."
+            ),
+            provenance=PROVENANCE_MEASURED,
+            stateful=False,
+            requires_model=False,
+            # 8-bit intensity level, 0-255, not a fraction. It is
+            # `gray.mean()` and nothing normalises it.
+            headline_unit=_LEVEL,
+        ),
     ),
     "edge_detection": ExperimentRegistration(
         lambda: StatelessExperiment("edge_detection", edge_detection.run),
         edge_detection.METRIC_KINDS,
+        ExperimentMetadata(
+            name="Edge detection",
+            headline_label="edge_density",
+            backend="opencv",
+            summary=(
+                "Fraction of pixels Canny calls an edge, after a Gaussian "
+                "blur. Moves visibly between a blank wall and a cluttered "
+                "desk."
+            ),
+            provenance=PROVENANCE_MEASURED,
+            stateful=False,
+            requires_model=False,
+            headline_unit=_FRACTION,
+        ),
     ),
     "frame_quality": ExperimentRegistration(
         lambda: StatelessExperiment("frame_quality", frame_quality.run),
         frame_quality.METRIC_KINDS,
+        ExperimentMetadata(
+            name="Frame quality",
+            headline_label="sharpness_laplacian_var",
+            backend="opencv",
+            summary=(
+                "Six usability signals from one decode -- sharpness, "
+                "gradient energy, entropy, contrast, edge density and "
+                "clipping -- so a threshold gets chosen from a "
+                "distribution rather than from taste."
+            ),
+            provenance=PROVENANCE_MEASURED,
+            stateful=False,
+            requires_model=False,
+            # Variance of a Laplacian over 8-bit levels. Squared levels is
+            # what it is; a nicer word would name a quantity nobody could
+            # reproduce.
+            headline_unit="level^2",
+            metric_units={
+                "sharpness_laplacian_var": "level^2",
+                "gradient_energy": _LEVEL,
+                "entropy_bits": "bits",
+                "contrast_std": _LEVEL,
+                "edge_density": _FRACTION,
+                "overexposed_fraction": _FRACTION,
+                "underexposed_fraction": _FRACTION,
+                "width": _PIXELS,
+                "height": _PIXELS,
+            },
+        ),
     ),
     "feature_detection": ExperimentRegistration(
         lambda: StatelessExperiment("feature_detection", feature_detection.run),
         feature_detection.METRIC_KINDS,
+        ExperimentMetadata(
+            name="Feature detection",
+            headline_label="keypoint_count",
+            backend="opencv",
+            summary=(
+                "How much trackable ORB texture a frame contains, and how "
+                "evenly it is spread. A thousand keypoints in one corner is "
+                "worse for geometry than three hundred across the view."
+            ),
+            provenance=PROVENANCE_MEASURED,
+            stateful=False,
+            requires_model=False,
+            headline_unit=_KEYPOINTS,
+            metric_units={
+                "keypoint_count": _KEYPOINTS,
+                "descriptor_count": "descriptors",
+                "spatial_coverage": _FRACTION,
+                # `mean_response` is deliberately absent: ORB's response
+                # is a corner score on an arbitrary scale, and a bare
+                # number is the honest rendering of it.
+                "mean_keypoint_size": _PIXELS,
+                "requested_features": _KEYPOINTS,
+            },
+        ),
     ),
     "redaction_impact": ExperimentRegistration(
         lambda: StatelessExperiment("redaction_impact", redaction_impact.run),
         redaction_impact.METRIC_KINDS,
+        ExperimentMetadata(
+            name="Redaction impact",
+            headline_label="region_keypoint_retention",
+            backend="opencv",
+            summary=(
+                "What blurring a region costs the geometry that runs after "
+                "it: how many keypoints survive inside the blur, and how "
+                "many survivors sit on its boundary rather than on the "
+                "scene."
+            ),
+            provenance=PROVENANCE_MEASURED,
+            stateful=False,
+            requires_model=False,
+            headline_unit=_FRACTION,
+            metric_units={
+                "region_keypoint_retention": _FRACTION,
+                "frame_keypoint_retention": _FRACTION,
+                "keypoints_before": _KEYPOINTS,
+                "keypoints_after": _KEYPOINTS,
+                "keypoints_lost": _KEYPOINTS,
+                "keypoints_in_region_before": _KEYPOINTS,
+                "keypoints_in_region_after": _KEYPOINTS,
+                "survivors_near_region": _KEYPOINTS,
+                "survivors_on_boundary": _KEYPOINTS,
+                "boundary_fraction": _FRACTION,
+                "region_area_fraction": _FRACTION,
+                "blur_kernel": _PIXELS,
+            },
+        ),
     ),
     "optical_flow": ExperimentRegistration(
-        optical_flow.OpticalFlowExperiment, optical_flow.METRIC_KINDS
+        optical_flow.OpticalFlowExperiment,
+        optical_flow.METRIC_KINDS,
+        ExperimentMetadata(
+            name="Optical flow",
+            headline_label="median_flow_px",
+            backend="opencv",
+            summary=(
+                "How much the scene is moving and how coherently, from "
+                "sparse Lucas-Kanade with a forward-backward check. The "
+                "first frame of a session has no answer and says so."
+            ),
+            provenance=PROVENANCE_MEASURED,
+            stateful=True,
+            requires_model=False,
+            headline_unit=_PIXELS,
+            metric_units={
+                "median_flow_px": _PIXELS,
+                "mean_flow_px": _PIXELS,
+                "max_flow_px": _PIXELS,
+                "tracked_fraction": _FRACTION,
+                "tracked_count": _KEYPOINTS,
+                "seeded_count": _KEYPOINTS,
+                "median_forward_backward_px": _PIXELS,
+                "rejected_by_forward_backward": _KEYPOINTS,
+                "direction_coherence": _FRACTION,
+                "dominant_direction_deg": _DEGREES,
+                # The three flags are 0/1 per frame and COUNT-kind, so
+                # their corpus total is a number of frames.
+                "has_reference": "frames",
+                "resolution_changed": "frames",
+                "reference_stale": "frames",
+                "seconds_since_reference": _SECONDS,
+            },
+        ),
     ),
     "object_detection": ExperimentRegistration(
-        object_detection.ObjectDetectionExperiment, object_detection.METRIC_KINDS
+        object_detection.ObjectDetectionExperiment,
+        object_detection.METRIC_KINDS,
+        ExperimentMetadata(
+            name="Object detection",
+            headline_label="detections",
+            backend="torch",
+            summary=(
+                "COCO classes from SSDLite/MobileNetV3, reported with the "
+                "score they cleared. Evidence that something scored above a "
+                "threshold -- not a statement that an object is there."
+            ),
+            # Model inference. object_detection.py's own header says so in
+            # as many words, and Rule 16 / Core Principle 2 require that to
+            # travel with the number rather than sit in a docstring.
+            provenance=PROVENANCE_INFERRED,
+            stateful=True,
+            requires_model=True,
+            headline_unit="detections",
+            metric_units={
+                "detections": "detections",
+                "raw_detections": "detections",
+                "score_threshold": "score",
+                "mean_score": "score",
+                "max_score": "score",
+                **{
+                    "count_" + name.replace(" ", "_"): "detections"
+                    for name in object_detection.TRACKED_CLASSES
+                },
+            },
+            annotation_metric="detections",
+        ),
     ),
-    "depth": ExperimentRegistration(depth.DepthEstimation, _DEPTH_METRIC_KINDS),
+    "depth": ExperimentRegistration(
+        depth.DepthEstimation,
+        _DEPTH_METRIC_KINDS,
+        ExperimentMetadata(
+            name="Monocular depth",
+            headline_label="mean_relative_depth",
+            backend="torch",
+            summary=(
+                "Relative inverse depth from MiDaS-small. NOT metric "
+                "distance: the model does not produce one, and no figure "
+                "here may be read as metres."
+            ),
+            provenance=PROVENANCE_INFERRED,
+            stateful=True,
+            requires_model=True,
+            # Deliberately unitless. IOS-to-Tower.md 0.5: "metric is not
+            # metres". MiDaS-small emits relative inverse depth on an
+            # arbitrary scale, so a bare number is the honest rendering
+            # and any unit string here would be a claim about scale.
+            headline_unit=None,
+        ),
+    ),
 }
 
 # The long-standing public shape, derived rather than duplicated: every
@@ -284,6 +572,17 @@ _REGISTRY: dict[str, ExperimentRegistration] = {
 EXPERIMENTS: dict[str, Callable[[], Experiment]] = {
     name: registration.factory for name, registration in _REGISTRY.items()
 }
+
+
+def experiment_metadata(experiment_name: str) -> ExperimentMetadata:
+    """What to call this experiment and what its numbers are. Or KeyError.
+
+    Separate from `metric_kinds` because the two answer different
+    questions and a caller usually wants one of them, but they come from
+    the same record and therefore cannot disagree about which experiments
+    exist.
+    """
+    return _REGISTRY[experiment_name].metadata
 
 
 def metric_kinds(experiment_name: str) -> Mapping[str, MetricKind]:

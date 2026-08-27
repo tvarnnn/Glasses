@@ -187,7 +187,7 @@ imported, so they reach `get_settings()`.
 | `TOWER_HOST`       | `0.0.0.0` | **Not wired to anything.** `tower/config.py` reads it into `Settings` and nothing reads it back; setting it binds nothing. Use `-BindHost` / `--host` |
 | `TOWER_PORT`       | `8000`    | **Not wired to anything**, same as `TOWER_HOST`. Use `-Port` / `--port` |
 | `TOWER_DEV_MODE`   | `true`    | Enables debug-level logging. Does **not** control the per-frame `[Tower][Frame]` lines, which are INFO and always on |
-| `TOWER_CV_EXPERIMENT` | `baseline` | Active CV experiment: `baseline`, `edge_detection`, `frame_quality`, `feature_detection`, `optical_flow`, `redaction_impact`, `object_detection`, `depth` |
+| `TOWER_CV_EXPERIMENT` | `baseline` | **Startup default only.** Which CV experiment this Tower arms at boot: `baseline`, `edge_detection`, `frame_quality`, `feature_detection`, `optical_flow`, `redaction_impact`, `object_detection`, `depth`. Since 2026-08-27 a client selects an experiment at runtime with `cv_lab_start` and no restart — see `docs/contracts/EXPERIMENTAL-CV-LAB.md`. This variable is what runs before anyone asks, so that a client which knows nothing about the CV Lab still gets a `frame_result` for every frame |
 | `TOWER_CV_DEVICE`   | `auto`    | Device for model-backed experiments (`auto`, `cpu`, or `cuda`) |
 | `TOWER_CAPTURE_ROOT` | *(unset)* | Arms the raw dataset recorder at this path. **Unset means no recording, ever.** Arming is not recording: nothing is written until a `stream_start` arrives, and `GET /health` reports the state. Use `data` — `tower/capture.py` appends `captures/<id>` itself |
 | `TOWER_WORLD_ROOT` | *(unset)* | Where World Builder worlds are stored. **Unset means iOS sees World Builder as unsupported.** Use `data/world_builder` — `tower/world_builder/store.py` appends `worlds/<id>` itself, and the value must equal `DEFAULT_ROOT` in `scripts/world_build_session.py` or the result channel reads a different tree than the builder writes |
@@ -398,12 +398,34 @@ async def main():
 asyncio.run(main())
 ```
 
-Expected output (values vary by image and by the active `TOWER_CV_EXPERIMENT`;
-`mean_intensity` is only present for the `baseline` experiment — see
-`tower/routes/ws.py`):
+Expected output (values vary by image and by whichever experiment is
+armed; `mean_intensity` is only present for the `baseline` experiment —
+see `tower/routes/ws.py`). The `cv_lab` block names the run and the
+experiment that produced the number, so a result can never be read as
+belonging to a different experiment:
 
 ```text
-{"type":"frame_result","seq":1,"processing_ms":4.1,"result_value":130.0,"result_label":"mean_intensity","stage_ms":{"total":4.1},"mean_intensity":130.0}
+{"type":"frame_result","seq":1,"processing_ms":4.1,"result_value":130.0,
+ "result_label":"mean_intensity","stage_ms":{"total":4.1},"mean_intensity":130.0,
+ "cv_lab":{"contract":"experimental_cv.frame_result/2026-08-27",
+           "tower_instance_id":"2a5b04b1b77c","run_id":"2a5b04b1b77c-1",
+           "result_seq":1,"experiment_id":"baseline","experiment_name":"Baseline",
+           "provenance":"measured","backend":"opencv","device":null,
+           "device_requested":"auto","result_label":"mean_intensity",
+           "processing_ms":4.1,"tower_received_at":1787810180.83,
+           "time_basis":"tower-receipt"}}
+```
+
+To see what this Tower can run, and what it is running:
+
+```powershell
+curl http://localhost:8000/cv-lab
+```
+
+To change experiment without restarting anything, on the same socket:
+
+```json
+{"type": "cv_lab_start", "experiment_id": "edge_detection"}
 ```
 
 The tower's own log output during this should show:
@@ -608,10 +630,15 @@ tower/
                           guidelines/docs/reports/2026-08-22-world-builder-v1-report.md).
                           Calibration-gated: no intrinsics means no poses,
                           and it says so rather than guessing.
+  cv_lab/                 The Experimental CV Lab as a product surface:
+                          the catalog, one run's measurements, and the
+                          lifecycle that selects an experiment at runtime.
+                          See docs/contracts/EXPERIMENTAL-CV-LAB.md.
   main.py                 FastAPI app factory + ASGI entrypoint; builds
-                          the one active module via TOWER_CV_EXPERIMENT
+                          the one Lab module and arms the startup default
+                          named by TOWER_CV_EXPERIMENT
   config.py               Environment-based settings (host/port/dev
-                          mode/CV experiment/CV device)
+                          mode/CV startup default/CV device)
   logging_config.py       Structured logging setup
   session.py              Minimal single-client connection tracking
   frames.py               Frame message validation/decoding
@@ -801,8 +828,10 @@ tests/
 
 The module system (`tower/modules/`) owns the module lifecycle
 (UNLOADED -> LOADING -> READY -> ACTIVE -> STOPPING/FAILED) and dispatches
-each decoded frame to whichever experiment is currently selected via
-`TOWER_CV_EXPERIMENT`. `frame_processing.py` no longer contains the only
+each decoded frame to the one Lab module. WHICH experiment that module is
+holding is `tower/cv_lab/`'s business and changes at runtime: the module
+is the slot, the Lab is what is in it, and the container still holds
+exactly one module constructed once with no discovery and no swap path. `frame_processing.py` no longer contains the only
 OpenCV usage in the codebase — `tower/experiments/edge_detection.py` and
 `tower/experiments/depth.py` also call into OpenCV (the latter only for
 JPEG decode/color conversion ahead of model inference); `frame_processing.py`

@@ -46,7 +46,15 @@ report others alongside it.
 
 Costs are measured on this host with synthetic imagery
 (`scripts/cv_lab_benchmark.py`) — real for the code, not a statement
-about a real room. Selected with `TOWER_CV_EXPERIMENT`.
+about a real room.
+
+**Selected at runtime**, since 2026-08-27: a client sends `cv_lab_start`
+and the Lab arms the named experiment with no Tower restart. The full
+wire contract — enumeration, lifecycle, provenance, metrics — is
+`docs/contracts/EXPERIMENTAL-CV-LAB.md`. `TOWER_CV_EXPERIMENT` survives as
+the **startup default**: what this Tower arms at boot, so that a client
+which knows nothing about the CV Lab still receives a `frame_result` for
+every frame exactly as before.
 
 **Every experiment must expose useful measurements.** An experiment whose
 result nobody can act on is not an experiment, and the headline exists to
@@ -186,6 +194,169 @@ the **shared** recorder's root (`tower/capture.py`, armed by
 `TOWER_CAPTURE_ROOT`), and measured results live in
 `guidelines/docs/reports/`.
 
+## Adding a new experiment
+
+Six steps, in order. Four of them are enforced — you cannot skip them and
+get a working Tower, because each is a missing positional argument or a
+failing gate rather than a convention.
+
+### 1. Write the experiment
+
+One module under `tower/experiments/`. A **stateless** experiment is a
+function; `StatelessExperiment` adapts it:
+
+```python
+# tower/experiments/my_experiment.py
+import cv2
+import numpy as np
+
+from tower.experiments import ExperimentResult, MetricKind, decode_gray
+from tower.instrumentation import StageTimer
+
+METRIC_KINDS: dict[str, MetricKind] = {
+    "things_found": MetricKind.COUNT,
+    "coverage": MetricKind.RATE,
+}
+
+
+def run(raw_bytes: bytes) -> ExperimentResult:
+    timer = StageTimer()
+    with timer.stage("decode"):
+        image = decode_gray(raw_bytes)
+    with timer.stage("measure"):
+        ...
+    return ExperimentResult(
+        result_value=score,          # the headline. Mandatory.
+        result_label="my_score",     # its name. Mandatory.
+        processing_ms=timer.total_ms,
+        stage_ms=timer.snapshot(),
+        metrics={"things_found": count, "coverage": coverage},
+    )
+```
+
+A **stateful** experiment is a class with `name`, `load(settings)`,
+`run(bytes)` and `release()`. `release()` must free whatever `load()`
+allocated, be safe to call twice, and be safe after a partial load — it
+runs on the FAILED transition, which is reachable from anywhere. If it
+holds a model, guard the handover with `LoadInvalidation` (see
+`tower/loading.py`; a load can be ABANDONED and a late install is a leak).
+
+**Decode through `decode_color` / `decode_gray`.** They turn three
+distinct wire-reachable failures — a truncated JPEG, an empty buffer, a
+1-pixel dimension — into a `FrameProcessingError`, which drops one frame.
+A bare `cv2.error` is a MODULE failure, and `mark_failed()` is terminal.
+
+**Persist nothing.** `test_no_experiment_persists_anything` forbids
+`open()`, `write_json_atomic`, `append_jsonl`, `WorldStore` and
+`ObservationStore` anywhere under `tower/experiments/`. **Import no
+cartridge**: `test_the_experimental_cv_lab_does_not_import_a_cartridge`
+forbids `world_builder` and `object_memory`. **Import torch inside a
+function, never at module level**:
+`test_importing_the_lab_does_not_import_torch` runs a subprocess to check.
+
+### 2. Classify every metric
+
+`METRIC_KINDS` above, beside the code that produces the numbers, because
+only that code knows how they combine:
+
+| Kind | Corpus answer | Use for |
+|---|---|---|
+| `RATE` | mean | a fraction, a score, a mean, a magnitude |
+| `COUNT` | sum | a tally, including a 0/1 flag whose sum is "how many frames" |
+| `CONSTANT` | the value observed | an image dimension, a configured threshold |
+| `UNAGGREGATED` | nothing — a frame count only | a circular or otherwise unsummarisable quantity |
+
+There is **no default**. A metric you emit and do not classify raises
+`UnclassifiedMetricError`, and
+`test_every_metric_the_experiment_emits_is_classified` will catch it
+before a user does. That loudness is deliberate: the predecessor
+classified by allowlist and SUMMED anything it did not recognise, which
+hid eight dead names and fifteen mis-summed rates.
+
+### 3. Register it, with its metadata
+
+In `tower/experiments/__init__.py`, one entry in `_REGISTRY`:
+
+```python
+"my_experiment": ExperimentRegistration(
+    lambda: StatelessExperiment("my_experiment", my_experiment.run),
+    my_experiment.METRIC_KINDS,
+    ExperimentMetadata(
+        name="My experiment",          # what a person reads
+        summary="One line saying what it measures and why.",
+        provenance=PROVENANCE_MEASURED,  # or PROVENANCE_INFERRED
+        stateful=False,
+        requires_model=False,
+        headline_label="my_score",     # must equal your result_label
+        backend="opencv",              # or "torch"
+        headline_unit=_FRACTION,       # or None if it genuinely has none
+        metric_units={"coverage": _FRACTION},
+        annotation_metric=None,        # or the metric that counts findings
+    ),
+),
+```
+
+A **FACTORY**, not an instance: constructing a detector at import time
+loads model weights in any process that imports this module, including
+every unrelated test.
+
+All three arguments are positional. An experiment registered without
+metric kinds or without metadata is a `TypeError` at import, not a blank
+row on somebody's phone.
+
+`provenance` is the one to think hardest about.
+**Model output is inference, not measured fact** unless the experiment
+validates against a ground-truth reference. iOS makes provenance a
+REQUIRED field on every metric so that whoever decodes a reply has to
+answer it — this is where the answer comes from.
+
+`headline_unit=None` is a real answer meaning "this quantity has no
+unit", and iOS renders it bare. Do not invent one: `depth` emits relative
+inverse depth on an arbitrary scale, and "metric is not metres".
+
+### 4. Add the tests
+
+Copy the shape of the ones that exist:
+
+| What | Where |
+|---|---|
+| It measures what it claims | `tests/test_experiments_measure_truth.py` |
+| Hostile frames do not take the module down | `tests/test_experiments_hostile_input.py` |
+| Every metric is classified, none is dead | `tests/test_experiment_metric_classification.py` |
+| It is in the registry and is a factory | `tests/test_experiments_registry.py` |
+| Its metadata is true | `tests/test_cv_lab_catalog.py` |
+
+Three of those iterate the registry and will fail on your new entry
+until you extend them. That is the intended signal.
+
+If it is model-backed, add an **opt-in** integration test gated on
+`TOWER_RUN_MODEL_TESTS=1` — see
+`tests/test_object_detection_integration.py`.
+
+### 5. Say what it costs
+
+`scripts/cv_lab_benchmark.py` runs every cheap experiment at three
+resolutions and prints a per-frame budget. Add yours to `CHEAP` (or
+`MODEL_BACKED`) and put the number in the table at the top of this
+document. An experiment with no measured cost cannot be chosen against
+another one, which is most of what the Lab is for.
+
+### 6. Check the wire
+
+Nothing else is needed: `GET /cv-lab` and `cv_lab_status` derive the
+catalog from `_REGISTRY`, so a registered experiment is a selectable one.
+Confirm it:
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/test_cv_lab_catalog.py -q
+curl http://localhost:8000/cv-lab
+```
+
+If `test_the_document_names_every_registered_experiment` fails, add your
+id to `docs/contracts/EXPERIMENTAL-CV-LAB.md` §3.2. The contract document
+is what a phone engineer implements from; a catalog that grows without it
+is a list that becomes a surprise.
+
 ## Promotion Path
 
 An experiment that proves useful should not remain permanently inside the sandbox.
@@ -203,6 +374,32 @@ implement through normal architecture
 ```
 
 For example, if relevance classification becomes essential across modules, it may later become a shared service after a separate architecture decision.
+
+**Graduating out of the Lab, concretely.** The Lab is where an idea is
+measured; a cartridge is where it is depended on. The move is not a
+rename, and four things change:
+
+1. **It stops being one of eight in one slot.** A cartridge gets its own
+   module, its own descriptor, and its own `data_behavior` declaration —
+   which is the point at which "persists nothing" stops being free and
+   becomes a decision somebody signs.
+2. **It stops sharing a run.** A Lab run is process-wide and shared by
+   every connection. A cartridge that needs per-session state needs the
+   session-boundary hook the module contract does not have yet (see
+   `optical_flow`'s own note about the residual it cannot close).
+3. **It gets its own contract identifier.** The Lab's status document
+   describes A LAB — what can run, what is running, what it found. A
+   cartridge's payload describes its own domain. Reusing
+   `experimental_cv.status/...` for a shipped cartridge would tell a
+   phone the wrong thing about what it is looking at.
+4. **Its metrics stop being generic.** `MetricKind` and the Lab's
+   aggregation exist because a bench compares experiments. A cartridge
+   reports what its domain means, and `tower/results/<cartridge>.py` is
+   where that shape is decided.
+
+What DOES carry over: the experiment code itself, its measured cost, its
+metric classification, and the evidence that made the case. That is the
+whole reason to measure in the Lab first.
 
 ## Persistence
 

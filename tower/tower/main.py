@@ -22,6 +22,7 @@ from tower.results.contracts import CARTRIDGE_OBJECT_MEMORY
 from tower.results.object_memory import build_face_filter, recorded_classes_for
 from tower.routes import (
     cartridges,
+    cv_lab,
     documents,
     geometry,
     health,
@@ -52,7 +53,7 @@ WORLD_BUILD_WORKER = "world-build-session"
 OBJECT_MEMORY_WORKER = "object-memory-session"
 
 
-def _build_cv_module(settings: Settings) -> Module:
+def _build_cv_module(settings: Settings, connection_count=None) -> Module:
     """The one module slot.
 
     There used to be a branch here selecting a different Module subclass
@@ -60,10 +61,24 @@ def _build_cv_module(settings: Settings) -> Module:
     Experiment state now lives behind the Experiment protocol, so the
     module is the same one whichever experiment is selected -- which is
     what the module doc always said: one Lab slot, many experiments.
+
+    `settings.cv_experiment` is now the STARTUP DEFAULT and nothing more.
+    It is what this Tower arms at boot so that a client which knows
+    nothing about the CV Lab still receives a `frame_result` for every
+    frame, exactly as before; a client that does know sends
+    `cv_lab_start` and the environment variable stops mattering until the
+    next restart. That is the whole of "remove the product dependence on
+    TOWER_CV_EXPERIMENT": it survives as a developer default, not as the
+    only way to choose.
+
+    `connection_count` lets the Lab report how many clients are attached,
+    which is what turns "I pressed Start and nothing happened" from a
+    guess into a reading.
     """
     return ExperimentalCVModule(
         settings.cv_experiment,
         ExperimentSettings(device=settings.cv_device),
+        connection_count=connection_count,
     )
 
 
@@ -321,6 +336,13 @@ def _log_effective_configuration(
                 ", ".join(KNOWN_VERIFIERS),
             )
 
+    logger.info(
+        "[Tower][Config] CV Lab startup default is %r on device %r; a client "
+        "may select another with cv_lab_start, no restart required",
+        settings.cv_experiment,
+        settings.cv_device,
+    )
+
     attached = supervisor.worker_names()
     if WORLD_BUILD_WORKER in attached:
         logger.info(
@@ -369,6 +391,14 @@ async def lifespan(app: FastAPI):
     live = getattr(app.state, "live_cartridges", None)
     if live is not None:
         await asyncio.to_thread(live.shutdown)
+    # Before the container, and awaited. An experiment may be mid-load in
+    # a background task; `ModuleContainer.shutdown()` would release the
+    # Lab synchronously and leave that task to be cancelled by a loop
+    # that is about to close. This is the one place with both a running
+    # loop and the authority to wait for it.
+    lab = getattr(app.state, "cv_lab", None)
+    if lab is not None:
+        await lab.shutdown()
     await app.state.module_container.shutdown()
 
 
@@ -378,7 +408,19 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Glasses Tower", lifespan=lifespan)
     app.state.session = ConnectionTracker()
     settings = get_settings()
-    app.state.module_container = ModuleContainer(_build_cv_module(settings))
+    cv_module = _build_cv_module(
+        settings,
+        # Read lazily, so the Lab reports the count at the moment it is
+        # asked rather than the count at startup, which is always zero.
+        connection_count=lambda: app.state.session.live_connections,
+    )
+    app.state.module_container = ModuleContainer(cv_module)
+    # The SAME object the module holds -- not a second Lab, and not a
+    # copy of its state. Two Labs sharing one slot would be the "two
+    # experiments at once" failure the whole design exists to prevent, and
+    # a copy would be a second answer to "what is running" that starts
+    # disagreeing the moment somebody switches.
+    app.state.cv_lab = cv_module.lab
     app.state.frame_observers = _build_frame_observers(settings)
     # Read-only, and read by the result channel alone. The web process
     # never builds a world; world_build_session.py does, in its own
@@ -468,6 +510,7 @@ def create_app() -> FastAPI:
         document_root=settings.document_root,
         scene_source=live.scene,
         document_source=live.document,
+        cv_lab=app.state.cv_lab,
     )
     # Started here, not in `lifespan` above: TestClient(create_app()) used
     # without `with client:` (every pre-existing test in this repo) never
@@ -476,6 +519,7 @@ def create_app() -> FastAPI:
     asyncio.run(app.state.module_container.load_and_start())
     app.include_router(health.router)
     app.include_router(cartridges.router)
+    app.include_router(cv_lab.router)
     app.include_router(geometry.router)
     app.include_router(observations.router)
     app.include_router(sessions.router)

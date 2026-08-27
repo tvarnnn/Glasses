@@ -184,19 +184,33 @@ def test_a_world_builder_subscription_only_ever_carries_world_builder(
 def test_no_other_cartridge_can_be_subscribed_to(monkeypatch, world_root):
     """The registry is the only gate, and it refuses everything else.
 
-    Two lists now, because there are two different refusals and a client
+    Two lists, because there are two different refusals and a client
     switches on the difference. `unknown_cartridge` means this Tower has
     never heard of it -- iOS's "not built yet". `cartridge_unavailable`
     means the contract exists and this Tower is not configured to serve
     it -- iOS's "connect". Collapsing them would tell a person to give up
     on a cartridge that one environment variable would turn on.
 
-    This fixture configures a world root and nothing else, so both new
-    cartridges are declared and unavailable here.
+    `experimental_cv`, `document_memory` and `scene_understanding` all
+    left the first list on 2026-08-27, each having gained a contract of
+    its own. Which list they land in now depends on configuration rather
+    than on this build: `make_client` builds the real app, so a CV Lab
+    always exists and `experimental_cv` is genuinely subscribable here --
+    it is covered by `tests/test_cv_lab_protocol.py`. The fixture sets a
+    world root and nothing else, so the other two are declared and
+    UNAVAILABLE, which is the second loop below.
+
+    That leaves two cartridges this Tower really has never heard of:
+    `translator`, which does not exist, and `object_memory`, which has a
+    control surface and a store but is deliberately absent from
+    `registry.declare()` until the iOS lane can take the declaration and
+    its pinned test together. Its presence here is load-bearing -- if
+    somebody declares Object Memory without that coordination, this line
+    is what notices.
     """
     client = make_client(monkeypatch, world_root)
     with client.websocket_connect("/ws") as ws:
-        for cartridge in ("experimental_cv", "object_memory", "translator"):
+        for cartridge in ("object_memory", "translator"):
             ws.send_json(
                 {
                     "type": "result_subscribe",

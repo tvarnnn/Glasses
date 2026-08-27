@@ -31,7 +31,10 @@ def test_every_experiment_selection_yields_the_one_lab_module():
 def test_the_requested_device_reaches_the_experiment_settings():
     module = _build_cv_module(_settings("depth", cv_device="cpu"))
 
-    assert module._settings == ExperimentSettings(device="cpu")
+    # On the Lab, not the module: the module is the SLOT and the Lab is
+    # what is in it, so the device an experiment is loaded onto belongs
+    # to the thing that loads it.
+    assert module.lab._settings == ExperimentSettings(device="cpu")
 
 
 def test_constructing_a_module_loads_no_model():
@@ -42,4 +45,7 @@ def test_constructing_a_module_loads_no_model():
     """
     module = _build_cv_module(_settings("object_detection", cv_device="cpu"))
 
-    assert module._experiment is None
+    # The Lab exists; the EXPERIMENT does not, until load. Building a
+    # detector at construction would load model weights merely because
+    # somebody constructed a module.
+    assert module.lab._experiment is None

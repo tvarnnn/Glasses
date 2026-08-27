@@ -108,12 +108,14 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
         result_type,
         document_root=inputs["document_root"],
         scene_enabled=inputs["scene_enabled"],
+        cv_lab=inputs["cv_lab"],
     )
     if offer is None:
         known = registry.known_cartridges(
             inputs["world_root"],
             document_root=inputs["document_root"],
             scene_enabled=inputs["scene_enabled"],
+            cv_lab=inputs["cv_lab"],
         )
         if cartridge not in known:
             await _error(

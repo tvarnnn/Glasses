@@ -41,8 +41,10 @@ import time
 
 from tower.results.contracts import (
     CARTRIDGE_DOCUMENT_MEMORY,
+    CARTRIDGE_EXPERIMENTAL_CV,
     CARTRIDGE_SCENE_UNDERSTANDING,
     CARTRIDGE_WORLD_BUILDER,
+    EXPERIMENTAL_CV_STATUS_CONTRACT,
     RESULT_TYPE_LIVE,
     RESULT_TYPE_STATUS,
     WORLD_BUILDER_STATUS_CONTRACT,
@@ -58,6 +60,7 @@ def make_snapshot_for(
     document_root=None,
     scene_source=None,
     document_source=None,
+    cv_lab=None,
 ):
     """A callable turning (cartridge, result_type, world, session) into a Snapshot.
 
@@ -75,13 +78,42 @@ def make_snapshot_for(
     test can drive the whole channel with a stub that has never seen
     torch.
 
-    Both are optional and default to None, which produces an explicit
-    `unavailable` snapshot rather than an exception -- the same
+    `cv_lab` is the third of those and the same shape: the live Lab
+    object or None. It is the first thing this channel reported that was
+    not a file -- see `tower/results/experimental_cv.py` for why that is
+    still read-only, and for the concurrency it introduces.
+
+    All three are optional and default to None, which produces an
+    explicit `unavailable` snapshot rather than an exception -- the same
     under-promise-on-omission rule `registry.declare` follows.
     """
     producers: dict = {}
 
     def snapshot_for(cartridge, result_type, world_id, session_id) -> Snapshot:
+        if (
+            cartridge == CARTRIDGE_EXPERIMENTAL_CV
+            and result_type == RESULT_TYPE_STATUS
+        ):
+            if cv_lab is None:
+                # Function-local import, the same pattern the World
+                # Builder producer uses below: `tower/results/__init__.py`
+                # is in the cartridge-blind core list, and a module-level
+                # import would put a cartridge in the shared surface.
+                from tower.results.experimental_cv import unavailable_payload
+
+                payload = unavailable_payload(
+                    "this Tower is running without a CV Lab module"
+                )
+                return Snapshot(payload=payload, revision=compute_revision(payload))
+            producer = producers.get(cartridge)
+            if producer is None:
+                from tower.results.experimental_cv import (
+                    ExperimentalCVStatusProducer,
+                )
+
+                producer = ExperimentalCVStatusProducer(cv_lab)
+                producers[cartridge] = producer
+            return producer.snapshot()
         if cartridge == CARTRIDGE_WORLD_BUILDER and result_type == RESULT_TYPE_STATUS:
             if world_root is None:
                 return _unavailable_snapshot(
@@ -180,6 +212,7 @@ def build_hub(
     document_root=None,
     scene_source=None,
     document_source=None,
+    cv_lab=None,
 ) -> ResultHub:
     return ResultHub(
         make_snapshot_for(
@@ -188,12 +221,15 @@ def build_hub(
             document_root=document_root,
             scene_source=scene_source,
             document_source=document_source,
+            cv_lab=cv_lab,
         ),
         clock=clock,
     )
 
 
 __all__ = [
+    "CARTRIDGE_EXPERIMENTAL_CV",
+    "EXPERIMENTAL_CV_STATUS_CONTRACT",
     "CARTRIDGE_WORLD_BUILDER",
     "RESULT_TYPE_STATUS",
     "WORLD_BUILDER_STATUS_CONTRACT",

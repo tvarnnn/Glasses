@@ -45,6 +45,7 @@ blind`). Their identifiers live in adapter modules rather than in
 `contracts.py`, so those two lanes own that move.
 """
 
+import logging
 from dataclasses import dataclass
 
 from tower.results.contracts import (
@@ -55,6 +56,7 @@ from tower.results.contracts import (
     DOCUMENT_MEMORY_LIBRARY_CONTRACT,
     DOCUMENT_MEMORY_STATUS_CONTRACT,
     ENVELOPE_CONTRACT,
+    EXPERIMENTAL_CV_STATUS_CONTRACT,
     RESULT_TYPE_LIVE,
     RESULT_TYPE_STATUS,
     SCENE_LIVE_CONTRACT,
@@ -79,16 +81,20 @@ from tower.results.contracts import (
 # that can say nothing at all; a cartridge that can say "I have observed
 # nothing, and here is precisely why" belongs in `cartridges`, available
 # or not.
-NOT_OFFERED = (
-    {
-        "cartridge": CARTRIDGE_EXPERIMENTAL_CV,
-        "reason": (
-            "results already reach the client on frame_result; a typed "
-            "contract awaits the experiment-registry and provenance work "
-            "described in IOS-to-Tower.md 2.1-2.3"
-        ),
-    },
-)
+# As of this integration the tuple is EMPTY, and that is a claim, not
+# an oversight: every cartridge with a wire contract in this build now
+# has an OFFER, available or not. Document Memory and Scene
+# Understanding left on 2026-08-27 and the Experimental CV Lab left with
+# `experimental_cv.status/2026-08-27`.
+#
+# OBJECT MEMORY IS IN NEITHER LIST, deliberately. Its identifier exists
+# in `contracts.py` and its control surface is live at
+# `/cartridges/{cartridge}/session`, but declaring it here breaks a
+# pinned iOS test, so the socket declaration waits for the iOS lane to
+# take both halves at once. See the note at CARTRIDGE_OBJECT_MEMORY.
+# That is a decision for a human and must not be closed by an
+# integrator noticing the gap.
+NOT_OFFERED: tuple[dict, ...] = ()
 
 # Why an offer can be present and unavailable. Module-level constants
 # rather than inline strings, so a test can assert the exact wording a
@@ -107,6 +113,9 @@ DOCUMENT_DISABLED_REASON = (
     "is unset), so there is nowhere to record a document and nothing to "
     "read back. This build implements the contract"
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -140,21 +149,32 @@ def declare(
     *,
     document_root: str | None = None,
     scene_enabled: bool = False,
+    cv_lab=None,
 ) -> dict:
     """The full capability declaration.
 
     Takes its inputs rather than reading configuration itself so the
     declaration is a pure function of them -- which is what lets one test
     assert that the HTTP route and the WebSocket message produce
-    byte-identical output.
+    byte-identical output. Passing the app instead would have made the
+    function impure again, which is why three cartridges' worth of state
+    arrives as three arguments and not as one `app`.
 
-    The two newer arguments are keyword-only WITH DEFAULTS, and that is a
-    decision about what an omission should mean rather than a
+    Every argument past `world_root` is keyword-only WITH A DEFAULT, and
+    that is a decision about what an omission should mean rather than a
     convenience. A caller that has not been taught about a cartridge gets
     that cartridge declared and UNAVAILABLE -- never silently offered as
     working. So the failure mode of forgetting to thread a value through
     is a Tower that under-promises, which iOS renders as "connect", and
-    not one that promises a channel it cannot serve.
+    not one that promises a channel it cannot serve. Use
+    `declaration_inputs(app_state)` rather than assembling them by hand.
+
+    `cv_lab` is DUCK-TYPED, never imported: anything with an
+    `availability()` returning `(available, reason)`. This module is part
+    of the result channel cartridge-blind core and
+    `test_the_result_channel_core_is_cartridge_blind` keeps it that way;
+    an import of the Lab here would bake one cartridge into the shared
+    surface, and this time the surface is a WIRE CONTRACT.
 
     Availability is about CONFIGURATION, never about current activity. A
     Scene Understanding that is enabled but stopped is `available: true`
@@ -172,6 +192,8 @@ def declare(
     else:
         world_available = True
         world_reason = None
+
+    cv_available, cv_reason = _cv_lab_availability(cv_lab)
 
     offers = (
         CartridgeOffer(
@@ -196,6 +218,13 @@ def declare(
             unavailable_reason=(
                 None if document_root is not None else DOCUMENT_DISABLED_REASON
             ),
+        ),
+        CartridgeOffer(
+            cartridge=CARTRIDGE_EXPERIMENTAL_CV,
+            result_type=RESULT_TYPE_STATUS,
+            contract=EXPERIMENTAL_CV_STATUS_CONTRACT,
+            available=cv_available,
+            unavailable_reason=cv_reason,
         ),
     )
 
@@ -226,6 +255,32 @@ def declare(
     }
 
 
+def _cv_lab_availability(cv_lab) -> tuple[bool, str | None]:
+    """Whether this build can serve the CV Lab contract, and why not.
+
+    A Tower with no Lab still OFFERS the contract -- this build knows how
+    to speak it -- and reports it unavailable, which is the third state in
+    IOS-to-Tower.md 0.1 ("offered, implemented, unreachable -> connect")
+    rather than the first ("the Tower says nothing -> not built yet").
+    Those call for opposite instructions to a person, which is why they
+    cannot be one state.
+
+    Never raises. A declaration is how a client learns what is possible;
+    it must not fail because a subsystem is unwell.
+    """
+    if cv_lab is None:
+        return False, (
+            "this Tower is running without a CV Lab module, so no "
+            "experiment can be enumerated or started"
+        )
+    try:
+        available, reason = cv_lab.availability()
+    except Exception:
+        logger.exception("[Tower][Results] could not read CV Lab availability")
+        return False, "the CV Lab could not report whether it is available"
+    return bool(available), reason
+
+
 def find_offer(
     world_root: str | None,
     cartridge: str,
@@ -233,6 +288,7 @@ def find_offer(
     *,
     document_root: str | None = None,
     scene_enabled: bool = False,
+    cv_lab=None,
 ):
     """The offer matching a subscribe request, or None.
 
@@ -241,7 +297,10 @@ def find_offer(
     message; this returns one thing so there is one lookup path.
     """
     declaration = declare(
-        world_root, document_root=document_root, scene_enabled=scene_enabled
+        world_root,
+        document_root=document_root,
+        scene_enabled=scene_enabled,
+        cv_lab=cv_lab,
     )
     for entry in declaration["cartridges"]:
         if entry["cartridge"] == cartridge and entry["result_type"] == result_type:
@@ -254,9 +313,13 @@ def known_cartridges(
     *,
     document_root: str | None = None,
     scene_enabled: bool = False,
+    cv_lab=None,
 ) -> set:
     declaration = declare(
-        world_root, document_root=document_root, scene_enabled=scene_enabled
+        world_root,
+        document_root=document_root,
+        scene_enabled=scene_enabled,
+        cv_lab=cv_lab,
     )
     return {entry["cartridge"] for entry in declaration["cartridges"]}
 
@@ -268,11 +331,12 @@ def declaration_inputs(app_state) -> dict:
     arguments -- which is what lets a test assert the HTTP route and the
     WebSocket message are byte-identical rather than merely equal today.
 
-    One definition, used by both surfaces, for the same reason. Two
-    call sites each reaching for their own subset of `app.state` is
-    precisely how `/cartridges` over HTTP and `{"type": "cartridges"}` on
-    the socket would come to disagree, and the disagreement would be
-    invisible until a phone hit the one that was wrong.
+    One definition, used by every surface, for the same reason. Two call
+    sites each reaching for their own subset of `app.state` is precisely
+    how `/cartridges` over HTTP and `{"type": "cartridges"}` on the socket
+    would come to disagree, and the disagreement would be invisible until
+    a phone hit the one that was wrong. Three cartridges now depend on
+    that, so this is the only supported way to build the arguments.
 
     `getattr` with a default throughout, because most tests in this
     repository construct an app state by hand and set only what they care
@@ -283,4 +347,5 @@ def declaration_inputs(app_state) -> dict:
         "world_root": getattr(app_state, "world_root", None),
         "document_root": getattr(app_state, "document_root", None),
         "scene_enabled": bool(getattr(app_state, "scene_enabled", False)),
+        "cv_lab": getattr(app_state, "cv_lab", None),
     }

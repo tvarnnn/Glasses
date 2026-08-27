@@ -414,7 +414,8 @@ The envelope is generic; payloads are not. To add a cartridge:
 
 Nothing in the envelope, publisher, registry or routes changes. The
 subscription, ordering, coalescing, reconnect and error machinery is
-already generic and already tested.
+already generic and already tested — the Experimental CV Lab was added
+without touching any of it.
 
 **Two lists, because there are two transports.** `cartridges` is what
 can be SUBSCRIBED to. `http_contracts` is what can be FETCHED, and it
@@ -429,19 +430,54 @@ their identifiers live in adapter modules rather than in `contracts.py`,
 and `registry.py` must stay cartridge-blind, so those two lanes own that
 move.
 
-**What is offered, as of 2026-08-27**
+**What is offered, as of the 2026-08-27 unification**
 
 | Cartridge | Result type | Contract | Section |
 |---|---|---|---|
 | World Builder | `status` | `world_builder.status/2026-08-25` | §10 |
+| Experimental CV Lab | `status` | `experimental_cv.status/2026-08-27` | `EXPERIMENTAL-CV-LAB.md` |
 | Scene Understanding | `live` | `scene_understanding.live/2026-08-27` | §14 |
 | Document Memory | `status` | `document_memory.status/2026-08-27` | §15 |
 
-**Why the remaining one is not offered yet**
+**`not_offered` is now EMPTY, and that is a claim.** Three cartridges
+left that list on 2026-08-27 — Scene Understanding, Document Memory and
+the Experimental CV Lab — and none of them left it because they got
+better. Document Memory's detector still fires on essentially nothing at
+the geometry the glasses deliver. They left because their limits became
+things the PAYLOAD STATES, which is what an offer is for. A cartridge
+belongs in `not_offered` only while it can say nothing at all; one that
+can say "I have observed nothing, and here is precisely why" belongs in
+`cartridges`, available or not.
 
-| Cartridge | Reason |
-|---|---|
-| Experimental CV Lab | its per-frame results already reach the client on `frame_result`. A typed contract wants the experiment registry, provenance and baseline work in `IOS-to-Tower.md` §2.1–2.3, which is a design decision, not a transport one |
+**Object Memory is in NEITHER list, and that is the one deliberate gap.**
+It has a store, read routes, imagery routes and a live control surface at
+`/cartridges/{cartridge}/session` — but no entry in `registry.declare()`.
+Declaring it breaks a pinned iOS test
+(`testTheTowerDeclaresOnlyTheWorldBuilderContract`), so the socket
+declaration waits for the iOS lane to take both halves in one change. The
+Tower side is about four lines. This is a decision for a human and must
+not be closed by an integrator noticing the asymmetry; a client that
+needs Object Memory today reaches it over HTTP and learns nothing about
+it from the declaration.
+
+**One shared signature, reconciled.** `declare()`, `find_offer()` and
+`known_cartridges()` take `world_root` positionally and everything else
+KEYWORD-ONLY with a default: `document_root`, `scene_enabled`, `cv_lab`.
+The defaults are the safety property — a caller that has not been taught
+about a cartridge gets it declared UNAVAILABLE rather than silently
+offered as working, so forgetting to thread a value through under-promises
+(iOS renders "connect") instead of promising a channel the Tower cannot
+serve. `cv_lab` is **duck-typed and never imported** — anything with an
+`availability()` returning `(available, reason)` — because
+`test_the_result_channel_core_is_cartridge_blind` forbids the registry
+from importing a cartridge, and this time the surface is a wire contract.
+
+Callers do not assemble those arguments by hand. `registry.declaration_inputs(app_state)`
+is the single reader of declaration state off an app, used by `GET
+/cartridges` and by `{"type": "cartridges"}` alike. Two call sites each
+reaching for their own subset of `app.state` is exactly how the two
+surfaces would come to disagree, and the disagreement would be invisible
+until a phone hit the one that was wrong.
 
 **A live cartridge does not fit steps 1–4 above, and Scene Understanding
 is the case.** It persists nothing by design — enforced, not intended —
@@ -456,7 +492,30 @@ handle from becoming a second frame path.
 
 So step 1 gains a clause: a cartridge that produces live state passes a
 SESSION OBJECT into `make_snapshot_for`, and the adapter projects it. A
-cartridge with a store still passes a root.
+cartridge with a store still passes a root. The CV Lab is the third
+shape: a live object that is neither a store nor a frame consumer, passed
+as `cv_lab` and read the same read-only way.
+
+**Experimental CV Lab is now offered** — `experimental_cv` / `status`,
+contract `experimental_cv.status/2026-08-27`, documented separately in
+`EXPERIMENTAL-CV-LAB.md`. It is the first producer in this package that
+reads **live in-process state** rather than files another process wrote,
+and that is worth knowing before adding a third:
+
+- Step 1 above still holds, and `tower/results/experimental_cv.py` is
+  still the only file allowed to know what a CV Lab is.
+- The channel is still **read-only**. It reports the Lab; it cannot
+  start, stop or configure one. Commands travel on their own messages
+  (`cv_lab_start` and friends), deliberately not here — a mutation on a
+  reporting surface is a place the next cartridge's author would look for
+  one.
+- What is new is **concurrency**. A World Builder snapshot is read from
+  disk by `asyncio.to_thread` while nothing in this process is writing
+  it. A CV Lab snapshot is read from a worker thread while the event loop
+  is mutating the object, so the LAB takes a lock around every state
+  transition and around building its document. A future live producer
+  must do the same; the hub offers no such guarantee and should not,
+  because it holds no state of its own.
 
 ---
 
@@ -1762,6 +1821,10 @@ identifier promised.
 | Document Memory producer | `tower/results/document_memory.py` |
 | Document Memory session | `tower/document_memory/live.py`, `tower/live_session.py` |
 | Document Memory library and control | `tower/routes/documents.py` |
+| Experimental CV Lab producer | `tower/results/experimental_cv.py` |
+| Experimental CV Lab control | `tower/routes/cv_lab.py`, `tower/routes/cv_lab_ws.py` |
+| Object Memory session control | `tower/routes/sessions.py`, `tower/cartridge_session.py` |
+| Object Memory store and imagery | `tower/object_memory/`, `tower/routes/observations.py` |
 | Live cartridge construction | `tower/cartridge_runtime.py` |
 | Wiring | `tower/main.py`, `tower/config.py` (`TOWER_WORLD_ROOT`, `TOWER_SCENE_UNDERSTANDING`, `TOWER_SCENE_DEVICE`, `TOWER_SCENE_ORIENTATION`, `TOWER_DOCUMENT_ROOT`, `TOWER_DOCUMENT_CAPTURE`) |
 
