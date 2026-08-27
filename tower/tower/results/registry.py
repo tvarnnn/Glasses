@@ -27,6 +27,22 @@ before V1.0, and iOS says so itself: it "caches a declaration rather than
 fetching a registry". The set below is a static, hand-maintained
 declaration compiled into this build. Nothing here enumerates loaded
 modules, and nothing here can grow at runtime.
+
+TWO LISTS, BECAUSE THERE ARE TWO TRANSPORTS.
+
+`cartridges` is what can be SUBSCRIBED to: each entry is a
+`(cartridge, result_type)` pair the result socket will serve.
+`http_contracts` is what can be FETCHED, and it exists because iOS
+caches a declaration -- a contract discoverable only by making a call is
+a contract a phone cannot plan around, and Document Memory's library was
+exactly that.
+
+Only Document Memory's is listed today. World Builder's geometry and
+Object Memory's observations are the same shape and are not declared;
+adding them would mean importing their identifiers here, and this module
+must stay cartridge-blind (`test_the_result_channel_core_is_cartridge_
+blind`). Their identifiers live in adapter modules rather than in
+`contracts.py`, so those two lanes own that move.
 """
 
 from dataclasses import dataclass
@@ -36,6 +52,7 @@ from tower.results.contracts import (
     CARTRIDGE_EXPERIMENTAL_CV,
     CARTRIDGE_SCENE_UNDERSTANDING,
     CARTRIDGE_WORLD_BUILDER,
+    DOCUMENT_MEMORY_LIBRARY_CONTRACT,
     DOCUMENT_MEMORY_STATUS_CONTRACT,
     ENVELOPE_CONTRACT,
     RESULT_TYPE_LIVE,
@@ -187,6 +204,25 @@ def declare(
         "envelope_contract": ENVELOPE_CONTRACT,
         "cartridges": [offer.to_json_dict() for offer in offers],
         "not_offered": [dict(entry) for entry in NOT_OFFERED],
+        "http_contracts": [
+            {
+                "cartridge": CARTRIDGE_DOCUMENT_MEMORY,
+                "contract": DOCUMENT_MEMORY_LIBRARY_CONTRACT,
+                "entry_route": "/documents",
+                "available": document_root is not None,
+                "unavailable_reason": (
+                    None
+                    if document_root is not None
+                    else DOCUMENT_DISABLED_REASON
+                ),
+                "why_not_a_subscription": (
+                    "document text is bulk and is the most sensitive data "
+                    "this platform holds. The result socket shares its "
+                    "send lock with the frame path, and a listing is "
+                    "pulled on demand rather than pushed"
+                ),
+            }
+        ],
     }
 
 

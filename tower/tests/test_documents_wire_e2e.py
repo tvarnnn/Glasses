@@ -172,8 +172,20 @@ class TestAnEmptyMemoryIsNotAnEmptyWorld:
         payload = client.get("/documents").json()
 
         kinds = {entry["limitation"] for entry in payload["recording_limitations"]}
-        assert kinds == {"detection-rate", "no-validated-positive", "resolution"}
+        assert kinds == {
+            "detection-rate",
+            "no-validated-positive",
+            "resolution",
+            "resolution-remedy-is-not-a-fix",
+        }
         assert payload["contract"] == LIBRARY_CONTRACT
+        # Every one of those is a measurement, and a measurement asserted
+        # in the present tense reads as current state. This platform's
+        # corpus grows continuously, so it is not.
+        measurement = payload["recording_measurement"]
+        assert measurement["measured_at"] == "2026-08-26"
+        assert measurement["corpus_frames"] == 9199
+        assert measurement["is_current"] is False
 
 
 class TestTheListCarriesNoText:
@@ -354,10 +366,19 @@ class TestTheDeclarationAndTheRoutesAgree:
 
         payload = first["payload"]
         assert payload["library"]["available"] is True
-        assert payload["library"]["document_count"] == 1
+        assert payload["library"]["document_count_unfiltered"] == 1
+        assert payload["library"]["retention_applied"] is False
         assert payload["library"]["location_disclosed"] is False
         assert payload["session"]["state"] == "unavailable"
         assert "TOWER_DOCUMENT_CAPTURE" in payload["session"]["reason"]
+        # The shape must not change with the configuration. A decoder
+        # that had to make thirty fields optional -- and handle a `state`
+        # the payload's own enum denied existed, in the one shape that
+        # did not carry the enum -- is a decoder that cannot be strict.
+        assert payload["session"]["session_id"] is None
+        assert payload["session"]["frames_observed"] is None
+        assert "unavailable" in payload["session"]["states"]
+        assert "running" in payload["session"]["states"]
 
     def test_a_library_with_no_journal_reads_as_empty_not_as_broken(
         self, monkeypatch, tmp_path
@@ -377,7 +398,7 @@ class TestTheDeclarationAndTheRoutesAgree:
             payload = ws.receive_json()["payload"]
 
         assert payload["library"]["available"] is True
-        assert payload["library"]["document_count"] == 0
+        assert payload["library"]["document_count_unfiltered"] == 0
         assert payload["library"]["unavailable_reason"] is None
 
 
@@ -413,7 +434,7 @@ class TestTheCaptureSessionControlsRealWork:
         frames = list(fx.document_frames(fx.TRANSFORMER_PAPER, count))
         for seq, raw in enumerate(frames):
             before = (
-                client.get("/documents-session").json()["frames_observed"]
+                client.get("/documents-session").json()["session"]["frames_observed"]
                 if client is not None
                 else None
             )
@@ -430,7 +451,7 @@ class TestTheCaptureSessionControlsRealWork:
             assert ws.receive_json()["type"] == "frame_result"
             if client is not None:
                 assert self._await(
-                    lambda: client.get("/documents-session").json()[
+                    lambda: client.get("/documents-session").json()["session"][
                         "frames_observed"
                     ]
                     > before
@@ -453,7 +474,7 @@ class TestTheCaptureSessionControlsRealWork:
         with client.websocket_connect("/ws") as ws:
             self._send_page_frames(ws)
 
-        status = client.get("/documents-session").json()
+        status = client.get("/documents-session").json()["session"]
         assert status["state"] == "stopped"
         assert status["frames_observed"] == 0
         assert status["frames_dropped_not_running"] == 8
@@ -471,7 +492,7 @@ class TestTheCaptureSessionControlsRealWork:
         client = _client(monkeypatch, document_root=tmp_path, capture=True)
         client.post("/documents-session/start")
         assert self._await(
-            lambda: client.get("/documents-session").json()["state"] == "running"
+            lambda: client.get("/documents-session").json()["session"]["state"] == "running"
         ), "the session never reached running"
 
         with client.websocket_connect("/ws") as ws:
@@ -498,7 +519,7 @@ class TestTheCaptureSessionControlsRealWork:
         client = _client(monkeypatch, document_root=tmp_path, capture=True)
         client.post("/documents-session/start")
         assert self._await(
-            lambda: client.get("/documents-session").json()["state"] == "running"
+            lambda: client.get("/documents-session").json()["session"]["state"] == "running"
         )
         with client.websocket_connect("/ws") as ws:
             self._send_page_frames(ws, client, 12)
@@ -530,16 +551,16 @@ class TestTheCaptureSessionControlsRealWork:
         )
         client.post("/documents-session/start")
         assert self._await(
-            lambda: client.get("/documents-session").json()["state"] == "running"
+            lambda: client.get("/documents-session").json()["session"]["state"] == "running"
         )
 
         with client.websocket_connect("/ws") as ws:
             ws.send_json({"type": "stream_start"})
             assert self._await(
-                lambda: client.get("/documents-session").json()["capture_id"]
+                lambda: client.get("/documents-session").json()["session"]["capture_id"]
                 is not None
             ), "the session was never told which capture it is following"
-            captured = client.get("/documents-session").json()["capture_id"]
+            captured = client.get("/documents-session").json()["session"]["capture_id"]
             ws.send_json({"type": "stream_stop"})
 
         assert captured
@@ -555,9 +576,9 @@ class TestTheCaptureSessionControlsRealWork:
         client = _client(monkeypatch, document_root=tmp_path, capture=True)
         client.post("/documents-session/start")
         assert self._await(
-            lambda: client.get("/documents-session").json()["state"] == "running"
+            lambda: client.get("/documents-session").json()["session"]["state"] == "running"
         )
-        status = client.get("/documents-session").json()
+        status = client.get("/documents-session").json()["session"]
 
         assert status["retention_days"] == 30.0
         assert status["retention_incomplete"] is False
@@ -582,7 +603,7 @@ class TestTheCaptureSessionControlsRealWork:
 
             client.post("/documents-session/start")
             assert self._await(
-                lambda: client.get("/documents-session").json()["state"] == "running"
+                lambda: client.get("/documents-session").json()["session"]["state"] == "running"
             )
             pump(client)
             after = ws.receive_json()["payload"]

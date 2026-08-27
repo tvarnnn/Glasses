@@ -256,6 +256,10 @@ def create_app() -> FastAPI:
     # records a document only when a session is started; unset means the
     # routes answer 404.
     app.state.document_root = settings.document_root
+    # Whether a live session exists is a SEPARATE question from whether
+    # the library can be read, and the two must not be conflated. A Tower
+    # reprocessing captures offline has a library and no session; that is
+    # a normal configuration and `/documents` must serve it.
     # Whether the contract may be offered at all, which is a question
     # about configuration and not about whether a session is running.
     app.state.scene_enabled = bool(live.scene is not None)

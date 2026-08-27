@@ -144,10 +144,20 @@ class LiveSession:
         self,
         *,
         clock=time.time,
+        follow_stream: bool = False,
         load_overdue_s: float = LOAD_OVERDUE_S,
         stop_join_timeout_s: float = STOP_JOIN_TIMEOUT_S,
     ) -> None:
         self._clock = clock
+        self._follow_stream = bool(follow_stream)
+        # Whether THIS session was started by a stream. `stream_closed`
+        # stops only what `stream_opened` started, and that distinction
+        # is not pedantry: `ws.py` tears the stream down on ANY exit,
+        # including a disconnect from a client that never sent
+        # `stream_start`. Without this flag, an operator who started a
+        # session by hand would lose it the moment any phone connected
+        # and dropped.
+        self._started_by_stream = False
         self._load_overdue_s = load_overdue_s
         self._stop_join_timeout_s = stop_join_timeout_s
 
@@ -195,6 +205,9 @@ class LiveSession:
             self._begin_session_locked()
             return self._status_locked()
 
+    def follows_stream(self) -> bool:
+        return self._follow_stream
+
     def pause(self) -> dict:
         """Stop consuming frames; keep the engine loaded.
 
@@ -222,25 +235,56 @@ class LiveSession:
     def stop(self) -> dict:
         """End the session.
 
+        THE ORDER OF THE FOUR STEPS BELOW IS THE WHOLE CORRECTNESS OF
+        THIS METHOD, and it was wrong once in a way worth recording.
+
+        1. **Close the door.** `_stopping`, `STOPPED` and an empty slot,
+           under the lock, FIRST.
+        2. **Then flush**, off the lock.
+        3. **Then join the worker.**
+        4. **Then release the engine.**
+
+        Steps 1 and 2 used to be the other way round -- flush first,
+        state second -- and an adversarial review measured what that
+        costs. `_on_pause` for Document Memory is `engine.flush()`, which
+        runs OCR: 1.19 s a page, up to two pages. For that entire window
+        the state was still `running`, so `offer_frame` kept accepting
+        frames and the worker kept calling `engine.observe()` on the SAME
+        engine the flushing thread was inside. Two threads, one
+        `DwellTracker`, no lock. Traced, with a real stop against a live
+        stream:
+
+            http-stop   flush   ENTER
+            worker      observe ENTER     <- inside flush
+            worker      observe ENTER     <- inside flush
+            http-stop   flush   EXIT
+
+        The visible damage was not a crash. It was TWO document memories
+        of one page, with overlapping observation windows and no field
+        linking them, because `_find_duplicate` only dedupes within a
+        dwell and the race produced two.
+
+        Steps 3 and 4 were also inverted. `LoadInvalidation` covers a
+        worker stuck in `_create()`; it does nothing for a worker inside
+        `_consume()`, so releasing before joining tore the model down
+        underneath a live forward pass -- `torch.cuda.empty_cache()`
+        racing an allocation on CUDA, and `EasyOcrRecogniser._reader =
+        None` mid-`read()`. Joining first means the worker is out of
+        `_consume` before anything is released, and the latch still
+        covers the case where the join times out.
+
         Counters are kept until the next `start()`, so an operator can
         still read what the session did after it ended. What a subclass
-        does with its RESULT is its own decision and the two cartridges
+        does with its RESULT is its own decision, and the two cartridges
         differ: a scene expires the moment nobody is looking, a document
         memory does not.
         """
         with self._condition:
             engine = self._engine
-            was_active = self._state in (STATE_RUNNING, STATE_STARTING)
-
-        if was_active and engine is not None:
-            # Before the state flips, and outside the lock: this is where
-            # a subclass finishes work that would otherwise be lost, and
-            # it may take as long as one unit of work.
-            self._safely(self._on_pause, engine, what="stop")
-
-        with self._condition:
             thread = self._thread
             invalidation = self._invalidation
+            was_active = self._state in (STATE_RUNNING, STATE_STARTING)
+            # Step 1. Nothing new enters the engine after this line.
             self._stopping = True
             self._state = STATE_STOPPED
             self._pending = None
@@ -248,19 +292,19 @@ class LiveSession:
             self._on_stop_locked()
             self._condition.notify_all()
 
-        if invalidation is not None:
-            # Closed OUTSIDE the condition: `invalidate` takes its own
-            # lock and runs a teardown under it, and nesting two locks in
-            # opposite orders in two threads is the deadlock this
-            # repository has already paid for once -- see the note on
-            # reentrancy in `tower/loading.py`.
-            invalidation.invalidate(self._release_engine)
+        if was_active and engine is not None:
+            # Step 2. Off the lock, because a flush may cost a page of
+            # OCR, and the session lock is taken by `offer_frame` on the
+            # event loop.
+            self._safely(self._on_pause, engine, what="stop")
 
         if thread is not None and thread is not threading.current_thread():
+            # Step 3. Before the release, so nothing is torn down under a
+            # forward pass that is still running.
             thread.join(timeout=self._stop_join_timeout_s)
             if thread.is_alive():
                 # It is inside a model load, which cannot be interrupted.
-                # The latch above guarantees it installs nothing and
+                # The latch below guarantees it installs nothing and
                 # releases what it built, so this is a delay in
                 # reclaiming memory rather than a leak. Said out loud
                 # because a silent one would be indistinguishable.
@@ -271,6 +315,14 @@ class LiveSession:
                     self.name,
                     self._stop_join_timeout_s,
                 )
+
+        if invalidation is not None:
+            # Step 4. Closed OUTSIDE the condition: `invalidate` takes
+            # its own lock and runs a teardown under it, and nesting two
+            # locks in opposite orders in two threads is the deadlock
+            # this repository has already paid for once -- see the note
+            # on reentrancy in `tower/loading.py`.
+            invalidation.invalidate(self._release_engine)
 
         with self._condition:
             return self._status_locked()
@@ -310,6 +362,55 @@ class LiveSession:
             self._pending = (raw_bytes, at, source_seq)
             self._condition.notify()
 
+    def stream_opened(self) -> None:
+        """The glasses began streaming. Start, if this session follows.
+
+        The reason this hook exists is a defect an adversarial review
+        found: nothing on the wire could start a session.
+        `IOS-to-Tower.md` 6.2 is explicit that opening a cartridge on the
+        phone sends NOTHING -- "a test asserts the wire stays silent" --
+        so a session only an HTTP POST could start was a contract offered
+        as `available: true` that a phone could subscribe to and would
+        watch report "not observing" forever.
+
+        `stream_start` is the right signal and not merely an available
+        one. It is the moment a feed exists, and a cartridge whose whole
+        claim is "what is around me now" has nothing to say before it.
+        `ws.py` already treats the same pair as the session boundary for
+        the dataset recorder.
+
+        Starting an already-running session is a no-op, so a second
+        `stream_start` does not restart anything -- but it does mark the
+        session as the stream's, which is correct: from here on the
+        stream is what keeps it alive.
+        """
+        if not self._follow_stream:
+            return
+        self.start()
+        with self._condition:
+            self._started_by_stream = True
+
+    def stream_closed(self) -> None:
+        """The stream ended. Stop, but ONLY what the stream started.
+
+        The symmetry matters more than the start: a session started by a
+        stream and never stopped by one would hold a model and park a
+        worker for as long as the Tower ran, and -- for Scene
+        Understanding -- keep serving a scene of a room whose wearer
+        walked out of range.
+
+        The ownership check matters just as much in the other direction.
+        `ws.py` tears the stream down on ANY exit, including a disconnect
+        from a client that never sent `stream_start` at all, so an
+        unconditional stop here would let any passing connection end a
+        session an operator had started by hand for a physical test.
+        """
+        with self._condition:
+            mine = self._started_by_stream
+            self._started_by_stream = False
+        if self._follow_stream and mine:
+            self.stop()
+
     def capture_started(self, capture_id) -> None:
         """A dataset capture opened, and this is its id.
 
@@ -348,6 +449,20 @@ class LiveSession:
 
     def _publish(self, result, received_at: float, now: float) -> None:
         """Record what `_consume` produced. Called under the lock."""
+
+    #: Whether `_consume` may already have had an effect the session
+    #: cannot take back -- a row appended to a store, most obviously.
+    #:
+    #: False for Scene Understanding: a `SceneState` that arrives after a
+    #: Pause describes a moment nobody asked about and is correctly
+    #: thrown away.
+    #:
+    #: True for Document Memory, and the difference is not a preference.
+    #: `engine.observe()` has ALREADY written the document by the time
+    #: this loop reaches its publish guard, so declining to publish does
+    #: not discard it -- it only hides it. A review measured exactly
+    #: that: two documents on disk, `documents_recorded: 1`.
+    commits_during_consume = False
 
     def _teardown(self, engine) -> None:
         release = getattr(engine, "release", None)
@@ -531,12 +646,20 @@ class LiveSession:
 
             now = self._clock()
             with self._condition:
-                if self._session_id != session_id or self._stopping:
-                    return
-                # A result produced while the session was paused is
-                # discarded rather than published: it was in flight when
-                # the operator said stop looking.
-                if self._state != STATE_RUNNING:
+                stale = self._session_id != session_id or self._stopping
+                paused = self._state != STATE_RUNNING
+                if (stale or paused) and not self.commits_during_consume:
+                    # A result produced while the session was paused
+                    # describes a moment nobody asked about, and is
+                    # discarded rather than published.
+                    if stale:
+                        return
                     continue
+                # `commits_during_consume` reaches here having ALREADY
+                # written something. Not publishing would not unwrite it;
+                # it would only make the counters disagree with the disk,
+                # which is the one outcome nobody could debug.
                 self._frames_observed += 1
                 self._publish(result, received_at, now)
+                if stale:
+                    return

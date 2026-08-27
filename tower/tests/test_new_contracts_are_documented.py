@@ -217,7 +217,7 @@ class TestTheDocumentContractsAreWrittenDown:
         timer.start()
         try:
             while not deadline.is_set():
-                if client.get("/documents-session").json()["state"] == "running":
+                if client.get("/documents-session").json()["session"]["state"] == "running":
                     break
                 deadline.wait(0.005)
         finally:

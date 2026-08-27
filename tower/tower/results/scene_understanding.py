@@ -99,6 +99,20 @@ REPORTED_CLASSES = tuple(sorted(CLASSES_OF_INTEREST))
 # `person` is excluded from `where`, and the exclusion is the point.
 POSITION_EXCLUDED_LABELS = ("person",)
 
+# When these were measured, and on what. Carried on every payload,
+# because a measurement asserted in the present tense reads as current
+# state -- and this platform's corpus grows continuously, so it is not.
+COUNT_MEASUREMENT = {
+    "measured_at": "2026-08-26",
+    "corpus_frames": 14128,
+    "corpus_captures": 28,
+    "is_current": False,
+    "note": (
+        "the corpus on this host has grown since. These figures describe "
+        "the frames they were measured on and have not been re-derived"
+    ),
+}
+
 COUNT_LIMITATIONS = (
     {
         "limitation": "size-floor",
@@ -111,10 +125,38 @@ COUNT_LIMITATIONS = (
     {
         "limitation": "recall",
         "detail": (
-            "class recall against the same oracle is 0.306 for person, "
-            "0.497 for cell phone and 0.209 for tv. The oracle shares COCO "
-            "training data with the shipped model, so these are upper "
-            "bounds, not estimates"
+            "class recall against the same oracle: 0.306 person, 0.730 "
+            "laptop, 0.497 cell phone, 0.388 chair, 0.209 tv, 0.108 couch. "
+            "The oracle shares COCO training data with the shipped model, "
+            "so every one is an upper bound, not an estimate. The two "
+            "worst are furniture -- couch 0.108 and chair 0.161 by the "
+            "stricter of the two measures -- and both are reported by "
+            "this payload, so 0.209 is not the floor"
+        ),
+    },
+    {
+        "limitation": "noise-classes",
+        "detail": (
+            "chair appeared in 4 of 340 sampled corpus frames and dining "
+            "table once in 9,199. Their counts and positions are published "
+            "as detector output, not as evidence that a chair was there. "
+            "The wire-path design excluded them for exactly this reason; "
+            "they are published with the disclosure instead, because a "
+            "class silently absent from `reported_classes` would be "
+            "indistinguishable from one that was looked for and not seen"
+        ),
+    },
+    {
+        "limitation": "departure-lag",
+        "detail": (
+            "a confirmed track keeps being counted for up to 12 further "
+            "OBSERVED frames after its last detection -- 1.0 s at the "
+            "measured 12.0 fps delivery, and longer whenever "
+            "frames_skipped is advancing, because the bound is a frame "
+            "count and not a duration. A count can therefore include "
+            "someone who has already left. Confirmation is latched on "
+            "purpose: it is what stops the count flickering when the "
+            "detector drops a frame"
         ),
     },
     {
@@ -128,12 +170,20 @@ COUNT_LIMITATIONS = (
 
 # Why `relations` is null, as a value rather than a silence.
 RELATIONS_ABSENT_REASON = (
-    "this cartridge asserts no relations on the wire. The two it can "
-    "compute from 2-D boxes -- left_of and higher_in_view -- are camera-"
-    "relative and change when the wearer turns their head, and every "
-    "relation worth having needs depth that survives motion, which was "
-    "measured and refused. See refused_relations"
+    "this cartridge asserts no relations on the wire. Three are "
+    "computable from 2-D boxes -- left_of, right_of and higher_in_view -- "
+    "and all three are withheld rather than refused: they are true, they "
+    "are camera-relative, and they change the moment the wearer turns "
+    "their head, so a client that cached one would be holding a claim "
+    "about a view that no longer exists. Every relation worth having "
+    "needs depth that survives motion, and that was measured and refused. "
+    "See refused_relations"
 )
+
+# The relations this cartridge CAN compute and does not publish, kept
+# apart from the ones it refuses. A client must be able to tell "we can
+# and will not" from "we cannot, and here is the measurement".
+WITHHELD_RELATIONS = ("left_of", "right_of", "higher_in_view")
 
 # The lifecycle vocabulary, published so a client can pin it. A value
 # outside this set is a value the phone decodes into nothing.
@@ -169,31 +219,127 @@ VOLATILE_PATHS = (
     "people.oldest_estimate_seconds",
 )
 
+# Why there is no entity list, as a value rather than an absence.
+#
+# `IOS-to-Tower.md` 4.1 asks for a session-scoped anonymous track handle
+# -- explicitly NOT a durable identifier, which it separately forbids --
+# so a client can tell the person on the left from the person on the
+# right within one session and label rows positionally. Its types exist
+# for it.
+#
+# This cartridge refuses, and the refusal was delivered as SILENCE until
+# an adversarial review pointed out that this file's own rule forbids
+# that: "a refusal that depends on remembering not to fill a field is not
+# a refusal". A client finding nothing to decode cannot tell "refused"
+# from "not implemented yet", and those call for opposite responses --
+# build a different screen, or wait for the next Tower.
+TRACKS_ABSENT_REASON = (
+    "this cartridge publishes no per-entity list and no track handle, not "
+    "even a session-scoped one. A handle plus a timestamp lets a "
+    "recipient assemble the per-person dwell timeline this cartridge "
+    "refuses to keep -- persists-nothing laundered onto the consumer. "
+    "Counts and aggregate facing are the only representation offered, and "
+    "there is no key below this one that could hold an entity"
+)
+
+REFUSED_ENTITY_FIELDS = (
+    {"field": "track_id", "reason": "joinable across time within a session"},
+    {"field": "box", "reason": "a repeated position is a movement trace"},
+    {
+        "field": "facing",
+        "reason": "per-person orientation is per-person state",
+    },
+    {
+        "field": "visible_eyes",
+        "reason": "facial-landmark evidence does not cross this boundary",
+    },
+    {
+        "field": "confidence",
+        "reason": "requires a per-entity row, which does not exist here",
+    },
+)
+
+# The one convention `IOS-to-Tower.md` declares rather than leaves open,
+# answered. 4.3: "a bearing has to be signed somehow to be usable and a
+# silent presumption is the dangerous version -- a Tower signing the
+# other way would put every person on the wrong side of the wearer,
+# rendering confidently and wrongly. Please state yours."
+#
+# This payload publishes no bearing. It publishes `where`, which is a
+# coarse signed bearing under another name, and the same warning applies
+# to it.
+SIDE_CONVENTION = (
+    "the wearer's own left and right, as the camera sees them. A track is "
+    "'left' when its box centre falls below 0.45 of frame width in the "
+    "frame as received, 'right' above 0.55, 'centre' between the two, and "
+    "'unknown' when the frame size was never learned. The stream is "
+    "assumed unmirrored and nothing on this wire verifies that. It is "
+    "camera-relative and changes when the wearer turns their head"
+)
+
 # The states in which the scene below is being refreshed. `paused` is
 # deliberately not one of them: a paused session's counts are the last
 # thing it saw, not what is there now.
 _CURRENT_STATES = (STATE_RUNNING,)
 
 
+# Where the full reasoning lives. The refusals in `tower/scene/state.py`
+# are research abstracts -- the `in_front_of` entry alone runs to 1,500
+# characters of flip rates and sample sizes -- and every one of them is
+# CONSTANT. Publishing them whole put 4 KB of unchanging prose into a
+# payload the heartbeat re-sends every 2 s, per subscriber, on the socket
+# that shares its send lock with the frame path.
+#
+# A client asking "why not?" wants a sentence. The measurement belongs in
+# the repository, and this names where.
+REFUSAL_EVIDENCE = (
+    "tower/scene/state.py: REFUSED_RELATIONSHIPS, and "
+    "docs/superpowers/research/2026-08-26-depth-ordering-on-real-frames.md"
+)
+
+
+def _first_sentence(text: str) -> str:
+    """The claim, without the workings.
+
+    Splits on the first full stop followed by a space, which is enough
+    for prose written as prose and degrades to the whole string when it
+    is not -- a truncation that cut a sentence in half would be worse
+    than a long one.
+    """
+    head, separator, _rest = text.partition(". ")
+    return head + "." if separator else text
+
+
 def _side_counts(state) -> dict:
     """Per-label side counts, for everything that is not a person.
 
-    Three fixed keys per label, so the block is bounded by the class list
-    and cannot grow with what is in the room.
+    Every non-person reported class is present with four zeroed buckets,
+    for the same reason `counts` is: a label that appeared and
+    disappeared would be indistinguishable from a version skew, and a
+    client could not tell "no chair on the left" from "this Tower does
+    not report chairs". Fixed arity is also what bounds the block --
+    12 labels x 4 integers, whatever is in the room.
 
     `describe_position` returns `side: "unknown"` when the frame size was
     never learned, and that lands in its own bucket rather than being
     folded into `centre` -- a scene whose frame size is unknown has not
     placed anything in the middle of the view, it has placed nothing.
+
+    The buckets themselves are defined on the wire, in `SIDE_CONVENTION`.
+    A left and a right with no stated convention is exactly the silent
+    presumption `IOS-to-Tower.md` 4.3 spends three sentences warning
+    about, arriving through the field it did not think to ask about.
     """
-    where: dict = {}
+    where = {
+        label: {"left": 0, "centre": 0, "right": 0, "unknown": 0}
+        for label in REPORTED_CLASSES
+        if label not in POSITION_EXCLUDED_LABELS
+    }
     for track in state.tracks:
         if track.label in POSITION_EXCLUDED_LABELS:
             continue
         side = describe_position(track, state.frame_width, state.frame_height)["side"]
-        bucket = where.setdefault(
-            track.label, {"left": 0, "centre": 0, "right": 0, "unknown": 0}
-        )
+        bucket = where[track.label]
         bucket[side] = bucket.get(side, 0) + 1
     return where
 
@@ -201,11 +347,14 @@ def _side_counts(state) -> dict:
 def _people_block(state) -> dict:
     """People, as a count and an aggregate -- never as a list.
 
-    `may_include_wearer` and `validated` are not hedging. Every `person`
-    box in this platform's only real corpus is the wearer's own torso
-    (median box bottom edge 0.981, 59% touching the frame edge), and no
-    bystander footage exists on this host. An unqualified count would
-    overclaim, and the overclaim would be invisible.
+    `may_include_wearer` and `validated` are not hedging. The `person`
+    boxes in this platform's only real corpus are almost certainly the
+    wearer's own torso -- median box bottom edge 0.985, 58.4% touching
+    the frame edge -- and the distribution is unimodal with a continuous
+    tail rather than bimodal, leaving a 34.3% residual that no threshold
+    separates and no confirmed bystander to validate against. No
+    bystander footage exists on this host at all. An unqualified count
+    would overclaim, and the overclaim would be invisible.
 
     `facing_wearer` is `null` -- with a reason -- whenever orientation
     never produced an estimate. It is never 0. Zero is an answer and
@@ -213,7 +362,8 @@ def _people_block(state) -> dict:
     where the difference is most likely to be mistaken.
     """
     people = state.of_class("person")
-    if state.orientation_enabled:
+    unknown = sum(1 for track in people if track.facing.state == FACING_UNKNOWN)
+    if state.orientation_enabled and not (people and unknown == len(people)):
         facing = len(state.facing_wearer())
         reason = None
         ages = [
@@ -222,7 +372,31 @@ def _people_block(state) -> dict:
             if track.facing.age_seconds is not None
         ]
         oldest = max(ages) if ages else None
-        unknown = sum(1 for track in people if track.facing.state == FACING_UNKNOWN)
+    elif state.orientation_enabled:
+        # Enabled, and every estimate has expired. `orientation_enabled`
+        # latches on ONE lifetime success, and an estimate ages out to
+        # unknown after 6 s -- so a pose model that succeeded once and
+        # then failed for good would have taken the branch above forever
+        # and published `facing_wearer: 0` while measuring nothing.
+        #
+        # Zero is an answer. "Every estimate has expired" is not, and
+        # this is the one field on this payload where the difference is
+        # most likely to be mistaken for data.
+        facing = None
+        reason = (
+            "every person's orientation estimate has expired -- none was "
+            "refreshed within the 6 s the estimator's own staleness bound "
+            "allows. Reporting 0 would be an observation gap presented as "
+            "an observation of absence"
+        )
+        oldest = max(
+            (
+                track.facing.age_seconds
+                for track in people
+                if track.facing.age_seconds is not None
+            ),
+            default=None,
+        )
     else:
         facing = None
         reason = (
@@ -243,6 +417,18 @@ def _people_block(state) -> dict:
         "facing_answered": bool(facing is not None),
         "facing_unavailable_reason": reason,
         "facing_unknown": unknown,
+        # The four-state enum `IOS-to-Tower.md` 4.2 asks for is not
+        # served: `away_from_wearer` and `profile` have no bucket, so
+        # `count - facing_wearer - facing_unknown` is an undifferentiated
+        # remainder rather than a fifth category. Stated rather than left
+        # to be inferred from arithmetic that does not close.
+        "facing_states_reported": ["facing_wearer", "unknown"],
+        "facing_states_withheld": ["away_from_wearer", "profile"],
+        "facing_states_withheld_reason": (
+            "a per-person facing state is per-person state. Publishing "
+            "the full enum as counts would narrow to one person's "
+            "orientation the moment only one person is in view"
+        ),
         "oldest_estimate_seconds": oldest,
         # The wording is part of the contract. `IOS-to-Tower.md` 4.2: this
         # is body/head orientation relative to the camera, it is NOT gaze,
@@ -274,6 +460,10 @@ def _lifecycle_block(status: dict) -> dict:
         "loading_seconds": status["loading_seconds"],
         "load_overdue": bool(status["load_overdue"]),
         "load_overdue_after_seconds": status["load_overdue_after_seconds"],
+        # Whether this session starts and stops with the glasses' stream.
+        # True is the default and is what makes the cartridge reachable
+        # from a phone, which sends nothing when a cartridge is opened.
+        "follows_stream": bool(status.get("follows_stream", False)),
     }
 
 
@@ -327,6 +517,17 @@ def live_payload(status: dict, state) -> dict:
         "time_basis": TIME_BASIS,
         "lifecycle": lifecycle,
         "observed_at": status["observed_at"],
+        # Named for what it is, because the name alone would mislead.
+        # `IOS-to-Tower.md` 0.3 holds observedAt and receivedAt separately
+        # and "will never substitute one for the other" -- and this is
+        # receipt time. A decoder mapping by field name would make exactly
+        # that substitution.
+        "observed_at_note": (
+            "tower-receipt time: when this Tower received the frame this "
+            "scene came from, never when the glasses captured it, and not "
+            "when the detector finished with it. There is no capture "
+            "timestamp anywhere on this wire"
+        ),
         "staleness_seconds": status["staleness_seconds"],
         "frames_offered": status["frames_offered"],
         "frames_observed": status["frames_observed"],
@@ -338,13 +539,40 @@ def live_payload(status: dict, state) -> dict:
         "count_basis": COUNT_BASIS,
         "count_is_lower_bound": True,
         "count_limitations": [dict(entry) for entry in COUNT_LIMITATIONS],
+        "count_measurement": dict(COUNT_MEASUREMENT),
+        # There is no confidence anywhere on this payload, and saying so
+        # is not the same as omitting it. `IOS-to-Tower.md` 4.1 asks for
+        # a confidence on every track; there are no tracks here, and a
+        # confidence attached to a COUNT would be an average with no
+        # defined meaning. `score_threshold` is the detector's floor and
+        # is published instead.
+        "confidence": None,
+        "confidence_absent_reason": (
+            "the detector emits a per-detection score, but the tracker "
+            "never uses it for confirmation and this payload publishes no "
+            "per-entity row for one to attach to. A confidence on a count "
+            "would be an average of scores that did not decide anything. "
+            "score_threshold is the floor those scores had to clear"
+        ),
         # Null and unexpressible. There is no key below this one that
         # could hold a relation, which is what makes the refusal a
         # refusal rather than an omission somebody has to keep making.
+        # Null and unexpressible, and the same treatment for the entity
+        # list: a refusal a client can act on, rather than an absence it
+        # has to interpret.
+        "tracks": None,
+        "tracks_absent_reason": TRACKS_ABSENT_REASON,
+        "refused_entity_fields": [dict(entry) for entry in REFUSED_ENTITY_FIELDS],
+        "side_convention": SIDE_CONVENTION,
         "relations": None,
         "relations_absent_reason": RELATIONS_ABSENT_REASON,
+        "withheld_relations": list(WITHHELD_RELATIONS),
         "refused_relations": [
-            {"relation": name, "reason": reason}
+            {
+                "relation": name,
+                "reason": _first_sentence(reason),
+                "reason_source": REFUSAL_EVIDENCE,
+            }
             for name, reason in sorted(REFUSED_RELATIONSHIPS.items())
         ],
         "where_excludes": list(POSITION_EXCLUDED_LABELS),

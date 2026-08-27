@@ -98,6 +98,20 @@ class Settings:
     # An operator on a machine that is not a 20-core workstation should
     # set this. A startup log line says so when it is unset.
     scene_torch_threads: int = 0
+    # Whether `stream_start` starts a scene session and `stream_stop`
+    # ends it.
+    #
+    # ON by default, and the default is what makes this cartridge
+    # reachable from a phone at all. `IOS-to-Tower.md` 6.2: opening a
+    # cartridge on the phone sends NOTHING, and a test asserts the wire
+    # stays silent -- so a session that only an HTTP POST could start is
+    # a contract a phone can subscribe to and will watch report "not
+    # observing" forever. That is not a safety property; it is a dead
+    # product path, and an adversarial review found it as one.
+    #
+    # Enabling the cartridge is already the opt-in. This does not widen
+    # what a Tower may do, only when it does it.
+    scene_autostart: bool = True
     # Where a document session writes what it read, and where the
     # document routes read it back.
     #
@@ -120,6 +134,18 @@ class Settings:
     # which is the right posture for a machine reprocessing captures
     # offline -- and the same escape hatch `world_autobuild` provides.
     document_capture: bool = False
+    # Whether `stream_start` starts a DOCUMENT session.
+    #
+    # OFF by default, unlike Scene Understanding's, and the asymmetry is
+    # the difference between the two cartridges: this one WRITES. A
+    # session that persists what a wearer read gets an explicit start,
+    # which is the standard 06-PRIVACY-DATA.md holds the dataset recorder
+    # to -- "arming is not recording".
+    #
+    # The cost is smaller than it looks: the half of this cartridge a
+    # phone reaches is the library, over HTTP, and that works whether or
+    # not anything is currently recording.
+    document_autostart: bool = False
     # Keyframes between mid-walk rebuilds in the attached builder.
     #
     # NOT the script's own default, which is 0 -- "build once, at the
@@ -153,8 +179,10 @@ def get_settings() -> Settings:
         scene_torch_threads=_non_negative_int(
             os.environ.get("TOWER_SCENE_TORCH_THREADS"), default=0
         ),
+        scene_autostart=_flag("TOWER_SCENE_AUTOSTART", default=True),
         document_root=_optional_path(os.environ.get("TOWER_DOCUMENT_ROOT")),
         document_capture=_flag("TOWER_DOCUMENT_CAPTURE", default=False),
+        document_autostart=_flag("TOWER_DOCUMENT_AUTOSTART", default=False),
     )
 
 

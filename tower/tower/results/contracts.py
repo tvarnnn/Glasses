@@ -99,6 +99,12 @@ SCENE_LIVE_CONTRACT = "scene_understanding.live/2026-08-27"
 # governs the HTTP surface.
 DOCUMENT_MEMORY_STATUS_CONTRACT = "document_memory.status/2026-08-27"
 
+# Document Memory's library, which travels over HTTP rather than on this
+# channel. Declared all the same -- see `registry.declare`'s
+# `http_contracts` -- because iOS CACHES a declaration, and a contract it
+# can only discover by making a call is a contract it cannot plan around.
+DOCUMENT_MEMORY_LIBRARY_CONTRACT = "document_memory.library/2026-08-27"
+
 # The channel's own envelope contract, distinct from any cartridge's.
 # A change here affects every cartridge at once, which is exactly why it
 # is versioned separately from the payloads it carries.

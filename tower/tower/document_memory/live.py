@@ -85,6 +85,12 @@ class DocumentLive(LiveSession):
 
     name = "Document"
 
+    # `engine.observe()` appends to the store before this session ever
+    # sees the result, so a result that arrives after a Pause or a Stop
+    # is already on disk. Reporting it is the only way the counters can
+    # agree with what is there.
+    commits_during_consume = True
+
     def __init__(
         self,
         root,
@@ -93,9 +99,19 @@ class DocumentLive(LiveSession):
         policy: DwellPolicy | None = None,
         recogniser_factory=None,
         keep_page_images: bool = False,
+        follow_stream: bool = False,
         **kwargs,
     ) -> None:
-        super().__init__(**kwargs)
+        # OFF by default, unlike Scene Understanding's, and the asymmetry
+        # is the difference between the two cartridges: this one WRITES.
+        # A session that persists what a wearer read gets an explicit
+        # start, which is the standard `06-PRIVACY-DATA.md` holds the
+        # dataset recorder to -- "arming is not recording".
+        #
+        # The cost is smaller than it looks: the half of this cartridge a
+        # phone reaches is the library, over HTTP, and that works whether
+        # or not anything is currently recording.
+        super().__init__(follow_stream=follow_stream, **kwargs)
         self._root = root
         self._retention_days = retention_days
         self._policy = policy
@@ -293,6 +309,7 @@ class DocumentLive(LiveSession):
             "last_document_at": self._last_document_at,
             "flushed_document_id": getattr(self, "_flushed_document_id", None),
             "keeps_page_images": bool(self._keep_page_images),
+            "follows_stream": bool(self._follow_stream),
             "retention_days": self._retention_days,
             "documents_pruned": self._pruned_documents,
             # True when a deletion could not be completed -- a locked

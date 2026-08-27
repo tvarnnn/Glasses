@@ -200,7 +200,18 @@ class TestAWebProcessCannotStorePageImages:
 
         assert document["retains_raw_imagery"] is False
         assert document["redaction"] == "none"
-        assert payload["imagery_treatment"] == "raw-ephemeral-not-served"
+        # `none-retained`, not a constant that said the same thing
+        # whatever was on disk. The pairing that matters is
+        # `retains_raw_imagery: false` WITH `redaction: "none"`: nothing
+        # was kept, and if anything ever were it would not have been
+        # redacted.
+        assert document["imagery_treatment"] == "none-retained"
+        assert document["imagery_served"] is False
+        # And the state named in iOS's own vocabulary, so the mapping is
+        # the Tower's decision rather than the phone's guess. Never
+        # `redacted`: this platform performs no redaction at all.
+        assert document["imagery_ios_state"] == "rawEphemeral"
+        assert payload["imagery_treatment"] == "none-retained"
         assert not (tmp_path / "pages").exists()
 
     def test_no_route_serves_an_image(self, monkeypatch, tmp_path):
@@ -273,7 +284,7 @@ def test_a_document_session_writes_only_into_its_own_root(monkeypatch, tmp_path)
     timer.start()
     try:
         while not deadline.is_set():
-            if client.get("/documents-session").json()["state"] == "running":
+            if client.get("/documents-session").json()["session"]["state"] == "running":
                 break
             deadline.wait(0.005)
     finally:

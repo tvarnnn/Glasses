@@ -77,8 +77,25 @@ class SceneLive(LiveSession):
 
     name = "Scene"
 
-    def __init__(self, engine_factory, *, decode=decode_frame, **kwargs) -> None:
-        super().__init__(**kwargs)
+    def __init__(
+        self,
+        engine_factory,
+        *,
+        decode=decode_frame,
+        follow_stream: bool = True,
+        **kwargs,
+    ) -> None:
+        # `follow_stream` defaults ON here and OFF on the base, and the
+        # difference is the cartridge. Enabling Scene Understanding is
+        # already the opt-in, it writes nothing, and requiring a second
+        # out-of-band step was not a safety property -- it was a dead
+        # product path, because iOS sends nothing when a cartridge is
+        # opened. TOWER_SCENE_AUTOSTART=false restores manual control,
+        # and the five routes work either way.
+        #
+        # Document Memory deliberately defaults it OFF: it writes to
+        # disk, and a session that persists gets an explicit start.
+        super().__init__(follow_stream=follow_stream, **kwargs)
         self._engine_factory = engine_factory
         self._decode = decode
         self._latest = None
@@ -168,4 +185,5 @@ class SceneLive(LiveSession):
                 else max(now - self._latest_observed_at, 0.0)
             ),
             "has_state": bool(self._latest is not None),
+            "follows_stream": bool(self._follow_stream),
         }

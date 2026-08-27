@@ -337,6 +337,40 @@ def _capture_workers(websocket):
     return getattr(websocket.app.state, "capture_workers", None)
 
 
+def _tell_cartridges_the_stream_opened(websocket) -> None:
+    """The stream boundary, handed to every live cartridge.
+
+    Separate from `_tell_cartridges_about_capture` and it must stay
+    separate. A CAPTURE exists only when a recorder is armed; a STREAM
+    exists whenever a phone is sending frames. A cartridge that started
+    on the capture signal would be silently inert on every Tower with no
+    `TOWER_CAPTURE_ROOT`, which is most of them.
+
+    Isolated per consumer for the same reason every other observer loop
+    here is: a cartridge that will not start must not end a connection
+    that is answering frames.
+    """
+    for consumer in _frame_consumers(websocket):
+        try:
+            consumer.stream_opened()
+        except Exception:
+            logger.exception(
+                "[Tower][Cartridge] a live session did not start with the "
+                "stream; the stream continues without it"
+            )
+
+
+def _tell_cartridges_the_stream_closed(websocket) -> None:
+    for consumer in _frame_consumers(websocket):
+        try:
+            consumer.stream_closed()
+        except Exception:
+            logger.exception(
+                "[Tower][Cartridge] a live session did not stop with the "
+                "stream; it may still be holding a model"
+            )
+
+
 def _start_capture(websocket, owner) -> None:
     """Bound a dataset recording to the existing stream window.
 
@@ -526,6 +560,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     "[Tower][Session] stream_start: measurement window opened"
                 )
                 _start_capture(websocket, connection_token)
+                # After the recorder, so a cartridge that wants the
+                # capture lineage has already been told what it is.
+                _tell_cartridges_the_stream_opened(websocket)
             elif message_type == "stream_stop":
                 if active_measurement is not None:
                     _finalize_stream_measurement(
@@ -538,6 +575,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "measurement window"
                     )
                 _stop_capture(websocket, END_REASON_STOP, owner=connection_token)
+                _tell_cartridges_the_stream_closed(websocket)
             elif message_type in results_ws.RESULT_MESSAGE_TYPES:
                 await results_ws.handle(
                     message,
@@ -587,6 +625,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         _stop_capture(
             websocket, END_REASON_DISCONNECT, owner=connection_token
         )
+        # On ANY exit, not only a polite stream_stop, and for the same
+        # reason the recorder is torn down here: a wearable client
+        # disconnects abruptly as the NORMAL case. A scene session left
+        # running by a dropped connection would hold a model, park a
+        # worker, and -- worse -- keep serving a scene of a room whose
+        # wearer walked out of range.
+        _tell_cartridges_the_stream_closed(websocket)
         if active_measurement is not None:
             _finalize_stream_measurement(active_measurement, end_reason="disconnect")
         session.client_disconnected()

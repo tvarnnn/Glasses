@@ -293,6 +293,18 @@ def test_the_result_channel_uses_no_gaze_or_identity_vocabulary():
     paths = list((TOWER / "results").rglob("*.py"))
     paths.append(TOWER / "routes" / "results_ws.py")
     paths.append(TOWER / "routes" / "cartridges.py")
+    # Widened 2026-08-27. The two cartridge control routes serve payloads
+    # to the same consumers this channel does, and a review pointed out
+    # they were outside the scan -- `SceneEngine.describe()` builds a dict
+    # containing the literal string "orientation evidence, not gaze; the
+    # camera cannot see attention", and a route that returned it would
+    # have shipped the word and passed this test.
+    for extra in (
+        TOWER / "routes" / "scene.py",
+        TOWER / "routes" / "documents.py",
+    ):
+        if extra.exists():
+            paths.append(extra)
 
     for path in paths:
         if "__pycache__" in path.parts:

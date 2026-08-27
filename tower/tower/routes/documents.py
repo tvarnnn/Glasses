@@ -46,6 +46,7 @@ from tower.results.document_memory import (
     one_document,
     recent_documents,
     search_documents,
+    session_view,
     store_from_root,
 )
 
@@ -201,7 +202,7 @@ def session_status(request: Request) -> dict:
     only works until somebody records a document called "session" is a
     bug waiting for a coincidence.
     """
-    return _session(request).status()
+    return session_view(_session(request))
 
 
 @router.post("/documents-session/start")
@@ -215,7 +216,7 @@ def start(request: Request) -> dict:
     """
     session = _session(request)
     session.start()
-    return session.status()
+    return session_view(session)
 
 
 @router.post("/documents-session/pause")
@@ -227,14 +228,14 @@ def pause(request: Request) -> dict:
     """
     session = _session(request)
     session.pause()
-    return session.status()
+    return session_view(session)
 
 
 @router.post("/documents-session/resume")
 def resume(request: Request) -> dict:
     session = _session(request)
     session.resume()
-    return session.status()
+    return session_view(session)
 
 
 @router.post("/documents-session/stop")
@@ -250,4 +251,4 @@ def stop(request: Request) -> dict:
     """
     session = _session(request)
     session.stop()
-    return session.status()
+    return session_view(session)

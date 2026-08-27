@@ -416,6 +416,19 @@ Nothing in the envelope, publisher, registry or routes changes. The
 subscription, ordering, coalescing, reconnect and error machinery is
 already generic and already tested.
 
+**Two lists, because there are two transports.** `cartridges` is what
+can be SUBSCRIBED to. `http_contracts` is what can be FETCHED, and it
+exists because iOS caches a declaration — a contract discoverable only by
+making a call is one a phone cannot plan around. Each entry carries
+`cartridge`, `contract`, `entry_route`, `available`, `unavailable_reason`
+and `why_not_a_subscription`.
+
+Only Document Memory's library is listed today. World Builder's geometry
+and Object Memory's observations are the same shape and are not declared;
+their identifiers live in adapter modules rather than in `contracts.py`,
+and `registry.py` must stay cartridge-blind, so those two lanes own that
+move.
+
 **What is offered, as of 2026-08-27**
 
 | Cartridge | Result type | Contract | Section |
@@ -975,6 +988,17 @@ asserts the wire stays silent. Sessions are driven over HTTP:
 | `POST /scene/resume` | observe again without reloading the model |
 | `POST /scene/stop` | end the session and **discard** the scene |
 
+**A phone does not call any of them.** `IOS-to-Tower.md` §6.2 is
+explicit that opening a cartridge on the phone sends nothing, so the
+session follows the STREAM: `stream_start` starts it and `stream_stop`
+ends it, as does a disconnect — which is the normal case for a wearable.
+`lifecycle.follows_stream` reports whether that is on, and
+`TOWER_SCENE_AUTOSTART=false` turns it off for an operator who wants
+manual control.
+
+A stop only ever ends what the stream started. A connection that never
+sent `stream_start` cannot end a session an operator began by hand.
+
 All five answer `404` when the cartridge is not enabled. A `POST` that
 returned `200` and did nothing is how an operator comes to believe a
 physical test is running when it is not.
@@ -1083,11 +1107,79 @@ would be a wrong answer where a refusal was available.
 `where_excludes: ["person"]` and `where_excludes_reason` say why: a
 per-person position, sampled repeatedly, is a movement trace.
 
+**`tracks`** — always `null`, and unexpressibly so
+
+`tracks_absent_reason` says why; `refused_entity_fields` is a list of
+`{field, reason}` naming `track_id`, `box`, `facing`, `visible_eyes` and
+`confidence`. There is no key anywhere in this payload that could hold an
+entity.
+
+This refuses `IOS-to-Tower.md` §4.1's session-scoped anonymous track
+handle. The refusal is delivered as a value rather than as silence
+because those are different instructions: "refused" means build a
+different screen, and "not implemented yet" means wait for the next
+Tower, and a client finding nothing to decode cannot tell them apart.
+
+**`side_convention`** — the one convention iOS declares rather than
+leaves open, answered
+
+§4.3: *"a bearing has to be signed somehow to be usable and a silent
+presumption is the dangerous version — a Tower signing the other way
+would put every person on the wrong side of the wearer."* This payload
+publishes no bearing, but `where` is a coarse signed bearing under
+another name, so it states its convention: the wearer's own left and
+right as the camera sees them, thresholds at 0.45 and 0.55 of frame
+width, stream assumed unmirrored and nothing verifies that.
+
+**`confidence`** — always `null`, with `confidence_absent_reason`
+
+§4.1 asks for a confidence on every track. There are no tracks, and a
+confidence attached to a COUNT would be an average of scores that did not
+decide anything. `score_threshold` is the floor those scores had to
+clear and is published instead. Stated rather than omitted, because
+§0.2's rule is that an unprovenanced value is worse than an absent one.
+
+**`observed_at_note`** — what `observed_at` actually is
+
+Tower-receipt time. §0.3 holds `observedAt` and `receivedAt` separately
+and never substitutes one for the other; a decoder mapping by field name
+would make exactly that substitution, so the payload says it in words.
+
+**`count_measurement`** — when the limitations above were measured
+
+`measured_at`, `corpus_frames`, `corpus_captures`, `is_current`, `note`.
+`is_current` is `false`: this platform's corpus grows continuously, and a
+rate asserted in the present tense would read as current state.
+
+**`people.facing_states_reported` / `facing_states_withheld`**
+
+Only `facing_wearer` and `unknown` have buckets, so
+`count − facing_wearer − facing_unknown` is an undifferentiated
+remainder rather than a fifth category. `away_from_wearer` and `profile`
+are withheld with a reason (`facing_states_withheld_reason`): a
+per-person facing state narrows to one person's orientation the moment
+only one person is in view.
+
+**`lifecycle.follows_stream`** — whether `stream_start` starts this
+session and `stream_stop` ends it. See §14.2.
+
 **`relations`** — always `null`
 
 `relations_absent_reason` says why; `refused_relations` is a list of
-`{relation, reason}` covering `in_front_of`, `behind`, `on`, `inside`,
-`near`, `nearer_than_same_class`. **There is no schema slot anywhere in
+`{relation, reason, reason_source}` covering `in_front_of`, `behind`,
+`on`, `inside`, `near`, `nearer_than_same_class`. The `reason` is the
+first sentence of each refusal and `reason_source` points at the full
+measurement in the repository — the `in_front_of` entry alone runs to
+1,500 characters of flip rates and sample sizes, and it is constant, so
+publishing it whole put 1.5 KB of unchanging prose into every 2 s
+heartbeat.
+
+`withheld_relations` is the separate and weaker list: `left_of`,
+`right_of` and `higher_in_view` are computable from 2-D boxes and are
+TRUE. They are withheld rather than refused because they are
+camera-relative and stop being true the moment the wearer turns their
+head. A client must be able to tell "we can and will not" from "we
+cannot, and here is the measurement". **There is no schema slot anywhere in
 this payload that could hold one.** A refusal that depends on remembering
 not to fill a field is not a refusal.
 
@@ -1257,6 +1349,19 @@ store, `DocumentStore` persists no retention manifest, so a reader cannot
 learn the window its writer used. A `retention_days` query parameter
 **narrows this read and can never widen what was kept**.
 
+**Imagery, on every response and every record**
+
+| Field | Meaning |
+|---|---|
+| `imagery_treatment` | `none-retained` or `raw-persisted`. It varies with the fact; a constant here said the same thing whether or not an image existed |
+| `imagery_ios_state` | `rawEphemeral` — the strictest of §5's three states that applies, named in iOS's vocabulary so the mapping is the Tower's decision and not the phone's guess. Never `redacted`: this platform performs no redaction |
+| `imagery_served` | always `false`. No route serves an image |
+| `imagery_note` | says the above in words |
+| `privacy_tag_vocabulary` | the closed set `privacy_tags` draws from, published so a client can pin it |
+| `recording_measurement` | `measured_at`, `corpus_frames`, `corpus_captures`, `is_current`, `note` — when the limitations were measured, and on what |
+| `semantic_retrieval_alternative` | what to do instead. iOS routes typed free text to `.semantic`, so its primary input path has no Tower route; saying only "no semantic retrieval" leaves it to guess |
+| `snippet_max_chars` | on a search result: how much verbatim text a match may carry |
+
 **Per document, in a list**
 
 `document_id`, `claim`, `identity`, `title`, `title_is_derived`,
@@ -1273,8 +1378,12 @@ Three of those deserve a sentence:
   camera cannot establish any of those. Render it as "In view 45 s".
   `observed_seconds_note` carries that qualification as data.
 - **`title`** is lifted from the document's own first text region.
-  `title_is_derived: true`. A null title must render as a description of
-  the RECORD — "Untitled document" — never as an invented name.
+  `title_is_derived: true`, and it is CLIPPED to `title_max_chars` (60)
+  with an ellipsis. iOS asks for a title in the list knowing it comes
+  from the document, and one line is a label — but 90 characters times a
+  200-document listing is 18 KB of verbatim first lines for a caller that
+  asked no question. A null title must render as a description of the
+  RECORD — "Untitled document" — never as an invented name.
 - **`summary` is NOT in the list.** The stored summary is the document's
   first forty words **verbatim** — an excerpt, not a paraphrase — and
   forty words per document across a list is exactly the bulk transfer
@@ -1291,6 +1400,13 @@ Three of those deserve a sentence:
 | `not_readable` | 0 | **a real answer**: we looked and found no readable text |
 | `extracted` | int > 0 | text was captured; fetch the document to read it |
 
+A **search** result additionally carries `score`, `matched_terms` and a
+`snippet` — a bounded window around the matched term, capped at
+`snippet_max_chars` (48). It is evidence, not an excerpt: a match with no
+evidence is a number a client has to trust, and `DocumentQueryEvidence`
+exists on the iOS side for exactly this. The cap is published beside it,
+and it is what keeps a 50-result search from becoming a bulk transfer.
+
 **`provenance`** — a pointer into a recording, not a place
 
 `kind: "frame-reference"`, `spatial_ref: null`, `capture_id`,
@@ -1298,7 +1414,21 @@ Three of those deserve a sentence:
 capture still exists), `page_source_seqs` (the sequence number of each
 frame actually read, at most two per document), `pages_without_source_seq`,
 `frames_considered`, `frames_ocred`, `world_id`, `world_session_id`,
-`imagery_retention: "capture-side"`.
+`imagery_retention: "capture-side"` with `imagery_retention_note`
+defining it, and `joinable: true` with `joinable_note`.
+
+**That last pair is said out loud rather than left to be noticed.** This
+block IS joinable: a capture id, frame sequence numbers and a timestamp
+locate this reading in a recording on disk, and the link is durable
+across sessions — which is precisely what Scene Understanding refuses to
+hand anyone. The two cartridges differ here on purpose. A document is a
+record; a scene is not.
+
+The capture id is stamped when the DWELL STARTED, not when the record was
+written. A `stream_start` arriving mid-reading does not move that reading
+onto the new capture, and a `stream_stop` does not erase it — both used
+to happen, and both produced a `page_source_seqs` pointer that resolved
+into the wrong recording.
 
 `frames_considered` will be much larger than `frames_ocred`. That is the
 architecture: OCR costs ~1.19 s a page against a 0.771 ms per-frame
@@ -1339,7 +1469,8 @@ captured** rather than to a number a client has to trust.
 | `source_seq` | int or null | the frame this page was read from. Null on a record written before provenance existed |
 | `observed_at` | float or null | Tower-receipt time of that frame |
 | `observation_count` | int | how many separate views of this page were merged into it. Two readings of one page during one dwell is one page with a count of two, not two pages |
-| `image_relpath` | string or null | **null unless page images were explicitly enabled**, which is off by default and must stay off: this platform has no redaction, so a stored page image is an unredacted photograph of what the wearer was reading |
+| `image_kept` | bool | whether a page image exists on this Tower's disk. **False unless page images were explicitly enabled**, which is off by default, must stay off, and has no configuration path from a web process: this platform has no redaction, so a stored page image is an unredacted photograph of what the wearer was reading |
+| `image_served` | bool | always `false`. A BOOLEAN and not the path, which told a reader where in the store to find that photograph — disclosure with no consumer, since no route resolves it and none may |
 
 The document object also carries `word_count`, and the two summary
 qualifiers `summary_is_model_output` and `summary_is_verbatim_excerpt`.
@@ -1360,8 +1491,34 @@ exists:
 | Block | Meaning |
 |---|---|
 | `contract_note` | a string pointing at the HTTP routes, carried IN the payload so a client that reads only this channel still learns the documents are elsewhere |
-| `library` | what is on disk, **regardless of whether anything is running**: `available`, `document_count`, `unavailable_reason`, `newest_observed_at`, `bytes`, `location_disclosed: false` |
+| `library` | what is on disk, **regardless of whether anything is running**: `available`, `document_count_unfiltered`, `retention_applied: false`, `unavailable_reason`, `newest_observed_at`, `bytes`, `location_disclosed: false` |
 | `session` | the live capture, or `{state: "unavailable", reason: ...}` when `TOWER_DOCUMENT_CAPTURE` is off |
+
+`library.document_count_unfiltered` and `session.library_count` are
+DIFFERENT QUANTITIES and are named apart for that reason. The first
+counts every parseable record on disk; the second is the same count
+through the session's retention window and is refreshed only by a prune.
+They diverge whenever records exist past the window.
+
+`session.follows_stream` reports whether `stream_start` starts this
+session. It defaults to FALSE for Document Memory — the opposite of Scene
+Understanding's — and the asymmetry is the difference between the two
+cartridges: this one writes, and a session that persists what a wearer
+read gets an explicit start. `TOWER_DOCUMENT_AUTOSTART=true` changes it.
+
+**The session block keeps its shape.** When no session exists every field
+is present and `null`, `state` is `"unavailable"`, and `states` carries
+the full vocabulary including that value. A block that changed shape
+forced a decoder to make thirty fields optional and to handle a `state`
+its own enum denied existed — in the one shape that did not carry the
+enum.
+
+**The five session routes carry the full envelope**, not a bare status:
+`contract`, `claim`, `identity`, `absence_means`, `time_basis`,
+`recording_limitations`, `recording_measurement` and the imagery fields,
+with the status under `session`. A client that polls the session and
+never calls a listing would otherwise never learn that an empty library
+is the expected result here.
 
 `session.engine` and `session.recogniser` both name the text recogniser
 in use; `engine` is the generic lifecycle field every live session

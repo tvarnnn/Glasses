@@ -197,7 +197,7 @@ def _scene_session(settings):
         device,
         "on" if settings.scene_orientation else "off",
     )
-    return SceneLive(make_engine)
+    return SceneLive(make_engine, follow_stream=settings.scene_autostart)
 
 
 def _document_session(settings):
@@ -215,7 +215,9 @@ def _document_session(settings):
         "session is running until one is started",
         settings.document_root,
     )
-    return DocumentLive(settings.document_root)
+    return DocumentLive(
+        settings.document_root, follow_stream=settings.document_autostart
+    )
 
 
 def build_live_cartridges(settings) -> LiveCartridges:

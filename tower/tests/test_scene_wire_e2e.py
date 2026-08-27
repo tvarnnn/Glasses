@@ -306,6 +306,38 @@ class TestThePayloadSaysWhatItMayNotSay:
             _await_scene(client)
         return client.get("/scene").json()
 
+    #: The blocks whose whole job is to NAME what is refused. They
+    #: contain the forbidden words on purpose -- `refused_entity_fields`
+    #: exists precisely to say "track_id: joinable across time" -- so the
+    #: leak scan runs over everything else.
+    #:
+    #: Listed explicitly, and asserted to be exactly this set, so a new
+    #: block cannot quietly become exempt by being prose-shaped.
+    PROSE_BLOCKS = (
+        "tracks_absent_reason",
+        "refused_entity_fields",
+        "refused_relations",
+        "relations_absent_reason",
+        "withheld_relations",
+        "where_excludes_reason",
+        "side_convention",
+        "count_limitations",
+        "confidence_absent_reason",
+        "scene_unavailable_reason",
+        "observed_at_note",
+    )
+
+    def test_the_prose_blocks_are_exactly_the_declared_set(self, payload):
+        """The exemption list must not drift ahead of the payload.
+
+        If a new self-describing block arrives and is not listed above,
+        the leak scan below covers it -- which is the safe direction. If
+        one is listed and no longer exists, the exemption is stale and
+        this says so.
+        """
+        for name in self.PROSE_BLOCKS:
+            assert name in payload, f"{name} is exempted and does not exist"
+
     @pytest.mark.parametrize(
         "forbidden",
         ("track_id", "visible_eyes", "visible_ears", "x0", "\"box\"", "normalised_x",
@@ -319,11 +351,34 @@ class TestThePayloadSaysWhatItMayNotSay:
         A key-by-key check tests the keys somebody remembered. Searching
         the encoded payload catches one nested three levels down in a
         block added later, which is how this would actually go wrong.
+
+        The self-describing blocks are removed first, because they name
+        the refused fields as their entire purpose. Everything else --
+        every number, every count, every position, every lifecycle field
+        -- is scanned.
         """
         import json
 
-        encoded = json.dumps(payload)
+        data = {
+            key: value
+            for key, value in payload.items()
+            if key not in self.PROSE_BLOCKS
+        }
+        encoded = json.dumps(data)
         assert forbidden not in encoded, f"the payload leaked {forbidden!r}"
+
+    def test_the_refusals_name_the_fields_they_refuse(self, payload):
+        """The other half, and the reason the exemption is safe.
+
+        A refusal that does not name what it refuses is an absence. These
+        blocks are where the forbidden words are allowed to appear, and
+        they are required to appear there.
+        """
+        refused = {entry["field"] for entry in payload["refused_entity_fields"]}
+
+        assert {"track_id", "box", "facing", "visible_eyes"} <= refused
+        assert payload["tracks"] is None
+        assert "dwell timeline" in payload["tracks_absent_reason"]
 
     def test_relations_are_unexpressible_not_merely_empty(self, payload):
         assert payload["relations"] is None
@@ -376,6 +431,29 @@ class TestThePayloadSaysWhatItMayNotSay:
         A scene with one of everything is the largest `counts` and
         `where` this contract can produce, because both are keyed on a
         fixed class list rather than on what is in the room.
+
+        THE CEILING IS 12 KB, NOT WORLD BUILDER'S 8, AND THE DIFFERENCE
+        IS DELIBERATE. That number is a bandwidth judgement, not a
+        protocol limit: the concern is starving the frame path, which
+        shares this socket's send lock. Measured, at maximum arity, this
+        payload is ~9.2 KB, of which roughly two thirds is CONSTANT
+        self-description -- the refusals, the count limitations, the
+        notes that keep a null from being read as a zero. Re-sent on the
+        2 s heartbeat that is 4.6 KB/s per subscriber, against frames at
+        12 fps and ~30 KB each: 1.3%.
+
+        The prose was already cut once. `refused_relations` used to carry
+        the full research abstracts from `tower/scene/state.py` -- 1,500
+        characters for `in_front_of` alone -- and now carries the first
+        sentence and a pointer, which took 1.5 KB off every heartbeat. It
+        will not be cut further by deleting disclosure: an undercount
+        published without its limitations is the failure this cartridge
+        exists to avoid, and it is cheaper to send than to explain.
+
+        The assertion below the ceiling is the one that matters more. It
+        pins the property rather than the number: saturating the room
+        must add only the fixed-arity delta, so the payload cannot grow
+        with what is in front of the wearer.
         """
         import json
 
@@ -420,7 +498,39 @@ class TestThePayloadSaysWhatItMayNotSay:
             payload = client.get("/scene").json()
             encoded = json.dumps(payload)
             assert payload["counts"]["dining table"] == 1
-            assert len(encoded) < 8000, f"the payload grew to {len(encoded)} bytes"
+            assert len(encoded) < 12000, (
+                f"the payload grew to {len(encoded)} bytes"
+            )
+
+            # An EMPTY running scene, for the delta. Everything but the
+            # counts is identical, so the difference is exactly what a
+            # full room costs.
+            session.stop()
+            empty = SceneLive(lambda: StubSceneEngine([]), decode=lambda raw: frame)
+            client.app.state.live_cartridges = type(
+                client.app.state.live_cartridges
+            )(frame_consumers=[empty], scene=empty, document=None)
+            try:
+                empty.start()
+                deadline = threading.Event()
+                timer = threading.Timer(10.0, deadline.set)
+                timer.start()
+                try:
+                    while not deadline.is_set() and empty.latest()[0] is None:
+                        empty.offer_frame(b"x", received_at=1.0)
+                        deadline.wait(0.005)
+                finally:
+                    timer.cancel()
+                bare = len(json.dumps(client.get("/scene").json()))
+            finally:
+                empty.stop()
+
+            assert len(encoded) - bare < 1200, (
+                "a full room added "
+                f"{len(encoded) - bare} bytes; this payload must grow with "
+                "its fixed class list, not with what is in front of the "
+                "wearer"
+            )
         finally:
             session.stop()
 
@@ -460,3 +570,110 @@ class TestTheSessionIsNotRunningUnlessSomebodySaidSo:
         )
         assert offer["available"] is False
         assert "TOWER_SCENE_UNDERSTANDING" in offer["unavailable_reason"]
+
+
+class TestAPhoneThatOnlyStreamsCanStillSeeAScene:
+    """The defect this class exists for: nothing on the wire could start.
+
+    `IOS-to-Tower.md` 6.2 is explicit that opening a cartridge on the
+    phone sends NOTHING, and a test on the iOS side asserts the wire
+    stays silent. So a session that only an HTTP POST could start was a
+    contract reported `available: true`, subscribable, and answering
+    "not observing" forever -- offered and unservable on the only path a
+    product has.
+
+    `stream_start` is the signal, because it is the moment a feed exists.
+    """
+
+    def test_stream_start_starts_the_session_without_any_http_call(self, client):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "stream_start"})
+            _send_frames(ws, 4)
+            scene = _await_scene(client)
+
+        assert scene["counts"]["person"] == 2
+        assert scene["lifecycle"]["scene_is_current"] is True
+
+    def test_stream_stop_ends_it_and_discards_the_scene(self, client):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "stream_start"})
+            _send_frames(ws, 4)
+            _await_scene(client)
+            ws.send_json({"type": "stream_stop"})
+            for _ in range(400):
+                after = client.get("/scene").json()
+                if after["lifecycle"]["state"] == "stopped":
+                    break
+
+        assert after["lifecycle"]["state"] == "stopped"
+        assert after["scene_available"] is False
+        assert after["counts"] is None
+
+    def test_a_disconnect_ends_it_too(self, client):
+        """A wearable disconnects abruptly as the NORMAL case.
+
+        Crash, network drop, walking out of range. A session left running
+        by one of those would hold a model and keep serving a scene of a
+        room whose wearer is gone.
+        """
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "stream_start"})
+            _send_frames(ws, 4)
+            _await_scene(client)
+
+        for _ in range(400):
+            after = client.get("/scene").json()
+            if after["lifecycle"]["state"] == "stopped":
+                break
+
+        assert after["lifecycle"]["state"] == "stopped"
+        assert after["scene_available"] is False
+
+    def test_a_connection_that_never_streamed_does_not_end_an_operator_s_session(
+        self, client
+    ):
+        """Stop only what the stream started.
+
+        `ws.py` tears the stream down on ANY exit, including a client
+        that never sent `stream_start`. An unconditional stop here would
+        let any passing connection kill a session an operator had started
+        by hand for a physical test -- which is exactly the situation
+        this cartridge most needs to survive.
+        """
+        client.post("/scene/start")
+        with client.websocket_connect("/ws") as ws:
+            _send_frames(ws, 4)
+            _await_scene(client)
+        after = client.get("/scene").json()
+
+        assert after["lifecycle"]["state"] == "running"
+        assert after["scene_available"] is True
+
+    def test_autostart_can_be_turned_off(self, monkeypatch):
+        """An operator who wants the manual control keeps it."""
+        from tower import cartridge_runtime
+        from tower.main import create_app
+        from tower.scene.live import SceneLive
+
+        monkeypatch.setenv("TOWER_SCENE_UNDERSTANDING", "true")
+        monkeypatch.setenv("TOWER_SCENE_AUTOSTART", "false")
+        monkeypatch.delenv("TOWER_WORLD_ROOT", raising=False)
+        monkeypatch.setattr(
+            cartridge_runtime,
+            "_scene_session",
+            lambda settings: SceneLive(
+                lambda: StubSceneEngine(TWO_PEOPLE_A_CHAIR_AND_A_LAPTOP),
+                follow_stream=settings.scene_autostart,
+            ),
+        )
+        manual = TestClient(create_app())
+        manual.__enter__()
+        _OPEN.append(manual)
+
+        with manual.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "stream_start"})
+            _send_frames(ws, 4)
+
+        status = manual.get("/scene").json()
+        assert status["lifecycle"]["state"] == "stopped"
+        assert status["lifecycle"]["follows_stream"] is False

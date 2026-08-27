@@ -179,12 +179,20 @@ class DocumentMemoryEngine:
         long-lived engine cannot be constructed holding one. This is how
         it learns.
 
-        Takes effect on the NEXT document recorded, never retroactively,
-        and that is the point rather than a limitation: a dwell already in
-        progress was fed by frames from the previous lineage, and
-        restamping it would attach a reading to a recording it did not
-        come from. Provenance that can be rewritten after the fact is not
+        Takes effect on the NEXT DWELL, never retroactively, and that is
+        the point rather than a limitation: a dwell already in progress
+        was fed by frames from the previous lineage, and restamping it
+        would attach a reading to a recording it did not come from.
+        Provenance that can be rewritten after the fact is not
         provenance.
+
+        This paragraph was true as a comment and false as code until
+        2026-08-27. `_record` read `self._capture_id` at RECORD time, so
+        a `stream_start` arriving mid-dwell moved the whole reading onto
+        the new capture and a `stream_stop` nulled it -- both measured,
+        both producing a `page_source_seqs` pointer that resolved into
+        the wrong recording. The id now travels ON THE DWELL, fixed when
+        it started; see `Dwell.lineage`.
         """
         self._capture_id = capture_id
 
@@ -215,6 +223,7 @@ class DocumentMemoryEngine:
             gray=gray if candidate is not None else None,
             source_seq=source_seq,
             frame_diagonal=diagonal,
+            lineage=self._capture_id,
         )
         return self._resolve(
             finished,
@@ -374,7 +383,11 @@ class DocumentMemoryEngine:
             frames_ocred=len(dwell.best),
             end_reason=dwell.end_reason,
             confidence=_document_confidence(pages),
-            capture_id=self._capture_id,
+            # From the DWELL, not from this engine's current field: the
+            # frames that produced this document belonged to whatever
+            # capture was open when the dwell began. See
+            # `set_capture_id`.
+            capture_id=dwell.lineage,
             timing_source=self._timing_source(),
             assumed_frame_interval_s=(
                 self._assumed_interval if self._used_assumed_time else None

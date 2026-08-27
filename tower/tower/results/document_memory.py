@@ -66,13 +66,18 @@ in. That is also why this paragraph does not quote the test's own name.
 """
 
 from tower.document_memory.records import TIME_BASIS
+from tower.results.contracts import DOCUMENT_MEMORY_LIBRARY_CONTRACT
 from tower.document_memory.retrieval import MIN_SCORE, DocumentMemory
 from tower.document_memory.store import DocumentStore
 
 # Opaque and dated, in the style of `object_memory.observations/2026-08-26`.
 # Compared for equality only: never parsed, never ordered, never used to
 # infer that one contract is newer than another.
-LIBRARY_CONTRACT = "document_memory.library/2026-08-27"
+#
+# Defined in `tower/results/contracts.py` and re-exported here, so the
+# capability declaration can name it without importing this adapter --
+# `registry.py` must stay cartridge-blind.
+LIBRARY_CONTRACT = DOCUMENT_MEMORY_LIBRARY_CONTRACT
 
 # The three answers, as values a decoder can switch on.
 ANSWER_MATCHED = "matched"
@@ -85,17 +90,83 @@ TEXT_UNKNOWN = "unknown"
 TEXT_NOT_READABLE = "not_readable"
 TEXT_EXTRACTED = "extracted"
 
-DOCUMENT_CLAIM = "a-document-was-in-view-and-was-read"
+# "OCRED", not "read", and the correction matters more than it looks.
+#
+# This file spends a paragraph explaining that the duration field must
+# never be named for viewing, because "appearing in the camera does not
+# establish that the wearer looked at it, noticed it, or read it" -- and
+# then the top-level claim, the value a decoder is invited to switch on,
+# said the document WAS READ. The intended reading was "read by OCR".
+# Nothing in the payload said so, and the field five keys below is
+# specifically about the wearer.
+#
+# Corrected before any consumer existed, which is why the contract
+# identifier did not move: an identifier is bumped to protect decoders
+# that exist, and none had ever decoded the earlier shape.
+DOCUMENT_CLAIM = "a-page-was-in-view-and-was-ocred"
 IDENTITY_SCOPE = "no-document-identity-across-sightings"
 ABSENCE_MEANING = "not-recorded-by-this-cartridge"
 
-# The one honest redaction value this platform has. `records.py:36`:
-# "'none' is the honest value for imagery this platform cannot redact".
-# Carried at the envelope so a client that reads the header and stops
-# still learns that no image here may be shown on a persisted surface.
-IMAGERY_TREATMENT = "raw-ephemeral-not-served"
+# What happened to the pixels, in this platform's terms and in iOS's.
+#
+# The earlier single constant was `"raw-ephemeral-not-served"`, and it
+# was wrong twice. It is not one of the three states `IOS-to-Tower.md` 5
+# defines, so a decoder falls through to unknown -- the safe direction,
+# but a mapping that never lands. And it was a module constant, so a
+# library that kept every page image and one that kept none emitted the
+# same string, while a kept image is raw and PERSISTED, which is the
+# opposite of ephemeral.
+IMAGERY_NONE_RETAINED = "none-retained"
+IMAGERY_RAW_PERSISTED = "raw-persisted"
+
+# The strictest iOS state that applies, named in iOS's own vocabulary so
+# the mapping is the Tower's decision rather than the phone's guess. It
+# is `rawEphemeral` in both cases and not `redacted` in either, because
+# this platform performs no redaction at all.
+IMAGERY_IOS_STATE = "rawEphemeral"
+
+IMAGERY_NOTE = (
+    "this platform performs no redaction. No route serves an image. "
+    "Where retains_raw_imagery is true, an unredacted page image exists "
+    "on this Tower's disk under capture-side retention and is not "
+    "reachable over any wire"
+)
+
+# What `imagery_retention` means, since it is this cartridge's own word
+# and iOS has no channel through which it could verify it.
+IMAGERY_RETENTION_NOTE = (
+    "capture-side: the frames this record points at live in the capture "
+    "store, whose lifetime this cartridge neither sets nor enforces. "
+    "Purging every document here leaves that imagery exactly where it is"
+)
+
+# The closed set `privacy_tags` draws from, published so a client can pin
+# it rather than discover it one record at a time.
+PRIVACY_TAG_VOCABULARY = ("document-text", "first-person")
 
 RETRIEVAL_KINDS = ("recent", "text", "observed_within")
+
+# How much verbatim text a SEARCH result may carry per match.
+#
+# `retrieval._snippet` produces 160 characters around the matched term,
+# and a review measured what that adds up to: with a 90-character title
+# beside it, 252 verbatim characters per match, at a limit of 50 that is
+# ~12.6 KB of document text -- delivered in the same object as a string
+# promising the summary is withheld so "a listing cannot become a bulk
+# transfer of what a wearer read".
+#
+# The snippet is not decoration and is not dropped: a match with no
+# evidence is a number a client has to trust, and `IOS-to-Tower.md`
+# models `DocumentQueryEvidence` for exactly this. It is bounded instead,
+# to a phrase rather than a paragraph, and the payload now says what it
+# serves rather than claiming it serves nothing.
+SNIPPET_MAX_CHARS = 48
+
+# And how much of a title. A title is a label and iOS asks for it in the
+# list (3.1) knowing it is lifted from the document's own first line --
+# but 90 characters times a 200-document listing is 18 KB of verbatim
+# first lines for a caller that asked no question at all.
+TITLE_MAX_CHARS_ON_WIRE = 60
 
 # What this cartridge cannot do, as data rather than as a document
 # somebody has to have read. Every response carries it.
@@ -114,23 +185,54 @@ RECORDING_LIMITATIONS = (
     {
         "limitation": "no-validated-positive",
         "detail": (
-            "no capture on this platform has ever contained a sheet of "
-            "paper, so the detector has never been shown a positive it "
-            "was built for. The premise is untested rather than disproved"
+            "no SAMPLED capture on this platform has contained a sheet of "
+            "paper -- a visual review of 51 frames at quartile positions "
+            "across 18 captures, on a corpus that has since grown. The "
+            "detector has never been shown a positive it was built for, "
+            "so the premise is untested rather than disproved"
         ),
     },
     {
         "limitation": "resolution",
         "detail": (
             "at the 360x640 the glasses deliver, EasyOCR returned zero "
-            "dictionary words across 919 sampled real frames dense with "
-            "screen text, at median confidence 0.056. Word recall on "
-            "rendered pages at this geometry is 0.343-1.000 depending on "
-            "tilt. A high-resolution still, not a higher stream, is the "
-            "measured fix"
+            "dictionary words across 919 sampled real frames -- every "
+            "tenth frame of a corpus that is dense with screen text and "
+            "also full of walls and carpet -- at median confidence 0.056. "
+            "Word recall on rendered pages at this geometry is 0.629-0.952 "
+            "with the page at its own aspect, which is the fairest "
+            "estimate of the delivered case"
+        ),
+    },
+    {
+        "limitation": "resolution-remedy-is-not-a-fix",
+        "detail": (
+            "a high-resolution still is the measured remedy for "
+            "RECOGNITION, and recognition is not what is failing. "
+            "Detection is the binding constraint and a still does not "
+            "touch it: the glyph gate is derived for 360x640 only and "
+            "must be re-derived at any other geometry, where the usable "
+            "window between real negatives and readable pages may close "
+            "entirely. Nobody has run that derivation"
         ),
     },
 )
+
+# When the figures above were measured, and on what.
+#
+# Asserted in the present tense they read as current state, and this
+# platform's corpus grows continuously -- so a rate measured on 9,199
+# frames says nothing about the frames recorded since.
+RECORDING_MEASUREMENT = {
+    "measured_at": "2026-08-26",
+    "corpus_frames": 9199,
+    "corpus_captures": 18,
+    "is_current": False,
+    "note": (
+        "the corpus on this host has grown since. These figures describe "
+        "the frames they were measured on and have not been re-derived"
+    ),
+}
 
 
 def store_from_root(root, *, retention_days: float | None = None, clock=None):
@@ -142,13 +244,18 @@ def store_from_root(root, *, retention_days: float | None = None, clock=None):
     `object_memory.store_from_root` where they are.
 
     `retention_days` is accepted and NARROWS ONLY. It reaches the store
-    as `retention_seconds`, and the store filters reads to that window.
-    Note the asymmetry with Object Memory that a caller must not be
-    misled about: `ObservationStore` persists the window it was written
-    under and clamps to `min(persisted, requested)`. `DocumentStore`
-    persists no such manifest, so it cannot clamp, and a reader asking
-    for a wide window gets a wide window. `_retention_view` says exactly
-    that rather than implying a guarantee that is not there.
+    as `retention_seconds`, and since 2026-08-27 the store genuinely
+    filters reads to that window -- `DocumentStore.read_all` explains why
+    that sentence used to be false and what it cost.
+
+    The asymmetry with Object Memory is real and a caller must not be
+    misled about it. `ObservationStore` persists the window it was
+    written under and clamps to `min(persisted, requested)`.
+    `DocumentStore` persists no such manifest, so it cannot clamp: a
+    reader asking for a WIDER window than the writer used gets the wider
+    window, and will simply see nothing the writer already pruned.
+    `_retention_view` says exactly that rather than implying a guarantee
+    that is not there.
     """
     seconds = None
     if retention_days is not None and retention_days > 0:
@@ -171,6 +278,20 @@ def _retention_view(requested_days: float | None) -> dict:
         ),
         "policy": "a reader may narrow this read; it cannot widen it",
     }
+
+
+def _clip(text, limit: int):
+    """Bound a verbatim excerpt, and say that it was bounded.
+
+    An ellipsis rather than a silent cut: a client rendering a clipped
+    title as a whole one is showing something the document does not say.
+    """
+    if text is None:
+        return None
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "\u2026"
 
 
 def _text_availability(document) -> dict:
@@ -224,9 +345,22 @@ def _provenance(document) -> dict:
         "frames_ocred": document.frames_ocred,
         "world_id": document.world_id,
         "world_session_id": document.world_session_id,
-        # This pointer resolves into `data/captures/`, whose lifetime this
-        # cartridge neither sets nor enforces.
         "imagery_retention": "capture-side",
+        "imagery_retention_note": IMAGERY_RETENTION_NOTE,
+        # Said out loud rather than left for a reviewer to notice. This
+        # block IS joinable: a capture id, frame sequence numbers and a
+        # timestamp let a holder align this reading with a recording on
+        # disk. That is what provenance is for and it is why
+        # `IOS-to-Tower.md` 3.8 asks for it -- but it is a durable link
+        # across sessions, which is exactly what Scene Understanding's
+        # payload refuses to hand anyone, and the two cartridges differ
+        # here on purpose. A document is a record; a scene is not.
+        "joinable": True,
+        "joinable_note": (
+            "capture_id, page_source_seqs and observed_at together locate "
+            "this reading in a recording. The link is durable across "
+            "sessions, unlike anything Scene Understanding publishes"
+        ),
     }
 
 
@@ -279,14 +413,20 @@ def _summary_view(document) -> dict:
         "document_id": document.document_id,
         "claim": DOCUMENT_CLAIM,
         "identity": IDENTITY_SCOPE,
-        "title": document.title,
+        "title": _clip(document.title, TITLE_MAX_CHARS_ON_WIRE),
         "title_is_derived": True,
+        "title_max_chars": TITLE_MAX_CHARS_ON_WIRE,
         "summary_available": bool(document.summary),
         "summary_withheld_reason": (
             "the stored summary is the document's first forty words "
-            "verbatim -- an excerpt, not a paraphrase. It is served with "
-            "the document, never in a list, so a listing cannot become a "
-            "bulk transfer of what a wearer read"
+            "verbatim -- an excerpt, not a paraphrase -- and is served "
+            "with the document, never in a listing. What a listing does "
+            "carry is a clipped title, and a search result additionally "
+            "carries a bounded snippet around the matched term as "
+            "evidence; both are capped, and the caps are published beside "
+            "them. The rule is that a listing must not become a bulk "
+            "transfer of what a wearer read, not that it carries no "
+            "verbatim characters at all"
         ),
         "confidence": document.confidence.value,
         "confidence_basis": "the weakest page read in this document",
@@ -306,7 +446,15 @@ def _summary_view(document) -> dict:
         "provenance": _provenance(document),
         "retains_raw_imagery": bool(document.retains_raw_imagery),
         "redaction": document.redaction,
-        "imagery_treatment": IMAGERY_TREATMENT,
+        # Varies with the fact, rather than being a constant that said
+        # the same thing whatever was on disk.
+        "imagery_treatment": (
+            IMAGERY_RAW_PERSISTED
+            if document.retains_raw_imagery
+            else IMAGERY_NONE_RETAINED
+        ),
+        "imagery_ios_state": IMAGERY_IOS_STATE,
+        "imagery_served": False,
         "privacy_tags": list(document.privacy_tags),
         "schema_version": document.schema_version,
     }
@@ -329,10 +477,14 @@ def _page_view(page) -> dict:
         # readings of one page during one dwell is one page with an
         # observation count of two, not two pages.
         "observation_count": page.observation_count,
-        # Present and null when no image was kept, which is the default
-        # and must stay the default: a document's whole point is to be
-        # readable and this platform has no redaction.
-        "image_relpath": page.image_relpath,
+        # A BOOLEAN, not the path. The path told a reader that an
+        # unredacted photograph of what the wearer was reading exists on
+        # this Tower's disk, and where in the store -- disclosure with no
+        # consumer, since no route resolves it and none may.
+        #
+        # False is the default and must stay the default.
+        "image_kept": bool(page.image_relpath),
+        "image_served": False,
     }
 
 
@@ -349,11 +501,32 @@ def _envelope(requested_days: float | None) -> dict:
         "semantic_retrieval": False,
         "semantic_retrieval_unavailable_reason": (
             "this cartridge matches literal terms with BM25 and computes "
-            "no embedding. Calling it semantic would be an overclaim, and "
-            "a client routing a description here will get a lexical answer"
+            "no embedding. Calling it semantic would be an overclaim"
         ),
+        # iOS routes typed free text to `.semantic`, so its PRIMARY input
+        # path has no Tower route. Saying only "no semantic retrieval"
+        # leaves it to guess what to do instead.
+        "semantic_retrieval_alternative": (
+            "route free text to retrieval_kind 'text'. It will be matched "
+            "literally, so a description of a document will usually miss "
+            "where a quotation from one will hit"
+        ),
+        "pagination": {
+            "supported": False,
+            "bound": "limit",
+            "reason": (
+                "there is no cursor. `limit` is the only bound, and a "
+                "caller can detect truncation by comparing document_count "
+                "with documents_in_memory"
+            ),
+        },
+        "privacy_tag_vocabulary": list(PRIVACY_TAG_VOCABULARY),
         "recording_limitations": [dict(entry) for entry in RECORDING_LIMITATIONS],
-        "imagery_treatment": IMAGERY_TREATMENT,
+        "recording_measurement": dict(RECORDING_MEASUREMENT),
+        "imagery_treatment": IMAGERY_NONE_RETAINED,
+        "imagery_ios_state": IMAGERY_IOS_STATE,
+        "imagery_served": False,
+        "imagery_note": IMAGERY_NOTE,
         "retention": _retention_view(requested_days),
     }
 
@@ -448,12 +621,14 @@ def search_documents(
     payload["reason"] = result.reason
     payload["match_kind"] = "lexical"
     payload["document_count"] = len(result.matches)
+    payload["snippet_max_chars"] = SNIPPET_MAX_CHARS
     payload["documents"] = [
         dict(
             _summary_view(match.document),
             score=round(match.score, 4),
             matched_terms=list(match.matched_terms),
-            snippet=match.snippet,
+            # Bounded evidence, not an excerpt. See SNIPPET_MAX_CHARS.
+            snippet=_clip(match.snippet, SNIPPET_MAX_CHARS),
         )
         for match in result.matches
     ]
@@ -513,14 +688,117 @@ STATUS_VOLATILE_PATHS = (
     "library.bytes",
 )
 
-_SESSION_ABSENT = {
-    "state": "unavailable",
-    "reason": (
-        "no document capture session exists on this Tower "
-        "(TOWER_DOCUMENT_CAPTURE is off). Documents recorded elsewhere "
-        "are still served: this says nothing was recorded HERE"
-    ),
-}
+# The reason a Tower has no capture session, and the state that says so.
+#
+# `unavailable` is NOT one of `LIFECYCLE_STATES`, and that is deliberate
+# rather than an omission: the lifecycle states describe a session, and
+# this is the case where there is none. It is published in `states` all
+# the same, so a decoder can pin the full vocabulary from any payload --
+# an adversarial review found the earlier version emitting a `state`
+# value the payload's own enum denied existed, in the one shape that did
+# not carry the enum.
+SESSION_UNAVAILABLE = "unavailable"
+
+SESSION_ABSENT_REASON = (
+    "no document capture session exists on this Tower "
+    "(TOWER_DOCUMENT_CAPTURE is off, or TOWER_DOCUMENT_ROOT is unset). "
+    "Documents recorded elsewhere are still served: this says nothing "
+    "was recorded HERE"
+)
+
+# Every key a live session's status carries, present and null when there
+# is no session.
+#
+# A block that changed shape forced a decoder to make 31 fields optional
+# and to handle a `state` outside the published enum -- and `states` was
+# itself one of the keys that disappeared, so a client could never learn
+# the vocabulary from the payload that needed it. Scene Understanding's
+# payload already keeps every key present with `null`; this now matches.
+_SESSION_NULL_FIELDS = (
+    "session_id",
+    "failure_reason",
+    "started_at",
+    "ready_at",
+    "loading_seconds",
+    "load_overdue",
+    "load_overdue_after_seconds",
+    "engine",
+    "frames_offered",
+    "frames_observed",
+    "frames_skipped",
+    "frames_dropped_not_running",
+    "recogniser",
+    "capture_id",
+    "capture_id_validated",
+    "in_dwell",
+    "dwells_started",
+    "pages_detected",
+    "documents_recorded",
+    "last_document_id",
+    "last_document_at",
+    "flushed_document_id",
+    "keeps_page_images",
+    "follows_stream",
+    "retention_days",
+    "documents_pruned",
+    "retention_incomplete",
+    "library_count",
+    "library_soft_limit",
+    "library_over_soft_limit",
+    "library_soft_limit_note",
+)
+
+
+def _session_absent() -> dict:
+    from tower.live_session import LIFECYCLE_STATES
+
+    absent = {
+        "state": SESSION_UNAVAILABLE,
+        "states": list(LIFECYCLE_STATES) + [SESSION_UNAVAILABLE],
+        "reason": SESSION_ABSENT_REASON,
+    }
+    absent.update({name: None for name in _SESSION_NULL_FIELDS})
+    return absent
+
+
+def session_view(session) -> dict:
+    """A session status, in the same envelope every other response has.
+
+    The five session routes used to return `session.status()` raw: no
+    contract, no claim, no recording limitations, no imagery statement --
+    while this module's own header says those travel on EVERY response.
+    They are responses. Scene Understanding's control routes already run
+    everything through one function for the same reason.
+
+    A client that polls the session and never calls a listing would
+    otherwise never learn that an empty library is the expected result on
+    this platform, which is the single most important thing this
+    cartridge has to say.
+    """
+    return {
+        "contract": LIBRARY_CONTRACT,
+        "claim": DOCUMENT_CLAIM,
+        "identity": IDENTITY_SCOPE,
+        "absence_means": ABSENCE_MEANING,
+        "time_basis": TIME_BASIS,
+        "recording_limitations": [dict(entry) for entry in RECORDING_LIMITATIONS],
+        "recording_measurement": dict(RECORDING_MEASUREMENT),
+        "imagery_treatment": IMAGERY_NONE_RETAINED,
+        "imagery_ios_state": IMAGERY_IOS_STATE,
+        "imagery_served": False,
+        "imagery_note": IMAGERY_NOTE,
+        "session": _session_present(session),
+    }
+
+
+def _session_present(session) -> dict:
+    status = dict(session.status())
+    status["states"] = list(status["states"]) + [SESSION_UNAVAILABLE]
+    # Present and null, so the two shapes have identical key sets.
+    status["reason"] = None
+    for name in _SESSION_NULL_FIELDS:
+        status.setdefault(name, None)
+    return status
 
 
 class DocumentStatusProducer:
@@ -558,7 +836,8 @@ class DocumentStatusProducer:
             # rather than an unreadable one. Those are opposite claims.
             return {
                 "available": True,
-                "document_count": 0,
+                "document_count_unfiltered": 0,
+                "retention_applied": False,
                 "unavailable_reason": None,
                 "newest_observed_at": None,
                 "bytes": {"journal": 0, "images": 0, "total": 0},
@@ -574,7 +853,13 @@ class DocumentStatusProducer:
             documents = store.read_all()
             summary = {
                 "available": True,
-                "document_count": len(documents),
+                # UNFILTERED, and named so. `session.library_count` is the
+                # same quantity through the session's retention window and
+                # refreshed only by a prune, so the two diverge whenever
+                # records exist past the window. Two numbers side by side
+                # with one name would be the worst of both.
+                "document_count_unfiltered": len(documents),
+                "retention_applied": False,
                 "unavailable_reason": None,
                 "newest_observed_at": (
                     max(document.observed_at for document in documents)
@@ -590,7 +875,8 @@ class DocumentStatusProducer:
         except Exception:
             return {
                 "available": False,
-                "document_count": None,
+                "document_count_unfiltered": None,
+                "retention_applied": False,
                 "unavailable_reason": (
                     "this Tower's document journal could not be read"
                 ),
@@ -630,14 +916,18 @@ class DocumentStatusProducer:
             "time_basis": TIME_BASIS,
             "library": self._library(),
             "session": (
-                dict(_SESSION_ABSENT)
+                _session_absent()
                 if self._session is None
-                else self._session.status()
+                else _session_present(self._session)
             ),
             "recording_limitations": [
                 dict(entry) for entry in RECORDING_LIMITATIONS
             ],
-            "imagery_treatment": IMAGERY_TREATMENT,
+            "recording_measurement": dict(RECORDING_MEASUREMENT),
+            "imagery_treatment": IMAGERY_NONE_RETAINED,
+            "imagery_ios_state": IMAGERY_IOS_STATE,
+            "imagery_served": False,
+            "imagery_note": IMAGERY_NOTE,
         }
 
 
@@ -650,6 +940,7 @@ __all__ = [
     "RECORDING_LIMITATIONS",
     "STATUS_VOLATILE_PATHS",
     "documents_around",
+    "session_view",
     "one_document",
     "recent_documents",
     "search_documents",
