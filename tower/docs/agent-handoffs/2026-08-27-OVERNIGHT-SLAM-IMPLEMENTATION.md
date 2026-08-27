@@ -2,9 +2,12 @@
 
 **Branch:** `world-builder/next-generation`
 **Starting commit:** `65f64a4` ("test: the branch end state, controls passing")
-**Ending commit:** _(filled at close)_
-**Commits added:** 12 · **Production files touched: 2** (+256 / −10)
-**Working tree / push status:** _(filled at close)_
+**Ending commit:** this document's own commit — see `git log 65f64a4..HEAD`
+**Commits added:** 24 (this one included) · **Production files touched: 2** (+256 / −10)
+**Working tree:** clean · **Push status:** all commits pushed to
+`origin/world-builder/next-generation` · **`ios/` untouched** (verified by
+`git diff 65f64a4..HEAD -- ios/`, empty)
+**Not merged.** Nothing was merged to `main` or to the integration branch.
 
 ---
 
