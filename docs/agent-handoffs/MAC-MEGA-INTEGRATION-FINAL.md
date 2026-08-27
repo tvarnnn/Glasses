@@ -651,6 +651,26 @@ path at all).
 
 ### BATCH A — one session, ~15 minutes
 
+### A0. The drawer badges — **no hardware needed, do this first**
+- **Cartridge:** all eight · **Duration:** under a minute
+- **Prerequisites:** none. A Simulator run is enough; no Tower, no glasses.
+- **Do:** launch, tap **Cartridges** in the toolbar.
+- **Expected UI:** World Builder, Object Memory and Experimental CV Lab read
+  **"Ready to test"** and are the only tinted badges. Document Memory and Scene
+  Understanding read **"Awaiting Tower"**. Visual Q&A, Accessibility and
+  Environmental Memory read **"Not built"** and remain untappable.
+- **Pass:** the three tinted rows are the three you can open and get real data
+  from; no row reads "Up next", "Planned" or "Future".
+- **Failure signatures:** more than one status tinted → the glance test is
+  gone. A "Not built" row that is tappable, or a "Ready to test" row that is
+  not → the badge and the drawer have drifted apart, which
+  `testTheOpenableRowsAreExactlyTheCartridgesThatAreNotUnbuilt` should have
+  caught.
+- **Note:** the badge describes *this build*. Against a Tower that is not
+  serving a cartridge, a "Ready to test" row can still open onto "Nothing yet"
+  — that is the app being ready and that Tower not being, and it is correct.
+
+
 #### A1. Fragment ranking on a real walk
 - **Cartridge:** World Builder · **Branch/commit:** this branch, final HEAD
 - **Tower:** any; a world must build
