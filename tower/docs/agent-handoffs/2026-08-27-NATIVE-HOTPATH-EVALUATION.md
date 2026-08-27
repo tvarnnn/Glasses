@@ -151,8 +151,18 @@ all point-residuals in one pass via a gather and an `einsum`.
 | process RSS | 186.7 MB | **183.9 MB** |
 | admitted pairs / segments / points | (4,5),(5,32) / 3 / 3,739 | **identical** |
 
-**1.64× end to end against a 1.74× ceiling — 94% of everything that was
+**1.64x end to end against a 1.74x ceiling — 94% of everything that was
 available.** Memory unchanged. Output identical.
+
+**Two figures, both real — quote the range, not the better one.** I
+measured **1.64x** end to end on the canonical world. The scaling lane,
+measuring independently across **sixteen** worlds, got **1.43x** on the
+registration stage with byte-identical outcomes. Different populations,
+not a disagreement: one world against sixteen, and `register()` end to end
+against the stage in isolation. **The honest headline is 1.4–1.6x**, and
+the ceiling argument is unaffected either way — the point was never the
+exact multiple, it was that numpy reached the neighbourhood of a bound
+that C++ could not have exceeded.
 
 The original loop is **kept as `_residuals`, the reference
 implementation**, and the two are checked against each other by 19 parity
