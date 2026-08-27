@@ -15,7 +15,8 @@ reasons, any one of which would be sufficient:
 1. **The product hot path has no Python bottleneck.** 79% of a full
    replay is already executing inside OpenCV's C++.
 2. **There is no GIL bottleneck.** A competing pure-Python thread keeps
-   **86.9%** of its throughput during a replay.
+   **82.7%** of its throughput during a replay, against a **46.5%**
+   floor established by a positive control that provably holds the GIL.
 3. **On the one genuine Python hotspot, vectorised numpy captured 94% of
    the theoretically available win** — measured end to end, not on a
    kernel microbenchmark. C++ could buy at most the remaining 6%.
@@ -34,7 +35,9 @@ measured wins without any of the cost. Those are in §4.
   otherwise resolves `tower` at the MAIN repo, a different branch.
 - cwd pinned to `<worktree>/tower`, because
   `redaction.DEFAULT_MODEL_PATH` is RELATIVE — face redaction silently
-  switches off from another directory, and it is 22.8% of the runtime.
+  switches off from another directory, and it is **33.6%** of the runtime
+  on the canonical capture (an earlier draft said 22.8%, which was the
+  figure from the smaller capture; 33.6% is the one that matters).
 - **Noise floor MEASURED at 11%** (registration, unprofiled, two runs:
   5.75 s and 6.39 s). No improvement below that is claimed.
 - **cProfile inflates Python frames specifically**, so every "native
@@ -60,9 +63,25 @@ Canonical capture, 1,848 frames → 448 keyframes, **32.0 s**:
 | `resize` | 0.873 s | 2.7% | native |
 | file I/O | ~2.42 s | 7.6% | OS |
 
-**Native OpenCV totals 25.29 s = 79.1%.** On the smaller capture it was
-68% — **the native share RISES with scale**, so the case for C++ gets
-weaker on exactly the workloads that matter most.
+**Time in compiled code totals ~79%** on this capture, against 68% on the
+smaller one — **the compiled share RISES with scale**, so the case for
+C++ gets weaker on exactly the workloads that matter most.
+
+**Two corrections to how that number was first stated.** It was labelled
+"native OpenCV totals 25.29 s = 79.1%", and both halves were loose. The
+classifier counts every `cv2.*` call, **every numpy ufunc and every
+builtin** as compiled, so "native OpenCV" is the wrong label — it is
+"time in compiled code". And the rows listed above sum to **22.911 s**,
+not 25.29 s; the remainder is in unlisted rows, so the headline could not
+be reconstructed from the evidence shown.
+
+Counting numpy as un-migratable was the one tendentious step, and **this
+lane's own sharpness win refutes it**: eliminating numpy `_var` was
+exactly a "compiled" cost removed by better dispatch.
+
+The share is real and the conclusion is unaffected — and §5 of the review
+shows the direction of the profiler's bias makes the TRUE figure higher,
+plausibly ~83%.
 
 The largest Python-side costs are JSON serialisation and filesystem
 syscalls. There is no Python loop, no object-churn hotspot, and no
@@ -130,14 +149,26 @@ happens when a wearer walks a room.
 thread (deliberately pure Python — a numpy probe would release the GIL
 itself and measure nothing) ran alongside a replay in the same process.
 
-**Throughput retained: 86.9%.** World Builder releases the GIL for the
-large majority of its work, which is what OpenCV does around native
-calls, and is consistent with the 79%-native profile.
+My first run reported **86.9%**, taken while two other agents saturated
+the machine. The adversarial reviewer could not get a quiet machine
+either — and instead of reporting an indefensible number, made the probe
+**self-calibrating** by adding a positive control: a second pure-Python
+hog that provably holds the GIL, establishing what "collapsed" looks like
+*under that exact load*. Three interleaved rounds:
 
-_Caveat, stated because it matters: that run was taken while two other
-agents were saturating the machine, so the absolute replay time was
-inflated. The direction is corroborated independently by the profile; the
-figure is re-measured on a quiet machine in §8._
+| | retained |
+|---|---|
+| negative control (spinner alone) | 100% |
+| **subject (during replay)** | **82.7%** (rounds: 68.4 / 91.9 / 82.7) |
+| positive control (a real GIL holder) | **46.5%** — against a ~50% prediction |
+
+**82.7% against a 46.5% floor is clean separation.** My 86.9% was about
+four points optimistic; the conclusion is unchanged. World Builder
+releases the GIL for the large majority of its work, which is what OpenCV
+does around native calls, and is consistent with the native-share profile.
+
+That positive control is the better method and is worth reusing: it turns
+"the machine was noisy" from an excuse into a calibrated axis.
 
 ## 4. What was changed — three wins, no native code
 
@@ -155,10 +186,26 @@ all point-residuals in one pass via a gather and an `einsum`.
 | **registration wall** | **5.75 / 6.39 s** | **3.10 / 4.02 / 3.99 s** |
 | peak Python-traced memory | 24.0 MB | **24.1 MB** |
 | process RSS | 186.7 MB | **183.9 MB** |
-| admitted pairs / segments / points | (4,5),(5,32) / 3 / 3,739 | **identical** |
+| admitted pairs / segments / points | (4,5),(5,32) / 3 / 3,739 | **same admissions** |
 
-**1.64x end to end against a 1.74x ceiling — 94% of everything that was
-available.** Memory unchanged. Output identical.
+**1.64x end to end against a 1.74x ceiling.** Memory unchanged.
+
+**"94% of what was available" is the flattering framing, and both numbers
+belong here.** 1.64/1.74 is a ratio of SPEEDUPS. By time actually
+removed, 6.409/1.64 = 3.908 s, so 2.501 s of the 2.724 s removable was
+removed: **91.8%**. Both are defensible, 94% is the higher, and neither
+changes the verdict.
+
+**And "output identical" was true of one world, not of the change.**
+Running the whole `_refine` both ways over 80 problems from a known
+Sim(3): **0 of 80 converged bit-identically**, max parameter divergence
+**1.405e-09**, max scale drift **0.0006 ppm**. The step-acceptance branch
+(`if probe_cost < cost`) does diverge, and the converged Sim(3) moves —
+by nanometres on metre-scale translations, against admission gates at
+4 px and whole degrees, so no gate can plausibly flip. Determinism is
+preserved: same code, same answer every time. The honest phrasing is
+**"agrees to ~1e-9 and re-derived the same admissions on every world
+tested"**, not "identical".
 
 **Two figures, both real — quote the range, not the better one.** I
 measured **1.64x** end to end on the canonical world. The scaling lane,
@@ -236,8 +283,9 @@ The intermediate is **exact, not approximate**: 8-bit input with
 `ksize=1` bounds the Laplacian at ±1020 against int16's ±32767, so
 saturation is unreachable — verified by `np.array_equal` against the
 float64 result on real frames (observed range −497..324). The variance
-then differs only in the last bits of a float64 (**max 4.1e-16, median
-1.2e-16**).
+then differs only in the last bits of a float64 — **max 6.22e-16 across
+all 9,372 corpus frames** (an earlier draft quoted 4.1e-16, measured on
+only 120).
 
 That last point matters because sharpness feeds an absolute threshold and
 a rolling ratio, so a frame sitting exactly on the bar could in principle

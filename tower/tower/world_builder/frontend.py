@@ -187,13 +187,53 @@ def measure_sharpness(gray: np.ndarray) -> float:
     on real frames, whose observed range was -497..324.
 
     The variance then differs only in the last bits of a float64 --
-    measured max relative error 4.1e-16, median 1.2e-16, across those 120
+    measured max relative error **6.22e-16** across all 9,372 corpus
     frames -- because `meanStdDev` accumulates in float64 exactly as
-    `.var()` does. That matters because this value is compared against an
-    absolute floor and a rolling ratio, so a frame sitting EXACTLY on a
-    threshold could in principle flip; the corpus replay was re-run to
-    confirm keyframe decisions are unchanged.
+    `.var()` does.
+
+    That matters because this value is compared against an absolute floor
+    and a rolling ratio, so a frame sitting EXACTLY on a threshold could
+    in principle flip. IT CANNOT, and the reason is stronger than the
+    empirical check: the CV_16S Laplacian is INTEGER, so the variance of
+    N such values lies on a lattice of spacing 1/N**2 -- **1.884e-11 at
+    360x640, about 5,300x coarser than one ULP at the 25.0 floor.** A
+    disagreement of order 1e-15 cannot move a value across a bar when the
+    representable values near it are 1.9e-11 apart.
+
+    Empirically, across all 9,372 corpus frames: **zero flips**, closest
+    approach 24.96532, minimum safety factor 4.9e12 against the floor.
+
+    THAT GUARANTEE IS RESOLUTION-DEPENDENT. The spacing is 1/N**2, so it
+    shrinks as the frame grows: comfortable at 360x640, weaker at 1080p,
+    gone above roughly 30 megapixels. DAT's adaptive ladder changes
+    resolution mid-stream, so this needs re-checking if a much larger
+    frame size is ever adopted -- the empirical margin would survive, the
+    proof would not.
     """
+    if gray.dtype != np.uint8 or gray.ndim != 2:
+        # NOT a defensive nicety. Violating this fails THREE ways, and the
+        # worst one is silent. MEASURED against the previous
+        # CV_64F/.var() form on the same array:
+        #
+        #   3-channel colour  109635.12 -> 110448.25   7.4e-3 relative
+        #   int16            6.89e9    -> 9.06e8       8.7e-1 relative
+        #   uint16 / float64                           raises cv2.error
+        #
+        # The colour case is the quiet one: `meanStdDev` returns a
+        # PER-CHANNEL deviation and `[0, 0]` would silently take channel
+        # zero, where `.var()` pooled all three -- a plausible number,
+        # twelve orders of magnitude outside the 6.2e-16 agreement this
+        # function's exactness argument claims.
+        #
+        # `decode_gray` uses IMREAD_GRAYSCALE so the product path cannot
+        # get here, and a test pins that. This guards the fact that the
+        # function is public and annotated only `np.ndarray`.
+        raise ValueError(
+            "measure_sharpness requires 8-bit single-channel input; got "
+            f"dtype={gray.dtype}, ndim={gray.ndim}. The CV_16S intermediate "
+            "is only exact for uint8, and colour input would silently "
+            "return a channel-0 answer."
+        )
     _, deviation = cv2.meanStdDev(cv2.Laplacian(gray, cv2.CV_16S))
     return float(deviation[0, 0] ** 2)
 

@@ -56,19 +56,30 @@ def write_json_atomic(path: Path, payload: dict) -> None:
             # representative payload) for **byte-identical** output. Same
             # encoder, same defaults, so the file on disk does not change.
             #
-            # The cost is that the whole document is materialised before
-            # it is written. MEASURED across every JSON this Tower has
-            # persisted, the largest is a 1.71 MB points.json, against a
-            # process RSS of ~184 MB -- so the transient string is a fair
-            # trade here. But it IS a trade, and it scales with payload
-            # size, so a future caller writing something an order of
-            # magnitude larger should revisit it rather than inherit it.
+            # The cost is that the whole document is materialised first,
+            # and the peak is worse than "one extra copy": MEASURED at
+            # 750k points, peak went 71.5 MB -> 167 MB, roughly 1.4x the
+            # document on top of it, because the string and its UTF-8
+            # encoding coexist.
             #
-            # Deliberately NOT orjson, which was measured and refused: its
-            # bytes differ (separators, `1e-07` vs `1e-7`) and it writes
-            # NaN/Infinity as `null`, which would silently defeat the
-            # `allow_nan=False` guard callers rely on to keep
-            # non-interoperable tokens off the wire.
+            # Negligible at the sizes this Tower writes -- the largest JSON
+            # it has ever persisted is a 1.71 MB points.json against
+            # ~184 MB RSS. But it scales with payload, so a caller writing
+            # something an order of magnitude larger should revisit this
+            # rather than inherit it.
+            #
+            # Deliberately NOT orjson, which was measured and refused
+            # because ITS BYTES DIFFER -- separators, and `1e-07` against
+            # `1e-7`. That alone disqualifies it here.
+            #
+            # An earlier version of this comment also claimed orjson would
+            # "defeat the allow_nan=False guard". CORRECTED: exactly one
+            # caller has that guard (`world_builder/store.py:463`,
+            # placements) and it runs `json.dumps(payload,
+            # allow_nan=False)` as a SEPARATE validation before calling
+            # this function -- so changing the encoder in here could not
+            # have defeated it. The byte difference is the real reason and
+            # it stands on its own.
             handle.write(json.dumps(payload))
             handle.flush()
             os.fsync(handle.fileno())
