@@ -28,6 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.capture import CaptureFollower  # noqa: E402
 from tower.document_memory.dwell import DwellPolicy  # noqa: E402
 from tower.document_memory.engine import DocumentMemoryEngine  # noqa: E402
@@ -63,7 +64,9 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Observe documents in a frame stream (never claims reading)."
     )
-    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument(
+        "--root", type=artifact_root_arg, default=str(DEFAULT_ROOT)
+    )
     parser.add_argument("--frames", type=Path, default=None)
     parser.add_argument("--follow-capture", type=Path, default=None)
     parser.add_argument("--synthetic", action="store_true")

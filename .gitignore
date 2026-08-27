@@ -1,0 +1,7 @@
+.DS_Store
+
+# Quarantine for misplaced/disposable development artifacts. It normally
+# lives OUTSIDE this repository (Projects\Glasses-scratch), so this entry is
+# defensive: if anyone ever creates one inside a checkout, it must not be
+# committed. See the filesystem policy in CLAUDE.md.
+Glasses-scratch/
