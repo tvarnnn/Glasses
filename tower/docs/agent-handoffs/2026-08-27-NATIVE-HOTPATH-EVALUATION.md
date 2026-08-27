@@ -221,9 +221,37 @@ the honest number comes from a same-session A/B running both arms back to
 back in one process with alternating arm order --
 `scripts/research/native_eval/ab_same_session.py`. Result in section 6.3.
 
-### 6.3 Same-session A/B
+### 6.3 Same-session A/B — the honest number is 1.16x
 
-_(filled at close)_
+Both arms run back to back in ONE process, same captures, same warm
+cache, **alternating arm order across repeats** so any drift in machine
+load is charged to both arms equally. The old implementations are
+restored by monkeypatch, so the only difference between arms is the two
+functions under test.
+
+| capture | old | new | speedup | parity |
+|---|---|---|---|---|
+| `64f48114` | 6.34 s | 5.53 s | 1.15x | **IDENTICAL** |
+| `4fea31e2` | 5.97 s | 4.92 s | 1.21x | **IDENTICAL** |
+| `fe744b68` | 6.89 s | 6.17 s | 1.12x | **IDENTICAL** |
+| **TOTAL** | **19.20 s** | **16.62 s** | **1.16x** | |
+
+Parity means keyframes, poses_solved and points were identical in every
+arm and every repeat.
+
+**1.16x measured against 1.17x predicted from the component
+measurements.** The model was right, and the naive
+compare-against-stored-baseline figure was inflated **~1.9x by
+measurement conditions alone**. That gap is the most transferable
+methodological result in this document.
+
+**Is 1.16x worth keeping?** It clears the 11% noise floor, but not by
+much, and it is consistent in direction across three captures and two
+repeats. It is kept because it is **free**: no new dependency, no build
+system, no fallback path, byte-identical output, behaviour-neutral
+keyframe decisions, and less memory traffic per frame. It would NOT be
+worth keeping if it cost a native toolchain -- which is exactly the
+trade this lane was opened to evaluate.
 
 ### 6.4 Tests
 
