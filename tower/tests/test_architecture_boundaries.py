@@ -7,9 +7,40 @@ next cartridge exists.
 """
 
 import ast
+import os
 import pathlib
 
 TOWER = pathlib.Path("tower")
+
+
+def _env_without_tower_settings() -> dict:
+    """The ambient environment, minus every `TOWER_` setting.
+
+    The two subprocess probes below assert that `import tower.main` pulls
+    in neither torch nor easyocr. `tower/main.py` ends with a module-level
+    `app = create_app()`, so importing it BUILDS THE APP -- and what the
+    app constructs depends on configuration. Inheriting the operator's
+    shell therefore made a structural invariant depend on an environment
+    variable, and the probe measured the machine it happened to run on
+    rather than the code.
+
+    That was already broken before anything in this lane touched it: with
+    `TOWER_SCENE_UNDERSTANDING` on and `TOWER_SCENE_DEVICE=cuda`,
+    `_resolve_device` imports torch at construction and both probes went
+    red. Making Scene import torch on the default `cpu` device widened
+    that from `{scene on AND device != cpu}` to `{scene on}`, which is how
+    it was noticed -- but a clean environment is what these tests always
+    needed, because the invariant they defend is about where imports SIT,
+    not about which flags are set.
+
+    Everything else is preserved, so the child still finds its
+    interpreter, its PATH and its `sys.path`.
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("TOWER_")
+    }
 
 
 def _imports(path: pathlib.Path) -> list[str]:
@@ -561,7 +592,10 @@ def test_importing_the_lab_does_not_import_torch():
         "print([m for m in ('torch','torchvision','timm') if m in sys.modules])"
     )
     result = subprocess.run(
-        [sys.executable, "-c", probe], capture_output=True, text=True
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        env=_env_without_tower_settings(),
     )
 
     assert result.returncode == 0, result.stderr
@@ -623,7 +657,10 @@ def test_the_ocr_dependency_is_not_imported_at_module_load():
         "if m in sys.modules])"
     )
     result = subprocess.run(
-        [sys.executable, "-c", probe], capture_output=True, text=True
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        env=_env_without_tower_settings(),
     )
 
     assert result.returncode == 0, result.stderr

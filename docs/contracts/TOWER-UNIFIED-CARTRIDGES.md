@@ -85,11 +85,30 @@ instructions to a person:
 |---|---|---|
 | the cartridge is absent from every list | this Tower has never heard of it | "not built yet" |
 | present, `contract` a string this build does not know | the Tower speaks a contract this app does not | "update the app" |
-| present, `"available": false` | this build implements it and is not configured for it | "connect" / the reason |
+| present, `"available": false` | this build implements it and cannot be started here | "connect" / the reason |
 
-`available` is about **CONFIGURATION, never about current activity.** A
-Scene Understanding that is enabled but stopped is `available: true` — it
-can be started — and its payload says `lifecycle.state: "stopped"`.
+`available` is about **whether a session could be started, never about
+current activity.** A Scene Understanding that is enabled but stopped is
+`available: true` — it can be started — and its payload says
+`lifecycle.state: "stopped"`. Folding "not running right now" into
+"unavailable" would tell a person their Tower cannot do this when in fact
+nobody has pressed Start.
+
+**Configuration is the usual reason but not the only one.** A cartridge
+whose mandatory runtime dependency is missing on this host — Scene
+Understanding needs `torch`, which ships in the optional `[ml]` extra —
+is `available: false` with a reason that says so. It was previously
+`available: true` on such a host, and `POST /scene/start` then answered
+`200` and failed ~50 ms later; a client had no way to learn that from the
+declaration, because the declaration never re-derived it. **Read
+`available: false` as "do not offer the control", and
+`unavailable_reason` as prose for a person — never parse it.**
+
+`available: true` still is not a promise that Start will succeed. It
+means this build implements the contract and this host is configured and
+equipped to run it. Weights can still be missing and a device can still
+vanish; those arrive as `lifecycle.state: "failed"` with a reason, which
+is the designated answer for a failure only a load can discover.
 
 **As of this branch:**
 
@@ -97,7 +116,7 @@ can be started — and its payload says `lifecycle.state: "stopped"`.
 |---|---|---|---|
 | `world_builder` | `status` | `world_builder.status/2026-08-25` | `TOWER_WORLD_ROOT` is set |
 | `experimental_cv` | `status` | `experimental_cv.status/2026-08-27` | a CV Lab module exists (normally always) |
-| `scene_understanding` | `live` | `scene_understanding.live/2026-08-27` | `TOWER_SCENE_UNDERSTANDING` is on |
+| `scene_understanding` | `live` | `scene_understanding.live/2026-08-27` | `TOWER_SCENE_UNDERSTANDING` is on **and** the session constructs (needs `torch`/`torchvision`, the `[ml]` extra) |
 | `document_memory` | `status` | `document_memory.status/2026-08-27` | `TOWER_DOCUMENT_ROOT` is set |
 
 `http_contracts` carries one entry — `document_memory.library/2026-08-27`
@@ -875,7 +894,12 @@ behind a fill, or fall back to `/frame`.
 instructions to a person** — "not built yet" against "connect" — and
 collapsing them tells someone to give up on a cartridge one environment
 variable would turn on. A `cartridge_unavailable` message names the
-`TOWER_` variable that would fix it.
+`TOWER_` variable that would fix it **where a variable is what is
+missing** — which is the common case but not the only one. When the
+cartridge is switched on and could not be constructed, the reason names
+what actually failed instead, because naming a variable that is already
+set sends an operator to check the one thing that is already correct.
+Either way it is prose for a person and must not be parsed.
 
 **Frame path**: `invalid_frame`, `frame_skipped`, `module_unavailable`,
 plus the six `cv_lab_*` states in §6.3.

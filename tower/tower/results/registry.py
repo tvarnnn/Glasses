@@ -149,6 +149,7 @@ def declare(
     *,
     document_root: str | None = None,
     scene_enabled: bool = False,
+    scene_unavailable_reason: str | None = None,
     cv_lab=None,
 ) -> dict:
     """The full capability declaration.
@@ -176,12 +177,29 @@ def declare(
     an import of the Lab here would bake one cartridge into the shared
     surface, and this time the surface is a WIRE CONTRACT.
 
-    Availability is about CONFIGURATION, never about current activity. A
-    Scene Understanding that is enabled but stopped is `available: true`
-    -- it can be started -- and its payload says `lifecycle.state:
-    "stopped"`. Folding "not running right now" into "unavailable" would
-    tell a person their Tower cannot do this when in fact nobody has
-    pressed Start, and those two call for opposite responses.
+    Availability is about whether a session COULD BE STARTED, never about
+    current activity. A Scene Understanding that is enabled but stopped is
+    `available: true` -- it can be started -- and its payload says
+    `lifecycle.state: "stopped"`. Folding "not running right now" into
+    "unavailable" would tell a person their Tower cannot do this when in
+    fact nobody has pressed Start, and those two call for opposite
+    responses.
+
+    That used to read "about CONFIGURATION", which was the intent but not
+    the whole truth, and the gap was reachable. Scene Understanding needs
+    torch, which ships in the optional `[ml]` extra; on a host without it
+    the session constructed anyway (the default device is `cpu`, and only
+    a non-cpu device imported torch), so this function was handed
+    `scene_enabled=True` and promised a cartridge that failed ~50 ms into
+    Start. The caller now imports the dependency while constructing, so
+    what arrives here is the same answer it always claimed to be.
+
+    `scene_unavailable_reason` exists because the fix made a second defect
+    common. `SCENE_DISABLED_REASON` names the environment variable, which
+    is right when nobody switched the cartridge on and WRONG when they
+    did and construction failed -- it sends an operator to check the one
+    thing that is already correct. It is `or`-ed, so an omitted reason
+    keeps the pinned configured-off wording exactly.
     """
     if world_root is None:
         world_available = False
@@ -208,7 +226,16 @@ def declare(
             result_type=RESULT_TYPE_LIVE,
             contract=SCENE_LIVE_CONTRACT,
             available=bool(scene_enabled),
-            unavailable_reason=None if scene_enabled else SCENE_DISABLED_REASON,
+            # `or`, so an omitted reason keeps the configured-off wording
+            # that `test_the_declaration_names_the_variable` pins. The
+            # specific reason only ever REPLACES it, never appends, and a
+            # caller that has not been taught to thread it through gets
+            # exactly the previous behaviour.
+            unavailable_reason=(
+                None
+                if scene_enabled
+                else (scene_unavailable_reason or SCENE_DISABLED_REASON)
+            ),
         ),
         CartridgeOffer(
             cartridge=CARTRIDGE_DOCUMENT_MEMORY,
@@ -347,5 +374,8 @@ def declaration_inputs(app_state) -> dict:
         "world_root": getattr(app_state, "world_root", None),
         "document_root": getattr(app_state, "document_root", None),
         "scene_enabled": bool(getattr(app_state, "scene_enabled", False)),
+        "scene_unavailable_reason": getattr(
+            app_state, "scene_unavailable_reason", None
+        ),
         "cv_lab": getattr(app_state, "cv_lab", None),
     }

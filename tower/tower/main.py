@@ -501,6 +501,11 @@ def create_app() -> FastAPI:
     # Whether the contract may be offered at all, which is a question
     # about configuration and not about whether a session is running.
     app.state.scene_enabled = bool(live.scene is not None)
+    # Why it is unavailable, when the reason is not "nobody enabled it".
+    # `None` keeps the configured-off wording, so the common case is
+    # unchanged; a construction failure replaces it with what actually
+    # went wrong instead of naming a variable that is already set.
+    app.state.scene_unavailable_reason = live.scene_unavailable_reason
     _log_effective_configuration(settings, app.state.capture_workers)
     # One shared reader for the whole app. It starts no task until a
     # client subscribes and stops again when the last one goes, so a Tower

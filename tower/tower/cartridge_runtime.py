@@ -51,6 +51,8 @@ absent from `sys.modules`.
 import logging
 from dataclasses import dataclass, field
 
+from tower.logging_config import client_safe_reason
+
 logger = logging.getLogger(__name__)
 
 
@@ -74,6 +76,19 @@ class LiveCartridges:
     frame_consumers: list = field(default_factory=list)
     scene: object | None = None
     document: object | None = None
+    # Why `scene` is None, when the reason is not "nobody enabled it".
+    #
+    # Without this the declaration blamed the wrong thing. A construction
+    # failure with `TOWER_SCENE_UNDERSTANDING` switched ON still served
+    # `SCENE_DISABLED_REASON`, which reads "TOWER_SCENE_UNDERSTANDING is
+    # unset or off" -- so an operator whose real problem was a missing
+    # `[ml]` extra was told to set a variable that was already set.
+    # Verified on the tree before this field existed, with the flag on,
+    # device `cuda` and torch absent.
+    #
+    # None means "no specific reason", and the declaration then falls back
+    # to the configured-off wording, which stays pinned by its own test.
+    scene_unavailable_reason: str | None = None
 
     def shutdown(self) -> None:
         """Stop every live session. Never raises.
@@ -173,7 +188,51 @@ def _scene_session(settings):
     The factory closes over the device rather than resolving it per
     session, so a `cuda` that has gone missing fails at startup where an
     operator sees it, not on the first frame of a physical test.
+
+    TORCH IS IMPORTED HERE, EAGERLY AND UNCONDITIONALLY, and that is the
+    same principle as the sentence above rather than a new one. It buys
+    two separate things.
+
+    **The declaration stops lying.** `build_live_cartridges` already
+    try/excepts this function and `main.py` already derives
+    `scene_enabled` from whether it returned a session, so a Tower that
+    cannot run Scene already reports it unavailable -- but only when
+    `_resolve_device` happened to import torch, which it does ONLY when
+    the device is not "cpu". On the default `cpu` a torch-less host
+    constructed a session happily, `/cartridges` said `available: true`,
+    and `start()` then failed in 51 ms. Measured on a host with torch
+    blocked: `auto` and `cuda` already answered `available: false`; `cpu`
+    was the one configuration that promised a cartridge it could not run.
+
+    **It closes a concurrent-import race.** Scene and Document Memory
+    both start on the same `stream_start`, on separate worker threads,
+    and each used to reach torchvision lazily and for the first time
+    there. MEASURED, 8 fresh processes out of 8, with both cartridges
+    enabled: BOTH landed in terminal `failed` with
+
+        ImportError: cannot import name 'InterpolationMode' from
+        partially initialized module 'torchvision.transforms'
+
+    Importing here is single-threaded inside `create_app()`, before any
+    worker exists. 6 of 6 trials clean afterwards. That race is invisible
+    to an in-process test suite, because once the first import succeeds it
+    cannot recur.
+
+    `find_spec` was measured as the alternative and REFUSED. It locates
+    without executing, so it fixed 0 of 6 race trials, and against a
+    package with a valid spec whose loader raises it reported
+    `available: true`, answered `POST /scene/start` with 200, and then
+    STILL said `available: true` after the session had failed.
+
+    The cost is moved, not added. Boot with Scene on goes 0.32 s -> 2.21 s,
+    but end to end from boot to a running session is 2.019 s before and
+    2.002 s after -- within 1%, because this is the same import the first
+    Start used to pay for. A Tower with Scene off pays nothing (0.3229 s
+    against a 0.3180 s base).
     """
+    import torch  # noqa: F401
+    import torchvision  # noqa: F401
+
     from tower.scene.detect import TorchvisionDetector
     from tower.scene.engine import SceneEngine
     from tower.scene.live import SceneLive
@@ -234,17 +293,32 @@ def build_live_cartridges(settings) -> LiveCartridges:
     consumers: list = []
     scene = None
     document = None
+    scene_unavailable_reason = None
 
     if settings.scene_understanding:
         try:
             scene = _scene_session(settings)
             consumers.append(scene)
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "[Tower][Config] Scene Understanding is enabled but could "
                 "not be constructed; this Tower will report it unavailable"
             )
             scene = None
+            # `client_safe_reason` rather than `str(exc)`, and it is the
+            # same helper `live_session` already uses for the same wire.
+            # This string reaches an unauthenticated `/cartridges`, and an
+            # OSError describes a failure by naming the PATH it happened
+            # on -- which would disclose the home directory and with it
+            # the OS username. This repository's own exceptions are
+            # written to be read by a person and pass through; everything
+            # else reduces to its type name.
+            scene_unavailable_reason = (
+                "Scene Understanding is enabled on this Tower but could "
+                "not be constructed, so no session can be started: "
+                f"{client_safe_reason(exc)}. This build implements the "
+                "contract"
+            )
 
     if settings.document_capture and settings.document_root is not None:
         try:
@@ -263,4 +337,9 @@ def build_live_cartridges(settings) -> LiveCartridges:
             "because there is nowhere to record it"
         )
 
-    return LiveCartridges(frame_consumers=consumers, scene=scene, document=document)
+    return LiveCartridges(
+        frame_consumers=consumers,
+        scene=scene,
+        document=document,
+        scene_unavailable_reason=scene_unavailable_reason,
+    )

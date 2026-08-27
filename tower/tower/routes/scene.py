@@ -58,9 +58,16 @@ def _session(request: Request):
         # The same distinction `observations.py` draws between a 404 and
         # `observed: false`: this Tower serves no live scene at all, which
         # is different from a scene that happens to be empty.
+        #
+        # The specific reason when there is one, so this route and
+        # `/cartridges` cannot give an operator two different explanations
+        # of one configuration -- which is the drift
+        # `SCENE_DISABLED_REASON` was made a module constant to prevent.
+        # Falls back to the configured-off wording, unchanged.
+        reason = getattr(request.app.state, "scene_unavailable_reason", None)
         raise HTTPException(
             status_code=404,
-            detail=(
+            detail=reason or (
                 "Scene Understanding is not enabled on this Tower "
                 "(TOWER_SCENE_UNDERSTANDING is unset or off)"
             ),
