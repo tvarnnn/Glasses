@@ -152,6 +152,49 @@ Retained live state rises from one frame of `observed` to `DEPTH` frames
 — ~0.15 MB to ~0.45 MB extrapolating the existing measurement. Still a
 constant; still flat in walk length; asserted by test.
 
+## 5a. A REGRESSION THE PER-SEGMENT SWEEP DID NOT SEE
+
+**Added after §2-§5 were written, and it changes the verdict.**
+
+The paired sweep in §2 ran `estimate_window` over each segment's own
+keyframes. The **engine** does not work that way: it replays frames
+through the live `begin/extend` path and re-segments dynamically. Running
+the real pipeline found something the sweep could not.
+
+Capture `4fea31e2` (the smallest pinned capture, 54 keyframes), replayed
+end to end — MEASURED:
+
+| | DEPTH=1 | DEPTH=3 |
+|---|---|---|
+| keyframes | 54 | 54 |
+| segments | 4 | 4 |
+| **poses_solved** | **10** | **5** |
+| points | 530 | 426 |
+| exactly-2-view | 84.2% | **62.0%** |
+| ≥3-view | 15.8% | **38.0%** |
+
+**Solved poses halved.** DEPTH=1 reproduces the Stage 0 baseline exactly
+(10 / 530 / 84.2%), which confirms two things: the run is a valid
+control, and the separately-added feature-starvation gate is inert on
+this capture (54 keyframes either way). The cause is Stage 1 alone.
+
+**The mechanism.** Guided associations are merged into `observed`. At the
+NEXT keyframe, a feature that would have been triangulated as new
+structure is instead found to already have a landmark, so it becomes a
+re-observation. Fewer new landmarks enter the map, so later PnP has fewer
+3-D points to solve against, so chains break earlier. §3's
+"duplicates being merged" reading is still correct about *why* the point
+count falls — but merging is not free, and on a small capture it starves
+the map.
+
+**This is the exact failure mode this stage was warned about**, and it is
+why the corpus-level A/B matters more than the segment-level one. A
+per-segment harness that hands the backend a segment's keyframes cannot
+observe an effect that only appears when the map has to grow itself.
+
+Full-corpus DEPTH=1 vs DEPTH=3 over all 8 pinned captures is running; the
+verdict below is provisional until it lands.
+
 ## 6. What is weak here, stated plainly
 
 - **The duplicate-merging reading of the falling point count is an
