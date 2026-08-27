@@ -3,7 +3,7 @@
 **Branch:** `ios/unified-cartridges-v1`
 **Start commit (pre-Tower iOS HEAD):** `1b6913c`
 **Tower merge point:** `715bf18`
-**End commit:** `0f00b1e`
+**End commit:** `57bfadf`
 **Tower consumed:** `e2ca9b2` on `integration/tower-unified-cartridges-v1`
 **Tree:** clean. **Push:** see §12.
 
@@ -21,7 +21,7 @@ adaptation.
 | | |
 |---|---|
 | Contracts implemented | **11 of 11** the Tower states (was 3) |
-| Tests | **662 passed, 0 failures** (was 441) |
+| Tests | **663 passed, 0 failures** (was 441) |
 | Debug build | ✅ |
 | Release build | ✅ — **and still not a readiness signal, see §9.1** |
 | Contract drift vs a live Tower | **AGREEMENT** |
@@ -322,7 +322,7 @@ more than it tested.
 
 | Gate | Result |
 |---|---|
-| Full XCTest, iPhone 17 Pro sim, Debug | **662 passed, 0 failures** |
+| Full XCTest, iPhone 17 Pro sim, Debug | **663 passed, 0 failures** |
 | Debug build | ✅ |
 | Release build | ✅ |
 | `build-for-testing` | ✅ |
@@ -559,6 +559,9 @@ Working tree **clean**. Four commits on `ios/unified-cartridges-v1` since
 the Tower merge:
 
 ```
+57bfadf  docs: the final review, including the two SEV-1s it found
+6f74c53  fix(ios): the final reviewer's two SEV-1s, one of which was mine
+a44dd40  docs: the Mac integration handoff, and four findings for the Tower lane
 0f00b1e  fix(ios): three defects the reviewers found that no screen would show
 9682b70  fix(ios): the drift check could not see the surface it was guarding
 98e5c08  feat(ios): two badges stop waiting for a Tower that already answered
@@ -570,8 +573,8 @@ a58f32d  feat(ios): four cartridges stop refusing, and the wire is decoded
 that a scratch venv and a scratch Tower data root live outside the repo, in
 the session scratchpad; nothing was written into `tower/`.
 
-**Push status:** recorded at the end of the run — see the final report. The
-branch is local unless that says otherwise.
+**Push status: PUSHED** to `origin/ios/unified-cartridges-v1`, tracking set.
+Not merged to `main`, matching the Tower lane's own posture.
 
 ---
 
