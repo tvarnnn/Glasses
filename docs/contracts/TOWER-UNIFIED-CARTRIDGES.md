@@ -177,6 +177,14 @@ most often gets wrong.**
 > producer that died. `state` says what a person asked for; `following`
 > says what is actually running.
 
+This is not advice, it is load-bearing, and a reviewer reproduced why. A
+Pause whose producer ignores `SIGTERM` answers **200** with `state:
+"paused"` and `changed: true` — a positive claim that the action took
+effect — while `following` still names the capture and the process is
+still alive and still recording. `state_means: "intent-not-liveness"` is
+the Tower saying so in the payload. **A Pause button keyed on `state` will
+tell a person they stopped being recorded when they did not.**
+
 Transition rules worth memorising:
 
 - **`start` is idempotent** and works from `stopped` *and* `paused`. It
@@ -207,6 +215,33 @@ differences are intentional:**
 **Pause is the deliberately different case for Scene:** the scene survives
 with its age and `lifecycle.scene_is_current` goes `false`. That is the
 "last known" state, and it must be kept visually apart from "observing".
+
+### 4.1 The four cartridges answer the same verb three different ways
+
+This is **measured on the merged tree**, not designed. Each lane chose its
+own refusal policy and no two agree. A Mac client must not write one
+lifecycle component and point it at four cartridges.
+
+| Verb, from a state that cannot honour it | Object Memory | Scene / Document | CV Lab |
+|---|---|---|---|
+| `pause` when already paused | **200**, `changed:false` | **200**, silent no-op | **refused** `invalid_state` |
+| `pause` when stopped | **409** `not-active` | **200**, silent no-op | **refused** `invalid_state` |
+| `resume` when stopped | **409** `not-paused` | **200**, silent no-op | **refused** `invalid_state` |
+| `stop` when already stopped | **200**, `changed:false` | **200**, silent no-op | **refused** `invalid_state` |
+
+Two consequences a client must code around today:
+
+1. **Scene and Document silently no-op.** `POST /scene/resume` on a
+   stopped scene returns **200 with `state: "stopped"`** and no refusal
+   field. **Read the returned `state`; never treat 200 as "it worked".**
+2. **The CV Lab refuses Stop** from `stopped`, `idle`, `failed` and
+   `unavailable`. A client whose recovery path is "Stop, then Start" is
+   refused on step one — send `cv_lab_start` directly instead.
+
+Neither is a merge regression; both are lane behaviour, preserved
+deliberately rather than harmonised during integration. Unifying them is a
+contract change and belongs to a human. Until then, **this table is the
+contract.**
 
 **Stream-bound lifecycle.** `stream_start` starts a Scene session and
 `stream_stop` or a disconnect ends it — which is the normal case for a
