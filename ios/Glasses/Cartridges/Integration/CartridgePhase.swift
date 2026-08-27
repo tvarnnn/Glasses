@@ -51,10 +51,22 @@ enum CartridgePhase: String, Equatable, Sendable, CaseIterable {
     /// reaches `.live`/`.settled` with real data. Object Memory reaches its own
     /// states over HTTP without passing through here at all.
     ///
-    /// It remains the answer for the three cartridges the Tower lists under
-    /// `not_offered` — Experimental CV Lab, Document Memory and Scene
-    /// Understanding — because it says nothing about them that this build could
-    /// subscribe to.
+    /// **It is no longer the answer for any cartridge with Tower code behind
+    /// it.** That sentence has now been rewritten twice by the same force, and
+    /// the pattern is worth naming: each time a Tower lane finished, a case
+    /// documented as "the permanent state of things" turned out to describe a
+    /// Tuesday. As of the 2026-08-27 unification the Tower declares four
+    /// contracts, `not_offered` is `[]`, and Experimental CV Lab, Document
+    /// Memory and Scene Understanding all resolve past this case with clients
+    /// that decode them.
+    ///
+    /// What it is still the honest answer for: the three cartridges with no
+    /// Tower code anywhere (Visual Q&A, Accessibility, Environmental Memory),
+    /// and any Tower that genuinely has not heard of a cartridge.
+    ///
+    /// **Object Memory does not pass through here**, and its absence is not an
+    /// oversight — it is undeclared on the socket by the Tower's own design and
+    /// reaches its states over HTTP.
     case unsupported
     /// The capability exists but the Tower cannot be reached right now.
     ///

@@ -57,16 +57,27 @@ enum CartridgeAvailability: Equatable, Sendable {
     /// This was once the answer for every cartridge. It no longer is: a live
     /// Tower declares `world_builder.status/2026-08-25` over `GET /cartridges`,
     /// which reaches `declared` as a `TowerCartridgeDeclaration` offer, so World
-    /// Builder resolves past this case. It remains the answer for every other
-    /// cartridge, and for those it is still a statement about the Tower's
-    /// roadmap rather than about this connection — the module container is V0.8
-    /// and the first module V0.9 (docs/03-ROADMAP.md), and the Tower lists
-    /// Experimental CV Lab, Document Memory and Scene Understanding explicitly
-    /// under `not_offered`, so for them there is genuinely nothing to declare.
+    /// Builder resolves past this case.
     ///
-    /// Two read-only HTTP routes existing for one cartridge is not that runtime
-    /// arriving, which is why the sentence above is scoped to the cartridges the
-    /// Tower says nothing about rather than deleted.
+    /// **The roadmap framing this comment used to carry is now wrong and has
+    /// been removed rather than softened.** It said this was "a statement about
+    /// the Tower's roadmap rather than about this connection", because the
+    /// module container was V0.8 and the first module V0.9, and because the
+    /// Tower listed Experimental CV Lab, Document Memory and Scene
+    /// Understanding under `not_offered`. As of 2026-08-27 the Tower declares
+    /// four contracts and `not_offered` is `[]`.
+    ///
+    /// So this is now a statement about **this connection and this build**, and
+    /// nothing else: either the Tower declared no contract for the cartridge,
+    /// or this app has no name for it. Both are answerable facts about two
+    /// machines, not a position on a roadmap — which is the better meaning,
+    /// because a person reading "not built yet" can at least be told truthfully
+    /// which of the two it is.
+    ///
+    /// Kept distinct from `unsupportedContract` for the reason the Tower's
+    /// contract §2 gives: a cartridge absent from every list means *"this Tower
+    /// has never heard of it"*, while one present with an unreadable contract
+    /// means *"update the app"*. Those are opposite instructions to a person.
     case noContract
     /// The Tower declared a contract this build does not implement. Kept
     /// separate from `noContract` because they call for opposite responses:

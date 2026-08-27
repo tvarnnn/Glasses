@@ -203,25 +203,37 @@ extension Cartridge {
         // seed, which says what it takes from its parent and what it leaves
         // behind.
         //
-        // Both are `.awaitingTower`, and the distinction from `.notBuilt`
-        // is load-bearing. **The Tower implements both of these** —
-        // `tower/tower/document_memory/` is a full detect/dwell/OCR/retrieval
-        // pipeline with a CLI, and `tower/tower/scene/` is a full
-        // detect/track/orientation engine — and lists both under `not_offered`
-        // on `GET /cartridges` with its own reasons: Document Memory has no
-        // typed contract yet, and Scene Understanding persists nothing by
-        // design, so the channel that reads persisted state has nothing to
-        // read.
+        // Both were `.awaitingTower`, on the grounds that the Tower listed them
+        // under `not_offered` — Document Memory having no typed contract, and
+        // Scene Understanding persisting nothing so the channel that reads
+        // persisted state had nothing to read.
         //
-        // So these are one Tower decision away from working, while the three
-        // `.notBuilt` entries are a backend away. Collapsing those into one
-        // badge would tell a reader the same thing about very different
-        // situations.
+        // **That Tower decision was made on 2026-08-27 and both premises are
+        // gone.** `not_offered` is now `[]`. Document Memory declares
+        // `document_memory.status/2026-08-27` on the socket *and*
+        // `document_memory.library/2026-08-27` under a new `http_contracts`
+        // block. Scene Understanding declares `scene_understanding.live/…` —
+        // and the persistence objection turned out to be answered by the
+        // result *type*: `live` rather than `status`, where the payload IS the
+        // answer rather than progress toward a stored one. A cartridge that
+        // persists nothing can still say what it can see right now.
+        //
+        // Both now have clients that decode those contracts, so both are
+        // `.readyToTest` on the same terms as the other three: this build
+        // implements them and can show real Tower data. Neither badge promises
+        // the Tower you happen to be connected to is configured for it — that
+        // is resolved per-connection by `CartridgeAvailability.resolve` and
+        // rendered inside the workspace, which is the separation this whole
+        // type exists to keep.
+        //
+        // What has NOT changed is the distinction from `.notBuilt`, which is
+        // still load-bearing for the three entries above that have no Tower
+        // code anywhere. Those are a backend away, not a decision away.
         Cartridge(
             id: "document-memory",
             name: "Document Memory",
             summary: "Documents you passed, kept as text and summaries rather than as pictures.",
-            status: .awaitingTower,
+            status: .readyToTest,
             specPath: "docs/modules/DOCUMENT-MEMORY.md",
             workspace: .documentMemory
         ),
@@ -229,7 +241,7 @@ extension Cartridge {
             id: "scene-understanding",
             name: "Scene Understanding",
             summary: "An anonymous read of how many people and objects the camera can see, and roughly where.",
-            status: .awaitingTower,
+            status: .readyToTest,
             specPath: "docs/modules/SCENE-UNDERSTANDING.md",
             workspace: .sceneUnderstanding
         ),

@@ -199,8 +199,8 @@ final class CartridgeWorkspaceTests: XCTestCase {
             "experimental-cv": .readyToTest,      // the Tower's only running module; module_state "active"
             "object-memory": .readyToTest,        // two live HTTP routes, decoder pinned against a real Tower
             "world-build": .readyToTest,          // the one offered contract; device-validated walk, 7,086 points
-            "document-memory": .awaitingTower,    // full Tower pipeline + CLI, listed not_offered
-            "scene-understanding": .awaitingTower,// full Tower engine, persists nothing by design, no route
+            "document-memory": .readyToTest,      // declares status/2026-08-27 + library under http_contracts
+            "scene-understanding": .readyToTest,  // declares live/2026-08-27; `live` answers the persistence objection
             "visual-qa": .notBuilt,               // zero Tower code
             "accessibility": .notBuilt,           // zero Tower code
             "environmental-memory": .notBuilt,    // zero Tower code; its own design says do not begin
@@ -218,12 +218,29 @@ final class CartridgeWorkspaceTests: XCTestCase {
             )
         }
 
-        // Restated positively: Module #1 is still exactly one cartridge, and
-        // shipping screens for four of them did not create a second.
+        // Restated positively. This count moved from three to five on
+        // 2026-08-27 when the Tower unified four lanes, and the number is
+        // asserted rather than derived so that moving it stays a decision
+        // somebody makes on evidence.
+        //
+        // `.awaitingTower` now has **no members**, and that is the honest
+        // state rather than a gap: the case meant "the Tower implements this
+        // and offers no contract for it", and there is no longer a cartridge
+        // in that position — every one with Tower code behind it now declares
+        // something. The case is kept because it is the correct answer the
+        // next time a Tower lane finishes an engine before its contract, which
+        // is the ordinary order of work.
         XCTAssertEqual(
             Cartridge.catalog.filter { $0.status == .readyToTest }.count,
-            3,
-            "three cartridges reach a person today: World Builder, Object Memory, Experimental CV Lab"
+            5,
+            """
+            five cartridges reach a person today: World Builder, Object Memory, \
+            Experimental CV Lab, Document Memory, Scene Understanding
+            """
+        )
+        XCTAssertTrue(
+            Cartridge.catalog.filter { $0.status == .awaitingTower }.isEmpty,
+            "a cartridge is waiting on a Tower contract again; say which and why beside it"
         )
     }
 
