@@ -10,10 +10,12 @@ lane needs to do.
 | Branch | `object-memory/lifecycle-and-semantics-v1` |
 | Worktree | `C:\Users\tvllo\Projects\Glasses-object-memory` (isolated; the primary tree stays on `integration/world-builder-lifecycle-v1`) |
 | Starting commit | `6e325f8` — *measure: the shipped detector is blind below 2% of the frame* |
-| Commits | `d5000b7` lifecycle · `f489da5` policy · `5b329ad` semantics · `f90eb2c` contract and evidence · `943861b` late verdicts · plus the review-response commit that carries this file |
-| Push status | pushed to `origin/object-memory/lifecycle-and-semantics-v1` |
+| Ending commit | `f5b2417` |
+| Commits | **13.** `d5000b7` lifecycle · `f489da5` policy · `5b329ad` semantics · `f90eb2c` contract and evidence · `943861b` late verdicts · `790e7e6` and `9821dfa` review round one · `b9b1fa1` verifier device · `7ea83d9` discovery research · `43d1f51` roadmap · `f28a81a` cleanup · `7c21144` review round two · `f5b2417` final A/B |
+| Push status | **pushed**; `HEAD == origin/object-memory/lifecycle-and-semantics-v1` |
+| Reviews | Three adversarial passes: defects, measurement audit, and a second pass on the fixes themselves. §12. |
 | Tests | **1703 passed, 64 skipped** (was 1513 / 64 at the starting commit) |
-| Known flake | `test_result_channel_hostile.py::test_the_channel_survives_the_world_vanishing_mid_subscription` failed once in five full runs with a Windows `WinError 32` on an unlink, and passed alone. This is the sharing-violation flake `LANE-OWNERSHIP.md` §3 already documents and rules to the World Builder lane; nothing in this branch touches it. |
+| Known flake | `test_result_channel_hostile.py::test_the_channel_survives_the_world_vanishing_mid_subscription` failed twice in nine full runs with a Windows `WinError 32` on an unlink, and passed alone. This is the sharing-violation flake `LANE-OWNERSHIP.md` §3 already documents and rules to the World Builder lane; nothing in this branch touches it. |
 | Never touched | `ios/**`, `tower/tower/world_builder/**`, `main` |
 
 ---
