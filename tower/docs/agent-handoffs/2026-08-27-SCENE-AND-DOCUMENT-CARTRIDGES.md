@@ -3,7 +3,8 @@
 **Date:** 2026-08-27
 **Lane:** Tower / cartridges
 **Started from:** `6e325f8` on `integration/world-builder-lifecycle-v1`
-**Ended at:** `integration/document-scene-cartridges-v1`, six commits
+**Ended at:** `37ebb62` on `integration/document-scene-cartridges-v1`, eight commits
+**Final gate:** 1,669 passed, 40 skipped, 0 failed
 **Worktree:** `C:\Users\tvllo\Projects\Glasses-cartridges`
 **Pushed:** yes, to `origin/integration/document-scene-cartridges-v1`
 
