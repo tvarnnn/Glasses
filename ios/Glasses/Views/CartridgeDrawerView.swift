@@ -44,20 +44,27 @@ struct CartridgeDrawerView: View {
                 }
 
                 Section {
-                    ForEach(Cartridge.catalog) { cartridge in
-                        if cartridge.workspace != nil {
+                    // Every catalog entry, in catalog order, and — critically —
+                    // the openability decision is read off the row rather than
+                    // re-derived here. `Cartridge.selectable` is defined as the
+                    // openable rows of this same list, so the drawer and the
+                    // rest of the app cannot come to different conclusions
+                    // about what may be opened.
+                    ForEach(Cartridge.drawerRows) { row in
+                        switch row {
+                        case .openable(let cartridge, _):
                             Button {
                                 selectedCartridgeID = cartridge.id
                                 dismiss()
                             } label: {
                                 CartridgeRow(
-                                    cartridge: cartridge,
+                                    row: row,
                                     isSelected: selectedCartridgeID == cartridge.id
                                 )
                             }
                             .buttonStyle(.plain)
-                        } else {
-                            CartridgeRow(cartridge: cartridge, isSelected: false)
+                        case .informational:
+                            CartridgeRow(row: row, isSelected: false)
                         }
                     }
                 } header: {
@@ -109,10 +116,14 @@ private struct HomeRow: View {
 }
 
 private struct CartridgeRow: View {
-    let cartridge: Cartridge
+    /// The row, not the cartridge: openability arrives already decided rather
+    /// than being worked out again here. The hint below is the second half of
+    /// that decision and comes from the same place.
+    let row: CartridgeDrawerRow
     let isSelected: Bool
 
-    private var isOpenable: Bool { cartridge.workspace != nil }
+    private var cartridge: Cartridge { row.cartridge }
+    private var isOpenable: Bool { row.isOpenable }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -147,8 +158,10 @@ private struct CartridgeRow: View {
         .contentShape(.rect)
         .accessibilityElement(children: .combine)
         // Two different truths, so two different hints. An unopenable row is
-        // informational exactly as it always was.
-        .accessibilityHint(isOpenable ? "Opens this workspace" : "No workspace in this app yet")
+        // informational exactly as it always was. The strings live on the row
+        // beside the decision that picks between them, so a row cannot be
+        // untappable while announcing that it opens something.
+        .accessibilityHint(row.accessibilityHint)
         // An openable row is already inside a `Button`, so only selection needs
         // stating. A row without a workspace gets no traits at all, which is
         // what makes it read as informational rather than actionable.

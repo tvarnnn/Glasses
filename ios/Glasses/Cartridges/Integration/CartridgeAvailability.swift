@@ -43,17 +43,30 @@ struct CartridgeContract: Equatable, Hashable, Sendable {
 
 /// Why a cartridge's Tower backing is, or is not, usable right now.
 ///
-/// Four cartridges need this and they need exactly the same four answers, which
-/// is what justifies it being shared rather than restated per cartridge. It is
-/// resolved by `resolve(declared:supported:towerStatus:)` below, so the ordering
-/// of the checks — which failure wins when several apply — is decided once
-/// instead of four times.
+/// Five cartridges need this and they need exactly the same four answers, which
+/// is what justifies it being shared rather than restated per cartridge. Four of
+/// them reach it through `resolve(declared:supported:isTowerReachable:)` below,
+/// so the ordering of the checks — which failure wins when several apply — is
+/// decided once instead of five times. Object Memory is the fifth and projects
+/// its own learned state onto these cases directly, because its contract is not
+/// declared in advance and `.unprobed` is a state none of the four can express;
+/// it follows the same precedence deliberately, and says so where it does.
 enum CartridgeAvailability: Equatable, Sendable {
-    /// The Tower has not declared a contract for this cartridge at all. Today
-    /// this is the answer for every cartridge, and it is a statement about the
-    /// Tower's roadmap rather than about this connection: the module container
-    /// is V0.8 and the first module V0.9 (docs/03-ROADMAP.md), so there is
-    /// nothing to declare.
+    /// The Tower has not declared a contract for this cartridge at all.
+    ///
+    /// This was once the answer for every cartridge. It no longer is: a live
+    /// Tower declares `world_builder.status/2026-08-25` over `GET /cartridges`,
+    /// which reaches `declared` as a `TowerCartridgeDeclaration` offer, so World
+    /// Builder resolves past this case. It remains the answer for every other
+    /// cartridge, and for those it is still a statement about the Tower's
+    /// roadmap rather than about this connection — the module container is V0.8
+    /// and the first module V0.9 (docs/03-ROADMAP.md), and the Tower lists
+    /// Experimental CV Lab, Document Memory and Scene Understanding explicitly
+    /// under `not_offered`, so for them there is genuinely nothing to declare.
+    ///
+    /// Two read-only HTTP routes existing for one cartridge is not that runtime
+    /// arriving, which is why the sentence above is scoped to the cartridges the
+    /// Tower says nothing about rather than deleted.
     case noContract
     /// The Tower declared a contract this build does not implement. Kept
     /// separate from `noContract` because they call for opposite responses:
@@ -64,8 +77,18 @@ enum CartridgeAvailability: Equatable, Sendable {
     /// can be asked of it. Not an error — a connection state.
     case towerUnreachable
     /// The Tower speaks a contract this build implements and is reachable.
-    /// **Unreachable today**, by construction: `TowerCapabilities` declares no
-    /// contracts and this build supports none.
+    ///
+    /// This case used to be documented as unreachable by construction, on the
+    /// grounds that `TowerCapabilities` declared no contracts and this build
+    /// supported none. Both halves of that are now false:
+    /// `TowerCapabilities.supported` contains
+    /// `WorldBuilderResultContract.identifier`, and a live Tower offers exactly
+    /// that identifier for `world_builder`. **World Builder genuinely resolves
+    /// here against a connected Tower.**
+    ///
+    /// It is still unreachable for every other cartridge, for the reason
+    /// `noContract` gives — which is a fact about what those cartridges' Towers
+    /// offer, not a property of this type.
     case available(CartridgeContract)
 
     /// Whether a request may be made at all.
@@ -135,7 +158,7 @@ enum CartridgeAvailability: Equatable, Sendable {
     /// The unavailable explanation, joined with whatever the cartridge's own
     /// client had to add.
     ///
-    /// Extracted because all four workspaces were restating the same join —
+    /// Extracted because every workspace was restating the same join —
     /// which of the two sentences comes first, and what happens when either is
     /// absent. The per-cartridge part (which of its own states yields a reason)
     /// stays in the cartridge, where it belongs; the ordering is a shared
@@ -168,9 +191,17 @@ enum CartridgeAvailability: Equatable, Sendable {
     ///
     /// - Parameters:
     ///   - declared: what the Tower says it offers for this cartridge, or `nil`
-    ///     if it has said nothing. Today always `nil`.
-    ///   - supported: the contract identifiers this build implements. Today
-    ///     always empty.
+    ///     if it has said nothing. Non-`nil` today for exactly one cartridge:
+    ///     World Builder, whose offer arrives over the wire in the Tower's
+    ///     `GET /cartridges` declaration and reaches here via
+    ///     `TowerCapabilities.declaredContract(for:in:)`. `nil` for every other
+    ///     cartridge, because the local `TowerCapabilities.declared` table is
+    ///     empty and the Tower declares nothing for them.
+    ///   - supported: the contract identifiers this build implements. One
+    ///     element today — `WorldBuilderResultContract.identifier`,
+    ///     `"world_builder.status/2026-08-25"`. Not empty, and it matches the
+    ///     identifier a live Tower offers, which is why `.available` is a
+    ///     reachable outcome rather than a theoretical one.
     ///   - isTowerReachable: whether the connection is currently up.
     static func resolve(
         declared: CartridgeContract?,
@@ -190,7 +221,7 @@ enum CartridgeAvailability: Equatable, Sendable {
 /// A cartridge-level failure, stated so a view can show it without inventing
 /// wording and a test can assert what it is without matching prose.
 ///
-/// Shared because all four cartridges fail the same ways, and because Rule 3
+/// Shared because every cartridge fails the same ways, and because Rule 3
 /// (Truthful State Only, docs/02-DEVELOPMENT-RULES.md) makes "the backend
 /// failed" a state the UI must be able to reach — a cartridge that can only
 /// render success and emptiness will render a failure as emptiness.

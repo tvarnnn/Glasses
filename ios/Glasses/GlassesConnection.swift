@@ -36,6 +36,77 @@ struct CapturedFrame {
 }
 #endif
 
+#if DEBUG
+/// Which rung of DAT's resolution enum the *next* capture session requests.
+///
+/// ## Why this exists, and why it is DEBUG-only
+///
+/// `StreamingResolution` is a **fixed three-case enum chosen once**, in the
+/// `StreamConfiguration` handed to `session.addCamera(config:)`. It is not an
+/// adaptive ladder: nothing in DAT renegotiates it mid-stream, and the P3
+/// clean walk recorded **108 frames, every one 360x640, with zero variation**
+/// (`docs/evidence/2026-08-26-p3-clean-walk-console.txt`). The app had this
+/// value hardcoded to `.low`, so changing it required an edit and a rebuild.
+///
+/// That hardcoding blocks a measurement the Tower lane needs. Document
+/// Memory's word recall is **0.429-0.810 at 360x640 and 0.957-1.000 at
+/// 1280x720**, so its central premise cannot be tested at all without a way to
+/// raise the rung on a device. Meanwhile 720p is *actively harmful* to World
+/// Builder tracking — `min_sharpness = 25.0` is absolute and **73.3%** of 720p
+/// frames are rejected as blurred.
+///
+/// Those two facts do not reconcile at a single rung, and choosing between
+/// them is a cross-cartridge product decision that is not iOS's to make alone
+/// (see `docs/agent-handoffs/TOWER-LANE-HANDOFF-FROM-MAC.md` 2.3). So this is
+/// deliberately **a developer control, not a product setting**: it makes the
+/// experiment runnable without pre-empting the decision.
+///
+/// `.low` remains the default, so World Builder's physically-proven path is
+/// unchanged unless someone deliberately changes it.
+enum CaptureResolutionPreference: String, CaseIterable, Identifiable, Sendable {
+    case low
+    case medium
+    case high
+
+    /// The default, and the rung every existing measurement was taken at.
+    static let `default`: CaptureResolutionPreference = .low
+
+    var id: String { rawValue }
+
+    var streamingResolution: StreamingResolution {
+        switch self {
+        case .low: return .low
+        case .medium: return .medium
+        case .high: return .high
+        }
+    }
+
+    /// Short name for a picker segment.
+    var shortLabel: String {
+        switch self {
+        case .low: return "Low"
+        case .medium: return "Medium"
+        case .high: return "High"
+        }
+    }
+
+    /// The frame size **DAT itself declares** for this rung, rendered for
+    /// display.
+    ///
+    /// Read from `StreamingResolution.videoFrameSize` rather than written out
+    /// as a literal here. A hardcoded "360x640" would be this app asserting a
+    /// number it did not measure, and it would silently go stale the first
+    /// time the SDK changed a rung. What arrives on the wire is separately and
+    /// independently taken from the decoded buffer's format description in
+    /// `pixelDimensions(for:)` — so if the two ever disagree, the log will say
+    /// so rather than this label quietly winning.
+    var declaredSizeDescription: String {
+        let size = streamingResolution.videoFrameSize
+        return "\(size.width)x\(size.height)"
+    }
+}
+#endif
+
 @MainActor
 final class GlassesConnection: ObservableObject {
     @Published private(set) var registrationState: RegistrationState
@@ -60,6 +131,18 @@ final class GlassesConnection: ObservableObject {
     // (Glasses/StreamManager.swift, unrelated to DAT) which would otherwise
     // shadow MWDATCamera's type of the same name.
     @Published private(set) var cameraStreamState: MWDATCamera.StreamState = .stopped
+
+    /// The rung the **next** capture session will request.
+    ///
+    /// Deliberately not `private(set)`: the Developer Tools picker writes it.
+    /// Equally deliberately, changing it does **not** disturb a running
+    /// session. `StreamConfiguration` is consumed once, by
+    /// `session.addCamera(config:)`, and DAT exposes no way to renegotiate a
+    /// live stream — so a control that appeared to change the rung mid-capture
+    /// would be claiming something that did not happen (Rule 3, Truthful State
+    /// Only). The picker says "next session" because that is the truth.
+    @Published var captureResolution: CaptureResolutionPreference = .default
+
     @Published private(set) var frameCount: Int = 0
     /// The most recent frame decoded for Tower transmission, sampled down to
     /// `FrameRateGate.towerTargetFPS` by `frameRateGate` — not every frame,
@@ -612,11 +695,21 @@ final class GlassesConnection: ObservableObject {
             return
         }
 
+        // Read from `captureResolution` rather than the former hardcoded
+        // `.low`. The default is still `.low`, so this is a no-op unless a
+        // developer deliberately changed it; see `CaptureResolutionPreference`
+        // for why the control exists and why it is not a product setting.
+        let requestedResolution = captureResolution
         let config = StreamConfiguration(
             videoCodec: VideoCodec.raw,
-            resolution: StreamingResolution.low,
+            resolution: requestedResolution.streamingResolution,
             frameRate: 24
         )
+        // Logged because the rung is otherwise invisible in the console, and
+        // every frame-dimension line below should be read against it. If the
+        // decoded dimensions disagree with the rung DAT declared, that is a
+        // finding and this pair of lines is what makes it visible.
+        print("[Glasses][Camera] requesting resolution \(requestedResolution.rawValue) (DAT declares \(requestedResolution.declaredSizeDescription))")
 
         do {
             guard let newCamera = try session.addCamera(config: config) else {

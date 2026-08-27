@@ -42,8 +42,19 @@ import Foundation
 /// vocabulary becomes a plugin framework.
 enum CartridgePhase: String, Equatable, Sendable, CaseIterable {
     /// The Tower cannot do this at all — no module runtime, or no declared
-    /// contract for this cartridge. Today this is the only reachable phase for
-    /// every cartridge in the app.
+    /// contract for this cartridge.
+    ///
+    /// This was once documented as "the only reachable phase for every
+    /// cartridge in the app", and that has stopped being true. A live Tower
+    /// declares `world_builder.status/2026-08-25` on `GET /cartridges` and this
+    /// build implements it, so World Builder resolves past this case and
+    /// reaches `.live`/`.settled` with real data. Object Memory reaches its own
+    /// states over HTTP without passing through here at all.
+    ///
+    /// It remains the answer for the three cartridges the Tower lists under
+    /// `not_offered` — Experimental CV Lab, Document Memory and Scene
+    /// Understanding — because it says nothing about them that this build could
+    /// subscribe to.
     case unsupported
     /// The capability exists but the Tower cannot be reached right now.
     ///

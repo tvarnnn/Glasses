@@ -33,6 +33,7 @@ struct DeveloperToolsView: View {
                 senderSection
                 deviceHealthSection
                 mockDeviceSection
+                captureResolutionSection
                 rawStateSection
                 towerSection
                 placeholderSection
@@ -205,6 +206,53 @@ struct DeveloperToolsView: View {
         } footer: {
             Text("Simulates Ray-Ban Meta glasses using this iPhone's camera. Enable, pair, then configure the feed — in that order — before starting a session.")
         }
+    }
+
+    // MARK: Capture resolution
+
+    /// Chooses the rung the next capture session requests.
+    ///
+    /// This exists so a Document Memory experiment can be run on a device
+    /// without an edit-and-rebuild. The app hardcoded `.low`, and Document
+    /// Memory's premise cannot be tested at 360x640 — its word recall is
+    /// 0.429-0.810 there against 0.957-1.000 at 1280x720. Raising the rung
+    /// globally is not the answer either: 73.3% of 720p frames fall below
+    /// World Builder's absolute `min_sharpness` and are rejected as blurred.
+    /// That conflict is a cross-cartridge decision, so this stays a developer
+    /// control rather than becoming a product setting. See
+    /// `docs/agent-handoffs/TOWER-LANE-HANDOFF-FROM-MAC.md` 2.3.
+    ///
+    /// The picker is disabled while a session is engaged, because
+    /// `StreamConfiguration` is consumed once by `addCamera(config:)` and DAT
+    /// offers no way to renegotiate a live stream. Leaving it enabled would
+    /// let the control move while nothing changed — a state the UI asserts and
+    /// the system does not hold.
+    private var captureResolutionSection: some View {
+        Section {
+            Picker("Next session", selection: $glasses.captureResolution) {
+                ForEach(CaptureResolutionPreference.allCases) { rung in
+                    Text(rung.shortLabel).tag(rung)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(glasses.isCaptureEngaged)
+
+            LabeledContent("DAT declares", value: glasses.captureResolution.declaredSizeDescription)
+        } header: {
+            Text("Capture Resolution")
+        } footer: {
+            Text(captureResolutionFooter)
+        }
+    }
+
+    /// Says which of the two situations the reader is in, rather than one
+    /// sentence covering both. A footer that explains the disabled case while
+    /// the control is enabled reads as a control that is broken.
+    private var captureResolutionFooter: String {
+        if glasses.isCaptureEngaged {
+            return "A session is running. DAT fixes the resolution when the stream is created and cannot renegotiate it, so this takes effect on the next session — stop capture to change it."
+        }
+        return "Applies when capture next starts. Default is Low (the rung every existing measurement was taken at). Raising it is known to harm World Builder tracking and to help Document Memory's OCR; it is a developer control, not a product setting."
     }
 
     // MARK: Raw state

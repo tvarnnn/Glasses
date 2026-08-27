@@ -31,8 +31,15 @@ struct WorldFragmentsModel: Equatable {
     /// Only resolved segments with real bounds can be drawn. A resolved
     /// segment with no bounds is incoherent and is refused rather than framed
     /// by guess.
+    ///
+    /// The filter decides membership; `ranked` decides only the order they are
+    /// read in. The two are kept separate on purpose — see `ranked` — so that
+    /// a change to display order can never quietly change which fragments the
+    /// grid shows, or what `unresolvedCount` says about the rest.
     var fragments: [WorldSegmentSummary] {
-        segments.filter { $0.resolutionState == .resolved && $0.bounds != nil }
+        Self.ranked(
+            segments.filter { $0.resolutionState == .resolved && $0.bounds != nil }
+        )
     }
 
     /// Segments that hold keyframes and recovered nothing. Counted, never
@@ -66,6 +73,43 @@ struct WorldFragmentsModel: Equatable {
 }
 
 extension WorldFragmentsModel {
+    /// Puts the most-mapped fragments first, and does it totally.
+    ///
+    /// ## Why the grid needs an order at all
+    ///
+    /// Manifest order is capture order, which says when a segment was walked
+    /// through and nothing about whether anything was recovered from it. That
+    /// was survivable while a walk produced tens of segments. It stops being
+    /// survivable as the Tower's segmentation gets finer — an unrestricted
+    /// version of it takes a real walk to hundreds of segments — because then
+    /// the parts of the room that actually reconstructed are scattered among
+    /// the parts that were barely seen, and the reader has to scan the whole
+    /// grid to find them.
+    ///
+    /// `point_count` is the Tower's own count of the points a segment
+    /// recovered, so ordering by it puts the fragments with the most recovered
+    /// geometry at the top. That is a statement about QUANTITY and nothing
+    /// else: a fragment above another has more points in it, not a better or
+    /// more trustworthy reconstruction. Nothing here, and nothing in the view,
+    /// may say otherwise.
+    ///
+    /// ## Why the tie-break is not optional
+    ///
+    /// `sorted(by:)` is not documented as stable, so two segments with equal
+    /// point counts could come back in either order — including a different
+    /// order on the next refresh, which in a `ForEach` is cards visibly
+    /// swapping places under the reader's finger for no reason they can see.
+    /// `segmentIndex` is unique within a manifest, so breaking ties on it
+    /// makes the order total: one manifest has exactly one display order.
+    static func ranked(_ fragments: [WorldSegmentSummary]) -> [WorldSegmentSummary] {
+        fragments.sorted { lhs, rhs in
+            if lhs.pointCount != rhs.pointCount {
+                return lhs.pointCount > rhs.pointCount
+            }
+            return lhs.segmentIndex < rhs.segmentIndex
+        }
+    }
+
     /// Maps a segment-local `(x, z)` into that segment's OWN tile.
     ///
     /// Lifted off the view deliberately: this is the single place a shared

@@ -317,6 +317,71 @@ final class WorldFragmentsModelTests: XCTestCase {
         XCTAssertEqual(projectSmall(1.0, 1.0).x,
                        projectLarge(100.0, 100.0).x, accuracy: 0.001)
     }
+
+    func testFragmentsAreOrderedByTheirPointCountDescending() {
+        // The grid is about to get crowded -- an unrestricted segmentation
+        // takes a real walk to ~470 segments -- and an unordered grid buries
+        // the parts of the room that were actually mapped behind the parts
+        // that were barely seen. point_count is the Tower's own measure of
+        // how much geometry a segment recovered, so it is what orders them.
+        let model = WorldFragmentsModel(segments: [
+            summary(index: 0, points: 50, state: .resolved, bounds: box),
+            summary(index: 1, points: 900, state: .resolved, bounds: box),
+            summary(index: 2, points: 300, state: .resolved, bounds: box),
+        ])
+
+        XCTAssertEqual(model.fragments.map(\.pointCount), [900, 300, 50])
+        XCTAssertEqual(model.fragments.map(\.segmentIndex), [1, 2, 0])
+    }
+
+    func testFragmentsTiedOnPointCountFallBackToTheirSegmentIndex() {
+        // Swift's sort is not documented as stable, and a ForEach whose order
+        // moves between refreshes shuffles cards under the reader's finger.
+        // Equal point counts therefore need a second key that is total, and
+        // segment_index is unique per manifest.
+        let model = WorldFragmentsModel(segments: [
+            summary(index: 4, points: 100, state: .resolved, bounds: box),
+            summary(index: 0, points: 100, state: .resolved, bounds: box),
+            summary(index: 2, points: 100, state: .resolved, bounds: box),
+        ])
+
+        XCTAssertEqual(model.fragments.map(\.segmentIndex), [0, 2, 4])
+
+        // And asked twice, it answers the same. The order is a function of the
+        // manifest, not of how the sort happened to run.
+        XCTAssertEqual(model.fragments, model.fragments)
+    }
+
+    func testRankingReordersTheGridAndNeverChangesWhatIsInIt() {
+        // Ranking is display order only. If it moved membership -- either the
+        // resolved-with-bounds filter or the unresolved tally -- something is
+        // wrong, and both numbers are read by other surfaces.
+        let model = WorldFragmentsModel(segments: [
+            summary(index: 0, points: 10, state: .resolved, bounds: box),
+            summary(index: 1, points: 0, state: .unresolved),
+            summary(index: 2, points: 900, state: .resolved, bounds: box),
+            summary(index: 3, points: 700, state: .resolved, bounds: nil),
+            summary(index: 4, points: 0, state: .unresolved),
+        ])
+
+        // The incoherent segment 3 (points, no bounds) stays out, and neither
+        // unresolved segment is promoted into the grid by its ranking.
+        XCTAssertEqual(model.fragments.map(\.segmentIndex), [2, 0])
+        XCTAssertEqual(model.fragments.count, 2)
+        XCTAssertEqual(model.unresolvedCount, 2)
+        XCTAssertEqual(model.headline, "2 fragments, not yet connected")
+    }
+
+    func testRankingAnEmptyOrSingleFragmentWorldIsANoOp() {
+        let empty = WorldFragmentsModel(segments: [])
+        XCTAssertTrue(empty.fragments.isEmpty)
+
+        let one = WorldFragmentsModel(segments: [
+            summary(index: 7, points: 42, state: .resolved, bounds: box),
+        ])
+        XCTAssertEqual(one.fragments.map(\.segmentIndex), [7])
+    }
+
 }
 
 // MARK: - The contract this build adopted

@@ -306,6 +306,98 @@ final class CartridgeWorkspaceTests: XCTestCase {
         )
         XCTAssertNil(Cartridge.workspaceCartridge(forID: withoutWorkspace.id))
     }
+
+    // MARK: One answer to "is this cartridge openable?"
+
+    /// `Cartridge.selectable` is documented as "every cartridge the drawer may
+    /// present as openable", but for most of this shell's life the drawer did
+    /// not consult it — or anything derived from it. It iterated
+    /// `Cartridge.catalog` and re-derived openability inline as
+    /// `cartridge.workspace != nil`, twice: once to decide whether to wrap the
+    /// row in a `Button`, and once inside the row to pick the accessibility
+    /// hint. `selectable`'s only callers were in this file.
+    ///
+    /// Two code paths answering one question agreed only by coincidence of
+    /// implementation. Nothing made them agree, so nothing would have caught
+    /// them diverging — a cartridge could have been openable to the drawer and
+    /// absent from `selectable`, and every test here would still have passed
+    /// while asserting the wrong list.
+    ///
+    /// `Cartridge.drawerRows` is now the single answer. The drawer renders it;
+    /// `selectable` is defined as the openable rows of it. These tests pin that
+    /// definition, so the identity below is not a coincidence being observed —
+    /// it is the construction being checked.
+    func testTheDrawerRendersEveryCatalogEntryInCatalogOrder() {
+        XCTAssertEqual(
+            Cartridge.drawerRows.map(\.cartridge.id),
+            Cartridge.catalog.map(\.id),
+            "the drawer shows all catalog entries, openable or not — dropping the informational rows would hide three modules"
+        )
+    }
+
+    func testTheDrawersOpenableRowsAreExactlyTheSelectableCartridges() {
+        let openable = Cartridge.drawerRows.filter(\.isOpenable).map(\.cartridge.id)
+        XCTAssertEqual(
+            openable,
+            Cartridge.selectable.map(\.id),
+            "the drawer and Cartridge.selectable disagree about which cartridges may be opened"
+        )
+        XCTAssertFalse(openable.isEmpty, "this test is vacuous if nothing is openable")
+    }
+
+    /// The other half of the same guarantee: a row is openable **if and only
+    /// if** its cartridge has a workspace. The `.openable` case carries a
+    /// non-optional `CartridgeWorkspace`, so the compiler already forbids an
+    /// openable row with nothing to open; this pins the converse, that a
+    /// cartridge with a workspace cannot be filed as informational.
+    func testARowIsOpenableExactlyWhenItsCartridgeHasAWorkspace() {
+        for row in Cartridge.drawerRows {
+            switch row {
+            case .openable(let cartridge, let workspace):
+                XCTAssertEqual(
+                    cartridge.workspace,
+                    workspace,
+                    "\(cartridge.name) opens a workspace that is not its own"
+                )
+            case .informational(let cartridge):
+                XCTAssertNil(
+                    cartridge.workspace,
+                    "\(cartridge.name) has a workspace but the drawer renders it as informational"
+                )
+            }
+        }
+    }
+
+    /// The three rows with no workspace, named. `testAStoredCartridgeWithout…`
+    /// only needs one of them to exist; this pins which three, so a cartridge
+    /// silently losing its workspace fails here rather than quietly becoming an
+    /// informational row in a shipped build.
+    func testTheThreeCartridgesWithoutAWorkspaceStayInformational() {
+        let informational = Cartridge.drawerRows.filter { !$0.isOpenable }.map(\.cartridge.id)
+        XCTAssertEqual(informational, ["visual-qa", "accessibility", "environmental-memory"])
+    }
+
+    /// Both hint strings, pinned to the same decision that decides tappability.
+    ///
+    /// These are the only two sentences VoiceOver reads that state whether a
+    /// row does anything. If the hint and the `Button` were ever derived
+    /// separately, one of them would eventually say a row opens something it
+    /// cannot open — a lie told only to the users who cannot see that nothing
+    /// happened (Rule 3, Truthful State Only).
+    func testTheAccessibilityHintFollowsTheSameOpenabilityDecision() {
+        for row in Cartridge.drawerRows {
+            XCTAssertEqual(
+                row.accessibilityHint,
+                row.isOpenable ? "Opens this workspace" : "No workspace in this app yet",
+                "\(row.cartridge.name)'s hint does not match its openability"
+            )
+        }
+        XCTAssertEqual(
+            Set(Cartridge.drawerRows.map(\.accessibilityHint)),
+            ["Opens this workspace", "No workspace in this app yet"],
+            "both hints must still be reachable — a drawer with one hint has stopped distinguishing the two kinds of row"
+        )
+    }
 }
 
 // MARK: - World model boundary
@@ -2494,3 +2586,88 @@ final class ConnectionLifetimeTests: XCTestCase {
         )
     }
 }
+
+// MARK: - Capture resolution
+
+/// Pins the DEBUG-only capture-resolution control.
+///
+/// The control exists because the rung was a hardcoded `.low` and Document
+/// Memory's premise cannot be tested at 360x640 — its measured word recall is
+/// 0.429-0.810 there against 0.957-1.000 at 1280x720. What these tests actually
+/// guard is the *other* side of that: World Builder's path is physically proven
+/// at `.low`, so the default must not move, and the label must not invent a
+/// size DAT did not declare.
+///
+/// DEBUG-only because `CaptureResolutionPreference` is, and because
+/// `MWDATCamera` is imported under `#if DEBUG` in `GlassesConnection.swift`.
+#if DEBUG
+final class CaptureResolutionPreferenceTests: XCTestCase {
+
+    /// The rung every existing measurement was taken at, including the P3 clean
+    /// walk. If this moves, every prior figure silently stops being comparable
+    /// and World Builder's proven path changes underneath it.
+    func testTheDefaultIsLow() {
+        XCTAssertEqual(CaptureResolutionPreference.default, .low)
+    }
+
+    /// A fresh connection starts at the default rather than at whatever the
+    /// picker last showed — there is no persistence here and there should not
+    /// be one, because a rung silently surviving a relaunch is how a walk gets
+    /// recorded at the wrong resolution without anyone choosing that.
+    @MainActor
+    func testAFreshConnectionStartsAtTheDefault() {
+        let connection = GlassesConnection(wearables: ScriptedWearables(permissionResults: []))
+        XCTAssertEqual(connection.captureResolution, .default)
+    }
+
+    /// Three rungs, each mapping to a distinct `StreamingResolution`. A
+    /// collapsed mapping would make the picker move while the stream did not.
+    func testEachRungMapsToADistinctStreamingResolution() {
+        let all = CaptureResolutionPreference.allCases
+        XCTAssertEqual(all.count, 3)
+        XCTAssertEqual(Set(all.map(\.id)).count, 3, "rung ids must be unique")
+
+        let resolutions = all.map(\.streamingResolution)
+        XCTAssertEqual(resolutions.count, 3)
+        for (index, lhs) in resolutions.enumerated() {
+            for rhs in resolutions[(index + 1)...] {
+                XCTAssertNotEqual(lhs, rhs, "two rungs collapsed onto one StreamingResolution")
+            }
+        }
+    }
+
+    /// The displayed size must come from DAT, not from a literal in this app.
+    ///
+    /// Asserted against `StreamingResolution.videoFrameSize` rather than
+    /// against the string "360x640", so that if the SDK ever changes a rung the
+    /// label follows it instead of quietly going stale — which is the whole
+    /// reason `declaredSizeDescription` reads the SDK at all.
+    func testTheDeclaredSizeIsReadFromDATRatherThanHardcoded() {
+        for rung in CaptureResolutionPreference.allCases {
+            let size = rung.streamingResolution.videoFrameSize
+            XCTAssertEqual(
+                rung.declaredSizeDescription,
+                "\(size.width)x\(size.height)",
+                "\(rung.rawValue) must render the size DAT declares"
+            )
+        }
+    }
+
+    /// Ties the default rung to the physical evidence. The P3 clean walk
+    /// recorded 108 frames, every one 360x640
+    /// (`docs/evidence/2026-08-26-p3-clean-walk-console.txt`). If DAT's `.low`
+    /// ever stops meaning that, the corpus and every figure derived from it
+    /// stop being comparable, and this test is the tripwire.
+    func testLowIsStillTheRungTheWalkWasMeasuredAt() {
+        XCTAssertEqual(CaptureResolutionPreference.low.declaredSizeDescription, "360x640")
+    }
+
+    /// Every rung needs a picker segment. An empty label renders as a blank
+    /// segment the user cannot identify.
+    func testEveryRungHasANonEmptyShortLabel() {
+        for rung in CaptureResolutionPreference.allCases {
+            XCTAssertFalse(rung.shortLabel.isEmpty, "\(rung.rawValue) has no label")
+        }
+    }
+}
+#endif
