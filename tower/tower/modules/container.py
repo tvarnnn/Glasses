@@ -151,8 +151,20 @@ class ModuleContainer:
                 self._module.descriptor.id,
                 exc,
             )
+            # A module that named a REASON also owns the WORDING: it knows
+            # what it refused and what a person should do about it, and
+            # "could not process this frame" would throw that away. A
+            # module that named nothing keeps the generic sentence, which
+            # is what every existing caller and test expects.
+            reason = getattr(exc, "reason", None)
             raise FrameSkippedError(
-                f"module {self._module.descriptor.id} could not process this frame"
+                str(exc)
+                if reason is not None
+                else (
+                    f"module {self._module.descriptor.id} could not process "
+                    "this frame"
+                ),
+                reason=reason,
             ) from exc
         except Exception as exc:
             logger.exception(

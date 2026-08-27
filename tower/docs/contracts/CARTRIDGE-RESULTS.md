@@ -414,15 +414,43 @@ The envelope is generic; payloads are not. To add a cartridge:
 
 Nothing in the envelope, publisher, registry or routes changes. The
 subscription, ordering, coalescing, reconnect and error machinery is
-already generic and already tested.
+already generic and already tested — the Experimental CV Lab was added
+without touching any of it.
 
-**Why the other three are not offered yet**
+One thing DID change when the CV Lab landed: `declare()`, `find_offer()`
+and `known_cartridges()` now take a second argument, the live Lab or
+`None`. It is **duck-typed and never imported** — anything with an
+`availability()` returning `(available, reason)` — because
+`test_the_result_channel_core_is_cartridge_blind` forbids the registry
+from importing a cartridge, and this time the surface is a wire contract.
+
+**Why the other two are not offered yet**
 
 | Cartridge | Reason |
 |---|---|
-| Experimental CV Lab | its per-frame results already reach the client on `frame_result`. A typed contract wants the experiment registry, provenance and baseline work in `IOS-to-Tower.md` §2.1–2.3, which is a design decision, not a transport one |
 | Document Memory | implemented and queryable by CLI, but no contract is offered. Also gated by the resolution finding in `TOWER-TO-IOS.md` §6.8 |
 | Scene Understanding | implemented as a **live in-process state that persists nothing**. There is no file for this channel to read, and giving it one would pre-empt Environmental Memory's whole reason to exist. It needs the live-module path, not this one |
+
+**Experimental CV Lab is now offered** — `experimental_cv` / `status`,
+contract `experimental_cv.status/2026-08-27`, documented separately in
+`EXPERIMENTAL-CV-LAB.md`. It is the first producer in this package that
+reads **live in-process state** rather than files another process wrote,
+and that is worth knowing before adding a third:
+
+- Step 1 above still holds, and `tower/results/experimental_cv.py` is
+  still the only file allowed to know what a CV Lab is.
+- The channel is still **read-only**. It reports the Lab; it cannot
+  start, stop or configure one. Commands travel on their own messages
+  (`cv_lab_start` and friends), deliberately not here — a mutation on a
+  reporting surface is a place the next cartridge's author would look for
+  one.
+- What is new is **concurrency**. A World Builder snapshot is read from
+  disk by `asyncio.to_thread` while nothing in this process is writing
+  it. A CV Lab snapshot is read from a worker thread while the event loop
+  is mutating the object, so the LAB takes a lock around every state
+  transition and around building its document. A future live producer
+  must do the same; the hub offers no such guarantee and should not,
+  because it holds no state of its own.
 
 ---
 
@@ -975,6 +1003,15 @@ identifier — the key set is unchanged apart from the added
 having read the paragraph above. That refusal is the point: this build
 serves a figure that means something different from what the old
 identifier promised.
+
+---
+
+## 12b. Other contracts on this channel
+
+| Cartridge | Contract | Document |
+|---|---|---|
+| `world_builder` | `world_builder.status/2026-08-25` | §10 of this file |
+| `experimental_cv` | `experimental_cv.status/2026-08-27` | `EXPERIMENTAL-CV-LAB.md` |
 
 ---
 

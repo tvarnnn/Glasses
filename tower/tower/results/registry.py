@@ -29,6 +29,7 @@ declaration compiled into this build. Nothing here enumerates loaded
 modules, and nothing here can grow at runtime.
 """
 
+import logging
 from dataclasses import dataclass
 
 from tower.results.contracts import (
@@ -37,6 +38,7 @@ from tower.results.contracts import (
     CARTRIDGE_SCENE_UNDERSTANDING,
     CARTRIDGE_WORLD_BUILDER,
     ENVELOPE_CONTRACT,
+    EXPERIMENTAL_CV_STATUS_CONTRACT,
     RESULT_TYPE_STATUS,
     WORLD_BUILDER_STATUS_CONTRACT,
 )
@@ -51,14 +53,6 @@ from tower.results.contracts import (
 # does not know what document_memory is" and "Tower knows and is not
 # serving it yet". iOS keys on `cartridges`; this list is for humans.
 NOT_OFFERED = (
-    {
-        "cartridge": CARTRIDGE_EXPERIMENTAL_CV,
-        "reason": (
-            "results already reach the client on frame_result; a typed "
-            "contract awaits the experiment-registry and provenance work "
-            "described in IOS-to-Tower.md 2.1-2.3"
-        ),
-    },
     {
         "cartridge": CARTRIDGE_DOCUMENT_MEMORY,
         "reason": (
@@ -76,6 +70,9 @@ NOT_OFFERED = (
         ),
     },
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -104,13 +101,22 @@ class CartridgeOffer:
         }
 
 
-def declare(world_root: str | None) -> dict:
+def declare(world_root: str | None, cv_lab=None) -> dict:
     """The full capability declaration.
 
-    Takes the world root rather than reading configuration itself so the
-    declaration is a pure function of its inputs -- which is what lets one
-    test assert that the HTTP route and the WebSocket message produce
-    byte-identical output.
+    Takes its inputs rather than reading configuration itself, so the
+    declaration is a pure function of them -- which is what lets one test
+    assert that the HTTP route and the WebSocket message produce
+    byte-identical output. `cv_lab` joined `world_root` for exactly that
+    reason: both surfaces now have two things to pass, and passing the app
+    instead would have made the function impure again.
+
+    DUCK-TYPED, never imported. `cv_lab` is anything with an
+    `availability()` returning `(available, reason)`. This module is part
+    of the result channel cartridge-blind core and
+    `test_the_result_channel_core_is_cartridge_blind` keeps it that way;
+    an import of the Lab here would bake one cartridge into the shared
+    surface, and this time the surface is a WIRE CONTRACT.
     """
     if world_root is None:
         available = False
@@ -122,6 +128,8 @@ def declare(world_root: str | None) -> dict:
         available = True
         reason = None
 
+    cv_available, cv_reason = _cv_lab_availability(cv_lab)
+
     offers = (
         CartridgeOffer(
             cartridge=CARTRIDGE_WORLD_BUILDER,
@@ -129,6 +137,13 @@ def declare(world_root: str | None) -> dict:
             contract=WORLD_BUILDER_STATUS_CONTRACT,
             available=available,
             unavailable_reason=reason,
+        ),
+        CartridgeOffer(
+            cartridge=CARTRIDGE_EXPERIMENTAL_CV,
+            result_type=RESULT_TYPE_STATUS,
+            contract=EXPERIMENTAL_CV_STATUS_CONTRACT,
+            available=cv_available,
+            unavailable_reason=cv_reason,
         ),
     )
 
@@ -140,18 +155,48 @@ def declare(world_root: str | None) -> dict:
     }
 
 
-def find_offer(world_root: str | None, cartridge: str, result_type: str):
+def _cv_lab_availability(cv_lab) -> tuple[bool, str | None]:
+    """Whether this build can serve the CV Lab contract, and why not.
+
+    A Tower with no Lab still OFFERS the contract -- this build knows how
+    to speak it -- and reports it unavailable, which is the third state in
+    IOS-to-Tower.md 0.1 ("offered, implemented, unreachable -> connect")
+    rather than the first ("the Tower says nothing -> not built yet").
+    Those call for opposite instructions to a person, which is why they
+    cannot be one state.
+
+    Never raises. A declaration is how a client learns what is possible;
+    it must not fail because a subsystem is unwell.
+    """
+    if cv_lab is None:
+        return False, (
+            "this Tower is running without a CV Lab module, so no "
+            "experiment can be enumerated or started"
+        )
+    try:
+        available, reason = cv_lab.availability()
+    except Exception:
+        logger.exception("[Tower][Results] could not read CV Lab availability")
+        return False, "the CV Lab could not report whether it is available"
+    return bool(available), reason
+
+
+def find_offer(
+    world_root: str | None, cartridge: str, result_type: str, cv_lab=None
+):
     """The offer matching a subscribe request, or None.
 
     None covers both "no such cartridge" and "no such result type on a
     cartridge that exists". The caller distinguishes them for the error
     message; this returns one thing so there is one lookup path.
     """
-    for entry in declare(world_root)["cartridges"]:
+    for entry in declare(world_root, cv_lab)["cartridges"]:
         if entry["cartridge"] == cartridge and entry["result_type"] == result_type:
             return entry
     return None
 
 
-def known_cartridges(world_root: str | None) -> set:
-    return {entry["cartridge"] for entry in declare(world_root)["cartridges"]}
+def known_cartridges(world_root: str | None, cv_lab=None) -> set:
+    return {
+        entry["cartridge"] for entry in declare(world_root, cv_lab)["cartridges"]
+    }

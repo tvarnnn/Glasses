@@ -78,7 +78,9 @@ async def _cartridges(websocket, sender) -> None:
     Served from the same `registry.declare()` so the two surfaces cannot
     drift. A test asserts they are byte-identical.
     """
-    await sender.send(registry.declare(_world_root(websocket)))
+    await sender.send(
+        registry.declare(_world_root(websocket), _cv_lab(websocket))
+    )
 
 
 async def _subscribe(message, websocket, sender, channel_holder) -> None:
@@ -102,9 +104,10 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
         return
 
     world_root = _world_root(websocket)
-    offer = registry.find_offer(world_root, cartridge, result_type)
+    cv_lab = _cv_lab(websocket)
+    offer = registry.find_offer(world_root, cartridge, result_type, cv_lab)
     if offer is None:
-        known = registry.known_cartridges(world_root)
+        known = registry.known_cartridges(world_root, cv_lab)
         if cartridge not in known:
             await _error(
                 sender,
@@ -273,6 +276,18 @@ async def _error(sender, reason: str, message: str, **extra) -> None:
 
 def _world_root(websocket):
     return getattr(websocket.app.state, "world_root", None)
+
+
+def _cv_lab(websocket):
+    """The live CV Lab, or None.
+
+    Fetched by name and tolerant of absence, like every other piece of app
+    state this module reads: most tests in this repository build an app
+    without one, and a missing Lab must mean "this Tower serves no
+    experiments", never an AttributeError on a connection that is
+    answering frames.
+    """
+    return getattr(websocket.app.state, "cv_lab", None)
 
 
 class ChannelHolder:

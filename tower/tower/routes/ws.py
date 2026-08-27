@@ -8,7 +8,7 @@ from tower.capture import END_REASON_DISCONNECT, END_REASON_STOP
 from tower.frames import FrameError, parse_and_decode_frame
 from tower.metrics import SessionMetrics
 from tower.modules.base import FrameSkippedError, ModuleUnavailableError
-from tower.routes import results_ws
+from tower.routes import cv_lab_ws, results_ws
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +113,18 @@ async def _handle_frame_message(
         if metrics is not None:
             metrics.record_frame_processing_error()
             metrics.record_frame_rejected()
-        await _send_frame_error(sender, frame.seq, "frame_skipped", str(exc))
+        # The module's own code when it named one, `frame_skipped`
+        # otherwise. This transport does not know what the codes mean and
+        # must not: a module that is deliberately not processing and a
+        # frame that could not be decoded are different facts, and only
+        # the module knows which one this was. See
+        # `FrameProcessingError.reason`.
+        await _send_frame_error(
+            sender,
+            frame.seq,
+            getattr(exc, "reason", None) or "frame_skipped",
+            str(exc),
+        )
         return
     except ModuleUnavailableError as exc:
         logger.warning(
@@ -163,6 +174,19 @@ async def _handle_frame_message(
     # contract work that is blocked.
     if getattr(result, "metrics", None):
         payload["metrics"] = dict(result.metrics)
+    # Who produced this number. Read HERE, between `process()` and the
+    # `await` below, and that placement is the whole guarantee: the frame
+    # path is synchronous up to this point, so nothing can have changed
+    # the running experiment since the result was computed. Additive and
+    # omitted entirely when the Tower runs no Lab.
+    #
+    # Fetched off `app.state` rather than imported: `tower/routes/ws.py`
+    # must not know which experiment produced anything, and a test
+    # (`test_shared_code_does_not_import_an_experiment_implementation`)
+    # enforces that.
+    provenance = _cv_lab_provenance(websocket)
+    if provenance is not None:
+        payload["cv_lab"] = provenance
 
     try:
         await sender.send(payload)
@@ -178,6 +202,25 @@ async def _handle_frame_message(
 
     if metrics is not None and metrics.should_log_summary():
         logger.info("[Tower][Session] summary: %s", metrics.snapshot())
+
+
+def _cv_lab_provenance(websocket):
+    """Attribution for the frame result just produced, or None.
+
+    Never raises and never blocks. A diagnostics block must not be able to
+    cost a client the result it is attached to.
+    """
+    lab = getattr(websocket.app.state, "cv_lab", None)
+    if lab is None:
+        return None
+    try:
+        return lab.frame_provenance()
+    except Exception:
+        logger.exception(
+            "[Tower][Frame] could not read CV Lab provenance; the result is "
+            "sent without it"
+        )
+        return None
 
 
 def _frame_observers(websocket):
@@ -450,6 +493,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "measurement window"
                     )
                 _stop_capture(websocket, END_REASON_STOP, owner=connection_token)
+            elif message_type in cv_lab_ws.CV_LAB_MESSAGE_TYPES:
+                await cv_lab_ws.handle(
+                    message, websocket=websocket, sender=sender
+                )
             elif message_type in results_ws.RESULT_MESSAGE_TYPES:
                 await results_ws.handle(
                     message,

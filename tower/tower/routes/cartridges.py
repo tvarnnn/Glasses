@@ -26,4 +26,7 @@ router = APIRouter()
 
 @router.get("/cartridges")
 def cartridges(request: Request) -> dict:
-    return registry.declare(getattr(request.app.state, "world_root", None))
+    return registry.declare(
+        getattr(request.app.state, "world_root", None),
+        getattr(request.app.state, "cv_lab", None),
+    )

@@ -63,6 +63,15 @@ RESULT_TYPE_STATUS = "status"
 # counts does.
 WORLD_BUILDER_STATUS_CONTRACT = "world_builder.status/2026-08-25"
 
+# The Experimental CV Lab status document. Restated here rather than
+# imported from `tower/cv_lab/contracts.py`, and a test asserts the two
+# are equal: this module is the result channel cartridge-blind core, and
+# importing a cartridge to learn its identifier is exactly the coupling
+# `test_the_result_channel_core_is_cartridge_blind` forbids. A duplicated
+# string that a test pins cannot drift; an import would make the shared
+# surface depend on one cartridge package layout.
+EXPERIMENTAL_CV_STATUS_CONTRACT = "experimental_cv.status/2026-08-27"
+
 # The channel's own envelope contract, distinct from any cartridge's.
 # A change here affects every cartridge at once, which is exactly why it
 # is versioned separately from the payloads it carries.

@@ -182,11 +182,15 @@ def test_a_world_builder_subscription_only_ever_carries_world_builder(
 
 
 def test_no_other_cartridge_can_be_subscribed_to(monkeypatch, world_root):
-    """The registry is the only gate, and it refuses everything else."""
+    """The registry is the only gate, and it refuses everything else.
+
+    `experimental_cv` left this list on 2026-08-27, when it gained a
+    contract of its own. It is covered by
+    `tests/test_cv_lab_protocol.py` instead; the three below have none.
+    """
     client = make_client(monkeypatch, world_root)
     with client.websocket_connect("/ws") as ws:
         for cartridge in (
-            "experimental_cv",
             "document_memory",
             "scene_understanding",
             "object_memory",

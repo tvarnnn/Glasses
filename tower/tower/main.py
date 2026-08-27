@@ -15,7 +15,14 @@ from tower.modules.base import Module
 from tower.modules.container import ModuleContainer
 from tower.modules.experimental_cv import ExperimentalCVModule
 from tower.results import build_hub
-from tower.routes import cartridges, geometry, health, observations, ws
+from tower.routes import (
+    cartridges,
+    cv_lab,
+    geometry,
+    health,
+    observations,
+    ws,
+)
 from tower.session import ConnectionTracker
 
 logger = logging.getLogger(__name__)
@@ -28,7 +35,7 @@ logger = logging.getLogger(__name__)
 TOWER_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _build_cv_module(settings: Settings) -> Module:
+def _build_cv_module(settings: Settings, connection_count=None) -> Module:
     """The one module slot.
 
     There used to be a branch here selecting a different Module subclass
@@ -36,10 +43,24 @@ def _build_cv_module(settings: Settings) -> Module:
     Experiment state now lives behind the Experiment protocol, so the
     module is the same one whichever experiment is selected -- which is
     what the module doc always said: one Lab slot, many experiments.
+
+    `settings.cv_experiment` is now the STARTUP DEFAULT and nothing more.
+    It is what this Tower arms at boot so that a client which knows
+    nothing about the CV Lab still receives a `frame_result` for every
+    frame, exactly as before; a client that does know sends
+    `cv_lab_start` and the environment variable stops mattering until the
+    next restart. That is the whole of "remove the product dependence on
+    TOWER_CV_EXPERIMENT": it survives as a developer default, not as the
+    only way to choose.
+
+    `connection_count` lets the Lab report how many clients are attached,
+    which is what turns "I pressed Start and nothing happened" from a
+    guess into a reading.
     """
     return ExperimentalCVModule(
         settings.cv_experiment,
         ExperimentSettings(device=settings.cv_device),
+        connection_count=connection_count,
     )
 
 
@@ -146,6 +167,13 @@ def _log_effective_configuration(
             settings.observation_root,
         )
 
+    logger.info(
+        "[Tower][Config] CV Lab startup default is %r on device %r; a client "
+        "may select another with cv_lab_start, no restart required",
+        settings.cv_experiment,
+        settings.cv_device,
+    )
+
     if supervisor.enabled:
         logger.info(
             "[Tower][Config] a builder will be attached to each capture, "
@@ -186,7 +214,19 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Glasses Tower", lifespan=lifespan)
     app.state.session = ConnectionTracker()
     settings = get_settings()
-    app.state.module_container = ModuleContainer(_build_cv_module(settings))
+    cv_module = _build_cv_module(
+        settings,
+        # Read lazily, so the Lab reports the count at the moment it is
+        # asked rather than the count at startup, which is always zero.
+        connection_count=lambda: app.state.session.live_connections,
+    )
+    app.state.module_container = ModuleContainer(cv_module)
+    # The SAME object the module holds -- not a second Lab, and not a
+    # copy of its state. Two Labs sharing one slot would be the "two
+    # experiments at once" failure the whole design exists to prevent, and
+    # a copy would be a second answer to "what is running" that starts
+    # disagreeing the moment somebody switches.
+    app.state.cv_lab = cv_module.lab
     app.state.frame_observers = _build_frame_observers(settings)
     # Read-only, and read by the result channel alone. The web process
     # never builds a world; world_build_session.py does, in its own
@@ -204,7 +244,7 @@ def create_app() -> FastAPI:
     # One shared reader for the whole app. It starts no task until a
     # client subscribes and stops again when the last one goes, so a Tower
     # nobody is watching does no polling and no disk IO on its behalf.
-    app.state.result_hub = build_hub(settings.world_root)
+    app.state.result_hub = build_hub(settings.world_root, app.state.cv_lab)
     # Started here, not in `lifespan` above: TestClient(create_app()) used
     # without `with client:` (every pre-existing test in this repo) never
     # runs ASGI lifespan events, leaving the module UNLOADED forever. See
@@ -212,6 +252,7 @@ def create_app() -> FastAPI:
     asyncio.run(app.state.module_container.load_and_start())
     app.include_router(health.router)
     app.include_router(cartridges.router)
+    app.include_router(cv_lab.router)
     app.include_router(geometry.router)
     app.include_router(observations.router)
     app.include_router(ws.router)

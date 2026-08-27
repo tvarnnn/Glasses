@@ -79,7 +79,13 @@ def test_an_unconfigured_tower_still_offers_the_contract(monkeypatch):
 
 
 def test_cartridges_without_a_contract_are_not_offered(monkeypatch, built):
-    """Presence in `not_offered` must never read as an offer."""
+    """Presence in `not_offered` must never read as an offer.
+
+    `experimental_cv` moved out of `not_offered` on 2026-08-27, when the
+    experiment-registry and provenance work its entry was waiting on
+    landed. The two sets must stay disjoint, which is the invariant this
+    test is really for.
+    """
     root, _, _ = built
     client = make_client(monkeypatch, root)
     declaration = client.get("/cartridges").json()
@@ -87,11 +93,20 @@ def test_cartridges_without_a_contract_are_not_offered(monkeypatch, built):
     offered = {entry["cartridge"] for entry in declaration["cartridges"]}
     silent = {entry["cartridge"] for entry in declaration["not_offered"]}
 
-    assert offered == {"world_builder"}
-    assert silent == {"experimental_cv", "document_memory", "scene_understanding"}
+    assert offered == {"world_builder", "experimental_cv"}
+    assert silent == {"document_memory", "scene_understanding"}
     assert offered.isdisjoint(silent)
     for entry in declaration["not_offered"]:
         assert "contract" not in entry
+
+
+def test_the_world_builder_offer_stays_at_index_zero(monkeypatch, built):
+    """Two tests in this file index `cartridges[0]`, and a shipped client
+    may too. Adding an offer must not renumber an existing one."""
+    root, _, _ = built
+    client = make_client(monkeypatch, root)
+    declaration = client.get("/cartridges").json()
+    assert declaration["cartridges"][0]["cartridge"] == "world_builder"
 
 
 def test_the_declaration_says_results_are_snapshots(monkeypatch, built):
@@ -353,7 +368,7 @@ def test_unknown_cartridge_is_refused_with_what_is_offered(monkeypatch, built):
         error = drain(ws, expect="result_error")
 
     assert error["reason"] == "unknown_cartridge"
-    assert error["offered"] == ["world_builder"]
+    assert error["offered"] == ["experimental_cv", "world_builder"]
 
 
 def test_unknown_result_type_is_distinct_from_unknown_cartridge(monkeypatch, built):
@@ -492,6 +507,13 @@ def test_the_registry_refuses_every_unoffered_pair(monkeypatch, built):
     assert registry.find_offer(root, "world_builder", "geometry") is None
     assert registry.find_offer(root, "document_memory", "status") is None
     assert registry.find_offer(None, "world_builder", "status")["available"] is False
+    # Offered, but unavailable without a Lab to serve it -- the third
+    # state, not the first.
+    assert registry.find_offer(root, "experimental_cv", "status") is not None
+    assert registry.find_offer(root, "experimental_cv", "metrics") is None
+    assert (
+        registry.find_offer(root, "experimental_cv", "status")["available"] is False
+    )
 
 
 # -- the document and the code must not drift --------------------------
