@@ -312,9 +312,8 @@ of them was wrong by about a third.
 carries several autonomous agent lanes at the same time — two more
 appeared in `git worktree list` while these numbers were being taken. So
 the latency figures below are **ranges**, and they are given as ranges.
-Four consecutive replays of the same capture, back to back, gave 40.6,
-43.4, 45.1 and 46.9 ms/frame: an 11% spread with nothing of ours
-competing.
+Five consecutive replays of the same capture, back to back, spanned
+**39.8 to 46.9 ms/frame**: an 18% spread with nothing of ours competing.
 
 That is the most transferable finding in this section. A benchmark that
 shares this box with a test suite reports numbers 30–50% high, and a
@@ -325,18 +324,16 @@ shares this box with a test suite reports numbers 30–50% high, and a
 Replaying the physically validated capture (2,203 frames, 186 s of
 recording), one run at a time:
 
-| device | seconds | ms/frame | detections | observations |
-|---|---|---|---|---|
-| **CPU** | 103.3 | **46.886** | 4,287 | 8 |
-| CPU, three more back-to-back runs | 89.4 / 95.5 / 99.3 | **40.572 / 43.366 / 45.086** | 4,287 | 8 |
-| CUDA | 107.4 | 48.757 | 4,285 | 8 |
+| device | ms/frame | detections | observations |
+|---|---|---|---|
+| **CPU**, five consecutive replays | **39.810 / 40.572 / 43.366 / 45.086 / 46.886** | 4,287 every time | 8 |
+| CUDA | 48.664 | 4,285 | 8 |
 
 **The two are within noise of each other.** The CPU spread alone is
-40.6–46.9 across four consecutive runs; CUDA measured 48.8 here and 43.9
-in an independent audit which also measured CPU at 51.0 — i.e. the
-ordering flipped between two honest measurements on the same machine. An
-earlier draft of this document claimed CPU was ~30% faster on the
-strength of contended runs.
+39.8–46.9; CUDA measured 48.7 here and 43.9 in an independent audit which
+also measured CPU at 51.0 — i.e. the ordering flipped between two honest
+measurements on the same machine. An earlier draft of this document
+claimed CPU was ~30% faster on the strength of contended runs.
 An independent audit on the same host measured the ordering the other way
 (CUDA 43.9 against CPU 51.0) at a similar margin; run-to-run variance on
 this machine is 16–25%, which is larger than the gap. The honest
@@ -408,24 +405,30 @@ One run at a time, idle host:
 
 | | observations | seconds | ms/frame | verifier calls | model time |
 |---|---|---|---|---|---|
-| `--verifier none` | 8 | 103.3 | 46.886 | — | — |
-| `--verifier owlv2` | **11** | 112.1 | 50.879 | **4** | 1.00 s |
+| `--verifier none` | 8 | 87.7 | 39.810 | — | — |
+| `--verifier owlv2` | **12** | 102.7 | 46.621 | **5** | 1.08 s |
 
-Of the 8.8 extra seconds, **1.0 is inference** and the remainder is the
-one-off model load. Excluding the load, that is **+0.45 ms/frame for
-three more memories** (2 `bottle`, 1 `mouse`). Queue peak depth **0**;
-backlog drops **0**; 250 ms per call end to end, against the 126 ms of
-pure inference in §5.3 — the difference is the colour conversion, the
-PIL round-trip and the processor.
+**1.08 seconds of inference across a 186-second capture** — 0.6% of the
+recording — for four more memories: 2 `bottle`, 1 `mouse`, 1 `keyboard`.
+Plus a one-off model load of about seven seconds.
 
-Four calls across 2,203 frames is **one per 551**, which is sparser than
-the corpus-wide 1-in-355 because this particular capture is dominated by
-a laptop and a phone.
+**The per-frame difference is not attributed to the verifier**, because
+it is inside the spread of the same configuration measured five times
+(§5.1). What is attributable is the 1.08 seconds, and that is counted
+rather than estimated. 216 ms per call end to end against the 126 ms of
+pure inference in §5.3 — the difference is the colour conversion, the PIL
+round-trip and the processor.
+
+Five calls across 2,203 frames is **one per 441**, sparser than the
+corpus-wide 1-in-355 because this capture is dominated by a laptop and a
+phone.
 
 The part-of rule (a `keyboard` sighting is suppressed while a `laptop`
-sighting is open) suppressed 96 detections on this capture and removed
-the `keyboard` record entirely — in this walk the keyboard is never in
-view without the laptop it belongs to.
+sighting is open) suppressed 36 detections on this capture. The one
+`keyboard` record that survives is a lit mechanical keyboard at a desk
+with no laptop near it — which is the whole reason the rule is
+concurrent rather than blanket, and the reason a later attempt to latch
+it was reverted (§12.6 of the handoff).
 
 ## 6. A defect in the face filter, found by using it
 

@@ -174,15 +174,16 @@ on an idle host:
 
 | | observations | seconds | ms/frame | verifier calls | model time |
 |---|---|---|---|---|---|
-| `--verifier none` | 8 | 103.3 | 46.886 | — | — |
-| `--verifier owlv2` | **11** | 112.1 | 50.879 | **4** | 1.00 s |
+| `--verifier none` | 8 | 87.7 | 39.810 | — | — |
+| `--verifier owlv2` | **12** | 102.7 | 46.621 | **5** | 1.08 s |
 
-Of the 8.8 extra seconds, **1.0 is inference** and the rest is the
-one-off model load — **+0.45 ms/frame excluding the load, for three more
-memories**. Queue peak depth 0, zero backlog drops. The part-of rule
-suppressed 96 detections on this capture and removed the `keyboard`
-record entirely: in this walk the keyboard is never in view without the
-laptop it belongs to.
+**1.08 seconds of inference across a 186-second capture** — 0.6% of the
+recording — for four more memories (2 `bottle`, 1 `mouse`, 1 `keyboard`),
+plus a one-off ~7 s model load. The per-frame difference is inside the
+spread of the same configuration measured five times, so it is not
+attributed to the verifier. Queue peak depth 0, zero backlog drops. The
+part-of rule suppressed 36 detections; the `keyboard` record that
+survives is a lit mechanical keyboard at a desk with no laptop near it.
 
 **The picture.** `/object-memory/observations/{id}/{imagery,frame,crop}`.
 The handle is **derived**, so the 64 records already on disk are
@@ -230,10 +231,10 @@ mattered most.
 
 **"Idle" would be the wrong word for this host.** It carries several
 autonomous agent lanes at once — two more appeared in `git worktree
-list` while these numbers were being taken. Four consecutive replays of
-the same capture gave 40.6 / 43.4 / 45.1 / 46.9 ms/frame with nothing of
-ours competing: an 11% spread. **Read every latency figure here as a
-range**, and re-measure before making a decision that turns on one.
+list` while these numbers were being taken. Five consecutive replays of
+the same capture spanned **39.8 to 46.9 ms/frame** with nothing of ours
+competing: an 18% spread. **Read every latency figure here as a range**,
+and re-measure before making a decision that turns on one.
 
 | what | figure |
 |---|---|
@@ -241,8 +242,8 @@ range**, and re-measure before making a decision that turns on one.
 | sightings (≥0.5, gap 3 s) | 763; 499 at ≥3 frames; 404 excluding `person` |
 | sightings by tier (≥3 frames) | 158 `remembered`, 53 `verify`, 158 `context` |
 | memories per unit of walking | 211 recordable sightings over 1,942 s = **one every 9.2 s**, about 380 an hour |
-| detector, CPU, validated capture | **40.6–46.9 ms/frame** across four consecutive replays, 4,287 detections every time |
-| detector, CUDA, same | 48.8 ms/frame, 4,285 detections |
+| detector, CPU, validated capture | **39.8–46.9 ms/frame** across five consecutive replays, 4,287 detections every time |
+| detector, CUDA, same | 48.7 ms/frame, 4,285 detections |
 | CPU against CUDA | **within noise.** The CPU spread alone exceeds the gap, and an independent audit measured the ordering the other way (CUDA 43.9, CPU 51.0) |
 | read + JPEG decode | 1.06 ms/frame, 46 MB RSS |
 | producer steady-state RSS | **704 MB** (CPU) / 1,442 MB (CUDA) |
@@ -250,7 +251,7 @@ range**, and re-measure before making a decision that turns on one.
 | verifier, CUDA | **126 ms** median / 129 p95 per crop; 620 MB resident, 842 MB peak; ~7 s cold load |
 | verifier, CPU | 2,473 ms per crop, +796 MB RSS — **19× slower** |
 | verifier accuracy (94 labelled crops) | accept **~93%** / reject **~94%** at min score 0.45 |
-| end-to-end cost of the verifier | **+0.45 ms/frame** excluding a one-off ~7 s load; 4 calls, peak queue depth 0 |
+| end-to-end cost of the verifier | **1.08 s of inference across a 186 s capture** (0.6%), plus a one-off ~7 s load; 5 calls, peak queue depth 0. The per-frame difference is inside the spread above and is not attributed to it |
 | face filter firing rate on real frames | **40.2%** of 1,845 frames; median region 12.5% of frame; of 36 inspected, **4 real faces, 32 not** |
 | face filter cost | 21.8 ms/frame |
 

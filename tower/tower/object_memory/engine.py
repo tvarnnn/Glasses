@@ -15,7 +15,7 @@ and was the actual product gap.
 
 THE FUNNEL, AND WHERE EACH STAGE'S COST GOES.
 
-    every frame        decode + detector          41-47 ms, CPU, measured
+    every frame        decode + detector          40-47 ms, CPU, measured
     every detection    four deterministic gates   microseconds
     every sighting     one record, once           an append
     some sightings     a semantic second opinion  off the frame path
@@ -28,13 +28,13 @@ that one capture. Every one of those figures is counted at runtime and
 printed, because a funnel whose narrowing is not measured is a funnel
 that has quietly stopped narrowing.
 
-The range is the measurement. Four consecutive replays of the same
-capture with no other work of ours running gave 40.6, 43.4, 45.1 and
-46.9 ms/frame; two earlier runs that overlapped our own benchmarks gave
-66 and 69. This host carries several autonomous agent lanes at once, so
-even the lower figures are not an idle-machine number -- and an earlier
-draft of this docstring quoting a flat "68 ms" was quoting one of the
-contended runs as if it were.
+The range is the measurement. Five consecutive replays of the same
+capture with no other work of ours running spanned **39.8 to 46.9
+ms/frame**; two earlier runs that overlapped our own benchmarks gave 66
+and 69. This host carries several autonomous agent lanes at once, so even
+the lower figures are not an idle-machine number -- and an earlier draft
+of this docstring quoting a flat "68 ms" was quoting one of the contended
+runs as if it were.
 
 WHY A RECORD IS WRITTEN EARLY AND UPDATED LATER.
 

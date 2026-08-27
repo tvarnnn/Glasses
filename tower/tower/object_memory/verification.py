@@ -28,13 +28,19 @@ runs about ten times a second.
 Measured end to end rather than projected, one run at a time on an idle
 host, replaying that capture:
 
-    verifier none    8 observations   103.3 s   46.886 ms/frame
-    verifier owlv2  11 observations   112.1 s   50.879 ms/frame
-                                      4 calls in 1.0 s of model time
+    verifier none    8 observations    87.7 s   39.810 ms/frame
+    verifier owlv2  12 observations   102.7 s   46.621 ms/frame
+                                      5 calls in 1.08 s of model time
 
-Of the 8.8 extra seconds, **1.0 is inference** and the rest is the
-one-off model load. Excluding the load that is +0.45 ms/frame, for three
-more memories. The queue never queued: peak depth 0, zero backlog drops.
+**1.08 seconds of inference across a 186-second capture** -- 0.6% of the
+recording -- for four more memories, plus a one-off model load of about
+seven seconds. The per-frame difference between the two runs is INSIDE
+the run-to-run spread of the same configuration (39.8 to 46.9 across five
+replays), so it is not attributed to the verifier here. What is
+attributable is the 1.08 seconds, and it is counted rather than
+estimated.
+
+The queue never queued: peak depth 0, zero backlog drops.
 
 Every one of those numbers is counted at runtime rather than assumed:
 `VerificationQueue` reports submissions, completions, refusals, drops and

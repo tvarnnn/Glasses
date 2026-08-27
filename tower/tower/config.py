@@ -103,14 +103,14 @@ class Settings:
     # was 87.8, and neither number describes a quiet host.
     #
     # Re-measured with no other work of ours running, replaying the same
-    # 2,203-frame capture: CPU **40.6, 43.4, 45.1 and 46.9 ms/frame**
-    # across four consecutive runs, against CUDA at 48.8. An independent
-    # audit on the same host measured the ordering the OTHER WAY (CUDA
-    # 43.9 against CPU 51.0). The spread within one device exceeds the
-    # gap between them, so the honest statement is that this detector
-    # costs about the same either way -- the work is single-frame
-    # preprocessing and transfer, not the 320x320 forward pass, and
-    # neither device is doing much of it.
+    # 2,203-frame capture: CPU **39.8 to 46.9 ms/frame** across five
+    # consecutive runs, against CUDA at 48.7. An independent audit on the
+    # same host measured the ordering the OTHER WAY (CUDA 43.9 against
+    # CPU 51.0). The spread within one device exceeds the gap between
+    # them, so the honest statement is that this detector costs about the
+    # same either way -- the work is single-frame preprocessing and
+    # transfer, not the 320x320 forward pass, and neither device is doing
+    # much of it.
     #
     # THIS HOST IS NOT QUIET. It carries several autonomous agent lanes
     # at once, and two more appeared in `git worktree list` while these
