@@ -540,6 +540,114 @@ def _pnp_observations(source, target, matches, intrinsics) -> list:
     return observations
 
 
+@dataclass(frozen=True)
+class _Pack:
+    """Every observation's arrays, stacked once.
+
+    `_refine` evaluates residuals 200-odd times per call and the
+    observation arrays never change across any of them, so the Python loop
+    that walked them was re-doing per-call work that is invariant. This is
+    that work, hoisted.
+
+    `camera` indexes rows back to the observation they came from, which is
+    what lets the whole set be projected in one pass instead of one pass
+    per camera.
+    """
+
+    object_points: np.ndarray   # (N, 3)
+    image_points: np.ndarray    # (N, 2)
+    r_target: np.ndarray        # (C, 3, 3)
+    t_target: np.ndarray        # (C, 3)
+    camera: np.ndarray          # (N,) int, row -> camera
+    count: int                  # N
+
+
+def _pack(observations: list) -> _Pack:
+    """Stack observations for repeated residual evaluation.
+
+    Row order is observation-then-point, matching what the per-observation
+    loop produced, because `_refine` pairs residual rows elementwise with
+    per-row weights and a different order would silently mis-weight them.
+    """
+    if not observations:
+        empty3 = np.zeros((0, 3), dtype=np.float64)
+        return _Pack(
+            object_points=empty3,
+            image_points=np.zeros((0, 2), dtype=np.float64),
+            r_target=np.zeros((0, 3, 3), dtype=np.float64),
+            t_target=np.zeros((0, 3), dtype=np.float64),
+            camera=np.zeros(0, dtype=np.intp),
+            count=0,
+        )
+    counts = [len(o.object_points) for o in observations]
+    return _Pack(
+        object_points=np.concatenate(
+            [np.asarray(o.object_points, dtype=np.float64).reshape(-1, 3)
+             for o in observations]
+        ),
+        image_points=np.concatenate(
+            [np.asarray(o.image_points, dtype=np.float64).reshape(-1, 2)
+             for o in observations]
+        ),
+        r_target=np.stack(
+            [np.asarray(o.r_target, dtype=np.float64) for o in observations]
+        ),
+        t_target=np.stack(
+            [np.asarray(o.t_target, dtype=np.float64).reshape(3)
+             for o in observations]
+        ),
+        camera=np.repeat(np.arange(len(observations), dtype=np.intp), counts),
+        count=int(sum(counts)),
+    )
+
+
+def _residuals_packed(params: np.ndarray, pack: _Pack, intrinsics) -> np.ndarray:
+    """`_residuals` over a stacked pack. Same arithmetic, no Python loop.
+
+    MEASURED, and the reason this exists: the per-observation loop cost
+    327 ns per point-residual -- roughly two orders of magnitude above the
+    arithmetic -- because it made about forty numpy calls per invocation
+    on arrays of ~44 rows, where numpy cannot amortise its dispatch. The
+    working size is 4.5 cameras and 197.6 points per call.
+
+    `_residuals` remains as the reference implementation and the two are
+    checked against each other in
+    tests/test_world_registration_residual_parity.py.
+    """
+    if pack.count == 0:
+        return np.zeros((0, 2))
+
+    scale = math.exp(params[0])
+    rotation, _ = cv2.Rodrigues(params[1:4])
+    translation = params[4:7]
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+
+    # Per CAMERA -- a handful of rows, so the cost here is negligible.
+    r_source = pack.r_target @ rotation.T                       # (C, 3, 3)
+    t_source = scale * pack.t_target - r_source @ translation   # (C, 3)
+
+    # Per POINT, in one pass. The gather is (N, 3, 3), which at the
+    # measured working size is a few tens of kilobytes.
+    index = pack.camera
+    camera = (
+        np.einsum("nij,nj->ni", r_source[index], pack.object_points)
+        + t_source[index]
+    )
+
+    depth = camera[:, 2]
+    behind = depth <= 1e-6
+    safe = np.where(behind, 1e-6, depth)
+    residual = np.empty((pack.count, 2))
+    residual[:, 0] = fx * camera[:, 0] / safe + cx - pack.image_points[:, 0]
+    residual[:, 1] = fy * camera[:, 1] / safe + cy - pack.image_points[:, 1]
+    # A point behind the camera is not a large error, it is a different
+    # solution. Saturate PER POINT rather than let the projection wrap
+    # sign and look like a good fit.
+    residual[behind] = 1e4
+    return residual
+
+
 def _residuals(params: np.ndarray, observations: list, intrinsics) -> np.ndarray:
     """Reprojection of the source's landmarks into the target's images.
 
@@ -580,7 +688,11 @@ def _residuals(params: np.ndarray, observations: list, intrinsics) -> np.ndarray
 
 
 def _huber_cost(params, observations, intrinsics) -> float:
-    norms = np.linalg.norm(_residuals(params, observations, intrinsics), axis=1)
+    return _huber_cost_packed(params, _pack(observations), intrinsics)
+
+
+def _huber_cost_packed(params, pack: _Pack, intrinsics) -> float:
+    norms = np.linalg.norm(_residuals_packed(params, pack, intrinsics), axis=1)
     return float(
         np.mean(np.where(norms < HUBER_PX, norms ** 2,
                          HUBER_PX * (2 * norms - HUBER_PX)))
@@ -597,10 +709,15 @@ def _refine(params, observations, intrinsics, *, iterations=40, fix_scale=False)
     params = np.asarray(params, dtype=np.float64).copy()
     free = [i for i in range(7) if not (fix_scale and i == 0)]
     damping = 1e-3
-    cost = _huber_cost(params, observations, intrinsics)
+    # Stacked ONCE. The observation arrays are invariant across every
+    # residual evaluation below -- roughly 200 of them per call -- and
+    # walking them per evaluation was the single largest cost in
+    # registration (38.8% of a run, 327 ns per point-residual).
+    pack = _pack(observations)
+    cost = _huber_cost_packed(params, pack, intrinsics)
 
     for _ in range(iterations):
-        base = _residuals(params, observations, intrinsics)
+        base = _residuals_packed(params, pack, intrinsics)
         norms = np.linalg.norm(base, axis=1)
         weights = np.repeat(
             np.where(norms < HUBER_PX, 1.0,
@@ -612,7 +729,7 @@ def _refine(params, observations, intrinsics, *, iterations=40, fix_scale=False)
             probe = params.copy()
             probe[index] += step
             jacobian[:, column] = (
-                (_residuals(probe, observations, intrinsics) - base) / step
+                (_residuals_packed(probe, pack, intrinsics) - base) / step
             ).ravel()
         weighted_j = jacobian * weights[:, None]
         weighted_r = base.ravel() * weights
@@ -631,7 +748,7 @@ def _refine(params, observations, intrinsics, *, iterations=40, fix_scale=False)
             probe = params.copy()
             for column, index in enumerate(free):
                 probe[index] += delta[column]
-            probe_cost = _huber_cost(probe, observations, intrinsics)
+            probe_cost = _huber_cost_packed(probe, pack, intrinsics)
             if probe_cost < cost:
                 params, cost = probe, probe_cost
                 damping = max(damping * 0.3, 1e-9)

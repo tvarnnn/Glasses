@@ -239,3 +239,101 @@ class TestItIsAPureFunction:
         first = wreg._residuals(params, [observation], INTRINSICS)
         second = wreg._residuals(params, [observation], INTRINSICS)
         assert first.tobytes() == second.tobytes()
+
+
+class TestTheVectorisedPathMatchesTheReference:
+    """`_residuals` (the per-observation loop) is kept as the reference.
+    `_residuals_packed` is what `_refine` actually calls. They must agree.
+
+    Tolerance rather than bit-equality, deliberately: the two do the same
+    arithmetic in a different ORDER -- per-camera matmul against one
+    gathered einsum -- so the last bits of a float64 can differ. What must
+    not differ is the answer to any question the caller asks of it. The
+    end-to-end check is that registration admits the same pairs, and that
+    is asserted in the corpus test rather than here.
+    """
+
+    def _pack_of(self, observations):
+        return wreg._pack(observations)
+
+    def test_they_agree_on_a_realistic_working_set(self):
+        """The measured working size: ~4.5 cameras, ~44 points each."""
+        rng = np.random.default_rng(11)
+        observations = []
+        for _ in range(5):
+            n = 44
+            points = np.column_stack([
+                rng.uniform(-2, 2, n), rng.uniform(-2, 2, n),
+                rng.uniform(1.5, 12.0, n),
+            ])
+            rvec = rng.uniform(-0.3, 0.3, 3)
+            rot, _ = __import__("cv2").Rodrigues(rvec)
+            observations.append(
+                _observation(points, rng.uniform(0, 400, (n, 2)),
+                             rotation=rot, translation=rng.uniform(-1, 1, 3))
+            )
+        params = np.array([0.05, 0.02, -0.03, 0.04, 0.5, -0.2, 0.3])
+
+        reference = wreg._residuals(params, observations, INTRINSICS)
+        packed = wreg._residuals_packed(params, self._pack_of(observations), INTRINSICS)
+
+        assert reference.shape == packed.shape
+        assert np.allclose(reference, packed, rtol=1e-9, atol=1e-9), (
+            f"max abs divergence {np.abs(reference - packed).max()}"
+        )
+
+    def test_they_agree_on_points_behind_the_camera(self):
+        """The saturation branch is where a vectorised rewrite most easily
+        diverges -- per-point versus per-observation."""
+        mixed = np.array([
+            [0.0, 0.0, 5.0], [0.0, 0.0, -5.0], [0.1, 0.1, 5.0], [0.0, 0.0, 0.0],
+        ])
+        pixels = np.zeros((4, 2))
+        clean = np.array([[0.2, 0.1, 3.0], [0.3, -0.1, 4.0]])
+        observations = [
+            _observation(mixed, pixels),
+            _observation(clean, np.zeros((2, 2))),
+        ]
+        params = np.array([0.1, 0.05, 0.0, 0.0, 0.0, 0.0, 0.2])
+
+        reference = wreg._residuals(params, observations, INTRINSICS)
+        packed = wreg._residuals_packed(params, self._pack_of(observations), INTRINSICS)
+        assert np.array_equal(reference, packed), (
+            "saturation disagreed between the loop and the vectorised path"
+        )
+
+    def test_they_agree_when_there_is_nothing_to_do(self):
+        assert wreg._residuals(_identity_params(), [], INTRINSICS).shape == (0, 2)
+        assert wreg._residuals_packed(
+            _identity_params(), self._pack_of([]), INTRINSICS
+        ).shape == (0, 2)
+
+    def test_they_agree_when_an_observation_is_empty(self):
+        observations = [
+            _observation(np.zeros((0, 3)), np.zeros((0, 2))),
+            _observation([[0.0, 0.0, 5.0]], [[1.0, 1.0]]),
+        ]
+        reference = wreg._residuals(_identity_params(), observations, INTRINSICS)
+        packed = wreg._residuals_packed(
+            _identity_params(), self._pack_of(observations), INTRINSICS
+        )
+        assert np.array_equal(reference, packed)
+
+    def test_the_pack_does_not_alias_its_inputs(self):
+        """The pack outlives every residual evaluation in a `_refine` call.
+        If it aliased the observation arrays, a later mutation anywhere
+        would silently change results mid-optimisation."""
+        points = np.array([[0.5, -0.25, 4.0]])
+        observation = _observation(points, [[10.0, 20.0]])
+        pack = wreg._pack([observation])
+        observation.object_points[0, 0] = 99.0
+        assert pack.object_points[0, 0] == 0.5, "the pack aliased its input"
+
+    def test_row_order_is_observation_then_point(self):
+        """`_refine` pairs rows elementwise with per-row weights."""
+        first = _observation([[0.0, 0.0, 5.0]], [[1.0, 2.0]])
+        second = _observation([[1.0, 1.0, 5.0], [2.0, 2.0, 5.0]],
+                              [[3.0, 4.0], [5.0, 6.0]])
+        pack = wreg._pack([first, second])
+        assert pack.camera.tolist() == [0, 1, 1]
+        assert np.array_equal(pack.image_points, [[1, 2], [3, 4], [5, 6]])
