@@ -941,3 +941,44 @@ this programme right now.
 9. **Do not start** Environmental Memory (its own design says so), Translator,
    or the voice halves of Visual Q&A and Accessibility. There is no audio path
    anywhere in the system and building one is a subsystem, not a feature.
+
+
+---
+
+# Commit Index
+
+| Commit | What it carries |
+|---|---|
+| `32ea0ee` | **feat(ios): the rung stops being a constant, and the grid gets an order** — World Builder fragment ranking; the DEBUG capture-resolution control; `CartridgeDrawerRow` unifying the four `workspace != nil` derivations; the stale doc comments the live Tower contradicts; and `TOWER-LANE-HANDOFF-FROM-MAC.md` |
+| `fea8e71` | **feat(ios): the badges stop describing a roadmap, and the Lab shows its answer** — the `CartridgeStatus` vocabulary change; the Experimental CV Lab surfacing its own output; the Tower capture-state panel; every fix from both adversarial reviews and the privacy review; and this report |
+
+Base of the run: `2dce88d`. Neither commit rewrote history; nothing was
+force-pushed; `main` was not touched.
+
+---
+
+# Closing note — what this run actually establishes
+
+The task assumed a large backend waiting to be wired into a UI. **The
+measurable finding is that the Mega branch was already fully consumed and that
+the Tower offers exactly one typed contract**, with four of the nine cartridges
+having no backend code at all. Building screens for those would have meant
+rendering data no backend produces.
+
+So the work that remained was smaller than briefed, and most of the value in
+this report is not the code:
+
+- **Three claims in the Tower's own contract document are stale**, and one of
+  them — the capture-timestamp prerequisite — was **answered by this lane days
+  ago and never handed back**. That handoff is the highest-value artifact here.
+- **The same stale belief** — "no module runtime exists yet" — was found in
+  **three separate places** in the iOS source, most visibly as a drawer badge
+  telling a person that a device-validated cartridge was a "Future" concept.
+- **Both adversarial reviews found real defects in this run's own work**, one of
+  which was a user-visible falsehood in Release that all four green gates
+  passed over. That is the argument for the reviewer rule, stated as evidence
+  rather than as policy.
+
+Nothing here was validated on hardware. **Batch A is four tests in a single
+~15-minute donning, and A4 is the only way to confirm the paused-session fix,
+because no test can produce a cap-touch.**
