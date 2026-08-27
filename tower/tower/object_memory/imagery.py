@@ -89,6 +89,20 @@ CONFIDENCE = 0.30
 NMS_THRESHOLD = 0.30
 TOP_K = 5000
 UPSCALE = 2
+# The longest side the detector is ever handed, after upscaling.
+#
+# `UPSCALE = 2` was measured at 640x360, where it produces 1280x720. At
+# that size the filter costs ~22 ms. Applied blindly to a larger frame it
+# is quadratic: a 4000x4000 image upscaled 2x holds the shared lock for
+# **2.18 seconds**, and every other request for a picture waits behind
+# it. That is not hypothetical -- raising capture resolution is the one
+# change this cartridge's own roadmap entry recommends.
+#
+# So the upscale is a TARGET rather than a constant: whatever factor gets
+# the long side to 1280, capped at 2 and never below 1. At the corpus's
+# 360x640 that is exactly 2, so nothing measured here changes; at 720x1280
+# it is 1, and the work stays bounded.
+TARGET_LONG_SIDE = 1280
 HEAD_DILATION = 1.6
 # Solid fill, not blur: blur is partially invertible, and it is not
 # cheaper.
@@ -152,6 +166,28 @@ class Imagery:
     @property
     def available(self) -> bool:
         return self.image_bytes is not None
+
+
+def detector_scale(height: int, width: int) -> float:
+    """The factor an image is resized by before detection.
+
+    A CAP, not a floor: whatever puts the long side at
+    `TARGET_LONG_SIDE`, never more than `UPSCALE`. A frame LARGER than
+    the target is scaled DOWN, and that is the only way the work under
+    the shared lock is actually bounded -- merely refusing to upscale a
+    4000x4000 frame still leaves a 4000x4000 detection holding it, which
+    a reviewer measured at 2.18 seconds while every other request for a
+    picture waited.
+
+    It costs small faces in a very large frame. A very large frame is
+    also not something this cartridge can receive: DAT caps capture at
+    720x1280, which lands exactly on the target, and at the corpus's
+    360x640 the factor is exactly the 2 every constant here was measured
+    at.
+
+    A free function so the decision can be asserted without a model.
+    """
+    return min(float(UPSCALE), TARGET_LONG_SIDE / max(height, width, 1))
 
 
 def model_path() -> Path | None:
@@ -282,9 +318,10 @@ class FaceFilter:
         import cv2
 
         height, width = image.shape[:2]
+        upscale = detector_scale(height, width)
         scaled = cv2.resize(
             image,
-            (width * UPSCALE, height * UPSCALE),
+            (max(1, int(width * upscale)), max(1, int(height * upscale))),
             interpolation=cv2.INTER_CUBIC,
         )
         size = (scaled.shape[1], scaled.shape[0])
@@ -303,7 +340,7 @@ class FaceFilter:
 
         boxes = []
         for face in faces:
-            x, y, w, h = (float(value) / UPSCALE for value in face[:4])
+            x, y, w, h = (float(value) / upscale for value in face[:4])
             # Dilate about the centre: a face box is not a head.
             cx, cy = x + w / 2.0, y + h / 2.0
             w *= HEAD_DILATION

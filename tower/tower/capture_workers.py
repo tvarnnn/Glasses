@@ -49,6 +49,14 @@ logger = logging.getLogger(__name__)
 # `failed` with a pid that no longer exists.
 DEFAULT_GRACE_SECONDS = 10.0
 
+# How long a TERMINATED worker gets to actually die before it is treated
+# as un-killable. Distinct from the grace above, which is how long a
+# worker gets to finish on its own BEFORE being terminated: this one is
+# waiting on a process that has already been shot, and on Windows that
+# wait is real -- `TerminateProcess` is asynchronous and a `poll()`
+# straight afterwards routinely still returns None.
+TERMINATE_TIMEOUT_SECONDS = 2.0
+
 PLACEHOLDER_CAPTURE_DIR = "{capture_dir}"
 PLACEHOLDER_CAPTURE_ID = "{capture_id}"
 # Substituted with one of the two values below. A worker whose argv does
@@ -327,7 +335,15 @@ class CaptureWorkerSupervisor:
                 return 0
             stopped = 0
             for root, worker in list(registry.workers.items()):
-                self._stop_worker(worker, grace_seconds)
+                if not self._stop_worker(worker, grace_seconds):
+                    # Still alive. KEEPING it in the registry is the
+                    # point: forgetting a worker that could not be
+                    # terminated makes it an orphan nothing can see --
+                    # not `status`, not `/health`, not the next
+                    # `shutdown` -- and three Stop/Start cycles then
+                    # leave four producers running with the supervisor
+                    # aware of one.
+                    continue
                 registry.forget(root)
                 stopped += 1
             return stopped
@@ -402,8 +418,8 @@ class CaptureWorkerSupervisor:
         with self._lock:
             for registry in self._registries.values():
                 for root, worker in list(registry.workers.items()):
-                    self._stop_worker(worker, grace_seconds)
-                    registry.forget(root)
+                    if self._stop_worker(worker, grace_seconds):
+                        registry.forget(root)
 
     # -- reporting ----------------------------------------------------
 
@@ -568,7 +584,16 @@ class CaptureWorkerSupervisor:
         )
         return True
 
-    def _stop_worker(self, worker: _Worker, grace_seconds: float) -> None:
+    def _stop_worker(self, worker: _Worker, grace_seconds: float) -> bool:
+        """Stop one worker. Returns whether it is actually gone.
+
+        The return value is what stops an orphan. A `terminate()` that
+        raises used to be logged and then forgotten anyway, which removed
+        the worker from the registry while leaving the process running --
+        invisible to `status`, to `/health` and to the next `shutdown`.
+        Three Stop/Start cycles left four producers alive with the
+        supervisor aware of one.
+        """
         process = worker.process
         try:
             process.wait(timeout=grace_seconds)
@@ -578,18 +603,46 @@ class CaptureWorkerSupervisor:
                 process.pid,
                 worker.capture_id,
             )
+            return True
+        except Exception:
+            if grace_seconds:
+                logger.warning(
+                    "[Tower][Worker] worker pid %s for capture %s did not "
+                    "exit within %.1fs; terminating.",
+                    process.pid,
+                    worker.capture_id,
+                    grace_seconds,
+                )
+        try:
+            process.terminate()
+        except Exception:
+            logger.exception(
+                "[Tower][Worker] could NOT terminate pid %s; it stays in the "
+                "registry so it is still visible to /health and to the next "
+                "shutdown, and nothing else will be attached in its place",
+                process.pid,
+            )
+            return False
+
+        # `terminate()` is asynchronous. On Windows it is
+        # `TerminateProcess`, and a `poll()` immediately afterwards
+        # routinely still returns None -- so a worker that WAS killed
+        # would be reported as un-killable, stay in the registry, and
+        # make a Pause report itself as still following a capture.
+        #
+        # This wait is not the grace window that was removed. That one
+        # waited on a process nobody had asked to stop; this one waits on
+        # a process that has just been shot, and it is measured in
+        # milliseconds.
+        try:
+            process.wait(timeout=TERMINATE_TIMEOUT_SECONDS)
+            return True
         except Exception:
             logger.warning(
-                "[Tower][Worker] worker pid %s for capture %s did not exit "
-                "within %.1fs; terminating. Whatever it was writing may be "
-                "left half-finished, which a later read skips as corruption.",
+                "[Tower][Worker] pid %s did not exit within %.1fs of being "
+                "terminated; it stays in the registry so it is still "
+                "visible, and nothing else will be attached in its place",
                 process.pid,
-                worker.capture_id,
-                grace_seconds,
+                TERMINATE_TIMEOUT_SECONDS,
             )
-            try:
-                process.terminate()
-            except Exception:
-                logger.exception(
-                    "[Tower][Worker] could not terminate pid %s", process.pid
-                )
+            return False

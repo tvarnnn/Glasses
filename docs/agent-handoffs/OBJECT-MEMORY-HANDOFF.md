@@ -12,7 +12,7 @@ lane needs to do.
 | Starting commit | `6e325f8` — *measure: the shipped detector is blind below 2% of the frame* |
 | Commits | `d5000b7` lifecycle · `f489da5` policy · `5b329ad` semantics · `f90eb2c` contract and evidence · `943861b` late verdicts · plus the review-response commit that carries this file |
 | Push status | pushed to `origin/object-memory/lifecycle-and-semantics-v1` |
-| Tests | **1685 passed, 64 skipped** (was 1513 / 64 at the starting commit) |
+| Tests | **1703 passed, 64 skipped** (was 1513 / 64 at the starting commit) |
 | Known flake | `test_result_channel_hostile.py::test_the_channel_survives_the_world_vanishing_mid_subscription` failed once in five full runs with a Windows `WinError 32` on an unlink, and passed alone. This is the sharing-violation flake `LANE-OWNERSHIP.md` §3 already documents and rules to the World Builder lane; nothing in this branch touches it. |
 | Never touched | `ios/**`, `tower/tower/world_builder/**`, `main` |
 
@@ -771,7 +771,89 @@ output. Re-run: **identical result**, accept 0.932 / reject 0.943 at
 - **The `id(sighting)` concern was REFUTED** — 4,000 adversarially-timed
   frames leaked zero entries from `_last_written`.
 
-### 12.6 What is left unfixed, deliberately
+### 12.6 A SECOND round, on the fixes themselves
+
+The fixes were reviewed adversarially in their own right, and that round
+found more than the first — including **a defect in one of the first
+round's fixes that was worse than the bug it fixed**.
+
+**One critical the first round missed: path traversal.** `frame_path`
+did no containment check at all, so a record carrying
+`best_relpath="C:/Windows/win.ini"` or `"../../../SECRET.jpg"` resolved
+out of the capture tree and was served over the LAN with a "filtered"
+label. Fixed while the review was still running, and the reviewer then
+probed the fix with junctions, UNC paths, `\\?\` prefixes,
+drive-relative paths and dot-segments — all blocked.
+
+**And a critical of my own making.** The first round's fix for the
+part-of rule LATCHED the suppression onto the sighting. That turned a
+concurrent rule into a blanket one: **one sub-maturity frame of a laptop
+permanently silenced a keyboard for the rest of an unbounded sighting**,
+so five minutes of a keyboard alone wrote nothing at all. Measured over
+the corpus, the pre-latch rule produced **zero** settle-time duplicates
+and the latch removed **three to four real records**. It also
+contradicted the comment directly above it, which the commit had not
+updated.
+
+Reverted. The actual bug was narrower — `_settle` asked "was this part's
+whole in view" of an **empty** set, because by then the sighting had left
+the tracker along with everything open beside it — and the fix is for the
+caller to capture the open set *before* the close. The rule is live
+again, and it is now evaluated against something real.
+
+**A correction to what the previous commit claimed.** It said "every one
+has a regression test verified to FAIL against the code as it stood."
+That was true of five of the six and **false of one**: the `wait_idle`
+ordering test passes against the pre-fix code, because the window it
+guards is smaller than the test's polling interval. It only reproduced
+with an injected delay. Corrected here rather than in the commit,
+because this branch does not force-push.
+
+**Seven more defects, all fixed, all with guards proven against the
+broken code:**
+
+| | |
+|---|---|
+| The `wait_idle` window **still existed**, at the other end | `_in_flight` was incremented *after* `_pending.get()` returned, so a job could be off the queue and uncounted. Replaced by one `_outstanding` counter, incremented before the put and decremented after the publish — no window at either end. |
+| Removing the `finally` **leaked that counter forever** on a `BaseException` | A `KeyboardInterrupt` inside the model left `wait_idle` unable to return True again. Publishing inside the `try` and decrementing in a `finally` gets both. |
+| …and then the synchronous path drove it **negative** | It skipped the increment while `_run_one` decremented. Caught by seven engine tests each sitting out a 30-second timeout — a slow suite as a correctness signal. |
+| A killed producer could **widen the retention promise** | `append()` rewrote the manifest with a bare `open("w")`. Killed between truncate and write it leaves an unreadable manifest, which falls back to the 30-day default — so a 3-day store silently becomes a 30-day one, and the next append persists that. Now written to a temp file and replaced. Pause and Stop terminate promptly and deliberately, so this was not remote. |
+| A `terminate()` that raised left an **invisible orphan** | `detach` forgot the worker anyway. Three Stop/Start cycles left four producers running with the supervisor aware of one. A worker that cannot be stopped now stays in the registry, visible to `/health` and to the next `shutdown`, and nothing is attached in its place. |
+| **One invalid byte bricked the entire store** | `UnicodeDecodeError` out of every read path including `purge()` — so the one operation that could clean it up was the one that could not run, and the routes answered 500. Read with `errors="replace"`; the damaged line becomes one corrupt line, which the existing skip-and-prune path already handles. |
+| The face filter's lock had **no bound on hold time** | `UPSCALE = 2` applied to a 4000×4000 frame held the shared lock for 2.18 s. The upscale is now a cap on the long side rather than a constant: exactly 2 at the corpus's 360×640, 1.0 at DAT's 720×1280 maximum, and a downscale above that. |
+
+**Also confirmed clean by the second round**, with reproductions rather
+than reasoning: **no deadlock** exists among the three new locks (20
+threads, ~32k operations, no hang — `is_active()` and `worker_names()`
+are lock-free, so Session→Supervisor is the only edge); all three
+critical fixes hold over a real uvicorn server (200/200 filtered
+responses with one sha256, and 19/20 unfiltered with the lock removed —
+the original bug independently reproduced); 50 HTTP Start/Stop races with
+zero violations and zero orphans; 30 `capture_opened`/`attach` races each
+spawning exactly one process; a 20-crop thumbnail grid at ~0.42 s wall
+regardless of parallelism; `_rewrite_locked` crash-safety at four kill
+points; truncated-JSONL tolerance across six damage shapes; and the
+entire corpus-count audit.
+
+**One known limit left standing.** The store's lock is **in-process**. It
+serialises the producer against itself and does nothing about the web
+process, which holds the file open for the length of a read — and on
+Windows `os.replace` fails while any handle is open. A reviewer measured
+87–92% of rewrites failing under a reader loop. Mitigated with a bounded
+retry (five attempts over ~150 ms, which clears a short read), not fixed:
+a real fix is a lock file, and the honest place for one is the SQLite
+move the store's own docstring already names as the trigger.
+
+### 12.7 More numbers, corrected
+
+| claim | was | is |
+|---|---|---|
+| verify-tier rate | "one every 33 s" | **36.6 s** (53 sightings over 1,942 s) |
+| §1.1's class table | counts at ≥0.5, scores and areas at ≥0.15 | **every column at ≥0.5.** The median scores were far too low: laptop 0.664 → **0.934**, cell phone 0.604 → **0.907** |
+| verifier accuracy | "93.2% / 94.3%" | **~93% / ~94%** everywhere, including the two files the previous commit said it had corrected |
+| label robustness | "seven adversarial flips" | **not quoted.** Two audits said seven and three; both agree any single flip moves balanced accuracy by ≤0.015 and that 0.45 stays optimal |
+
+### 12.8 What is left unfixed, deliberately
 
 - **`bed` (24 read, 20 right) and `chair` (6 read, 5 right) have no
   machine-readable record.** They were read off contact sheets that
@@ -790,6 +872,14 @@ output. Re-run: **identical result**, accept 0.932 / reject 0.943 at
 - **The session lock serialises Pause behind a process stop.** With the
   grace at zero that is milliseconds, so it is not worth the complexity
   of releasing the lock across the detach.
+- **The store's lock is in-process**, so a rewrite still races a reader
+  in the web process. Mitigated with a bounded retry; the real fix is a
+  lock file, and the honest place for one is the SQLite move the store's
+  own docstring names as the trigger. See §12.6.
+- **A frame larger than 720×1280 is scaled DOWN before face detection**,
+  which costs small faces in a very large frame. DAT caps capture at
+  exactly that size, so it is not reachable from this pipeline — but if
+  imagery from another source is ever served, this is the trade.
 
 ---
 

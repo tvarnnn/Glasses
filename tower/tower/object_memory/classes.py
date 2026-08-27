@@ -427,8 +427,10 @@ PROMPT_FOR = {
 # "computer keyboard" and the sighting is refused.
 #
 # Measured on 94 human-labelled crops from the real corpus: with this
-# vocabulary `owlv2-base-patch16-ensemble` accepts 93.2% of correct
-# labels and rejects 94.3% of wrong ones. See
+# vocabulary `owlv2-base-patch16-ensemble` accepts ~93% of correct labels
+# and rejects ~94% of wrong ones -- two figures rather than three, because
+# 81% of the positives in that set are two block assertions and a third
+# significant figure would be more precision than the labels carry. See
 # `docs/superpowers/research/2026-08-27-object-memory-corpus-precision.md`.
 #
 # `human hand` is here as a DISTRACTOR and nothing else. A crop of
@@ -472,7 +474,11 @@ VERIFIER_DISTRACTORS = (
 # laptop.
 #
 # Suppression is CONCURRENT, not blanket, and the distinction is the
-# whole reason this is a table rather than a tier change. The other
+# whole reason this is a table rather than a tier change. It is also the
+# reason a later attempt to LATCH the suppression onto the sighting was
+# reverted: latching made one frame of a laptop silence a keyboard for
+# the rest of an unbounded sighting, which is a blanket rule wearing a
+# concurrent rule's comment. The other
 # `keyboard` record in that replay is a lit mechanical keyboard at a desk
 # with no laptop anywhere near it, which is a real object somebody could
 # genuinely go looking for. A blanket rule would lose it; a rule that

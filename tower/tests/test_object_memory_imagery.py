@@ -531,3 +531,59 @@ class TestPathContainment:
         (observation,) = store.all_observations()
 
         assert frame_path(captures, observation) is not None
+
+
+class TestTheFilterIsBounded:
+    """The lock is shared, so the work under it must not be unbounded.
+
+    `UPSCALE = 2` was measured at 640x360. Applied blindly it is
+    quadratic: a reviewer measured a 4000x4000 frame holding the shared
+    lock for 2.18 seconds while every other request for a picture waited.
+    Raising capture resolution is the one change this cartridge's own
+    roadmap entry recommends, so this is not hypothetical.
+    """
+
+    def test_the_corpus_resolution_is_upscaled_exactly_as_before(self):
+        """Nothing measured on 360x640 may move."""
+        from tower.object_memory.imagery import TARGET_LONG_SIDE, UPSCALE
+
+        assert TARGET_LONG_SIDE / 640 == UPSCALE
+
+    def test_a_frame_larger_than_the_target_is_scaled_down(self):
+        """Asserted on the decision, not on a stopwatch.
+
+        A timing assertion on a machine that carries several agent lanes
+        would be a flake generator, and the invariant is not "it is fast"
+        -- it is "the detector is never handed more than the target".
+        """
+        from tower.object_memory.imagery import TARGET_LONG_SIDE, detector_scale
+
+        for height, width in ((4000, 4000), (2400, 1800), (1440, 2560)):
+            scale = detector_scale(height, width)
+            assert max(height, width) * scale <= TARGET_LONG_SIDE + 1, (
+                height,
+                width,
+                scale,
+            )
+
+    def test_the_corpus_frame_is_still_upscaled_by_exactly_two(self):
+        from tower.object_memory.imagery import UPSCALE, detector_scale
+
+        assert detector_scale(640, 360) == UPSCALE
+
+    def test_it_still_finds_a_face_in_a_large_frame(self):
+        """A bound that stopped the filter working would be worse than
+        the unbounded version."""
+        from skimage import data
+
+        large = cv2.resize(
+            cv2.cvtColor(data.astronaut(), cv2.COLOR_RGB2BGR), (1600, 1600)
+        )
+
+        _, filled = build_face_filter().apply(large)
+
+        # At least one, not exactly one. Above the target long side the
+        # upscale is 1.0 rather than 2, and YuNet at native scale finds
+        # extra regions in this image -- which is the filter erring
+        # towards covering more, the direction it should err in.
+        assert len(filled) >= 1

@@ -629,3 +629,71 @@ class TestPartsAtTheEndOfASighting:
         engine.finish()
 
         assert [o.object_class for o in store.all_observations()] == ["keyboard"]
+
+
+class TestThePartOfRuleStaysConcurrent:
+    """A latch was tried here and was worse than the bug it fixed.
+
+    Latching the suppression onto the sighting made one sub-maturity
+    frame of a laptop silence a keyboard for the rest of an unbounded
+    sighting: five minutes of a keyboard alone wrote nothing at all. A
+    reviewer measured it removing three to four real records over the
+    corpus while preventing zero duplicates.
+
+    The rule is live again, and the actual bug -- `_settle` asking the
+    question of an EMPTY set -- is fixed by the caller capturing the open
+    classes before the close.
+    """
+
+    def _verified(self, tmp_path, frames):
+        store = ObservationStore(tmp_path, retention_seconds=None)
+        engine = ObjectMemoryEngine(
+            store,
+            FixedDetector(frames),
+            policy=RelevancePolicy(verification_available=True),
+            verification=VerificationQueue(
+                ScriptedVerifier({"keyboard", "remote", "mouse"}), workers=0
+            ),
+            clock=lambda: 1000.0,
+        )
+        engine.load()
+        return store, engine
+
+    def test_a_keyboard_alone_after_a_brief_laptop_is_still_remembered(
+        self, tmp_path
+    ):
+        """The case the latch destroyed.
+
+        Two frames of a laptop -- not even enough to mature into a record
+        of its own -- followed by a long look at a keyboard on its own.
+        The keyboard is a real object somebody could go looking for, and
+        under the latch it was never written.
+        """
+        both = [_detection(label="laptop"), _detection(label="keyboard", score=0.9)]
+        keyboard_only = [_detection(label="keyboard", score=0.9)]
+        store, engine = self._verified(
+            tmp_path, [both, both] + [keyboard_only] * 60
+        )
+
+        _walk(engine, 62, start=900.0, step=0.1)
+        engine.finish()
+
+        assert "keyboard" in [o.object_class for o in store.all_observations()]
+
+    def test_a_keyboard_that_is_never_alone_is_still_suppressed(self, tmp_path):
+        """Pre-agreed, so the part-of rule is the ONLY thing between the
+        keyboard and a record.
+
+        Without that this case passes for the wrong reason: a sighting
+        the rule suppressed is never sent for verification either, so it
+        would be refused as `unverified` even with the rule removed.
+        """
+        both = [_detection(label="laptop"), _detection(label="keyboard", score=0.9)]
+        store, engine = self._verified(tmp_path, [both])
+
+        _walk(engine, 20, start=900.0, step=0.1)
+        for sighting in engine._tracker.open_sightings.values():
+            sighting.verdict = {"agrees": True, "model": "scripted"}
+        engine.finish()
+
+        assert [o.object_class for o in store.all_observations()] == ["laptop"]

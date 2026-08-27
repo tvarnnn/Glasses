@@ -206,16 +206,19 @@ class ObjectMemoryEngine:
             # not refused for a verdict that was already in flight.
             self._verification.wait_idle()
             self._collect_verdicts()
+        # Captured before `close_all` empties the tracker, for the same
+        # reason as in `observe`.
+        open_classes = self._open_classes()
         for sighting in self._tracker.close_all():
             self.sightings_closed += 1
-            self._settle(sighting)
+            self._settle(sighting, open_classes)
         # Anything still parked never got its verdict -- the queue
         # dropped it, or the verifier hung past `wait_idle`. Settled
         # anyway, so it is refused for a reason the counters record
         # rather than vanishing from the accounting entirely.
         for sighting in list(self._awaiting_verdict):
             self._awaiting_verdict.remove(sighting)
-            self._settle(sighting)
+            self._settle(sighting, open_classes)
 
     # -- the frame path ------------------------------------------------
 
@@ -247,9 +250,16 @@ class ObjectMemoryEngine:
         # Then stale sightings, using the FRAME's clock rather than the
         # wall clock, so a replay closes them at the times the recording
         # implies.
+        #
+        # The open set is captured BEFORE the close. `close_stale`
+        # removes what it closes, and `_settle` asks whether a part's
+        # whole was in view -- against an empty set that question always
+        # answers no, and the duplicate the part-of rule exists to
+        # prevent gets written at the end of every sighting.
+        open_classes = self._open_classes()
         for sighting in self._tracker.close_stale(observed_at):
             self.sightings_closed += 1
-            self._settle(sighting)
+            self._settle(sighting, open_classes)
 
         recorded = []
         for detection in self._detector.detect(frame):
@@ -359,7 +369,12 @@ class ObjectMemoryEngine:
             sighting.verdict = verdict.to_json_dict()
             if sighting in self._awaiting_verdict:
                 self._awaiting_verdict.remove(sighting)
-                self._settle(sighting)
+                # This sighting has already left the tracker, so what is
+                # open now is the honest answer to "is its whole still in
+                # view" -- the alternative would be to remember the set
+                # from the moment it closed, which is state with a
+                # shorter half-life than the bug it would prevent.
+                self._settle(sighting, self._open_classes())
 
     # -- writing -------------------------------------------------------
 
@@ -427,13 +442,18 @@ class ObjectMemoryEngine:
         if changed:
             self.sighting_updates += 1
 
-    def _settle(self, sighting) -> None:
+    def _settle(self, sighting, open_classes) -> None:
         """A sighting has ended. Write it if it earned it, then let it go.
 
-        Unless it is still waiting for a verdict it has already paid for,
-        in which case it is parked until the verdict arrives and settled
-        then. Deciding now would refuse it for `unverified` when the
-        answer is already in flight.
+        `open_classes` is captured by the CALLER, before the close that
+        emptied the tracker. Recomputing it here would ask "is this
+        part's whole in view" of a set that no longer contains anything,
+        which always answers no.
+
+        Unless the sighting is still waiting for a verdict it has already
+        paid for, in which case it is parked until the verdict arrives
+        and settled then. Deciding now would refuse it for `unverified`
+        when the answer is already in flight.
         """
         if (
             sighting.verification_requested
@@ -443,7 +463,7 @@ class ObjectMemoryEngine:
         ):
             self._awaiting_verdict.append(sighting)
             return
-        if self._relevance.decide_sighting(sighting, self._open_classes()) == RECORD:
+        if self._relevance.decide_sighting(sighting, open_classes) == RECORD:
             self._write(sighting)
         if sighting.recorded:
             self._refresh(sighting, force=True)

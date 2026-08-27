@@ -148,8 +148,8 @@ def _build_verifier(name: str, device: str):
     than reachable and always refused.
 
     `none` is the DEFAULT, and that is a deliberate conservatism rather
-    than a lack of confidence in the alternative. `owlv2` measured 93.2%
-    acceptance of correct labels and 94.3% rejection of wrong ones over
+    than a lack of confidence in the alternative. `owlv2` measured ~93%
+    acceptance of correct labels and ~94% rejection of wrong ones over
     94 human-labelled crops -- but those 94 crops are from one home, and
     turning it on downloads ~600 MB of weights and takes ~620 MB of VRAM
     on a GPU this cartridge shares. One environment variable enables it;

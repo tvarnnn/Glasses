@@ -55,19 +55,24 @@ above 0.5.
 
 At ≥ 0.5, by detection count:
 
+Every column is at ≥0.5. An earlier draft of this table mixed
+thresholds — the counts were ≥0.5 and the score and area columns were
+over every detection down to 0.15, which made the median scores look far
+worse than the rows they sat in. An audit caught it.
+
 | class | ≥0.5 | ≥0.7 | median score | median area | captures |
 |---|---|---|---|---|---|
-| laptop | 8,218 | 6,811 | 0.664 | 21.5% | 32 |
-| person | 6,899 | 2,940 | 0.300 | 38.7% | 32 |
-| cell phone | 3,613 | 2,814 | 0.604 | 8.7% | 27 |
-| bed | 1,314 | 295 | 0.307 | 49.7% | 21 |
-| keyboard | 1,086 | 695 | 0.295 | 10.5% | 19 |
-| tv | 1,085 | 437 | 0.276 | 16.0% | 23 |
-| couch | 396 | 76 | 0.252 | 43.7% | 15 |
-| sink | 310 | 166 | 0.243 | 17.0% | 8 |
-| chair | 171 | 63 | 0.197 | 9.0% | 15 |
+| laptop | 8,218 | 6,811 | 0.934 | 21.5% | 32 |
+| person | 6,899 | 2,940 | 0.672 | 38.6% | 32 |
+| cell phone | 3,613 | 2,814 | 0.907 | 8.7% | 27 |
+| bed | 1,314 | 295 | 0.601 | 53.9% | 21 |
+| keyboard | 1,086 | 695 | 0.784 | 13.9% | 15 |
+| tv | 1,085 | 437 | 0.655 | 16.9% | 19 |
+| couch | 396 | 76 | 0.606 | 41.4% | 14 |
+| sink | 310 | 166 | 0.712 | 23.7% | 8 |
+| chair | 171 | 63 | 0.662 | 12.1% | 10 |
 
-`person` has a median box area of **38.7% of the frame** at the ≥0.5
+`person` has a median box area of **38.6% of the frame** at the ≥0.5
 threshold this table uses (35.4% if every detection down to 0.15 is
 counted — an earlier draft quoted that figure against a table of ≥0.5
 rows, which was an apples-to-oranges slip an audit caught). On
@@ -198,13 +203,17 @@ positives, 35 negatives. The labels are hard-coded in
 
 **They are 81% block assertions** — `[True] * 24` for laptop and the same
 for cell phone — and an audit tested how much that matters. Any single
-flip moves balanced accuracy by **at most 0.015**; it takes **seven
-adversarial flips (7.4% of the set)** to drop below 0.90; and under every
+flip moves balanced accuracy by **at most 0.015**, and under every
 plausible group relabelling tried (`suitcase` → True, the AirPods case →
 True, `remote` all-False, `remote` all-True, four of the 48 laptop and
 phone crops wrong) OWLv2 stays between 0.89 and 0.97 and **0.45 remains
-the optimal threshold in every scenario**. The conclusion is robust; the
-third significant figure is not, which is why §4.3 reports ~93% and ~94%.
+the optimal threshold in every scenario**.
+
+Two audits disagreed about how many *adversarial* flips it takes to push
+balanced accuracy below 0.90 — one said seven, one said three — so
+neither figure is quoted. What both agree on is the shape: the conclusion
+is robust and the third significant figure is not, which is why §4.3
+reports ~93% and ~94%.
 
 **The vocabulary is the shipped one.** It was restated once and the two
 drifted — the benchmark ran 34 words while `verifier_vocabulary()`

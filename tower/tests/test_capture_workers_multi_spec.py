@@ -380,3 +380,45 @@ def test_two_specs_may_not_share_a_name(spawn):
     """
     with pytest.raises(ValueError):
         CaptureWorkerSupervisor([_spec("memory"), _spec("memory")], spawn=spawn)
+
+
+class TestAWorkerThatWillNotDie:
+    """Forgetting a worker that could not be terminated makes an orphan.
+
+    Invisible to `status`, to `/health` and to the next `shutdown` -- and
+    a reviewer measured three Stop/Start cycles leaving four producers
+    alive with the supervisor aware of one.
+    """
+
+    class Immortal(FakeProcess):
+        def terminate(self):
+            raise PermissionError("access is denied")
+
+    def test_it_stays_in_the_registry(self, tmp_path):
+        supervisor = CaptureWorkerSupervisor(
+            [_spec("memory")],
+            spawn=lambda argv, **kwargs: self.Immortal(argv, **kwargs),
+        )
+        _open(supervisor, tmp_path, "a")
+
+        stopped = supervisor.detach("memory", grace_seconds=0.0)
+
+        assert stopped == 0
+        assert [row["worker"] for row in supervisor.status()] == ["memory"]
+
+    def test_and_nothing_is_attached_in_its_place(self, tmp_path):
+        """A second producer on one store loses the first one's writes."""
+        spawned = []
+
+        def spawn(argv, **kwargs):
+            process = self.Immortal(argv, **kwargs)
+            spawned.append(process)
+            return process
+
+        supervisor = CaptureWorkerSupervisor([_spec("memory")], spawn=spawn)
+        _open(supervisor, tmp_path, "a")
+        supervisor.detach("memory", grace_seconds=0.0)
+
+        supervisor.attach("memory", "a", tmp_path / "captures" / "a")
+
+        assert len(spawned) == 1

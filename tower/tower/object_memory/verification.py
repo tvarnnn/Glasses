@@ -22,7 +22,7 @@ detections. Nothing here runs on any of them. Verification is asked ONCE
 PER SIGHTING, when the sighting matures -- and across the whole
 18,821-frame corpus there are 499 sightings of at least three frames, of
 which the `verify` tier accounts for **53**. That is one call per 355
-frames, or one every 33 seconds of recording, against a detector that
+frames, or one every 36.6 seconds of recording, against a detector that
 runs about ten times a second.
 
 Measured end to end rather than projected, one run at a time on an idle
@@ -74,8 +74,8 @@ logger = logging.getLogger(__name__)
 # How many sightings may be waiting for a verdict at once.
 #
 # Small on purpose. At the measured rate -- roughly one `verify`-tier
-# sighting every 33 seconds of recording -- a backlog of eight means the
-# verifier has fallen more than four minutes behind, and at that point
+# sighting every 36.6 seconds of recording -- a backlog of eight means
+# the verifier has fallen nearly five minutes behind, and at that point
 # the honest thing is to drop rather than to keep a queue that will never
 # catch up. If this is ever seen to fill in the field, the finding is
 # that the model is too slow for this host, not that the queue is too
@@ -245,7 +245,18 @@ class VerificationQueue:
         self._done: queue.Queue = queue.Queue()
         self._stopping = threading.Event()
         self._thread: threading.Thread | None = None
-        self._in_flight = 0
+        # Jobs submitted whose verdict has not yet been PUBLISHED.
+        #
+        # One counter rather than "the queue is empty and nothing is in
+        # flight", because those are two observations and there were two
+        # windows between them. It was `_in_flight`, incremented after
+        # `_pending.get()` returned -- so a job could be off the queue and
+        # not yet counted, and `wait_idle` would say idle while a verdict
+        # was still coming. Moving the decrement past `_done.put` closed
+        # the tail of that window and left the head open; a single counter
+        # incremented BEFORE the put and decremented AFTER the publish has
+        # no window at either end.
+        self._outstanding = 0
         self._lock = threading.Lock()
 
         self.submitted = 0
@@ -281,11 +292,13 @@ class VerificationQueue:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
+                with self._lock:
+                    outstanding = self._outstanding
                 logger.warning(
                     "[Tower][ObjectMemory] the verifier did not finish within "
                     "%.0fs; %s sightings will not be verified",
                     timeout,
-                    self._in_flight + self._pending.qsize(),
+                    outstanding,
                 )
         self._verifier.release()
 
@@ -304,6 +317,14 @@ class VerificationQueue:
             return False
         if self._synchronous:
             self.submitted += 1
+            # Counted here too, and it must be: `_run_one` decrements in
+            # a `finally`, so a synchronous submit that skipped the
+            # increment drove the counter negative and `wait_idle` --
+            # which asks for exactly zero -- never returned again. Seven
+            # engine tests sat out a 30-second timeout apiece before this
+            # line existed.
+            with self._lock:
+                self._outstanding += 1
             self._run_one(_Job(sighting, crop, self._clock()))
             return True
 
@@ -313,6 +334,10 @@ class VerificationQueue:
             except queue.Empty:
                 break
             self.dropped_backlog += 1
+            # A dropped job will never publish a verdict, so it must stop
+            # being outstanding here or `wait_idle` waits forever for one.
+            with self._lock:
+                self._outstanding -= 1
             logger.warning(
                 "[Tower][ObjectMemory] verification backlog full (%s); the "
                 "oldest waiting sighting was dropped and will not be "
@@ -320,6 +345,10 @@ class VerificationQueue:
                 self._max_pending,
             )
         self.submitted += 1
+        # Counted BEFORE it reaches the queue, so there is never a moment
+        # when a job exists and nothing knows about it.
+        with self._lock:
+            self._outstanding += 1
         self._pending.put(_Job(sighting, crop, self._clock()))
         self.peak_pending = max(self.peak_pending, self._pending.qsize())
         return True
@@ -340,19 +369,23 @@ class VerificationQueue:
                 return finished
 
     def wait_idle(self, timeout: float = 30.0) -> bool:
-        """Block until nothing is queued or in flight. Returns whether it is.
+        """Block until every submitted job has PUBLISHED its verdict.
 
         For the end of a session and for tests. A producer that exited
         without waiting would discard verdicts it had already paid for.
+
+        Reads one counter rather than two conditions. "The queue is empty
+        and nothing is in flight" is two observations with a gap at each
+        end of the worker's handling of a job, and both gaps were real.
         """
         deadline = self._clock() + timeout
         while self._clock() < deadline:
             with self._lock:
-                busy = self._in_flight
-            if self._pending.empty() and busy == 0:
-                return True
+                if self._outstanding == 0:
+                    return True
             time.sleep(0.01)
-        return False
+        with self._lock:
+            return self._outstanding == 0
 
     def counters(self) -> dict:
         return {
@@ -388,46 +421,52 @@ class VerificationQueue:
             self._run_one(job)
 
     def _run_one(self, job: _Job) -> None:
-        with self._lock:
-            self._in_flight += 1
+        """Verify one job, publish the verdict, then stop counting it.
+
+        The `finally` is not optional. An earlier version dropped it to
+        get the publish before the decrement, and that leaked the counter
+        forever on any `BaseException` -- a `KeyboardInterrupt` inside the
+        model would leave `wait_idle` unable to return True again, and in
+        threaded mode the worker would die silently holding the count.
+        Publishing inside the `try` and decrementing in the `finally`
+        gets both.
+        """
         started = self._clock()
         try:
-            verdict = self._verifier.verify(job.crop, job.sighting.object_class)
-        except Exception:
-            # Counted, not swallowed, and NOT treated as agreement. A
-            # verifier that raised has said nothing, and "said nothing"
-            # must resolve the same way as "said no" -- otherwise a
-            # broken model becomes a way to widen the policy.
-            self.failed += 1
-            logger.exception(
-                "[Tower][ObjectMemory] the verifier raised on a %s sighting; "
-                "it will not be remembered",
-                job.sighting.object_class,
-            )
-            verdict = Verdict(
-                agrees=False,
-                proposed=job.sighting.object_class,
-                label=None,
-                score=None,
-                model=getattr(self._verifier, "name", "unknown"),
-                reason="verifier-failed",
-            )
-        self.verify_seconds += self._clock() - started
-        self.completed += 1
-        if verdict.agrees:
-            self.agreed += 1
-        else:
-            self.refused += 1
-
-        # PUBLISHED BEFORE the in-flight count drops, and the order is
-        # the whole point. `wait_idle` returns when nothing is queued and
-        # nothing is in flight; decrementing first opened a window in
-        # which both were true and the verdict had not yet been
-        # published, so a caller that waited and then drained would
-        # discard an answer it had already paid for.
-        self._done.put((job.sighting, verdict))
-        with self._lock:
-            self._in_flight -= 1
+            try:
+                verdict = self._verifier.verify(
+                    job.crop, job.sighting.object_class
+                )
+            except Exception:
+                # Counted, not swallowed, and NOT treated as agreement. A
+                # verifier that raised has said nothing, and "said
+                # nothing" must resolve the same way as "said no" --
+                # otherwise a broken model becomes a way to widen the
+                # policy.
+                self.failed += 1
+                logger.exception(
+                    "[Tower][ObjectMemory] the verifier raised on a %s "
+                    "sighting; it will not be remembered",
+                    job.sighting.object_class,
+                )
+                verdict = Verdict(
+                    agrees=False,
+                    proposed=job.sighting.object_class,
+                    label=None,
+                    score=None,
+                    model=getattr(self._verifier, "name", "unknown"),
+                    reason="verifier-failed",
+                )
+            self.verify_seconds += self._clock() - started
+            self.completed += 1
+            if verdict.agrees:
+                self.agreed += 1
+            else:
+                self.refused += 1
+            self._done.put((job.sighting, verdict))
+        finally:
+            with self._lock:
+                self._outstanding -= 1
 
 
 # --- the verifier this build actually offers ----------------------------
@@ -489,8 +528,10 @@ OWLV2_REPO = "google/owlv2-base-patch16-ensemble"
 # laptop and the same for cell phone -- so three significant figures
 # would be more precision than the labels carry. An audit found the
 # conclusion robust to relabelling: any single flip moves balanced
-# accuracy by at most 0.015, it takes seven adversarial flips to drop
-# below 0.90, and 0.45 stays optimal under every scenario tried.
+# accuracy by at most 0.015, and 0.45 stays optimal under every group
+# relabelling tried. Two audits disagreed about how many adversarial
+# flips it takes to push balanced accuracy below 0.90 -- one said seven,
+# one said three -- so neither number is quoted here.
 #
 # It is still a threshold fitted to 94 crops from ONE home, and it should
 # be re-measured against any corpus with a different camera, a different

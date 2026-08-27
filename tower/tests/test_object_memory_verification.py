@@ -517,3 +517,125 @@ class TestOwlV2Verifier:
         from tower.object_memory.classes import verifier_vocabulary
 
         assert "person" not in verifier_vocabulary()
+
+
+# -- what the SECOND review found, including in the first round's fixes --
+
+
+class TestOutstandingAccounting:
+    """`wait_idle` reads one counter, because two conditions had two gaps.
+
+    It was "the queue is empty and nothing is in flight". `_in_flight`
+    was incremented *after* `_pending.get()` returned, so a job could be
+    off the queue and not yet counted -- and a reviewer reproduced
+    `wait_idle()` returning True with a verdict still to come. Moving the
+    decrement past `_done.put` closed the tail of that window and left
+    the head open.
+    """
+
+    def test_a_submitted_job_is_outstanding_before_a_worker_touches_it(self):
+        blocked = threading.Event()
+        started = threading.Event()
+
+        class BlockingVerifier:
+            name = "blocking"
+
+            def load(self):
+                return None
+
+            def verify(self, crop, proposed_class):
+                started.set()
+                blocked.wait(timeout=5.0)
+                return Verdict(True, proposed_class, proposed_class, 1.0, "b", "ok")
+
+            def release(self):
+                return None
+
+        queue = VerificationQueue(BlockingVerifier(), workers=1)
+        queue.start()
+        try:
+            queue.submit(_Sighting(), crop=None)
+            assert started.wait(timeout=5.0)
+
+            # The job is off the queue and inside the verifier. Under the
+            # old two-condition check this is exactly the window.
+            assert queue.wait_idle(timeout=0.2) is False
+
+            blocked.set()
+            assert queue.wait_idle(timeout=5.0) is True
+            assert len(queue.drain()) == 1
+        finally:
+            blocked.set()
+            queue.stop(timeout=5.0)
+
+    def test_the_counter_never_goes_negative_in_synchronous_mode(self):
+        """It did, and seven engine tests then sat out a 30-second
+        timeout apiece: the synchronous path skipped the increment while
+        `_run_one` decremented in a `finally`."""
+        queue = VerificationQueue(ScriptedVerifier({"remote"}), workers=0)
+        queue.start()
+
+        for _ in range(5):
+            queue.submit(_Sighting(), crop=None)
+
+        assert queue.wait_idle(timeout=1.0) is True
+        queue.stop()
+
+    def test_a_dropped_job_stops_being_outstanding(self):
+        """A job evicted by the backlog will never publish a verdict, so
+        it must stop being counted or `wait_idle` waits for one forever."""
+        blocked = threading.Event()
+
+        class BlockingVerifier:
+            name = "blocking"
+
+            def load(self):
+                return None
+
+            def verify(self, crop, proposed_class):
+                blocked.wait(timeout=5.0)
+                return Verdict(False, proposed_class, None, None, "b", "held")
+
+            def release(self):
+                return None
+
+        queue = VerificationQueue(BlockingVerifier(), max_pending=2, workers=1)
+        queue.start()
+        try:
+            for _ in range(10):
+                queue.submit(_Sighting(), crop=None)
+            assert queue.dropped_backlog > 0
+            blocked.set()
+
+            assert queue.wait_idle(timeout=5.0) is True
+        finally:
+            blocked.set()
+            queue.stop(timeout=5.0)
+
+    def test_a_base_exception_does_not_leak_the_counter(self):
+        """The `finally` is not optional.
+
+        An earlier version dropped it to publish before decrementing, and
+        that leaked forever on a `KeyboardInterrupt` inside the model --
+        `wait_idle` could then never return True again.
+        """
+
+        class ExplodingVerifier:
+            name = "exploding"
+
+            def load(self):
+                return None
+
+            def verify(self, crop, proposed_class):
+                raise KeyboardInterrupt("from inside the model")
+
+            def release(self):
+                return None
+
+        queue = VerificationQueue(ExplodingVerifier(), workers=0)
+        queue.start()
+
+        with pytest.raises(KeyboardInterrupt):
+            queue.submit(_Sighting(), crop=None)
+
+        assert queue.wait_idle(timeout=1.0) is True

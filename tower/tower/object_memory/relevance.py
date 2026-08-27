@@ -198,18 +198,19 @@ class RelevanceFilter:
         if sighting.frame_count < self._policy.min_frames:
             return TOO_BRIEF
         # A part that is only in view because its whole is. Checked
-        # against what is open RIGHT NOW rather than against the class
-        # table, so a keyboard on a desk with no laptop near it is still
-        # a memory and a laptop's own keyboard is not a second one.
+        # against what is open RIGHT NOW, so a keyboard on a desk with no
+        # laptop near it is still a memory and a laptop's own keyboard is
+        # not a second one.
         #
-        # LATCHED onto the sighting once it fires. A settled sighting has
-        # already been removed from the tracker, and so has everything
-        # that was open beside it, so a live check at that moment sees an
-        # empty set and lets the duplicate through -- which is what it
-        # did until a reviewer reproduced it.
+        # LIVE, not latched. Latching it was tried and was worse than the
+        # bug it fixed: one sub-maturity frame of a laptop permanently
+        # suppressed a keyboard for the rest of an unbounded sighting, so
+        # five minutes of a keyboard alone wrote nothing at all. The
+        # actual bug was that `_settle` passed an EMPTY set -- by then the
+        # sighting has left the tracker and so has everything open beside
+        # it -- and the fix is for the caller to capture the open set
+        # BEFORE closing, which `ObjectMemoryEngine` now does.
         if any(whole in open_classes for whole in wholes_of(sighting.object_class)):
-            sighting.suppressed_as_part = True
-        if sighting.suppressed_as_part:
             return PART_OF_ANOTHER
         if tier_of(sighting.object_class) == VERIFY:
             agreed = sighting.verdict is not None and sighting.verdict.get("agrees")

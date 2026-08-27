@@ -390,3 +390,39 @@ def test_the_producer_argv_is_runnable_as_written(tower):
     assert result.returncode == 0, result.stderr[-2000:]
     assert "frames_observed" in result.stdout
     assert sys.executable == argv[0], "the spec must run THIS interpreter"
+
+
+def test_pause_reports_the_producer_gone_the_moment_it_returns(tower):
+    """`terminate()` is asynchronous, and a Pause must not outrun it.
+
+    On Windows `TerminateProcess` returns before the process is reaped,
+    so a `poll()` straight afterwards routinely still says None. A
+    supervisor that read that as "could not be killed" would keep a
+    correctly-killed worker in the registry and make Pause report itself
+    as still following a capture -- the one thing the session surface
+    must never do, because `following` is what a phone renders as "still
+    remembering".
+    """
+    client, app, _ = tower
+
+    client.post(f"{SESSION_URL}/start")
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "stream_start"})
+        for index, data in enumerate(_frames(8), start=1):
+            ws.send_json(_frame_message(index, data))
+            ws.receive_json()
+        _wait_for(
+            lambda: app.state.capture_workers.following(OBJECT_MEMORY_WORKER),
+            20.0,
+            "the producer",
+        )
+
+        paused = client.post(f"{SESSION_URL}/pause").json()
+
+        # No polling, no sleep: the answer has to be right AS IT RETURNS.
+        assert paused["state"] == "paused"
+        assert paused["following"] == []
+
+        ws.send_json({"type": "stream_stop"})
+        ws.send_json({"type": "ping"})
+        ws.receive_json()
