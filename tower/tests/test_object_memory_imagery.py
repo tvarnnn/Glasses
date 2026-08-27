@@ -444,3 +444,90 @@ class TestTheFilter:
         for node in ast.walk(ast.parse(source)):
             if isinstance(node, ast.ImportFrom) and node.module:
                 assert "tower.object_memory" not in node.module
+
+
+class TestPathContainment:
+    """A record builds a path, so a record must not be able to leave the tree.
+
+    `session_id` and `best_relpath` both come off a JSONL record and both
+    go into `Path(...)`. Nothing that writes them today can produce a
+    `..`: `CaptureRecorder` mints the id and names every frame
+    `frames/<seq:08d>.jpg`. But a store file is a plain text file on
+    disk, and an operator restoring one from a backup, a future producer,
+    or a merge of two stores could all introduce a path this route would
+    otherwise follow out of the capture tree and serve over HTTP.
+    """
+
+    def _secret(self, tmp_path):
+        secret = tmp_path / "secret.jpg"
+        cv2.imwrite(str(secret), np.full((32, 32, 3), 7, np.uint8))
+        return secret
+
+    def test_a_relpath_that_climbs_out_resolves_to_nothing(
+        self, world, tmp_path
+    ):
+        """Asserted against `frame_path` rather than the route.
+
+        The route would fall back to the frame-sequence convention and
+        serve the RIGHT frame, which is correct behaviour and hides the
+        thing under test. What matters is that the escaping path itself
+        never resolves.
+        """
+        from tower.object_memory.imagery import frame_path
+
+        captures, _, _ = world
+        self._secret(tmp_path)
+        escaping = _observation(
+            best_relpath="../../../secret.jpg",
+            best_frame_seq=None,
+            frame_seq=None,
+        )
+
+        assert frame_path(captures, escaping) is None
+
+    def test_a_session_id_that_climbs_out_serves_nothing(
+        self, world, monkeypatch, tmp_path
+    ):
+        _, store_root, _ = world
+        secret = self._secret(tmp_path)
+        store = ObservationStore(store_root, retention_seconds=None)
+        escaping = _observation(
+            observed_at=3000.0,
+            session_id="../..",
+            best_relpath="secret.jpg",
+            best_frame_seq=None,
+            frame_seq=None,
+        )
+        store.append(escaping)
+        client = _client(world, monkeypatch)
+
+        response = client.get(
+            f"/object-memory/observations/{escaping.observation_id}/frame"
+        )
+
+        assert response.status_code in (404, 410), response.status_code
+        assert response.content != secret.read_bytes()
+
+    def test_an_absolute_relpath_serves_nothing(self, world, tmp_path):
+        """`Path("a") / "/etc/passwd"` is `/etc/passwd`. Pathlib joins that way."""
+        from tower.object_memory.imagery import frame_path
+
+        captures, _, _ = world
+        secret = self._secret(tmp_path)
+        escaping = _observation(
+            best_relpath=str(secret),
+            best_frame_seq=None,
+            frame_seq=None,
+        )
+
+        assert frame_path(captures, escaping) is None
+
+    def test_the_containment_check_still_admits_a_real_frame(self, world):
+        """A guard that refuses everything guards nothing."""
+        from tower.object_memory.imagery import frame_path
+
+        captures, store_root, observation_id = world
+        store = ObservationStore(store_root, retention_seconds=None)
+        (observation,) = store.all_observations()
+
+        assert frame_path(captures, observation) is not None

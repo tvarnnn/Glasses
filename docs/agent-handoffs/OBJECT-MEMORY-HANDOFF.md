@@ -12,7 +12,7 @@ lane needs to do.
 | Starting commit | `6e325f8` — *measure: the shipped detector is blind below 2% of the frame* |
 | Commits | `d5000b7` lifecycle · `f489da5` policy · `5b329ad` semantics · `f90eb2c` contract and evidence · `943861b` late verdicts · plus the review-response commit that carries this file |
 | Push status | pushed to `origin/object-memory/lifecycle-and-semantics-v1` |
-| Tests | **1681 passed, 64 skipped** (was 1513 / 64 at the starting commit) |
+| Tests | **1685 passed, 64 skipped** (was 1513 / 64 at the starting commit) |
 | Known flake | `test_result_channel_hostile.py::test_the_channel_survives_the_world_vanishing_mid_subscription` failed once in five full runs with a Windows `WinError 32` on an unlink, and passed alone. This is the sharing-violation flake `LANE-OWNERSHIP.md` §3 already documents and rules to the World Builder lane; nothing in this branch touches it. |
 | Never touched | `ios/**`, `tower/tower/world_builder/**`, `main` |
 
@@ -223,9 +223,17 @@ Host: RTX 5070 (Blackwell, sm_120) 12 GB, driver 596.21, torch
 2.13.0+cu132, Windows 11, 20 logical cores. Corpus: 34 captures, 18,821
 frames, **1,942 seconds** of recording, 360×640.
 
-**Every latency figure below was re-measured on an IDLE host, one run at
-a time.** The first set was not, and an audit found every one of them
-wrong by about a third. §4.1 is the retraction that mattered most.
+**Every latency figure below was re-measured with no other work of ours
+running, one job at a time.** The first set was not, and an audit found
+every one of them wrong by about a third. §4.1 is the retraction that
+mattered most.
+
+**"Idle" would be the wrong word for this host.** It carries several
+autonomous agent lanes at once — two more appeared in `git worktree
+list` while these numbers were being taken. Four consecutive replays of
+the same capture gave 40.6 / 43.4 / 45.1 / 46.9 ms/frame with nothing of
+ours competing: an 11% spread. **Read every latency figure here as a
+range**, and re-measure before making a decision that turns on one.
 
 | what | figure |
 |---|---|
@@ -233,9 +241,9 @@ wrong by about a third. §4.1 is the retraction that mattered most.
 | sightings (≥0.5, gap 3 s) | 763; 499 at ≥3 frames; 404 excluding `person` |
 | sightings by tier (≥3 frames) | 158 `remembered`, 53 `verify`, 158 `context` |
 | memories per unit of walking | 211 recordable sightings over 1,942 s = **one every 9.2 s**, about 380 an hour |
-| detector, CPU, validated capture | 103.3 s / 2,203 frames = **46.886 ms/frame**, 4,287 detections |
-| detector, CUDA, same | 107.4 s = 48.757 ms/frame, 4,285 detections |
-| CPU against CUDA | **within noise.** An independent audit measured the ordering the other way at a similar margin; run-to-run variance on this host is 16–25% |
+| detector, CPU, validated capture | **40.6–46.9 ms/frame** across four consecutive replays, 4,287 detections every time |
+| detector, CUDA, same | 48.8 ms/frame, 4,285 detections |
+| CPU against CUDA | **within noise.** The CPU spread alone exceeds the gap, and an independent audit measured the ordering the other way (CUDA 43.9, CPU 51.0) |
 | read + JPEG decode | 1.06 ms/frame, 46 MB RSS |
 | producer steady-state RSS | **704 MB** (CPU) / 1,442 MB (CUDA) |
 | long-session drift, 6,000–10,000 frames | **none** — window-median ratios 0.968 (CUDA), 0.808 (CPU), 1.041 (independent audit); CUDA reserve plateaus at 436 MB |

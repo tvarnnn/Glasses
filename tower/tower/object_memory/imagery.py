@@ -334,12 +334,13 @@ def frame_path(capture_root, observation) -> Path | None:
     session_id = observation.session_id
     if session_id is None:
         return None
-    directory = Path(capture_root) / "captures" / session_id
+    root = Path(capture_root) / "captures"
+    directory = root / session_id
 
     relpath = observation.best_relpath
     if relpath:
-        candidate = directory / relpath
-        if candidate.exists():
+        candidate = _contained(root, directory / relpath)
+        if candidate is not None and candidate.exists():
             return candidate
 
     frame_seq = (
@@ -349,8 +350,34 @@ def frame_path(capture_root, observation) -> Path | None:
     )
     if frame_seq is None:
         return None
-    candidate = directory / "frames" / f"{int(frame_seq):08d}.jpg"
-    return candidate if candidate.exists() else None
+    candidate = _contained(root, directory / "frames" / f"{int(frame_seq):08d}.jpg")
+    return candidate if candidate is not None and candidate.exists() else None
+
+
+def _contained(root: Path, candidate: Path) -> Path | None:
+    """The path, if it really is under the capture root. Otherwise None.
+
+    `session_id` and `best_relpath` both come off a record in a JSONL
+    file, and both are used to BUILD A PATH. Nothing in the pipeline that
+    writes them can produce a `..` -- `CaptureRecorder` mints the id and
+    names every frame `frames/<seq:08d>.jpg` -- so this is defence in
+    depth rather than a fix for a reachable bug.
+
+    It is cheap defence in depth against a real class of problem, though.
+    A store file is a plain text file on disk; an operator restoring one
+    from a backup, a future producer, or a merge of two stores could all
+    introduce a path this route would happily follow out of the capture
+    tree and serve over HTTP. Resolving and comparing is four lines.
+
+    `resolve()` on both sides, so a symlink cannot be used to step out
+    either.
+    """
+    try:
+        resolved = candidate.resolve()
+        base = root.resolve()
+    except OSError:
+        return None
+    return resolved if resolved.is_relative_to(base) else None
 
 
 def _bounding_box(observation):

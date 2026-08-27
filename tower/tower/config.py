@@ -99,15 +99,23 @@ class Settings:
     #
     # It said "a CUDA pass over the whole corpus measured a WORSE 75
     # ms/frame mean". 75.0 was the running average printed at frame
-    # 10,000 of a run that was competing with a test suite; the run's
-    # actual mean was 87.8, and neither number describes an idle host.
-    # Measured properly, one replay at a time with nothing else running:
-    # CPU 46.9 ms/frame against CUDA 48.8. An independent audit on the
-    # same host measured the ordering the other way (CUDA 43.9 against
-    # CPU 51.0). Run-to-run variance exceeds the gap, so the honest
-    # statement is that this detector costs about the same either way --
-    # the work is single-frame preprocessing and transfer, not the
-    # 320x320 forward pass, and neither device is doing much of it.
+    # 10,000 of a run competing with a test suite; the run's actual mean
+    # was 87.8, and neither number describes a quiet host.
+    #
+    # Re-measured with no other work of ours running, replaying the same
+    # 2,203-frame capture: CPU **40.6, 43.4, 45.1 and 46.9 ms/frame**
+    # across four consecutive runs, against CUDA at 48.8. An independent
+    # audit on the same host measured the ordering the OTHER WAY (CUDA
+    # 43.9 against CPU 51.0). The spread within one device exceeds the
+    # gap between them, so the honest statement is that this detector
+    # costs about the same either way -- the work is single-frame
+    # preprocessing and transfer, not the 320x320 forward pass, and
+    # neither device is doing much of it.
+    #
+    # THIS HOST IS NOT QUIET. It carries several autonomous agent lanes
+    # at once, and two more appeared in `git worktree list` while these
+    # numbers were being taken. Read every latency figure in this
+    # cartridge as a range.
     #
     # What is NOT within noise is what else wants the GPU. Object Memory
     # does not own this Tower: World Builder runs on it, the depth

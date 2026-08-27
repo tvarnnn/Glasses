@@ -295,12 +295,21 @@ tiled detection on the async path. Neither is this wave's.
 RTX 5070 (Blackwell, sm_120), 12 GB, driver 596.21; torch 2.13.0+cu132;
 Windows 11; 20 logical cores.
 
-**Every figure in this section was re-measured on an IDLE host, one run
-at a time.** The first set was not, and every one of them was wrong by
-about a third. That is the most transferable finding here: on this
-machine, a benchmark that shares the box with a test suite reports
-numbers 30–50% high, and a *cumulative* mean of such a run looks like a
-trend (§5.2).
+**Every figure in this section was re-measured with no other work of
+ours running, one job at a time.** The first set was not, and every one
+of them was wrong by about a third.
+
+**This host is not quiet, and "idle" would be the wrong word.** It
+carries several autonomous agent lanes at the same time — two more
+appeared in `git worktree list` while these numbers were being taken. So
+the latency figures below are **ranges**, and they are given as ranges.
+Four consecutive replays of the same capture, back to back, gave 40.6,
+43.4, 45.1 and 46.9 ms/frame: an 11% spread with nothing of ours
+competing.
+
+That is the most transferable finding in this section. A benchmark that
+shares this box with a test suite reports numbers 30–50% high, and a
+*cumulative* mean of such a run looks like a trend (§5.2).
 
 ### 5.1 The detector
 
@@ -310,10 +319,15 @@ recording), one run at a time:
 | device | seconds | ms/frame | detections | observations |
 |---|---|---|---|---|
 | **CPU** | 103.3 | **46.886** | 4,287 | 8 |
+| CPU, three more back-to-back runs | 89.4 / 95.5 / 99.3 | **40.572 / 43.366 / 45.086** | 4,287 | 8 |
 | CUDA | 107.4 | 48.757 | 4,285 | 8 |
 
-**The two are within noise of each other**, and an earlier draft of this
-document claimed CPU was ~30% faster on the strength of contended runs.
+**The two are within noise of each other.** The CPU spread alone is
+40.6–46.9 across four consecutive runs; CUDA measured 48.8 here and 43.9
+in an independent audit which also measured CPU at 51.0 — i.e. the
+ordering flipped between two honest measurements on the same machine. An
+earlier draft of this document claimed CPU was ~30% faster on the
+strength of contended runs.
 An independent audit on the same host measured the ordering the other way
 (CUDA 43.9 against CPU 51.0) at a similar margin; run-to-run variance on
 this machine is 16–25%, which is larger than the gap. The honest
