@@ -373,6 +373,44 @@ def read_points_discarded(manifest: dict | None) -> dict:
     return {"_unexpected_shape": repr(value)}
 
 
+def parse_policy(spec: str | None):
+    """KEY=VALUE,... into a KeyframePolicy, or None for the shipped one.
+
+    Fields are looked up on the dataclass rather than accepted blindly, so
+    a typo is an error instead of a silently ignored experiment that
+    reports the baseline twice.
+    """
+    if not spec:
+        return None, {}
+    from dataclasses import fields
+
+    from tower.world_builder.keyframes import KeyframePolicy
+
+    known = {f.name: f.type for f in fields(KeyframePolicy)}
+    overrides = {}
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise BenchmarkError(f"--policy entry {item!r} is not KEY=VALUE")
+        key, _, raw = item.partition("=")
+        key = key.strip()
+        if key not in known:
+            raise BenchmarkError(
+                f"--policy: KeyframePolicy has no field {key!r}. "
+                f"Known: {', '.join(sorted(known))}"
+            )
+        current = getattr(KeyframePolicy(), key)
+        try:
+            overrides[key] = type(current)(raw.strip())
+        except ValueError as exc:
+            raise BenchmarkError(
+                f"--policy {key}={raw!r} is not a {type(current).__name__}"
+            ) from exc
+    return KeyframePolicy(**overrides), overrides
+
+
 # ---------------------------------------------------------------------
 # One capture
 # ---------------------------------------------------------------------
@@ -383,6 +421,7 @@ def run_capture(
     capture_dir: Path,
     scratch_root: Path,
     intrinsics_store: IntrinsicsStore,
+    policy=None,
 ) -> dict:
     """Replay one pinned capture and measure it. Raises rather than skips."""
     # Re-seeded per capture so a --only subset measures each capture
@@ -436,7 +475,9 @@ def run_capture(
     # this, and on Windows those 24 extra characters are the difference
     # between a run and a WinError 206.
     store = WorldStore(scratch_root / prefix)
-    engine = WorldBuilderEngine(store)
+    engine = WorldBuilderEngine(store, policy=policy) if policy else (
+        WorldBuilderEngine(store)
+    )
     world_id = engine.create_world(f"corpus:{prefix}")
     session_id = engine.start_session(
         world_id,
@@ -620,6 +661,7 @@ def do_run(args) -> int:
         # output of a subset run lines up with a full run.
         prefixes = tuple(p for p in PINNED_PREFIXES if p in wanted)
 
+    policy, policy_overrides = parse_policy(getattr(args, "policy", None))
     resolved = resolve_pinned_captures(captures_root, prefixes)
     intrinsics_store = IntrinsicsStore(MAIN_WORLD_ROOT)
     scratch_root.mkdir(parents=True, exist_ok=True)
@@ -629,6 +671,10 @@ def do_run(args) -> int:
     print(f"intrinsics  {intrinsics_store.path_for(*EXPECTED_RESOLUTION)}")
     print(f"scratch     {scratch_root}")
     print(f"captures    {len(resolved)} of {len(PINNED_PREFIXES)} pinned")
+    if policy_overrides:
+        print(f"policy      OVERRIDDEN {policy_overrides}")
+    else:
+        print("policy      shipped defaults")
     if len(resolved) != len(PINNED_PREFIXES):
         print("SUBSET RUN -- not comparable with a full-corpus run.")
     print()
@@ -642,7 +688,7 @@ def do_run(args) -> int:
             prefix,
             directory.name,
         )
-        captures.append(run_capture(prefix, directory, scratch_root, intrinsics_store))
+        captures.append(run_capture(prefix, directory, scratch_root, intrinsics_store, policy=policy))
 
     totals = totals_of(captures)
     report = {
@@ -653,6 +699,8 @@ def do_run(args) -> int:
         "pinned_prefixes": list(PINNED_PREFIXES),
         "prefixes_run": list(prefixes),
         "complete_corpus": len(resolved) == len(PINNED_PREFIXES),
+        # Recorded so a result file always says which policy produced it.
+        "policy_overrides": policy_overrides,
         "captures": captures,
         "totals": totals,
     }
@@ -681,7 +729,7 @@ def _load_report(path: Path) -> dict:
     return report
 
 
-def do_compare(paths) -> int:
+def do_compare(paths, expect_tracking_change: bool = False) -> int:
     left_path, right_path = Path(paths[0]), Path(paths[1])
     left, right = _load_report(left_path), _load_report(right_path)
 
@@ -738,6 +786,21 @@ def do_compare(paths) -> int:
         f"{rt['points'] - lt['points']:+8d}"
     )
 
+    waived = bool(violations) and expect_tracking_change
+    if waived:
+        print()
+        print("TRACKING EXPERIMENT -- segments/keyframes moved BY DESIGN on:")
+        print("  " + ", ".join(violations))
+        print(
+            "The invariant guard is waived because "
+            "--expect-tracking-change was passed. Read the pose and point "
+            "columns carefully: a change that cuts segments while costing "
+            "solved poses is the exact trap loss-grace-3 fell into, and "
+            "segment count alone cannot show it."
+        )
+        print()
+        violations = []
+
     if violations:
         bar = "!" * len(header)
         print()
@@ -761,7 +824,16 @@ def do_compare(paths) -> int:
         return 1
 
     print()
-    print("invariants hold: segments and keyframes identical on every capture.")
+    if waived:
+        print(
+            "invariants WAIVED: this was a tracking experiment, so segments "
+            "and keyframes moved by design."
+        )
+    else:
+        print(
+            "invariants hold: segments and keyframes identical on every "
+            "capture."
+        )
     print()
     d_solved = rt["poses_solved"] - lt["poses_solved"]
     d_points = rt["points"] - lt["points"]
@@ -809,6 +881,26 @@ def main(argv=None) -> int:
             "Never adds captures; it can only narrow the pinned set."
         ),
     )
+    parser.add_argument(
+        "--policy",
+        default=None,
+        metavar="KEY=VALUE,...",
+        help=(
+            "Override KeyframePolicy fields for a tracking experiment, e.g. "
+            "--policy min_survival_ratio=0.06. Recorded in the output so a "
+            "result file always says which policy produced it."
+        ),
+    )
+    parser.add_argument(
+        "--expect-tracking-change",
+        action="store_true",
+        help=(
+            "In --compare, allow segments/keyframes to differ. Those are "
+            "invariant for a point-path change and a comparison is VOID if "
+            "they move -- but a TRACKING experiment is supposed to move "
+            "them. Opt in explicitly so the guard keeps meaning something."
+        ),
+    )
     parser.add_argument("--captures", type=Path, default=DEFAULT_CAPTURES_ROOT)
     parser.add_argument(
         "--scratch",
@@ -842,7 +934,10 @@ def main(argv=None) -> int:
         if args.compare:
             if args.label or args.out or args.only:
                 parser.error("--compare takes no --label, --out or --only")
-            return do_compare(args.compare)
+            return do_compare(
+                args.compare,
+                expect_tracking_change=args.expect_tracking_change,
+            )
 
         if not args.label:
             parser.error("--label is required for a run (or use --compare)")
