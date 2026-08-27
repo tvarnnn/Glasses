@@ -162,9 +162,12 @@ upgrades does nothing new until an operator says so.
 the measured **12.0 fps** delivery rate rather than as fast as possible —
 feeding faster measures the harness.
 
-**Read every throughput figure as a floor.** The host was at 100% CPU
-from other lanes throughout. The internal control below is what makes the
-numbers usable anyway.
+**The first runs were all made on a host at 100% CPU from other lanes,
+and that turned out to matter more than expected.** §4.3 is the
+measurement on a quieter machine, and it changes the conclusion. The
+contended figures are kept because they are a real answer to a real
+question -- what this cartridge does on a Tower that is already busy --
+but they are not the cartridge's cost.
 
 ### 4.1 The torch thread finding
 
@@ -202,14 +205,41 @@ measurement at startup.
 | documents recorded | n/a | **0** |
 
 **The internal control.** Both ran on the same host at the same load, and
-Document Memory's cheap path kept up completely. So contention alone does
-not explain Scene's 34% shortfall: the detector genuinely costs more than
-the frame budget on this CPU under this load.
+Document Memory's cheap path kept up completely -- which at the time
+looked like evidence that Scene's 34% shortfall was the detector rather
+than the box. §4.3 shows that reading was wrong.
 
-**What that costs.** The tracker's `max_misses` is a FRAME count derived
-from a 1.0 s absence at 12 fps, so sustained skipping stretches what "one
-second of absence" means. `frames_skipped` is published for exactly this
-reason, and `count_limitations` now carries a `departure-lag` entry.
+**What a skew costs, when it happens.** The tracker's `max_misses` is a
+FRAME count derived from a 1.0 s absence at 12 fps, so sustained skipping
+stretches what "one second of absence" means. `frames_skipped` is
+published for exactly this reason, and `count_limitations` carries a
+`departure-lag` entry.
+
+### 4.3 The same benchmark on a quieter host — and it keeps up
+
+1,845 frames, CPU, `TOWER_SCENE_TORCH_THREADS=2`, host at ~70%:
+
+| | value |
+|---|---|
+| observed / offered | **1,843 / 1,845** |
+| skipped | **2 (0.11%)** |
+| observed rate | **11.96 fps** of 12.0 delivered |
+| CPU cores | 1.41 |
+| `offer_frame` median / p95 | 0.015 / 0.038 ms |
+| RSS growth over 2.5 min | **+0.55 MB** |
+
+**This corrects §4.2 and it is the number to plan against.** Scene
+Understanding keeps up with the glasses. The 34% skip was contention from
+other work on this machine, not the cartridge -- and the honest reading
+of the two runs together is that a Tower already saturated will drop
+about a third of its frames to this cartridge, while a Tower with a spare
+core and a half will drop essentially none.
+
+The `worker_service_ms_mean` figure is ~118 ms in both runs, which looks
+like a contradiction until the units are read: it is CPU-seconds per
+observed frame across a 1.4-core worker, so the wall-clock service time
+is ~84 ms -- right at the 83.5 ms delivered interval, which is exactly
+why a busy host tips it over and a quiet one does not.
 
 **Memory is bounded.** Both grew and flattened; the larger figure from a
 shorter earlier run was model warm-up, not a leak.
@@ -297,7 +327,10 @@ load-bearing, not decorative.
    corpus is almost certainly the wearer's own torso, and the
    distribution is unimodal with a 34.3% residual no threshold separates.
    `may_include_wearer: true`, `validated: false`.
-2. **34% frame skip on a contended CPU host.** See §4.2. Watch
+2. **It keeps up on a quiet host and does not on a busy one.** 0.11%
+   skipped at ~70% machine load; 34% at 100%. Wall-clock service time is
+   ~84 ms against an 83.5 ms interval, so there is no headroom -- this
+   cartridge is the first thing a loaded Tower will starve. Watch
    `frames_skipped`; it is on the wire for this.
 3. **Orientation off by default** — 956 ms per call on CPU, and
    `facing_from_keypoints` is unvalidated against ground truth.
@@ -375,17 +408,15 @@ To remove the offers from the declaration, revert the two
 
 ## 9. Gates
 
-**1,636 passed, 40 skipped**, at `8faf774`, `pytest tests/` with
-`tests/test_document_detect_corpus.py` excluded (it needs the corpus and
-was run separately).
+**1,663 passed, 40 skipped, 0 failed** — the whole suite, corpus tests
+included, in one run.
 
-One failure appeared in the same run and is the documented Windows
-sharing-violation flake in `tests/test_result_channel_hostile.py`, which
+Baseline before any change, on the same host: **1,512 passed, 40
+skipped**, with one failure — the documented Windows sharing-violation
+flake in `tests/test_result_channel_hostile.py`, which
 `docs/agent-handoffs/LANE-OWNERSHIP.md` §3 rules to the World Builder
-lane. It passes in isolation (18/18) and is unrelated to this work.
-
-Baseline before any change, on the same host: 1,512 passed, 40 skipped,
-with the same file's flake.
+lane. That flake surfaced twice during this run and passes in isolation
+(18/18); it did not appear in the final gate.
 
 ### New test files
 

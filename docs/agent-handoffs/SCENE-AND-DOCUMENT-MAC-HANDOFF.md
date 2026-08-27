@@ -534,23 +534,26 @@ A scene session was measured at **1.03 cores with
 `TOWER_SCENE_TORCH_THREADS=2`, and 4.12 cores without it**, at identical
 throughput. Set it.
 
-**And expect to lose frames.** Over 5,204 real corpus frames fed at the
-delivered 12.0 fps, on a host that was fully loaded by other work, the
-scene session observed 3,437 and skipped 1,767 — **34%**, at 7.91 fps.
-Read that as a floor rather than an estimate: the machine was contended.
-But the contention is not the whole story, because on the SAME host at
-the SAME load Document Memory's cheap path kept up completely — 5,203 of
-5,204 frames, 11.97 fps, 0.185 cores. The difference is the detector, not
-the box.
+**It keeps up — on a machine with room.** Measured twice, on the same
+corpus at the delivered 12.0 fps:
 
-What that costs you: the tracker's `max_misses` is a FRAME count derived
-from a 1.0 s absence at 12 fps, so a session that is skewing skips
-stretches what "1 second of absence" means. Watch `frames_skipped`. The
-payload publishes it for exactly this reason.
+| host load | observed | skipped | rate |
+|---|---|---|---|
+| ~70% | 1,843 / 1,845 | **0.11%** | **11.96 fps** |
+| 100% (other lanes) | 3,437 / 5,204 | 34% | 7.91 fps |
 
-Resident memory over the same seven-minute run grew **7.8 MB** for Scene
-and **12.2 MB** for Document Memory, and flattened — model warm-up, not a
-leak. `offer_frame`, which runs on the event loop, cost **0.0099 ms at
+Wall-clock service time is ~84 ms against an 83.5 ms interval, so there
+is no headroom: this cartridge is the first thing a loaded Tower will
+starve, and it degrades by dropping frames rather than by falling behind.
+
+What that costs you when it happens: the tracker's `max_misses` is a
+FRAME count derived from a 1.0 s absence at 12 fps, so a session that is
+skipping stretches what "1 second of absence" means. Watch
+`frames_skipped`. The payload publishes it for exactly this reason.
+
+Resident memory grew **7.8 MB** for Scene and **12.2 MB** for Document
+Memory over seven minutes, and **0.55 MB** for Scene over a later 2.5
+minute run once the model was warm — warm-up, not a leak. `offer_frame`, which runs on the event loop, cost **0.0099 ms at
 the median and 0.035 ms at p95**. The frame path is untouched.
 
 ---

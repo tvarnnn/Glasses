@@ -611,3 +611,72 @@ class TestTheCaptureSessionControlsRealWork:
         assert before["session"]["state"] == "stopped"
         assert after["session"]["state"] == "running"
         assert after["session"]["in_dwell"] is False
+
+
+def test_the_session_block_has_one_shape_whatever_the_configuration(
+    monkeypatch, tmp_path
+):
+    """A decoder must not have to guess which half of a payload it got.
+
+    Two Towers with the same contract -- one with a capture session, one
+    without -- must emit the same key set under `session`, or a strict
+    decoder has to make every field optional and can never tell a missing
+    value from a version skew.
+
+    Compared as SETS rather than field by field, so a field added to a
+    live session and forgotten in the absent shape fails here rather than
+    on a phone.
+    """
+    from tower.document_memory.live import DocumentLive
+    from tower.document_memory.ocr import FixedTextRecogniser
+    from tower.results import document_memory as adapter
+
+    session = DocumentLive(
+        tmp_path, recogniser_factory=lambda: FixedTextRecogniser(pages=[])
+    )
+    try:
+        absent = adapter.DocumentStatusProducer(str(tmp_path), None).payload()
+        present = adapter.DocumentStatusProducer(str(tmp_path), session).payload()
+    finally:
+        session.stop()
+
+    assert set(absent["session"]) == set(present["session"])
+    # And the state a session cannot be in is still in the vocabulary, so
+    # a client that only ever sees the absent shape can still pin it.
+    assert absent["session"]["state"] == "unavailable"
+    assert "unavailable" in absent["session"]["states"]
+    assert "unavailable" in present["session"]["states"]
+    assert set(absent["session"]["states"]) == set(present["session"]["states"])
+
+
+def test_the_session_route_and_the_channel_agree_on_the_session_block(
+    monkeypatch, tmp_path
+):
+    """Two surfaces, one shape.
+
+    `/documents-session` and the `document_memory/status` subscription
+    both carry a `session` block. They are built by different functions,
+    and functions that agree today are how `/cartridges` and its socket
+    twin would have drifted if a test had not held them together.
+    """
+    client = _client(monkeypatch, document_root=tmp_path, capture=True)
+
+    over_http = client.get("/documents-session").json()
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json(
+            {
+                "type": "result_subscribe",
+                "cartridge": "document_memory",
+                "result_type": "status",
+            }
+        )
+        assert ws.receive_json()["type"] == "result_subscribed"
+        over_socket = ws.receive_json()["payload"]
+
+    assert set(over_http["session"]) == set(over_socket["session"])
+    assert over_http["contract"] == LIBRARY_CONTRACT
+    # The route carries the same limitations every other response does. A
+    # client that polls the session and never calls a listing would
+    # otherwise never learn that an empty library is expected here.
+    assert over_http["recording_limitations"]
+    assert over_http["imagery_served"] is False
