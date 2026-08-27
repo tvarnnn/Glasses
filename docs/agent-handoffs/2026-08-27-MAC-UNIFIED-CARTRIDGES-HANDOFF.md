@@ -244,10 +244,77 @@ Object Memory's **required** `subject_obscured`. Same for ±∞ and anything
 past `Int.max`. Guarded, along with Scene's side-count sums on the push
 path.
 
-### 6.4 Final whole-app review
+### 6.4 Final whole-app review — two SEV-1s, one of them mine
 
-**Still running when this document was written.** Its findings are not in
-here. Read its report before treating §0 as final.
+Verdict: **shippable, with the two SEV-1s landing before anyone puts glasses
+on.** Both landed (`6f74c53`). Neither was a crash or data loss; both put a
+false statement on a screen.
+
+**The F2 fix above was half-done, and it re-opened F1.** Scene, Document and
+the CV Lab inherited World Builder's flag clear and **not its resume**.
+Nothing retries a subscription mid-connection, so after `channel_failed` or
+`consumer_too_slow` the cartridge went permanently silent on a socket that
+was still up and still feeding World Builder perfectly. `consumer_too_slow`
+is routine — it fires when the phone does not accept a result inside the
+send timeout, which is a backgrounded or thermally-throttled phone on a
+walk.
+
+The two fixes then interacted: because the run gate is now fed *only* by the
+subscription for runs this phone did not start, a dead subscription freezes
+the watched run id and every later `frame_result` is discarded — F1 in full,
+through the door F2 left open — while the CV Lab kept a **`live` badge over
+frozen figures**, both halves of its LIVE gate stuck at their last values.
+Neither earlier reviewer could have seen this, because they looked at F1 and
+F2 separately.
+
+**A cold launch told four workspaces the Tower had never heard of them.**
+`resolve` tested `declared == nil` before reachability, and those four learn
+`declared` only from the socket declaration — so `.towerUnreachable` was
+unreachable on a first run, and the shipped string says, wrongly and in so
+many words, *"That is a statement about what the Tower offers, not about
+this connection."* This was the first thing anyone would see with the Tower
+not yet up.
+
+**Two regressions I had introduced in `0f00b1e`,** both caught here: the
+`"stopped"` headline claimed *"Stop was requested"* on a session that died
+from a missing Python module — which is exactly what the bench Tower reports
+— and the `days()` sentinel read *"in the last an unreported window"*.
+
+Also fixed: Document's library ignored the `available` flag it had decoded,
+so an unconfigured Tower offered a search box that 404s while the Tower's
+own sentence naming the variable went unshown; and the drift check was blind
+to a **second** nested identifier (§8).
+
+Three fixes were narrowed after the tests pushed back, and the narrowing is
+the point in each case:
+
+- Making every undeclared cartridge report `.towerUnreachable` was **too
+  broad**. For Visual Q&A, which has no Tower code anywhere, that is its own
+  false story — reconnecting cannot help. Gated on the Tower-name mapping:
+  can this build ever *receive* a declaration?
+- Routing a stopped-with-failure Scene session to `.failed` **weakened the
+  stop-discards invariant to fix a copy problem**, and the Tower keeps
+  `failure_reason` across a stop, so a session that failed, recovered and
+  stopped normally would report a failure it had recovered from. Corrected
+  in the *sentence*; the state stays `.idle` and the scene is still
+  discarded.
+- That sentence fix then had to be narrowed to `stopped` alone, because an
+  `unrecognised` state must still reach the screen as the Tower's own words.
+
+**Its remaining findings are open and recorded here rather than fixed:**
+
+| # | Sev | Finding |
+|---|---|---|
+| R6 | 2 | `0f00b1e` fixed four defect classes and shipped one test. F2, F3 and every F7 guard have **no coverage**; `TowerSceneUnderstandingClient` and `TowerDocumentMemoryClient` are named nowhere in the test target. The F3 revert is *masked* by the harness, which sets `urlCache = nil` at the session level. |
+| R8 | 3 | One `channel_failed` produces four different presentations across four cartridges. |
+| R10 | 3 | `CartridgePhase.mayCarryData` has **zero production call sites** despite its doc calling it "the load-bearing half of this type" — the invariant holds because tests say so, not because any screen is prevented from violating it. `ExperimentalCVContract.frameResult` is the one contract identifier declared and never compared, and it governs the block feeding the F1 gate. `unsubscribeFromResults` is fully dead. ~60 decoded-and-never-rendered fields in `DocumentMemoryLibrary.swift` alone. |
+| R11 | 3 | Home asserts *"The Tower returns a measurement for each frame"*; a Lab that is idle/paused answers `frame_error` instead, and that has one reader app-wide. |
+| R12 | 4 | Four tests pass for the wrong reason (tautology, hardcoded `.absent`, `?? 0` making an assertion unfalsifiable, one whose assertion inverts its stated intent). |
+| R13 | 4 | Post-`sendStreamStart` heartbeat blanks the reading card once (<100 ms) and leaves a ≤2 s ungated window. Needs hardware to observe. |
+| R14 | 4 | Tower-side: `failure_reason` and `loading_seconds` survive a stop (26,362 s observed on a stopped session). |
+
+**R6 is the one to act on first.** The gap it names is real: this run fixed
+more than it tested.
 
 ---
 
