@@ -202,7 +202,8 @@ declaration gets caught.
 | after Object Memory | 1856 | 64 |
 | after Document/Scene | 1988 | 64 |
 | after CV Lab | 2144 | 64 |
-| after reviewer fixes | **2153** | **64** |
+| after reviewer fixes | 2153 | 64 |
+| after the final adversarial review | **2160** | **64** |
 
 `/cartridges` was inspected after every merge, over HTTP **and** on the
 socket, with the two compared for byte-identity every time.
@@ -341,6 +342,63 @@ other half. `test_the_contract_quotes_the_values_the_wire_actually_carries`
 now does, for the load-bearing constants, and asserts the retired spelling
 appears **nowhere** — which caught its own first draft.
 
+### The final adversarial review, and six more fixes (`4cac6e3`)
+
+Fourteen findings against the twelve-item checklist. Six fixed; eight
+recorded below. **Two of the six were in documents I wrote, and one was
+in the smoke I wrote to be the gate the Mac handoff points at.**
+
+- **CRITICAL — a `person` record was served over HTTP.** `append` refuses
+  a class this store may not persist, and its message names the threat
+  model exactly ("a script, a future consumer, a careless refactor").
+  That guard protects the FILE; nothing protected the WIRE. A record that
+  arrived by any of those routes was served in full — class, normalised
+  box, and a `session_id`+`frame_seq` that resolve to the original
+  first-person JPEG — while the payload said `recordable: false`. The
+  guard is now in `_parse_observations`, which every read path crosses.
+- **MAJOR — the only deletion path deleted from the wrong directory.**
+  `object_query.py --purge-all` defaulted to a CWD-relative
+  `data/object_memory` and never read `TOWER_OBSERVATION_ROOT` — the
+  precise defect `config.py` exists to prevent, and which
+  `object_memory_session.py` was fixed for and this file was not. A
+  wearer asks for erasure; `purge()` on a directory nothing wrote to
+  removes nothing and exits 0. Every existing CLI test passes `--root`
+  explicitly, which is why none caught it.
+- **MEDIUM — absolute paths on unauthenticated error paths.** Three sites
+  put an exception's text on a wire. **The first fix was wrong** and two
+  tests correctly refused it: suppressing the message wholesale destroyed
+  "this build does not recognise that pose convention", which is the
+  contract working. `client_safe_reason` splits by KIND — this repo's own
+  exceptions pass through, `OSError` reduces to its type name.
+- **MAJOR — my smoke's shutdown check was vacuous.** With autobuild off
+  and the session stopped before the only capture opened, **zero** capture
+  workers ever existed, so "no child outlives the Tower" passed because
+  there was nothing to leak. It now runs on the shipped default, holds a
+  stream open, waits for a real `world_build_session.py` child, and brings
+  the Tower down with the capture still open — via `CTRL_BREAK_EVENT`,
+  because `terminate()` on Windows is `TerminateProcess`, runs no
+  lifespan, and orphans every child. Proven able to fail: revert only the
+  signal and it goes red with three orphans.
+- **Five more contract drifts**, all verified on a running Tower: four
+  per-record fields hoisted into `record_notes` and still documented as
+  per-record (a non-optional Swift decode throws on **every** document);
+  `imagery_treatment` documented with a spelling the code calls retired;
+  `count_limitations` listed as three slugs when five ship
+  unconditionally; the publisher bounds documented 2/2/5 s against real
+  values of 1/1/2 s, with a justification for a number that had already
+  changed; and **every non-200 body nested under `detail`**, which is
+  worst on Object Memory's 410, where `memory_retained` is unreachable at
+  the documented path — degrading the "memory kept, picture gone" render
+  into the broken image the contract forbids.
+- **Two false claims in my own documents.** `TOWER-UNIFIED-CARTRIDGES.md`
+  said a hand-started operator session survives a phone disconnecting; it
+  does not, and my own Mac handoff said so in its known-defects table.
+  `OBJECT-MEMORY.md` said `captures` is session-scoped; it is
+  supervisor-scoped, so a new session can report an old one's capture. The
+  two fields now carry the caveat that they fail in **opposite**
+  directions — `state` can claim a stop that did not happen, `following`
+  a start that did not happen — and both point at `attached_capture_id`.
+
 ### Regression tests, proven red
 
 `tower/tests/test_unified_lifecycle_regressions.py`, 8 tests, in the
@@ -382,6 +440,19 @@ next person decides on evidence.
 | 10 | **Object Memory retention only runs on a clean producer exit** | `Stop` terminates immediately, skipping `prune_expired()`. On-disk growth, not a read-surface leak — reads still clamp. |
 | 11 | **Two HTTP contracts are declared nowhere** | `world_builder.geometry` and `object_memory.observations`. Declaring them means moving identifiers into `contracts.py`, and `registry.py` must stay cartridge-blind. **Those two lanes own the move.** |
 | 12 | **`world_builder/redaction.py` resolves its model path relative to CWD** | So face redaction — a privacy feature — is on or off depending on the launch directory, and it changes geometry (112 vs 194 solved poses on one capture). Disclosed by the WB lane, frozen to it. |
+
+From the final adversarial review:
+
+| # | Finding | Why it stands |
+|---|---|---|
+| 13 | **A Stop still flushing can tear down the NEXT session's engine, and leaks its own** (CRITICAL, reproduced) | `stop()` holds `_lifecycle` for four steps; `start()` takes only `_condition`, so a Start landing in the flush or join window stands up session 2 whose engine the old latch then releases. Document's flush is ~1–2.4 s wide, so this is not a microsecond race. It is deep surgery on the Document/Scene lane's most carefully ordered method — its docstring calls that order "the whole correctness of this method" — and getting it wrong reintroduces the defect it was written to fix. **Highest-value thing to fix next.** |
+| 14 | **A stopped Scene session's discarded scene can publish under the NEW session's identity** (MAJOR, reproduced 5 times in 93 cycles) | `latest()` and `status()` are two locked reads of state one lock clears atomically. The payload can say `state: "stopped"` *and* `scene_available: true` with `counts: {"person": 3}` — a room the wearer has left. Fixing it means changing a lane's public read API, not adding a lock. |
+| 15 | **Scene `Stop`→`Start` on the HTTP routes orphans the session from the stream** (MAJOR, reproduced) | `stop()` clears the owner set and `start()` never re-adopts the open stream, so the session runs, consumes frames, is owned by nobody, and no disconnect can stop it. Same lane, same file, same class of change as 13. |
+| 16 | **Two `object-memory-session` producers can share one store**, and one's exit-prune loses the other's writes (MAJOR, reproduced: 229 records lost) | The supervisor keys uniqueness by capture lineage; every producer gets the same `--root`. The existing guard enforces one producer per CAPTURE, which is not the invariant that matters. |
+| 17 | **Any connection's CV Lab choice puts 59–67 ms per frame on the shared event loop** (MAJOR, measured) | `object_detection` 67.0 ms and `depth` 53.2 ms against an 83.3 ms frame interval. Pre-existing V0.8 architecture — `process()` is synchronous by design — but the CV Lab lane made it a *runtime* choice any connection can make, and `_fan_out_frame` means the recorder and both live cartridges now pay it. Scene has ~0 ms of margin. Documented for the Mac; fixing it is an architecture change. |
+| 18 | **`capture_root` has no pruner**, and Object Memory's CLI cites one as the reason it need not touch it | `CaptureRecorder.purge()` has zero callers. Derived records expire in 30 days; the photographs they point at are kept forever. A retention decision for a human, not an integrator. |
+| 19 | **`ResultHub` can be resurrected after `shutdown()`** | No terminal latch, unlike every other lifecycle object here. Reasoned, not reproduced. |
+| 20 | **Scene/Document `session_id` collide across Tower restarts** | Bare integers from 0, published with "two payloads must not be compared". The CV Lab solves the same hazard with a per-process instance id. Bounded today because Scene publishes no tracks to mis-join. |
 
 ### The one deliberate gap: Object Memory is not in `/cartridges`
 
@@ -503,15 +574,16 @@ on it yet:
 
 | Check | Result |
 |---|---|
-| Complete Tower suite | **2153 passed, 64 skipped** |
+| Complete Tower suite | **2160 passed, 64 skipped** |
 | `-m slow` | 23 passed, 10 skipped |
 | Contract drift / documented-values | 10 passed |
 | Architecture boundaries (cartridge-blindness) | included in the 264 |
 | Boundary/bounds/hostile/startup sweep (12 files) | **264 passed** |
 | Route startup and import | `test_startup_scripts.py` green |
 | **Corpus replay, 8 real captures** | **reproduces the lane's figures exactly** (§6) |
-| **Autonomous uvicorn + socket smoke** | **68/68 with real models** |
-| Child processes after shutdown | **0** |
+| **Autonomous uvicorn + socket smoke** | **57/57**, and **69/69** with real models |
+| The smoke's shutdown check, deliberately broken | **goes red**, 3 orphaned workers |
+| Real capture worker attached, then reaped | **verified** (0 survivors) |
 | `/cartridges` HTTP vs socket | byte-identical |
 | `ios/` touched | **0 files** |
 | Working tree | clean |
@@ -584,18 +656,22 @@ Run 1 and 2 first. They are the two that can falsify something.
 **Commits on the branch** (first-parent):
 
 ```
-923aee6  docs(contracts): the Mac handoff, and the lifecycle divergences
-b42e6b2  fix(runtime): three cross-lane defects the reviewers found
-3e7e72b  fix(contracts): two documented values the wire had stopped carrying
-12ece7f  test(integration): an autonomous smoke that proves the lanes coexist
-4f52359  merge(integration): Experimental CV Lab productization
-84b85a6  merge(integration): Document Memory + Scene Understanding
-68141f9  merge(integration): Object Memory lifecycle-and-semantics
-83736e3  merge(integration): World Builder next-generation
+4cac6e3 fix(runtime,contracts): the final adversarial review, acted on
+60d6202 docs(handoff): check the four iOS-side claims against ios/, read-only
+354f87b fix(contracts): resume-from-stopped refuses not-paused, not not-active
+e2ca9b2 docs(handoff): the Tower unification integration report
+923aee6 docs(contracts): the Mac handoff, and the lifecycle divergences the reviewers found
+b42e6b2 fix(runtime): three cross-lane defects the two shared-runtime reviewers found
+3e7e72b fix(contracts): two documented values the wire had stopped carrying
+12ece7f test(integration): an autonomous smoke that proves the four lanes coexist
+4f52359 merge(integration): Experimental CV Lab productization into tower-unified-cartridges-v1
+84b85a6 merge(integration): Document Memory + Scene Understanding into tower-unified-cartridges-v1
+68141f9 merge(integration): Object Memory lifecycle-and-semantics into tower-unified-cartridges-v1
+83736e3 merge(integration): World Builder next-generation into tower-unified-cartridges-v1
 25eb794  (base)
 ```
 
-302 files changed, 149,355 insertions, 1,215 deletions against the base.
+306 files changed, 150655 insertions(+), 1219 deletions(-) against the base.
 
 **Pushed** to `origin/integration/tower-unified-cartridges-v1` after every
 lane. **Not merged to `main`.** No feature branch was force-pushed; no
@@ -610,7 +686,7 @@ feature branch was modified at all. `ios/` is untouched.
 | `68141f9` | + Object Memory |
 | `84b85a6` | + Document/Scene |
 | `4f52359` | all four lanes, before the reviewer fixes |
-| `923aee6` | HEAD |
+| `4cac6e3` | HEAD |
 
 Each merge commit is a true two-parent merge, so `git revert -m 1 <sha>`
 backs out exactly one lane. The four source branches are untouched at
@@ -635,3 +711,24 @@ Read this before filing a bug against this branch.
    would close it stays rejected on measured evidence.
 8. **`world_builder.geometry` and `object_memory.observations` are
    undeclared.** Those lanes own the move.
+9. **Every non-200 body is nested under `detail`.** FastAPI's
+   `HTTPException(detail=...)` with no custom handler. Documented now
+   rather than unwrapped, because unwrapping it is a wire change.
+10. **The CV Lab can cost Scene its entire frame-time margin.** Measured,
+    documented, and left: it is the V0.8 synchronous `process()`, not
+    something this merge introduced.
+
+### What I would fix first
+
+Finding 13 — a Stop still flushing tearing down the next session's
+engine. It is the only CRITICAL left open, it is reproduced, and its
+window is seconds wide rather than microseconds because Document's flush
+is OCR. Findings 14 and 15 are the same lane and the same file, so one
+careful pass could take all three.
+
+The clustering the final reviewer noticed is worth repeating: every
+falsifiable NUMBER in the two Mac documents held, and every claim that
+failed was about **lifecycle ownership or session scope** — written from
+design intent rather than read off the wire. Findings 13, 14, 15 and 16
+live in exactly that region. That is where the next reviewer should
+start.
