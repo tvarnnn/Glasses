@@ -1,5 +1,79 @@
 # Walk evidence for the World Builder lane — phone-side, 2026-08-26
 
+> **READ §0 FIRST. A second, controlled walk has since been run and it
+> REFUTES this document's central hypothesis.** §1 and §2 are kept because
+> their measurements are still correct and the reasoning is worth seeing
+> falsified, but the conclusion they point at is wrong.
+
+## 0. The controlled walk — the transport gap was NOT the cause
+
+A second walk was run specifically to test §2: **no reconnect, no pause, no
+interruption, sustained lateral/arc movement**, on an instrumented build.
+
+**The controlled condition held perfectly.**
+
+| | walk 1 (with the 9 s gap) | walk 2 (clean) |
+|---|---|---|
+| reconnects | 1 | **0** |
+| send stalls | 1 | **0** |
+| frames not sent | ~216 | **0** |
+| `tracking` != Good | 2 samples | **0 of 129 samples** |
+| stream brackets | 2 | **1** |
+| keyframes | 141 | 353 |
+| segments | 14 | **28** |
+| anchors | 14 | **28** |
+| solved poses | 30 | 72 |
+| points | 3,732 | 7,086 |
+| `scale_state` | unknown | **unknown** |
+
+**The fragmentation and the yield collapse happened anyway, and both were
+worse.** Marginal reconstruction yield across walk 2:
+
+| keyframes | points | poses | segments | marginal pts/keyframe |
+|---|---|---|---|---|
+| 91 | 1,138 | 16 | 6 | — |
+| 127 | 4,886 | 45 | 9 | 88.6 |
+| 174 | 4,958 | 49 | 12 | 2.4 |
+| 223 | 6,195 | 59 | 14 | 41.2 |
+| 245 | 6,942 | 66 | 18 | 34.0 |
+| 300 | 7,086 | 72 | 25 | 4.2 |
+| **353** | **7,086** | **72** | **28** | **0.0** |
+
+First half **28.1 points/keyframe**; second half **1.4**. A **20× collapse**,
+against the 14× that walk 1 showed — with no transport gap anywhere in it.
+
+**From keyframe ~300 to 353 the reconstruction produced literally nothing:**
+points frozen at 7,086, poses frozen at 72, while segments still grew 25 → 28.
+The last ~53 keyframes bought three more empty segments and not one point.
+
+**So the hypothesis in §2 is refuted.** The nine-second gap in walk 1 was real
+and is still worth avoiding, but it is **not** what fragments the world. This
+lane will not offer it as an explanation again, and you should not spend time
+on it.
+
+**What the controlled walk points at instead**, stated as observation not
+diagnosis, because the algorithm is yours:
+
+- **`anchors == segments` in both walks — 14/14 and 28/28.** Every segment is
+  its own anchor. Nothing has ever registered to anything else in any walk this
+  lane has observed.
+- **Yield is stepwise, not smooth**: 88.6, then 2.4, then 41.2, 34.0, then 4.2,
+  then flat. That reads like rebuilds landing intermittently and then ceasing,
+  rather than accumulation tailing off.
+- **New segments keep opening after point growth has stopped entirely.**
+  Whatever decides to start a segment is still firing when whatever solves one
+  has given up.
+- **`tracking` reported `Good` for the entire walk** while all of the above was
+  happening. Whatever "Good" measures, it is not predictive of reconstruction
+  succeeding — worth knowing before it is surfaced to a wearer as reassurance.
+
+**P11 also ran, and its prediction failed.** The walk was sustained lateral and
+arc movement — the motion the sidestep experiment says should make scale
+observable — and `scale` remained `Unknown` from the first status to the last.
+That is a negative result on a stated prediction, not a missing measurement.
+
+---
+
 **From:** Mac/iOS lane. **For:** `world-builder/next-generation`.
 **Session:** Tower World Builder `8ad340d01e0d477599d701bbcaf9ed29`,
 world `3d49a7711f6f4329a00c23dd395c95e8`. Phone capture binding

@@ -26,7 +26,7 @@ Every row below was produced from a clean `derivedDataPath` in this session.
 | Signed device build | **0 errors, 0 warnings** — `Apple Development: tv.lloyd@icloud.com` |
 | XCTest | **396 passed, 0 failed** (was 388 at the start of this lane's session) |
 | Install on physical iPhone 16 Pro | **done** — `com.tristanvarner.Glasses` |
-| Re-install of the instrumented build | **blocked** — device locked (`CoreDeviceError 4016`). Unlock the phone and re-run `xcrun devicectl device install app`; nothing else gates it |
+| Instrumented build on device | **done** — and note it had to be *verified at runtime*, not assumed: the phone was still running the previous build, which is only visible because the new one logs `ping sent (connect+upgrade N ms)`. Baseline handshake on this link is **7 ms** total, which is the number any future reconnect should be read against |
 
 **The `warning:` lines from `appintentsmetadataprocessor` are not compiler
 warnings.** They are a tool notice that the target declares no
@@ -423,12 +423,64 @@ and total points drawn — plus explicit lines for a failed manifest and for a
 pose-convention refusal. **A walk is expensive to repeat and this one could not
 answer the question it was run for.**
 
+### 7.2 P3 — **PHYSICALLY VALIDATED. Fragments do appear during a walk.**
+
+The clean walk ran on the instrumented build: **zero reconnects, zero stalls,
+one bracket, `tracking=Good` in 129 of 129 samples**, ~2 minutes, 2,546 DAT
+ordinals delivered and 1,343 frames written by the Tower — consistent with the
+12 fps gate and **no frame loss**.
+
+The geometry path, which had never been observable before:
+
+```
+[Glasses][Geometry] manifest world=adc75972… revision=d97a045a segments=28 withPoints=14 current=true
+[Glasses][Geometry] segments drawn=28 fetched=1 cached=27 points=7086
+```
+
+| | |
+|---|---|
+| manifests fetched during the walk | **67** |
+| segment chunks fetched | **88** |
+| segment cache hits | **1,043** (92.2% hit rate) |
+| manifest failures | **0** |
+| segments that failed to fetch | **0** |
+| pose-convention refusals | **0** |
+| points drawn, live | **7,086 across 28 segments** |
+
+**This is the first affirmative answer to the program's central product
+question.** The phone fetches the manifest when — and only when — the geometry
+revision moves, refetches exactly the one segment whose content hash changed,
+serves the other 27 from cache, and draws the result while the wearer is still
+walking. The revision-keyed cache the design argued for is doing precisely what
+it was designed to do, measured rather than asserted.
+
+**The iOS half of World Builder is DEVICE-VALIDATED.** What is not solved is
+the reconstruction itself, and that is the Tower's.
+
+### 7.3 The Mac lane's own hypothesis was refuted by this walk
+
+`WORLD-BUILDER-WALK-EVIDENCE-2026-08-26.md` §2 proposed that the 9-second
+transport gap in walk 1 explained the fragmentation. **The controlled walk
+refutes it.** With no gap at all, fragmentation was *worse* — 28 segments
+against 14, and a **20×** yield collapse against 14× — and from keyframe ~300
+to 353 the reconstruction produced **zero** points and **zero** poses while
+still opening three more segments.
+
+The refutation is written at the top of that document so the World Builder lane
+does not spend time on a phantom this lane created. `anchors == segments` in
+both walks (14/14, 28/28): nothing has ever registered to anything else.
+
+**P11's prediction also failed.** Sustained lateral and arc movement — the
+motion that should make scale observable — and `scale` stayed `Unknown` from
+the first status to the last. A negative result on a stated prediction, not a
+missing measurement.
+
 **PENDING, and every one needs a wearer:**
 
 | | What it needs |
 |---|---|
-| **P3 — do fragments appear during a walk** | **re-run.** The walk happened; the phone could not report the answer. Now instrumented — see §7.1 |
-| **P11 — the sidestep experiment** | walk *laterally* rather than panning. Highest-leverage: it tests a prediction |
+| ~~P3 — do fragments appear during a walk~~ | **DONE — YES. See §7.2.** |
+| **P11 — the sidestep experiment** | **ran; prediction FAILED** — scale stayed `Unknown` through sustained lateral motion (§7.3). Worth one repeat with a longer, wider arc before calling it settled |
 | P9/P10 — loop closure | a walk that returns to its start |
 | Sender FPS against the physical baseline | a live stream, to measure encode/backlog headroom |
 | Frames from the real camera reaching the Tower | glasses powered on |
