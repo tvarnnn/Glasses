@@ -170,6 +170,31 @@ That last point matters because sharpness feeds an absolute threshold and
 a rolling ratio, so a frame sitting exactly on the bar could in principle
 flip. Corpus parity was therefore re-run: _(result in §6)_.
 
+### 4.4 The closing evidence: the profile no longer contains Python
+
+Re-profiling the same 1,848-frame capture after the three changes, the
+top of the profile by tottime is:
+
+| | tottime | |
+|---|---|---|
+| `FaceDetectorYN.detect` | 9.877 s | native |
+| `calcOpticalFlowPyrLK` | 4.282 s | native |
+| `goodFeaturesToTrack` | 1.330 s | native |
+| `findHomography` | 1.294 s | native |
+| `imdecode` | 0.982 s | native |
+| `detectAndCompute` | 0.980 s | native |
+| `resize` | 0.797 s | native |
+| `_io.open` | 0.604 s | OS |
+| `nt.replace` | 0.362 s | OS |
+
+**Every Python-side entry has left the top of the profile.** numpy `_var`
+(was 1.302 s), `Laplacian` (1.129 s) and the JSON encoder are all gone.
+What remains is native OpenCV and filesystem syscalls, in that order.
+
+That is the strongest closing argument for the verdict: **there is now
+nothing left in this pipeline that a C++ rewrite could take.** The
+remaining cost is either already C++, or it is the operating system.
+
 ## 5. Rejected, with the measurement that rejected it
 
 | candidate | verdict | why |
