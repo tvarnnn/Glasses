@@ -45,6 +45,7 @@ It cannot hand it a frame, and there is no code path here that could.
 from fastapi import APIRouter, HTTPException, Request
 
 from tower.results.contracts import SCENE_LIVE_CONTRACT
+from tower.results.registry import SCENE_DISABLED_REASON
 from tower.results.scene_understanding import live_payload
 
 router = APIRouter()
@@ -64,13 +65,14 @@ def _session(request: Request):
         # of one configuration -- which is the drift
         # `SCENE_DISABLED_REASON` was made a module constant to prevent.
         # Falls back to the configured-off wording, unchanged.
+        # The SHARED constant for the fallback, not a second copy of the
+        # sentence. This route used to carry its own shorter wording, so
+        # the configured-off case already answered differently here than
+        # at `/cartridges` -- the drift the constant exists to prevent,
+        # sitting next to a comment claiming it could not happen.
         reason = getattr(request.app.state, "scene_unavailable_reason", None)
         raise HTTPException(
-            status_code=404,
-            detail=reason or (
-                "Scene Understanding is not enabled on this Tower "
-                "(TOWER_SCENE_UNDERSTANDING is unset or off)"
-            ),
+            status_code=404, detail=reason or SCENE_DISABLED_REASON
         )
     return session
 

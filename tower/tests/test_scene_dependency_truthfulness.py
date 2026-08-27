@@ -193,6 +193,68 @@ class TestTheReasonNamesWhatIsActuallyWrong:
         assert client_safe_reason(leaked) == "FileNotFoundError"
 
 
+class TestEverySceneSurfaceAgrees:
+    """Drive the REAL app, not hand-set `app.state`.
+
+    The reason travels four hops -- `LiveCartridges` -> `main.py` ->
+    `declaration_inputs` -> `declare()`/`find_offer` -> the routes -- and
+    every other test here sets `app.state` by hand or calls `declare()`
+    with the keyword directly. That meant the thread was never pinned end
+    to end, and two independent reviewers found the same consequence: one
+    hop was missed. `find_offer` had not been taught the keyword, so the
+    WebSocket subscribe refusal went on naming the environment variable
+    while three other surfaces told the truth -- and it is the surface a
+    phone actually receives.
+
+    This builds the app under a torch blocker and asks every surface.
+    """
+
+    def _app_without_torch(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("TOWER_SCENE_UNDERSTANDING", "true")
+        monkeypatch.setenv("TOWER_SCENE_DEVICE", "cpu")
+        monkeypatch.delenv("TOWER_CAPTURE_ROOT", raising=False)
+        monkeypatch.delenv("TOWER_WORLD_ROOT", raising=False)
+        with _BlockModules("torch", "torchvision"):
+            from tower.main import create_app
+
+            return create_app()
+
+    def test_no_surface_blames_the_variable_that_is_already_set(
+        self, monkeypatch, tmp_path
+    ):
+        from fastapi.testclient import TestClient
+
+        app = self._app_without_torch(monkeypatch, tmp_path)
+        assert app.state.scene_enabled is False
+        reason = app.state.scene_unavailable_reason
+        assert reason and "unset or off" not in reason
+
+        client = TestClient(app)
+
+        http = next(
+            entry
+            for entry in client.get("/cartridges").json()["cartridges"]
+            if entry["cartridge"] == "scene_understanding"
+        )
+        assert http["available"] is False
+        assert http["unavailable_reason"] == reason
+
+        assert client.get("/scene").json()["detail"] == reason
+
+        # The socket subscribe refusal -- the surface a phone receives,
+        # and the one that was missed.
+        offer = registry.find_offer(
+            None, "scene_understanding", "live",
+            **{
+                key: value
+                for key, value in registry.declaration_inputs(app.state).items()
+                if key != "world_root"
+            },
+        )
+        assert offer["available"] is False
+        assert offer["unavailable_reason"] == reason
+
+
 class TestTheContractSaysSo:
     """The wire changed meaning, so the prose had to change with it.
 

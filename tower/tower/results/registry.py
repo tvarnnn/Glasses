@@ -315,6 +315,7 @@ def find_offer(
     *,
     document_root: str | None = None,
     scene_enabled: bool = False,
+    scene_unavailable_reason: str | None = None,
     cv_lab=None,
 ):
     """The offer matching a subscribe request, or None.
@@ -322,11 +323,20 @@ def find_offer(
     None covers both "no such cartridge" and "no such result type on a
     cartridge that exists". The caller distinguishes them for the error
     message; this returns one thing so there is one lookup path.
+
+    `scene_unavailable_reason` is threaded through for the same reason it
+    exists at all: the offer this returns carries `unavailable_reason`,
+    and `result_subscribe` puts it on the wire. Without it that ONE
+    surface went on saying "TOWER_SCENE_UNDERSTANDING is unset or off"
+    while `/cartridges` over HTTP, the socket declaration and `/scene`
+    had all been taught the truth -- which is exactly the four-surfaces-
+    disagreeing drift the shared constant was introduced to prevent.
     """
     declaration = declare(
         world_root,
         document_root=document_root,
         scene_enabled=scene_enabled,
+        scene_unavailable_reason=scene_unavailable_reason,
         cv_lab=cv_lab,
     )
     for entry in declaration["cartridges"]:

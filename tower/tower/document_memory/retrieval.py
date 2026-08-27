@@ -133,9 +133,17 @@ class _Corpus:
         # `sum(1 for token_list in corpus.tokens if term in set(token_list))`
         # -- so scoring D documents against T query terms rescanned the
         # whole corpus D*T times AND rebuilt a set per document per scan.
-        # Exactly quadratic in library size: 25 documents 7.6 ms, 800
-        # documents 9,532 ms, with ~99% of the query spent re-deriving a
-        # number that never changed. One pass here costs 62 ms at 800.
+        # Exactly quadratic in library size. Same-session A/B on the test
+        # fixture's short documents: 0.89 ms -> 0.49 ms at 25, and
+        # 356.92 ms -> 14.18 ms at 800. An independent audit measured
+        # 9,532 ms at 800 on a heavier corpus of realistic page-length
+        # text; both are the same defect at different document lengths.
+        #
+        # This pass costs 0.98 ms at 800 on the short-document corpus and
+        # scales with total tokens, not with D^2. The multiplier is
+        # roughly length-INDEPENDENT (old is O(D^2*T*L), new is O(D*L),
+        # so L cancels); what grows with page length is the absolute time
+        # saved, measured at 671 ms for 400 realistic pages.
         #
         # Arithmetically identical, not merely close: `containing` for a
         # given term took the same value on every iteration it was

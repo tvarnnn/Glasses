@@ -357,6 +357,99 @@ def test_shutdown_stops_every_spec(spawn, spawned, tmp_path):
     assert supervisor.status() == []
 
 
+def test_shutdown_waits_on_every_worker_at_once_not_one_after_another(tmp_path):
+    """Teardown must cost the slowest worker, not the sum of all of them.
+
+    `_stop_worker` opens with `process.wait(timeout=grace_seconds)`, and
+    `shutdown` ran those one after another while holding `self._lock`.
+    Serially that is `N * (grace + TERMINATE_TIMEOUT_SECONDS)`. MEASURED
+    on the real thing with two stubborn workers: 24.00 s, with a
+    concurrent `status()` -- what `/health` calls -- blocked 23.95 s.
+
+    Asserted by OBSERVED CONCURRENCY rather than by wall time. A timing
+    assertion would measure the machine, and this suite already carries
+    load-sensitive flakes; counting how many waits were in flight at once
+    is the same claim without the flake.
+
+    Nothing about the grace window changes: each worker still gets its
+    own full wait and the same terminate-then-confirm sequence.
+    """
+    import threading
+
+    barrier_state = {"live": 0, "peak": 0}
+    lock = threading.Lock()
+    release = threading.Event()
+
+    class SlowProcess:
+        _pids = iter(range(50_000, 60_000))
+
+        def __init__(self, argv, **kwargs):
+            self.args = list(argv)
+            self.pid = next(SlowProcess._pids)
+            self._returncode = None
+            self.terminated = False
+
+        def poll(self):
+            return self._returncode
+
+        def wait(self, timeout=None):
+            if self._returncode is not None:
+                return self._returncode
+            with lock:
+                barrier_state["live"] += 1
+                barrier_state["peak"] = max(
+                    barrier_state["peak"], barrier_state["live"]
+                )
+            try:
+                # Held until every wait has arrived. Serial code deadlocks
+                # here and the test times out rather than passing quietly.
+                release.wait(timeout=5.0)
+            finally:
+                with lock:
+                    barrier_state["live"] -= 1
+            raise subprocess.TimeoutExpired(self.args, timeout)
+
+        def terminate(self):
+            self.terminated = True
+            self._returncode = -15
+
+        def kill(self):
+            self._returncode = -9
+
+    spawned = []
+
+    def spawn(argv, **kwargs):
+        process = SlowProcess(argv, **kwargs)
+        spawned.append(process)
+        return process
+
+    supervisor = CaptureWorkerSupervisor(
+        [_spec("builder"), _spec("memory")], spawn=spawn
+    )
+    _open(supervisor, tmp_path, "a")
+    assert len(spawned) == 2
+
+    def unblock():
+        # Let the waits sit together long enough to be counted, then free
+        # them so the test cannot hang if the code IS serial.
+        import time
+
+        time.sleep(0.5)
+        release.set()
+
+    releaser = threading.Thread(target=unblock)
+    releaser.start()
+    supervisor.shutdown(grace_seconds=1.0)
+    releaser.join()
+
+    assert barrier_state["peak"] == 2, (
+        f"only {barrier_state['peak']} worker wait was in flight at a time; "
+        f"teardown still costs the SUM of every worker's grace window"
+    )
+    assert all(process.terminated for process in spawned)
+    assert supervisor.status() == []
+
+
 def test_enabled_is_false_only_when_nothing_is_configured(spawn):
     assert CaptureWorkerSupervisor(None).enabled is False
     assert CaptureWorkerSupervisor([]).enabled is False

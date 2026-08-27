@@ -76,7 +76,15 @@ def client_safe_reason(exc: BaseException) -> str:
         # on an unauthenticated wire and a caller can construct an
         # ImportError by hand with anything in it.
         if isinstance(name, str) and re.fullmatch(r"[A-Za-z_][\w.]*", name):
-            return f"{type(exc).__name__}: no module named {name!r}"
+            # "no module named" only for the case where that is true. A
+            # plain ImportError means the module WAS found and something
+            # inside it could not be reached -- a partially initialised
+            # package, a missing symbol, a broken DLL -- and telling an
+            # operator the module is absent sends them to install
+            # something that is already installed.
+            if isinstance(exc, ModuleNotFoundError):
+                return f"{type(exc).__name__}: no module named {name!r}"
+            return f"{type(exc).__name__}: failed to import {name!r}"
         return type(exc).__name__
     if isinstance(exc, OSError):
         return type(exc).__name__

@@ -218,6 +218,13 @@ def _scene_session(settings):
     to an in-process test suite, because once the first import succeeds it
     cannot recur.
 
+    IT DOES NOT CLOSE THE RACE CLASS, only this instance of it. Scene is
+    one of several first-time torchvision importers; a reviewer reproduced
+    the identical failure between Document Memory's easyocr and
+    `tower/detection.py`'s lazy import with Scene OFF, where nothing here
+    runs. Preimporting is the fix for the pair that ships enabled
+    together, not a general answer to two threads racing an import.
+
     `find_spec` was measured as the alternative and REFUSED. It locates
     without executing, so it fixed 0 of 6 race trials, and against a
     package with a valid spec whose loader raises it reported

@@ -339,3 +339,113 @@ def test_a_partially_deleted_world_reports_honestly_and_does_not_crash(
         "the journals survived, so the counts must too"
     )
     _assert_no_fabrication(payload)
+
+
+# -- Echo amplification ----------------------------------------------------
+#
+# `ws.py` bounds a client-supplied `seq` before echoing it, and says why:
+# "the alternative is letting a remote party choose the size of our
+# messages". `cv_lab/lab.py` has the same guard, in the same words, with
+# the same 120-character limit. The result channel echoes THREE
+# client-supplied identifiers -- `cartridge`, `result_type` and
+# `subscription_id` -- into both a message string and a field, and bounded
+# none of them.
+#
+# MEASURED before the fix, exactly 2.00x and unbounded:
+#
+#     cartridge      in=1,000,000  reply=2,000,311   2.00x
+#     subscription   in=1,000,000  reply=2,000,189   2.00x
+#
+# It matters more here than the size alone suggests: these replies are sent
+# while holding the send lock the FRAME PATH shares, so an oversized echo
+# is paid by every frame_result queued behind it.
+
+
+def _reply_to(handler_coroutine):
+    import asyncio
+
+    sent = []
+
+    class _Recorder:
+        async def send(self, payload):
+            sent.append(payload)
+
+    asyncio.run(handler_coroutine(_Recorder()))
+    assert sent, "the handler sent nothing"
+    return json.dumps(sent[0])
+
+
+class _NoChannel:
+    def existing(self):
+        return None
+
+
+def _app_state_websocket():
+    import types
+
+    state = types.SimpleNamespace(
+        world_root=None,
+        document_root=None,
+        scene_enabled=False,
+        scene_unavailable_reason=None,
+        cv_lab=None,
+    )
+    return types.SimpleNamespace(app=types.SimpleNamespace(state=state))
+
+
+@pytest.mark.parametrize("field", ["cartridge", "result_type"])
+def test_a_huge_subscribe_identifier_cannot_choose_our_reply_size(field):
+    from tower.routes import results_ws
+
+    blob = "A" * 200_000
+    message = {"type": "result_subscribe", "cartridge": "world_builder",
+               "result_type": "status"}
+    message[field] = blob
+
+    reply = _reply_to(
+        lambda sender: results_ws._subscribe(
+            message, _app_state_websocket(), sender, _NoChannel()
+        )
+    )
+
+    assert len(reply) < 4_000, (
+        f"a {len(blob)}-character {field} produced a {len(reply)}-character "
+        f"reply; a remote party is choosing the size of our messages"
+    )
+    assert blob not in reply
+
+
+def test_a_huge_unsubscribe_id_cannot_choose_our_reply_size():
+    from tower.routes import results_ws
+
+    blob = "B" * 200_000
+
+    reply = _reply_to(
+        lambda sender: results_ws._unsubscribe(
+            {"type": "result_unsubscribe", "subscription_id": blob},
+            sender,
+            _NoChannel(),
+        )
+    )
+
+    assert len(reply) < 4_000, reply[:200]
+    assert blob not in reply
+
+
+def test_a_bounded_identifier_still_comes_back_whole():
+    """The bound must not corrupt the ordinary case.
+
+    An unknown cartridge name is how a client learns it asked for
+    something this Tower does not serve, so the name has to survive.
+    """
+    from tower.routes import results_ws
+
+    reply = _reply_to(
+        lambda sender: results_ws._subscribe(
+            {"type": "result_subscribe", "cartridge": "not_a_cartridge",
+             "result_type": "status"},
+            _app_state_websocket(), sender, _NoChannel(),
+        )
+    )
+
+    assert "not_a_cartridge" in reply

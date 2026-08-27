@@ -50,6 +50,44 @@ ERR_TOO_MANY = "too_many_subscriptions"
 ERR_UNKNOWN_SUBSCRIPTION = "unknown_subscription"
 ERR_SNAPSHOT_FAILED = "snapshot_failed"
 
+# How much of a client-supplied identifier comes back in a refusal.
+#
+# `cartridge`, `result_type` and `subscription_id` are echoed into both a
+# message string and a field, and were bounded by nothing. MEASURED at
+# exactly 2.00x and unbounded: a 1,000,000-character `cartridge` produced
+# a 2,000,311-character reply.
+#
+# It costs more than its size. These replies are sent while holding the
+# send lock the FRAME PATH shares, so an oversized echo is paid by every
+# `frame_result` queued behind it -- which is the starvation
+# `CARTRIDGE-RESULTS.md` forbids in Tower responsibility #3.
+#
+# 120 to match the two guards that already exist for exactly this, in the
+# same words: `routes/ws.py: _echo_safe` ("the alternative is letting a
+# remote party choose the size of our messages") and `cv_lab/lab.py:
+# _clip` ("A remote party must not be able to choose the size of a message
+# this Tower sends"). Not imported from either: `ws.py`'s helper passes
+# numbers through untouched because it bounds a numeric `seq`, and
+# `cv_lab`'s lives inside a cartridge that this module is forbidden to
+# import -- `test_the_result_channel_core_is_cartridge_blind` is what
+# keeps the result-channel core cartridge-blind, and reaching through it
+# for a string helper would honour the letter of that rule while breaking
+# it.
+ECHO_LIMIT = 120
+
+
+def _echo_safe(value) -> str:
+    """A client-supplied identifier on its way back out, bounded.
+
+    Always a string: these three fields are typed as strings by the
+    contract, an ill-formed client can send anything, and the refusal has
+    to name what arrived so a person can see their own typo.
+    """
+    text = str(value)
+    if len(text) <= ECHO_LIMIT:
+        return text
+    return text[: ECHO_LIMIT - 1] + "…"
+
 
 async def handle(message: dict, *, websocket, sender, channel_holder) -> None:
     """Dispatch one result-channel message. Never raises."""
@@ -92,6 +130,21 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
         )
         return
 
+    # Bounded HERE, once, rather than at each of the eight sites that echo
+    # them. A guard applied per call site is a guard someone adds a ninth
+    # call site next to, and the ninth one is the hole -- this function
+    # already echoes `cartridge` and `result_type` into six different
+    # refusals, and an audit that listed the sites missed
+    # `requested_contract` below.
+    #
+    # Safe to rebind before the lookup rather than only on the way out:
+    # every cartridge and result type this Tower serves is a short
+    # identifier from a closed set in `contracts.py`, so truncation can
+    # only ever affect a value that was already going to be refused. A
+    # name long enough to be clipped is not a name `find_offer` knows.
+    cartridge = _echo_safe(cartridge)
+    result_type = _echo_safe(result_type)
+
     world_id = message.get("world_id")
     session_id = message.get("session_id")
     if world_id is not None and not isinstance(world_id, str):
@@ -108,6 +161,9 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
         result_type,
         document_root=inputs["document_root"],
         scene_enabled=inputs["scene_enabled"],
+        # The offer's `unavailable_reason` goes on the wire below, so this
+        # surface must be told the same thing `/cartridges` was.
+        scene_unavailable_reason=inputs["scene_unavailable_reason"],
         cv_lab=inputs["cv_lab"],
     )
     if offer is None:
@@ -150,7 +206,8 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
             cartridge=cartridge,
             result_type=result_type,
             offered_contract=offer["contract"],
-            requested_contract=requested,
+            # Client-supplied and echoed, exactly like the two above.
+            requested_contract=_echo_safe(requested),
         )
         return
 
@@ -255,6 +312,10 @@ async def _unsubscribe(message, sender, channel_holder) -> None:
             sender, ERR_MALFORMED, "result_unsubscribe requires 'subscription_id'"
         )
         return
+    # Same rebinding as `_subscribe`, same reason. Ids are minted by
+    # `next_subscription_id()` and are short, so a value long enough to be
+    # clipped is one `remove()` was never going to match.
+    subscription_id = _echo_safe(subscription_id)
     channel = channel_holder.existing()
     removed = False
     if channel is not None:
