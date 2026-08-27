@@ -109,6 +109,24 @@ class BuildResult:
     diagnostics: dict = field(default_factory=dict)
 
 
+# How much a solve chain must have achieved before a break is allowed to
+# start a new segment.
+#
+# Splitting on EVERY break was measured and refused. It recovers a great
+# deal of geometry -- solved poses 346 -> 863, points 47k -> 107k across
+# the pinned eight -- but shatters the world: segments 127 -> 470, median
+# 2 keyframes each, and the mean largest-segment share of points falls
+# 0.549 -> 0.295. Twice the geometry in a third of the coherence is not
+# progress toward one recognisable room.
+#
+# The shatter comes from regions that break immediately after seeding,
+# over and over, turning genuinely unmappable footage into dozens of
+# two-frame islands. Requiring the broken chain to have solved at least
+# two poses -- i.e. to have built a real multi-view reconstruction rather
+# than a lone seed pair -- restarts the segments that earned it and lets
+# the unmappable ones stay one honestly-refused segment.
+MIN_SOLVED_BEFORE_RESTART = 2
+
 class WorldBuilderEngine:
     def __init__(
         self,
@@ -137,6 +155,7 @@ class WorldBuilderEngine:
         self._tracker: FrameTracker | None = None
         self._events: EventLog | None = None
         self._segment_index = 0
+        self._segment_solved = 0
         self._rejected: dict[str, int] = {}
         # Survives stop_session() on purpose: the usual order is
         # observe... stop_session() build(), and throwing the solve away
@@ -243,6 +262,10 @@ class WorldBuilderEngine:
             self._tracker.reset()
             self._selector.note_lost()
             self._segment_index += 1
+            # A new segment starts with nothing solved. Without this the
+            # restart budget would be inherited from the segment that
+            # just died.
+            self._segment_solved = 0
             if self._live is not None:
                 self._live.close_segment(self._segment_index)
             self._note_rejected(decision.reason)
@@ -275,10 +298,43 @@ class WorldBuilderEngine:
             # redact() hands back the very object it was given whenever
             # it changed nothing, which is the overwhelmingly common case
             # and makes this free.
-            self._live.extend(
+            step = self._live.extend(
                 keyframe.keyframe_id,
                 gray if image_bytes is raw_bytes else decode_gray(image_bytes),
             )
+            if step is not None and step.pose.status == POSE_STATUS_SOLVED:
+                self._segment_solved += 1
+            if (
+                step is not None
+                and step.chain_broken
+                and self._segment_solved >= MIN_SOLVED_BEFORE_RESTART
+            ):
+                # The solve chain failed on this keyframe. Everything
+                # after it shares no coordinate frame with what came
+                # before -- which is precisely what a segment boundary
+                # means here, and what the comment on the tracking-loss
+                # increment above already says.
+                #
+                # Without this, `chain.broken` latches and every later
+                # keyframe in the segment is refused WITHOUT ORB
+                # detection, matching, or any geometry attempted.
+                # Measured on capture 22e9d428: 354 refusals from 26
+                # decisions, 328 cascade, 0 of 26 segments ever
+                # recovering. classical.py has claimed for a long time
+                # that "the engine turns this into a new segment"; it did
+                # not, and this makes the claim true.
+                #
+                # The TRACKER IS NOT RESET. Tracking is healthy; the
+                # solve failed. Resetting would manufacture a tracking
+                # loss out of a geometry failure and throw away a
+                # perfectly good reference frame.
+                self._segment_index += 1
+                self._segment_solved = 0
+                self._live.close_segment(self._segment_index)
+                self._events.append(
+                    "solve_chain_broken",
+                    {"segment_index": self._segment_index},
+                )
 
         self._tracker.set_reference(gray)
         self._selector.note_accepted()
@@ -895,17 +951,25 @@ class _LiveSolve:
         self._open: list[str] = []
         self._frozen: dict[int, tuple[tuple[str, ...], object]] = {}
 
-    def extend(self, keyframe_id: str, gray) -> None:
+    def extend(self, keyframe_id: str, gray):
+        """Extend the open solve and return the backend's Extension.
+
+        The return value was previously discarded. It carries
+        `chain_broken`, the signal that lets the engine split a segment
+        when the solve fails instead of refusing every later keyframe in
+        it without looking.
+        """
         if not self.usable:
-            return
+            return None
         try:
-            self.backend.extend(
+            step = self.backend.extend(
                 KeyframeInput(keyframe_id=keyframe_id, image_gray=gray)
             )
         except Exception:
             self._give_up("extending")
-            return
+            return None
         self._open.append(keyframe_id)
+        return step
 
     def close_segment(self, segment_index: int) -> None:
         if not self.usable:

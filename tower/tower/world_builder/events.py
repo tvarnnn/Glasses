@@ -31,6 +31,11 @@ EVENT_KINDS = frozenset(
         "keyframe_accepted",
         "frame_rejected",
         "tracking_lost",
+        # The SOLVE chain failed, not tracking. Distinct from
+        # tracking_lost on purpose: the tracker is healthy and its
+        # reference is kept, so a consumer must not read this as the
+        # wearer having lost the world. It does not set last_tracking.
+        "solve_chain_broken",
         "segment_started",
         "backend_downgraded",
         "mapping_stalled",
