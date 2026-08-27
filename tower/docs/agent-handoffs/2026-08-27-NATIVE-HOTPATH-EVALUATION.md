@@ -68,9 +68,29 @@ The largest Python-side costs are JSON serialisation and filesystem
 syscalls. There is no Python loop, no object-churn hotspot, and no
 NumPy/OpenCV boundary hotspot to migrate.
 
-**And the product is not latency-constrained:** 1,848 frames in 32.0 s is
-**17.3 ms/frame against an ~83 ms budget at 12 fps** — roughly 5×
-headroom, and that figure includes `build()`.
+**And the product is not latency-constrained — but by less than I first
+claimed. CORRECTED.**
+
+My first version of this line read "17.3 ms/frame against an ~83 ms
+budget — roughly 5x headroom". That averaged over ALL delivered frames,
+and most frames are cheap rejections, so it flattered the result.
+
+The scaling lane measured the number that actually matters — latency on
+frames that are ACCEPTED as keyframes, which is where the expensive work
+happens: **47.2 ms median in the first quarter of a 448-keyframe walk,
+50.0 ms in the last.** Against an ~83 ms budget at 12 fps that is roughly
+**1.7x headroom, not 5x.**
+
+Still not latency-constrained, and **flat in session length** — a fitted
+slope of +0.008 ms per keyframe with r = +0.099, which is noise. But 1.7x
+is a margin worth protecting rather than spending, and it makes the
+per-frame sharpness win (§4.3) more valuable than I first credited, since
+it applies to every delivered frame rather than only to accepted ones.
+
+The live `observe()` path measures **94.7% native** by tottime in
+isolation — higher than the 79.1% for replay+build, because that figure
+includes `build()` and the filesystem. Its single largest Python frame is
+**0.092 s out of 24 s.**
 
 Incidentally: **face redaction is the single most expensive operation in
 World Builder**, larger than optical flow. It is already native, and §5
