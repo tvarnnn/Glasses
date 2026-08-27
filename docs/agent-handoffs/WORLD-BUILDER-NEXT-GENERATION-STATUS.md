@@ -2,7 +2,7 @@
 
 **Branch:** `world-builder/next-generation`, based on
 `origin/integration/world-builder-lifecycle-v1` @ `25eb794`
-**Tower tests:** 478 passed, 10 skipped (`-k world`)
+**Tower tests:** 502 passed, 10 skipped (`-k world`)
 **Not merged.** Not force-pushed. The mega branch is untouched.
 
 ---
@@ -43,7 +43,17 @@ recovering.
 root and cascaded, with a degeneracy histogram over roots.
 
 **Registration results are persisted and served.** `placements.json`,
-`transform_to_world`, `registration_state`, and `placement_hash`.
+`transform_to_world`, `registration_state`, and `placement_hash`. A
+placement is bound to the `input_digest` of the build it was solved
+against, so it cannot outlive its geometry; one whose reference segment is
+not itself placed is refused rather than inviting a composite into a frame
+nothing defines.
+
+**Registration got affordable.** Cross-segment matching samples 8 keyframes
+per segment instead of a full cross-product — measured as the smallest
+sample preserving every verdict on both registering captures, where 5 lost
+all of them. 192 s to 44 s on one world, 20 s on the other. Comfortable at
+finalisation; still not live.
 
 ---
 
@@ -114,6 +124,12 @@ which is the highest-leverage experiment available and needs a wearer.
   appears beside the largest piece, which is not a loss. That misreading nearly
   discarded a 2.5x reconstruction gain.
 - **Nothing here is physically validated.** Every number is replay.
+- **Four adversarial reviews have run**, and each found something the tests
+  did not. The most valuable finding was that a whole feature could be
+  reverted with the suite green, because its only engine-level test asserted
+  the mechanism did *not* fire. The second was that a placement outlived the
+  reconstruction it was fitted to and was served against points that no
+  longer existed. Neither was reachable by reading the code alone.
 
 ---
 
