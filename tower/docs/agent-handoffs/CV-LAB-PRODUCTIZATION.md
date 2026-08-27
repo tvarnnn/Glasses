@@ -8,7 +8,7 @@
 "Running things" below, the CWD is load-bearing)
 **Starting commit:** `6e325f8` — *measure: the shipped detector is blind
 below 2% of the frame*
-**Ending commit:** see `git log` on the branch; the sequence is in §3.
+**Ending commit:** `dc37655` — *fix: what three adversarial reviews found*
 **Pushed:** yes, `origin/cv-lab/productization-v1`.
 **Tree:** clean.
 
@@ -141,7 +141,7 @@ putting a lock on the measured path.
 | `43b590d` | feat: the CV Lab stops being an environment variable — the whole implementation, contract document, and 110 tests |
 | `3adc484` | fix: a shutdown that waits for the load it cancelled — plus the overhead benchmark and the iOS handoff |
 | `ee10594` | test: drive a real Tower, not an in-process shim — `scripts/cv_lab_smoke.py` |
-| (final) | fix: what three adversarial reviews found — see §5. 22 findings from the first two, 3 found while fixing them, 10 more from a verification pass over the fixes, 5 investigated and deliberately not changed |
+| `dc37655` | fix: what three adversarial reviews found — see §5. 22 findings from the first two, 3 found while fixing them, 10 more from a verification pass over the fixes, 5 investigated and deliberately not changed |
 
 ---
 
