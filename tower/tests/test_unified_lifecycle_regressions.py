@@ -544,3 +544,47 @@ def test_a_failure_reason_on_the_wire_never_carries_a_filesystem_path():
         "a domain exception's explanation was suppressed; the client is "
         "left with a type name it cannot act on"
     )
+
+
+def test_an_import_failure_names_the_module_without_naming_the_file():
+    """`ImportError` is the second exception that carries a path.
+
+    The rule above reduces `OSError` and passes everything else through,
+    which is correct for this repository's own exceptions and WRONG for
+    `ImportError`: CPython builds the message for a failed
+    `from X import Y` by appending the module's `__file__` in
+    parentheses. Measured before this guard, on a real one:
+
+        ImportError: cannot import name 'X' from 'torchvision.transforms'
+        (C:\\Users\\tvllo\\Projects\\Glasses\\tower\\.venv\\Lib\\site-packages
+        \\torchvision\\transforms\\__init__.py)
+
+    That reached `/cartridges` the moment Scene Understanding began
+    reporting WHY it could not be constructed, and it discloses the home
+    directory and the OS username -- the exact threat this helper exists
+    to stop, arriving through the one exception type it did not cover.
+
+    The module NAME is kept, because it is the actionable half and it is
+    structured data rather than prose: `exc.name` is set by the import
+    system and never holds a path.
+    """
+    from tower.logging_config import client_safe_reason
+
+    leaky = ImportError(
+        "cannot import name 'InterpolationMode' from 'torchvision.transforms' "
+        r"(C:\Users\someone\.venv\Lib\site-packages\torchvision\transforms\__init__.py)",
+        name="torchvision.transforms",
+        path=r"C:\Users\someone\.venv\Lib\site-packages\torchvision\transforms\__init__.py",
+    )
+    text = client_safe_reason(leaky)
+
+    assert "someone" not in text, text
+    assert ".venv" not in text and "site-packages" not in text, text
+    assert "__init__.py" not in text, text
+    # Still says what is missing.
+    assert "torchvision.transforms" in text, text
+
+    missing = ModuleNotFoundError("No module named 'torch'", name="torch")
+    text = client_safe_reason(missing)
+    assert "torch" in text, text
+    assert "\\" not in text and "/" not in text, text

@@ -39,7 +39,15 @@ class _BlockModules:
     def find_spec(self, fullname, path=None, target=None):
         root = fullname.split(".")[0]
         if root in self._names:
-            raise ModuleNotFoundError(f"No module named {root!r}")
+            # `name=` is not decoration. CPython's import system always
+            # sets it, and `client_safe_reason` READS it -- it reports the
+            # module name and discards the message, because CPython puts
+            # the module's `__file__` in an ImportError's text and that
+            # string reaches an unauthenticated wire. A blocker that
+            # omitted `name` simulated an exception the import system
+            # cannot produce, and the test that noticed was asserting the
+            # reason names the missing module.
+            raise ModuleNotFoundError(f"No module named {root!r}", name=root)
         return None
 
     def __enter__(self):

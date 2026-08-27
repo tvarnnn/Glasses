@@ -1,4 +1,5 @@
 import logging
+import re
 
 from tower.config import Settings
 
@@ -35,7 +36,48 @@ def client_safe_reason(exc: BaseException) -> str:
     Blanket-suppressing the message was tried first and was wrong: it
     turned "this build does not recognise that pose convention" into
     "UnknownPoseConventionError", and two tests correctly refused it.
+
+    `ImportError` IS THE SECOND KIND THAT CARRIES A PATH, and it was
+    missed because it is not an `OSError`. CPython builds the message for
+    a failed `from X import Y` by appending the module's `__file__` in
+    parentheses, so a real one reads
+
+        cannot import name 'InterpolationMode' from
+        'torchvision.transforms' (C:\\Users\\<user>\\...\\__init__.py)
+
+    which discloses the home directory and the OS username exactly as an
+    OSError would. It became reachable when Scene Understanding started
+    reporting why it could not be constructed; before that no import
+    failure had a route to this function.
+
+    It is reduced differently from `OSError` rather than identically,
+    because the two differ in what the useful half is. An OSError's useful
+    half IS the path, so nothing survives suppression. An ImportError's is
+    the MODULE NAME -- "no module named 'easyocr'" tells an operator to
+    install an extra, while a bare "ModuleNotFoundError" tells them
+    nothing. `exc.name` is set by the import system and holds a dotted
+    module name, never a path, so it is safe to keep and it is read
+    instead of the message rather than out of it.
+
+    NOT a general fix for third-party exceptions. Anything that is neither
+    an OSError nor an ImportError still passes its message through, which
+    is right for this repository's own exceptions and is a standing risk
+    for a dependency that decides to put a path in a `RuntimeError`.
+    Inverting the rule -- pass through `tower.*` types, reduce everything
+    else -- was considered and NOT done here: it would also discard useful
+    path-free messages like torch's own CUDA diagnostics, and it is a
+    judgement about every cartridge's wire rather than a fix for a
+    measured leak. Recorded so the next reader knows the hole is known.
     """
+    if isinstance(exc, ImportError):
+        name = getattr(exc, "name", None)
+        # Guarded rather than trusted: `name` is a dotted module path in
+        # every case the import system produces, but this string is going
+        # on an unauthenticated wire and a caller can construct an
+        # ImportError by hand with anything in it.
+        if isinstance(name, str) and re.fullmatch(r"[A-Za-z_][\w.]*", name):
+            return f"{type(exc).__name__}: no module named {name!r}"
+        return type(exc).__name__
     if isinstance(exc, OSError):
         return type(exc).__name__
     return f"{type(exc).__name__}: {exc}"
