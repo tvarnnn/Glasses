@@ -74,6 +74,67 @@ tip it the other way just as readily.
 perpendicular to reality, with a `solved` status and healthy-looking
 evidence, and no existing gate catches it.**
 
+## 0.2 A clean discriminator exists on synthetic data — and does NOT transfer
+
+Both this investigation and the independent adversarial review converged
+on the same statistic, from values `classical.py:664-673` **already
+computes and discards**: the ratio of **cheirality inliers to epipolar
+inliers** at the seed pair.
+
+MEASURED, synthetic, 120 solves across 60 seeds x {raw, JPEG}:
+
+| | RIGHT (<10 deg) | WRONG (>45 deg) |
+|---|---|---|
+| cheirality fraction | n=119, min **0.924**, p50 0.954 | **0.300** |
+| median triangulation angle | min 4.380 | 0.700 |
+| epipolar inlier ratio | min 0.924 | 0.900 |
+
+**Cheirality separates cleanly (0.924 vs 0.300); the epipolar inlier ratio
+does NOT** (0.924 vs 0.900 — a 0.024 gap). The review reached the same
+place independently, at 0.9755 worst-good against 0.3470 best-bad, and
+noted that normalising by *epipolar* inliers rather than raw matches
+avoids the false-refusal-at-short-baseline problem this codebase's own
+comments warn about.
+
+`r_h` does not separate them either (bad 0.474-0.477 sits inside good
+0.454-0.494) — one more measurement confirming r_H is not the
+discriminator it looks like.
+
+### Then it was measured on real footage, and it does not hold
+
+MEASURED over all persisted `edges.jsonl` — 2,832 edges, of which 126
+carry both fields, 70 of those on solved poses:
+
+| | cheirality / epipolar |
+|---|---|
+| median | **0.982** |
+| p5 | **0.204** |
+| min | **0.069** |
+
+| a gate at | would refuse, of currently-SOLVED edges |
+|---|---|
+| 0.5 | **17.1%** |
+| 0.6 | 20.0% |
+| 0.7 | 25.7% |
+| 0.8 | 32.9% |
+
+Most real edges are healthy — but real footage has a **long low tail that
+the synthetic scenes do not**. A gate anywhere near the synthetic
+separation point removes roughly a sixth of the reconstruction.
+
+**That is only the right trade if those edges are ALSO wrong, and on this
+corpus there is no ground truth with which to find out.** So the gate is
+NOT implemented. Shipping it would trade a measured 17% loss against an
+unmeasured 2.5% gain.
+
+**This is the single most valuable experiment PT-1 footage would unlock**:
+with a walk carrying genuine translation, the low tail should thin, and
+whether the remaining low-ratio edges are wrong becomes answerable.
+
+Caveat on the real-footage numbers: those edges come from worlds built by
+the PREVIOUS engine, and only 126 of 2,832 edges carry both fields. The
+tail is real; its exact shape at HEAD is not established.
+
 ## 1. Why this matters more than a synthetic-scene curiosity
 
 **A ~2% rate of confidently-wrong reconstructions is a product problem,
