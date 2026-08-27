@@ -2,7 +2,9 @@
 
 **Branch:** `world-builder/next-generation`
 **Starting commit:** `e68b323`
-**Ending commit:** _(filled at close)_
+**Ending commit:** see `git log e68b323..HEAD` — **21 commits**
+**Working tree:** clean · **Push status:** all pushed to
+`origin/world-builder/next-generation` · **`ios/` untouched** · **not merged**
 
 ---
 
@@ -415,6 +417,28 @@ trade this lane was opened to evaluate.
 | before this lane | 1,637 passed, 64 skipped |
 | after residual vectorisation (+19 parity tests) | **1,656 passed, 64 skipped, 0 failed** |
 | after sharpness + JSON (+9 tests) | **1,665 passed, 64 skipped, 0 failed** (4m49s) |
+| after the review's corrections (+1 test) | **1,665 passed, 64 skipped, 1 flake** — see below |
+
+**The one failure is an environmental flake, not a regression, and here is
+why I am confident rather than hopeful:**
+
+`test_result_channel_hostile.py::test_the_channel_survives_the_world_vanishing_mid_subscription`
+failed with `PermissionError: [WinError 32] The process cannot access the
+file because it is being used by another process`.
+
+- It passes **3/3 in isolation** after the change.
+- **The same code already passed**: the 1,665-run above included the
+  `storage.py` change and had zero failures. Same code, passed once,
+  failed once under heavy concurrent load.
+- The test's own docstring documents this exact hazard: it unlinks
+  `world.json` while a subscription is live, and records that an earlier
+  version "passed or failed by luck" against Windows open handles.
+- The direction is wrong for it to be mine: `handle.write(json.dumps(...))`
+  holds the file open for LESS time than per-token `json.dump`, so the
+  change **narrows** this race window rather than widening it.
+
+Recorded rather than re-run until green, because "it passed on the
+retry" is how a real intermittent bug gets buried.
 
 ## 6.5 CPU, RAM, GPU, VRAM
 
