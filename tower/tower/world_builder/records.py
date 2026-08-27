@@ -394,6 +394,12 @@ class SegmentPlacement:
                 raise ValueError(
                     f"scale must be a real number, got {self.scale!r}"
                 )
+            if self.refusal_reason is not None:
+                raise ValueError(
+                    "a registered placement must not carry a refusal reason; "
+                    "the wire drops it silently, so it would be a field that "
+                    "looks meaningful and is not"
+                )
             if not math.isfinite(self.scale) or self.scale <= 0:
                 raise ValueError(
                     f"scale must be finite and positive, got {self.scale!r}; "

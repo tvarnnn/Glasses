@@ -526,8 +526,17 @@ class WorldStore:
         if not path.exists():
             return None
         try:
-            return read_json_closed(path)["support"]
-        except (json.JSONDecodeError, KeyError):
+            support = read_json_closed(path)["support"]
+            # Shape-checked, not just parsed. A top-level list raised
+            # TypeError straight out of a method whose docstring promises
+            # it never raises, and a string was returned AS the support
+            # table -- which cross-segment registration then consumes.
+            if not isinstance(support, list):
+                raise TypeError(
+                    f"support must be a list, got {type(support)}"
+                )
+            return support
+        except Exception:
             logger.warning(
                 "world builder: support association unreadable at %s; "
                 "treating as absent",

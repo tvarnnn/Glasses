@@ -723,3 +723,57 @@ def test_non_standard_json_never_reaches_disk(tmp_path):
         ])
     path = store.derived_dir(world_id) / session_id / "placements.json"
     assert not path.exists(), "a refused write must leave no file"
+
+
+def test_a_registered_placement_cannot_carry_a_refusal_reason():
+    """The wire drops it silently for a registered row, so storing one
+    creates a field that looks meaningful and is not."""
+    with pytest.raises(ValueError, match="refusal reason"):
+        _placement(refusal_reason="bogus")
+
+
+@pytest.mark.parametrize(
+    "label,body",
+    [
+        ("truncated json", "{ not json"),
+        ("support is null", '{"support": null}'),
+        ("top-level list", "[]"),
+        ("support is a string", '{"support": "oops"}'),
+    ],
+)
+def test_no_support_corruption_shape_breaks_or_leaks(tmp_path, label, body):
+    """`_read_support` promises it never raises. It raised on a top-level
+    list -- and, worse, RETURNED the string "oops" as the support table on
+    another shape, which cross-segment registration then consumes.
+
+    Same class of defect as the placements reader had; the new code had
+    copied the old shape.
+    """
+    store = WorldStore(tmp_path)
+    world_id, session_id = "w" * 32, "s" * 32
+    derived = store.derived_dir(world_id) / session_id
+    derived.mkdir(parents=True, exist_ok=True)
+    (derived / "poses.json").write_text('{"poses": []}', encoding="utf-8")
+    (derived / "points.json").write_text('{"points": []}', encoding="utf-8")
+    (derived / "support.json").write_text(body, encoding="utf-8")
+
+    read = store.read_derived(world_id, session_id, verify=False)
+    assert read is not None, f"{label} must not refuse the whole world"
+    assert read["support"] is None, (
+        f"{label} must read as absent, never as a usable support table"
+    )
+
+
+def test_a_valid_support_table_still_reads(tmp_path):
+    """The control: the shape check must not refuse real data."""
+    store = WorldStore(tmp_path)
+    world_id, session_id = "w" * 32, "s" * 32
+    derived = store.derived_dir(world_id) / session_id
+    derived.mkdir(parents=True, exist_ok=True)
+    (derived / "poses.json").write_text('{"poses": []}', encoding="utf-8")
+    (derived / "points.json").write_text('{"points": []}', encoding="utf-8")
+    (derived / "support.json").write_text(
+        '{"support": [[0, 1, 2], [0, 3, 4]]}', encoding="utf-8"
+    )
+    read = store.read_derived(world_id, session_id, verify=False)
+    assert read["support"] == [[0, 1, 2], [0, 3, 4]]
