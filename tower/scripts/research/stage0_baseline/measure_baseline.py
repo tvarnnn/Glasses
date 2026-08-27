@@ -923,12 +923,32 @@ def configuration_block():
     Recorded here so a later stage can tell instantly whether it is comparable
     with this one, instead of discovering a 70% swing and blaming its change.
     """
+    from tower.world_builder import backend as _backend  # noqa: F401
     from tower.world_builder import redaction
 
     override = os.environ.get("TOWER_FACE_REDACTION_MODEL")
     resolved = redaction.model_path()
+
+    # WHICH BYTES SOLVED THIS. A shared checkout can be edited by another
+    # lane between the start of a run and its repeats, and when it is, two
+    # "identical" runs differ for a reason no output previously showed. That
+    # happened during the first Stage 0 run: the corpus moved 591 -> 620
+    # solved poses and 75,369 -> 71,122 points across a 30-minute window
+    # because `backends/classical.py` and `geometry.py` had changed on disk,
+    # which read exactly like nondeterminism until the commit was checked.
+    # Hashing the two files that carry the solve makes that visible on sight.
+    solver_digests = {}
+    for name in ("backends/classical.py", "geometry.py", "engine.py",
+                 "keyframes.py", "frontend.py"):
+        path = Path(_backend.__file__).parent / name
+        solver_digests[name] = sha256_of(path)
+
     return {
         "cwd": os.getcwd(),
+        "tower_package": str(Path(_backend.__file__).parent),
+        "solver_source_sha256": solver_digests,
+        "git_head": _git(["rev-parse", "HEAD"]),
+        "git_status_porcelain": _git(["status", "--porcelain"]),
         "redaction_model_env_override": override,
         "redaction_default_path": str(redaction.DEFAULT_MODEL_PATH),
         "redaction_model_resolved": str(resolved) if resolved else None,
@@ -943,7 +963,7 @@ def configuration_block():
     }
 
 
-def corpus_repeat_check(repeats, scratch_root):
+def corpus_repeat_check(repeats, scratch_root, own_captures=None):
     """Re-run the SHIPPED harness end to end, in fresh processes, N times.
 
     The single-capture determinism probe answers "is one replay reproducible".
@@ -956,6 +976,13 @@ def corpus_repeat_check(repeats, scratch_root):
     It runs `world_builder_corpus_benchmark.py` itself -- the real instrument,
     not a reimplementation -- with cwd pinned to `tower/` so redaction is in
     the same state as the run that produced this baseline.
+
+    THE REPEATS ARE COMPARED AGAINST THIS RUN, NOT ONLY AGAINST EACH OTHER.
+    The first version of this function compared the repeats only to each
+    other, reported IDENTICAL, and was wrong in the way that matters: both
+    repeats agreed with one another and disagreed with the run they were
+    attached to, because the source tree changed between the two. A stability
+    check that cannot see the drift it exists to catch is worse than none.
     """
     runs = []
     failures = []
@@ -993,27 +1020,47 @@ def corpus_repeat_check(repeats, scratch_root):
             },
         })
 
-    if len(runs) < 2:
+    needed = 1 if own_captures else 2
+    if len(runs) < needed:
         return {
             "measured": False,
-            "reason": "fewer than two corpus runs completed",
+            "reason": (
+                f"fewer than {needed} corpus repeat(s) completed, so there is "
+                f"nothing to compare"
+            ),
             "repeats_requested": repeats,
             "repeats_completed": len(runs),
             "failures": failures,
         }
 
     keys = ("segments", "keyframes", "poses_solved", "poses_refused", "points")
-    first = runs[0]["by_prefix"]
+    series = list(runs)
+    if own_captures:
+        # This run goes FIRST in the series, so "moved" means moved away from
+        # the baseline these numbers are being recorded as -- not merely
+        # disagreement among the repeats.
+        series.insert(0, {
+            "wall_seconds": 0.0,
+            "totals": {
+                key: sum(c[key] for c in own_captures) for key in keys
+            },
+            "by_prefix": {
+                c["prefix"]: {k: c[k] for k in keys} for c in own_captures
+            },
+            "_is_this_run": True,
+        })
+
+    first = series[0]["by_prefix"]
     moved = {}
     for prefix in first:
         for key in keys:
-            values = [run["by_prefix"][prefix][key] for run in runs]
+            values = [run["by_prefix"][prefix][key] for run in series]
             if len(set(values)) > 1:
                 moved.setdefault(prefix, {})[key] = values
     totals_moved = {
-        key: [run["totals"][key] for run in runs]
+        key: [run["totals"][key] for run in series]
         for key in keys
-        if len({run["totals"][key] for run in runs}) > 1
+        if len({run["totals"][key] for run in series}) > 1
     }
     # The guard the shipped comparator applies. If these move on a rerun with
     # no code change, that guard can VOID a comparison for no reason.
@@ -1024,13 +1071,15 @@ def corpus_repeat_check(repeats, scratch_root):
     return {
         "measured": True,
         "repeats_completed": len(runs),
+        "compared_against_this_run": bool(own_captures),
         "fresh_processes": True,
         "identical_across_runs": not moved,
         "captures_that_moved": moved,
         "totals_that_moved": totals_moved,
         "captures_violating_the_ab_invariant": invariants_moved,
+        # First row is THIS run when own_captures was supplied.
         "per_run_totals": [
-            {k: run["totals"][k] for k in keys} for run in runs
+            {k: run["totals"][k] for k in keys} for run in series
         ],
         "wall_seconds": round(sum(run["wall_seconds"] for run in runs), 3),
         "failures": failures,
@@ -1310,9 +1359,10 @@ def do_measure(args):
         )
 
     corpus_repeat = None
-    if args.corpus_repeats > 1:
+    if args.corpus_repeats > 0:
         corpus_repeat = corpus_repeat_check(
-            args.corpus_repeats, scratch_root / "corpus-repeat"
+            args.corpus_repeats, scratch_root / "corpus-repeat",
+            own_captures=captures,
         )
 
     totals = bench.totals_of(captures) if captures else None
