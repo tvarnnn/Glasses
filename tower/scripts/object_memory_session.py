@@ -135,22 +135,40 @@ def loose_frames(directory: Path):
         yield path.read_bytes(), index, None, path.name
 
 
-def _build_verifier(name: str):
+VERIFIERS = ("none", "owlv2")
+
+
+def _build_verifier(name: str, device: str):
     """Whatever may second-guess a detector label, or None.
 
-    A NAME rather than a flag, because the answer will eventually be a
-    model identifier and a boolean cannot become one. `none` returns
-    None, and None is what makes `verification_available` False -- which
-    is what keeps the `verify` tier unreachable on a Tower with no
-    semantic model, rather than reachable and always refused.
+    A NAME rather than a flag, because the answer is a model identifier
+    and a boolean could never have become one. `none` returns None, and
+    None is what makes `verification_available` False -- which keeps the
+    `verify` tier unreachable on a Tower with no semantic model, rather
+    than reachable and always refused.
+
+    `none` is the DEFAULT, and that is a deliberate conservatism rather
+    than a lack of confidence in the alternative. `owlv2` measured 93.2%
+    acceptance of correct labels and 94.3% rejection of wrong ones over
+    94 human-labelled crops -- but those 94 crops are from one home, and
+    turning it on downloads ~600 MB of weights and takes ~620 MB of VRAM
+    on a GPU this cartridge shares. One environment variable enables it;
+    the evidence for doing so is in
+    `docs/superpowers/research/2026-08-27-object-memory-corpus-precision.md`.
     """
     if name == "none":
         return None
+    if name == "owlv2":
+        from tower.object_memory.classes import prompt_for, verifier_vocabulary
+        from tower.object_memory.verification import OwlV2Verifier
+
+        return OwlV2Verifier(
+            device=device,
+            vocabulary=verifier_vocabulary(),
+            prompt_for=prompt_for,
+        )
     raise SystemExit(
-        f"unknown verifier {name!r}. This build offers 'none'; see "
-        "docs/superpowers/research/"
-        "2026-08-27-object-memory-vision-model-landscape.md for what a "
-        "real one would be and why none is wired yet."
+        f"unknown verifier {name!r}; this build offers {', '.join(VERIFIERS)}"
     )
 
 
@@ -178,7 +196,21 @@ def main(argv=None) -> int:
         help=(
             "What may second-guess a detector label. 'none' (the default) "
             "agrees with nothing, so only the classes measured reliable on "
-            "the detector's own word are written."
+            "the detector's own word are written. 'owlv2' loads "
+            "google/owlv2-base-patch16-ensemble (~600 MB, Apache-2.0) and "
+            "unlocks the verify tier."
+        ),
+    )
+    parser.add_argument(
+        "--verifier-device",
+        choices=("cpu", "cuda"),
+        default="cuda",
+        help=(
+            "Where the verifier runs. CUDA by default even though the "
+            "detector defaults to CPU, and deliberately: measured 128 ms "
+            "a crop on this GPU against 2,473 ms on this CPU, and putting "
+            "the two stages on different devices is what keeps a 2.5-second "
+            "burst off the cores the detector is using."
         ),
     )
     parser.add_argument("--score-threshold", type=float, default=SCORE_THRESHOLD)
@@ -290,7 +322,7 @@ def main(argv=None) -> int:
     )
     retention = None if args.retention_days <= 0 else args.retention_days * 86400.0
     store = ObservationStore(args.root, retention_seconds=retention)
-    verifier = _build_verifier(args.verifier)
+    verifier = _build_verifier(args.verifier, args.verifier_device)
     # Synchronous for a replay, threaded for a live follow. A replay has
     # no reason to be asynchronous and every reason to be deterministic;
     # a live session must not stall the frame path on a model.
@@ -342,6 +374,8 @@ def main(argv=None) -> int:
         "session_id": session_id,
         "detector": detector.name,
         "device": args.device if detector.name != "fixed" else None,
+        "verifier": args.verifier,
+        "verifier_device": args.verifier_device if verifier is not None else None,
         "timing_source": timing,
         "attach_mode": attach_mode,
         # What this run could have written, which is narrower than what

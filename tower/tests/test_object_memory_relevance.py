@@ -23,6 +23,7 @@ from tower.object_memory.classes import (
     VERIFY,
     classes_in,
     tier_of,
+    wholes_of,
 )
 from tower.object_memory.relevance import (
     ALREADY_RECORDED,
@@ -30,6 +31,7 @@ from tower.object_memory.relevance import (
     CONTEXT_ONLY,
     EXCLUDED,
     NOT_WHITELISTED,
+    PART_OF_ANOTHER,
     RECORD,
     TOO_BRIEF,
     UNVERIFIED,
@@ -236,3 +238,43 @@ class TestClassEvidence:
     def test_the_excluded_set_is_not_silently_empty(self):
         """A guard that guards nothing passes for the wrong reason."""
         assert EXCLUDED_CLASSES
+
+
+# -- parts and wholes --------------------------------------------------
+
+
+class TestPartOfAnother:
+    """A laptop's keyboard is not a second memory of the laptop.
+
+    Measured: `keyboard` produced 24 sightings across 12 captures, every
+    one of them in a capture that also had a laptop in view. A verified
+    replay of the validated capture wrote two `keyboard` records and one
+    of them was the keyboard of a laptop that already had its own.
+    """
+
+    def test_a_part_is_suppressed_while_its_whole_is_in_view(self):
+        sighting = _sighting("keyboard", verdict={"agrees": True})
+
+        verdict = _filter().decide_sighting(sighting, open_classes={"laptop"})
+
+        assert verdict == PART_OF_ANOTHER
+
+    def test_a_part_on_its_own_is_still_a_memory(self):
+        """The other record in that replay is a lit mechanical keyboard at
+        a desk with no laptop near it. A blanket rule would lose it."""
+        sighting = _sighting("keyboard", verdict={"agrees": True})
+
+        verdict = _filter().decide_sighting(sighting, open_classes={"cell phone"})
+
+        assert verdict == RECORD
+
+    def test_a_whole_is_never_suppressed_by_its_part(self):
+        sighting = _sighting("laptop")
+
+        verdict = _filter().decide_sighting(sighting, open_classes={"keyboard"})
+
+        assert verdict == RECORD
+
+    def test_the_table_is_not_silently_empty(self):
+        assert wholes_of("keyboard") == ("laptop",)
+        assert wholes_of("laptop") == ()

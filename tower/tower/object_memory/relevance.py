@@ -64,6 +64,7 @@ from tower.object_memory.classes import (  # noqa: F401
     classes_in,
     is_excluded,
     tier_of,
+    wholes_of,
 )
 from tower.object_memory.sightings import GAP_SECONDS, MIN_FRAMES
 
@@ -77,6 +78,7 @@ CONTEXT_ONLY = "context-only"
 BELOW_MIN_SCORE = "below-min-score"
 TOO_BRIEF = "too-brief"
 UNVERIFIED = "unverified"
+PART_OF_ANOTHER = "part-of-another-sighting"
 ALREADY_RECORDED = "already-recorded"
 
 DROP_REASONS = (
@@ -86,6 +88,7 @@ DROP_REASONS = (
     BELOW_MIN_SCORE,
     TOO_BRIEF,
     UNVERIFIED,
+    PART_OF_ANOTHER,
     ALREADY_RECORDED,
 )
 
@@ -174,13 +177,18 @@ class RelevanceFilter:
             return BELOW_MIN_SCORE
         return RECORD
 
-    def decide_sighting(self, sighting) -> str:
+    def decide_sighting(self, sighting, open_classes=()) -> str:
         """Whether a sighting has become worth a record.
 
         Called on every frame of an open sighting, which is why
         ALREADY_RECORDED is a verdict rather than an assertion: on the
         second and every later frame the common answer is "that one is
         already on disk".
+
+        `open_classes` is what else is in view at this moment. It is
+        passed in rather than reached for, because this filter holds no
+        state -- the temporal state lives in `SightingTracker`, where it
+        describes something that happened.
         """
         if sighting.recorded:
             return ALREADY_RECORDED
@@ -189,6 +197,12 @@ class RelevanceFilter:
             return verdict
         if sighting.frame_count < self._policy.min_frames:
             return TOO_BRIEF
+        # A part that is only in view because its whole is. Checked
+        # against what is open RIGHT NOW rather than against the class
+        # table, so a keyboard on a desk with no laptop near it is still
+        # a memory and a laptop's own keyboard is not a second one.
+        if any(whole in open_classes for whole in wholes_of(sighting.object_class)):
+            return PART_OF_ANOTHER
         if tier_of(sighting.object_class) == VERIFY:
             agreed = sighting.verdict is not None and sighting.verdict.get("agrees")
             if not agreed:

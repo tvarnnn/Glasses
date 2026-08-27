@@ -262,7 +262,7 @@ class ObjectMemoryEngine:
 
     def _consider(self, sighting) -> ObjectObservation | None:
         """Write, request a second opinion, refresh, or do nothing."""
-        verdict = self._relevance.decide_sighting(sighting)
+        verdict = self._relevance.decide_sighting(sighting, self._open_classes())
         if verdict == RECORD:
             return self._write(sighting)
         if verdict == UNVERIFIED:
@@ -280,6 +280,17 @@ class ObjectMemoryEngine:
             return None
         self.dropped[verdict] = self.dropped.get(verdict, 0) + 1
         return None
+
+    def _open_classes(self) -> frozenset:
+        """What else is in view right now.
+
+        Only the classes, not the sightings: the one rule that reads this
+        asks whether a whole is present while a part is being considered,
+        and handing it the sightings would invite something to start
+        comparing boxes -- which is a spatial claim this cartridge does
+        not make.
+        """
+        return frozenset(self._tracker.open_sightings)
 
     def _request_verification(self, sighting) -> None:
         """Ask once per sighting, when it matures, with its best look.
@@ -374,7 +385,7 @@ class ObjectMemoryEngine:
 
     def _settle(self, sighting) -> None:
         """A sighting has ended. Write it if it earned it, then let it go."""
-        if self._relevance.decide_sighting(sighting) == RECORD:
+        if self._relevance.decide_sighting(sighting, self._open_classes()) == RECORD:
             self._write(sighting)
         if sighting.recorded:
             self._refresh(sighting, force=True)

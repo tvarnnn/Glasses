@@ -163,12 +163,15 @@ CLASS_EVIDENCE: dict[str, ClassEvidence] = {
     "cell phone": ClassEvidence(
         REMEMBERED,
         sightings=80,
-        inspected=12,
-        correct=12,
+        inspected=24,
+        correct=24,
         note=(
-            "Median best score 0.979 across 27 captures. Small boxes "
-            "(median 8.5% of frame) and still reliable, which is unusual "
-            "here -- a lit screen is a strong, distinctive signal."
+            "24 of 24 strongest crops were phones, twenty of them at a "
+            "score of exactly 1.00. Median best score 0.979 across 27 "
+            "captures. Small boxes -- a median 8.5% of the frame, five of "
+            "the inspected crops under 7% -- and still reliable, which is "
+            "unusual here: a lit screen is a strong, distinctive signal, "
+            "and it is the one small object this detector is good at."
         ),
     ),
     # -- worth finding, and not trustworthy without a second opinion --
@@ -373,6 +376,105 @@ CLASS_EVIDENCE: dict[str, ClassEvidence] = {
 # on what a COCO-only cartridge can ever be for. Recorded here rather
 # than in a document so the gap is visible from the code that has it.
 WORTH_FINDING_WITHOUT_A_COCO_CLASS = ("keys", "wallet", "glasses", "charger", "medication")
+
+
+# --- what a verifier is asked, and what it is asked to choose between ---
+#
+# A COCO class name is not always the phrase a language-conditioned model
+# understands best. `mouse` alone is an animal.
+PROMPT_FOR = {
+    "mouse": "computer mouse",
+    "keyboard": "computer keyboard",
+    "remote": "remote control",
+    "cup": "drinking cup",
+    "tv": "television screen",
+    "microwave": "microwave oven",
+    "tie": "necktie",
+}
+
+# Every alternative a verifier gets to choose from, every time.
+#
+# Fixed rather than per-crop, and that is the whole reason a verifier
+# works at all. Asked "is this a remote?" with nothing else on offer, a
+# model says yes -- there is nothing else to say. Given the alternatives,
+# and specifically the ones this detector actually confuses, it says
+# "computer keyboard" and the sighting is refused.
+#
+# Measured on 94 human-labelled crops from the real corpus: with this
+# vocabulary `owlv2-base-patch16-ensemble` accepts 93.2% of correct
+# labels and rejects 94.3% of wrong ones. See
+# `docs/superpowers/research/2026-08-27-object-memory-corpus-precision.md`.
+#
+# `human hand` is here as a DISTRACTOR and nothing else. A crop of
+# something held in a hand is the commonest confuser in this corpus, and
+# a model allowed to say so rejects it. No score against it is ever
+# stored, no record is ever created from it, and `person` is deliberately
+# NOT in the list -- the exclusion above is not a thing a prompt list
+# should be able to work around.
+VERIFIER_DISTRACTORS = (
+    "ceiling fan",
+    "airplane",
+    "door",
+    "door frame",
+    "wall",
+    "window blinds",
+    "television screen",
+    "computer monitor",
+    "clothes on hangers",
+    "human hand",
+    "bed",
+    "couch",
+    "chair",
+    "sink",
+    "toilet",
+    "refrigerator",
+    "microwave oven",
+)
+
+
+# --- parts, and the wholes that make them redundant ---------------------
+#
+# A class whose sighting is usually a PART of another class's sighting.
+# Measured rather than assumed: `keyboard` produced 24 sightings across
+# 12 captures over the real corpus, and every one of those captures also
+# had a laptop in view. A replay of the validated capture with the
+# verifier on wrote two `keyboard` records, and inspection showed one of
+# them to be the keyboard of a laptop that already had its own record --
+# the same object, remembered twice under two names.
+#
+# Suppression is CONCURRENT, not blanket, and the distinction is the
+# whole reason this is a table rather than a tier change. The other
+# `keyboard` record in that replay is a lit mechanical keyboard at a desk
+# with no laptop anywhere near it, which is a real object somebody could
+# genuinely go looking for. A blanket rule would lose it; a rule that
+# only fires while the whole is ALSO in view keeps it.
+PART_OF = {
+    "keyboard": ("laptop",),
+}
+
+
+def wholes_of(object_class: str) -> tuple[str, ...]:
+    return PART_OF.get(object_class, ())
+
+
+def prompt_for(object_class: str) -> str:
+    return PROMPT_FOR.get(object_class, object_class)
+
+
+def verifier_vocabulary() -> tuple[str, ...]:
+    """Every phrase a verifier may rank, in a stable order.
+
+    Persistable classes first so the list reads as "the things this
+    cartridge could remember, and everything they get confused with".
+    Duplicates are removed while keeping the first occurrence, because a
+    repeated prompt is a repeated query and costs latency for nothing.
+    """
+    seen = {}
+    for name in PERSISTABLE_CLASSES:
+        seen.setdefault(prompt_for(name), None)
+    for name in VERIFIER_DISTRACTORS:
+        seen.setdefault(name, None)
+    return tuple(seen)
 
 
 def tier_of(object_class: str) -> str:

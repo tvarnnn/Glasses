@@ -17,7 +17,7 @@ from tower.modules.container import ModuleContainer
 from tower.modules.experimental_cv import ExperimentalCVModule
 from tower.results import build_hub
 from tower.results.contracts import CARTRIDGE_OBJECT_MEMORY
-from tower.results.object_memory import recorded_classes_for
+from tower.results.object_memory import build_face_filter, recorded_classes_for
 from tower.routes import cartridges, geometry, health, observations, sessions, ws
 from tower.session import ConnectionTracker
 
@@ -338,6 +338,15 @@ def create_app() -> FastAPI:
     # A tuple of strings, not an import: `tower/routes/observations.py`
     # is not allowed to know what a verifier is.
     app.state.object_memory_recorded_classes = _recorded_classes(settings)
+    # Where the pictures behind the records are. Read-only, and read by
+    # one route family: this process serves frames out of the capture
+    # tree and never writes to it.
+    app.state.capture_root = settings.capture_root
+    # One filter for the whole app, so the ONNX session is built once
+    # rather than per request. A Tower whose weights are missing gets a
+    # filter that reports itself unavailable, and the imagery routes
+    # then refuse -- they never fall back to an unfiltered frame.
+    app.state.object_memory_face_filter = build_face_filter()
     # Mutually referential, resolved by a lookup rather than by an
     # ordering trick: the worker spec's gate asks a session whether it is
     # active, and the session needs the supervisor the spec is registered

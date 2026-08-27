@@ -414,3 +414,211 @@ class VerificationQueue:
         else:
             self.refused += 1
         self._done.put((job.sighting, verdict))
+
+
+# --- the verifier this build actually offers ----------------------------
+
+# `google/owlv2-base-patch16-ensemble`. Apache-2.0, 155 M parameters,
+# ~600 MB of weights downloaded on first use, and reachable through plain
+# `transformers` with no compiled operator, no MMCV and no compiler --
+# which matters on Windows and matters more on a Blackwell card, where
+# prebuilt CUDA extensions for older architectures do not load at all.
+#
+# CHOSEN ON MEASURED FITNESS, NOT ON A LEADERBOARD.
+#
+# Benchmarked against `iSEE-Laboratory/llmdet_tiny` -- the stronger model
+# on LVIS rare-class AP, and the one a survey of the literature picks --
+# over 94 human-labelled crops from this corpus
+# (`scripts/research/open_vocab_verifier_bench.py`):
+#
+#     model         accept correct  reject wrong  median ms  peak VRAM
+#     owlv2-base            0.949         0.857        128       842 MB
+#     llmdet-tiny           0.407         1.000      3,508     1,648 MB
+#
+# The gap is architectural rather than incidental. OWLv2 embeds each
+# prompt SEPARATELY and scores it against the image's object queries, so
+# a vocabulary of thirty-one names produces thirty-one scores and the
+# question "did the proposed label come first" has an answer. LLMDet is
+# phrase grounding: the vocabulary is joined into one sentence and what
+# comes back is TEXT SPANS -- "a set", "a pair", "a" -- which have to be
+# mapped back onto class names by string matching. It also pays for that
+# sentence, at 3.5 seconds a crop against 128 milliseconds, because
+# cross-attention scales with text length.
+#
+# A model that answers a different question well is not the better model
+# for this question.
+#
+# WHAT IT DOES NOT FIX. Every one of its false rejects is a crop of 5.3%
+# of the frame or smaller -- three real remotes at 3.7-3.9%, called
+# `computer mouse` and `cell phone`. The size floor the shipped detector
+# has is not removed by a second opinion; it moves one stage later. On
+# 360x640 source imagery that is a property of the pixels.
+OWLV2_REPO = "google/owlv2-base-patch16-ensemble"
+
+# Accept only if the proposed label ranks FIRST and scores at least this.
+#
+# Swept over the 94 labelled crops. 0.40 to 0.50 is a plateau and the
+# peak is 0.45: balanced 0.938, accepting 93.2% of correct labels and
+# rejecting 94.3% of wrong ones, with two false accepts. Above 0.55
+# acceptance collapses -- 0.576 at 0.60 -- because the small crops score
+# low even when they are right.
+#
+# It is a threshold fitted to 94 crops from ONE home, and it should be
+# re-measured against any corpus with a different camera, a different
+# room, or a bystander in it.
+OWLV2_MIN_SCORE = 0.45
+
+
+class OwlV2Verifier:
+    """Ranks a proposed label against a fixed vocabulary, on one crop.
+
+    Holds a model, so it follows the same load/act/release shape as
+    `tower/detection.py`'s detector, and for the same reason: whatever
+    holds weights must be loadable late and releasable early.
+
+    Deliberately answers the NARROWEST question that serves the need. It
+    is not asked what is in the picture; the funnel has already produced
+    a crop and a proposed name, and all that is left is whether the name
+    survives against the alternatives. That is a much easier question,
+    and asking it is why one model call per three hundred frames is
+    enough.
+    """
+
+    name = "owlv2-base-patch16-ensemble"
+
+    def __init__(
+        self,
+        *,
+        device: str = "cuda",
+        min_score: float = OWLV2_MIN_SCORE,
+        vocabulary=None,
+        prompt_for=None,
+        repo: str = OWLV2_REPO,
+    ) -> None:
+        self._device = device
+        self._min_score = min_score
+        self._repo = repo
+        # Injected rather than imported, so this class stays testable
+        # without the policy, and so the policy stays where it is.
+        self._vocabulary = tuple(vocabulary) if vocabulary else ()
+        self._prompt_for = prompt_for or (lambda name: name)
+        self._processor = None
+        self._model = None
+
+    @property
+    def device(self) -> str:
+        return self._device
+
+    def load(self) -> None:
+        # Local imports: `transformers` is an optional extra, and nothing
+        # outside a verification path may require it. A Tower without it
+        # must still start, still record, and still serve.
+        import torch
+        from transformers import (
+            AutoModelForZeroShotObjectDetection,
+            AutoProcessor,
+        )
+
+        device = self._device
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            # Reported, not silently honoured. A CUDA verifier that
+            # quietly became a CPU one would turn a 128 ms call into a
+            # 2.5-second one on a host whose report still says GPU.
+            logger.warning(
+                "[Tower][ObjectMemory] %s was asked for CUDA and this host "
+                "has none; running on CPU, which measured 2.5 s a crop "
+                "against 128 ms",
+                self.name,
+            )
+            device = "cpu"
+        self._device = device
+        self._processor = AutoProcessor.from_pretrained(self._repo)
+        self._model = (
+            AutoModelForZeroShotObjectDetection.from_pretrained(self._repo)
+            .eval()
+            .to(device)
+        )
+        logger.info(
+            "[Tower][ObjectMemory] verifier %s loaded on %s over a "
+            "%s-word vocabulary (accept at rank 1 and score >= %.2f)",
+            self.name,
+            device,
+            len(self._vocabulary),
+            self._min_score,
+        )
+
+    def verify(self, crop_bgr, proposed_class: str) -> Verdict:
+        import cv2
+        import torch
+        from PIL import Image
+
+        if self._model is None:
+            self.load()
+        prompt = self._prompt_for(proposed_class)
+        if prompt not in self._vocabulary:
+            # A class the vocabulary cannot express cannot be confirmed
+            # by it. Refusing is the only honest answer and also the safe
+            # one: this is the shape a policy change would take if it
+            # added a class and forgot the prompt.
+            return Verdict(
+                agrees=False,
+                proposed=proposed_class,
+                label=None,
+                score=None,
+                model=self.name,
+                reason="not-in-verifier-vocabulary",
+            )
+
+        image = Image.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
+        inputs = self._processor(
+            text=[list(self._vocabulary)], images=image, return_tensors="pt"
+        ).to(self._device)
+        with torch.inference_mode():
+            outputs = self._model(**inputs)
+        results = self._processor.post_process_grounded_object_detection(
+            outputs, threshold=0.0, target_sizes=[(image.height, image.width)]
+        )[0]
+
+        best: dict[str, float] = {}
+        for index, score in zip(
+            results["labels"].tolist(), results["scores"].tolist()
+        ):
+            name = self._vocabulary[int(index)]
+            best[name] = max(best.get(name, 0.0), float(score))
+        if not best:
+            return Verdict(
+                agrees=False,
+                proposed=proposed_class,
+                label=None,
+                score=None,
+                model=self.name,
+                reason="nothing-matched",
+            )
+
+        top_label, top_score = max(best.items(), key=lambda kv: kv[1])
+        agrees = top_label == prompt and top_score >= self._min_score
+        return Verdict(
+            agrees=agrees,
+            proposed=proposed_class,
+            # What the verifier would have called it. Recorded and NOT
+            # used to relabel the observation: relabelling would let a
+            # model move a record between classes the tables gate
+            # separately.
+            label=top_label,
+            score=round(top_score, 4),
+            model=self.name,
+            reason=(
+                "ranked-first"
+                if agrees
+                else ("below-threshold" if top_label == prompt else "outranked")
+            ),
+        )
+
+    def release(self) -> None:
+        was_cuda = str(self._device).startswith("cuda")
+        self._model = None
+        self._processor = None
+        if was_cuda:
+            import torch
+
+            torch.cuda.empty_cache()
