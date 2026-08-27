@@ -337,7 +337,7 @@ def _capture_workers(websocket):
     return getattr(websocket.app.state, "capture_workers", None)
 
 
-def _tell_cartridges_the_stream_opened(websocket) -> None:
+def _tell_cartridges_the_stream_opened(websocket, owner) -> None:
     """The stream boundary, handed to every live cartridge.
 
     Separate from `_tell_cartridges_about_capture` and it must stay
@@ -352,7 +352,7 @@ def _tell_cartridges_the_stream_opened(websocket) -> None:
     """
     for consumer in _frame_consumers(websocket):
         try:
-            consumer.stream_opened()
+            consumer.stream_opened(owner)
         except Exception:
             logger.exception(
                 "[Tower][Cartridge] a live session did not start with the "
@@ -360,10 +360,34 @@ def _tell_cartridges_the_stream_opened(websocket) -> None:
             )
 
 
-def _tell_cartridges_the_stream_closed(websocket) -> None:
+async def _close_cartridge_streams(websocket, owner) -> None:
+    """End the stream for every live cartridge, OFF the event loop.
+
+    `stream_closed` reaches `LiveSession.stop()`, which flushes -- up to
+    two pages of OCR at ~1.19 s each for Document Memory -- and then
+    joins its worker under a 5 s bound. Run inline, that is a Tower that
+    answers no frames, no pings and no `/health` on ANY connection for as
+    long as it takes.
+
+    It is not hypothetical and needs no unusual configuration: measured
+    at 5.00 s for a scene session whose phone dropped during a cold model
+    load, and 2.39 s for a document session mid-dwell. A wearable
+    disconnecting abruptly is the NORMAL case.
+
+    `main.py`'s lifespan already says this about the same call -- "a
+    bounded join on the event loop is still a join on the event loop" --
+    and `routes/scene.py` says it about its own handlers. This is the
+    third place the rule applies and the one that had it wrong.
+
+    `stream_opened` stays inline: it starts a thread and returns.
+    """
+    await asyncio.to_thread(_tell_cartridges_the_stream_closed, websocket, owner)
+
+
+def _tell_cartridges_the_stream_closed(websocket, owner) -> None:
     for consumer in _frame_consumers(websocket):
         try:
-            consumer.stream_closed()
+            consumer.stream_closed(owner)
         except Exception:
             logger.exception(
                 "[Tower][Cartridge] a live session did not stop with the "
@@ -562,7 +586,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 _start_capture(websocket, connection_token)
                 # After the recorder, so a cartridge that wants the
                 # capture lineage has already been told what it is.
-                _tell_cartridges_the_stream_opened(websocket)
+                _tell_cartridges_the_stream_opened(
+                    websocket, connection_token
+                )
             elif message_type == "stream_stop":
                 if active_measurement is not None:
                     _finalize_stream_measurement(
@@ -575,7 +601,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "measurement window"
                     )
                 _stop_capture(websocket, END_REASON_STOP, owner=connection_token)
-                _tell_cartridges_the_stream_closed(websocket)
+                await _close_cartridge_streams(websocket, connection_token)
             elif message_type in results_ws.RESULT_MESSAGE_TYPES:
                 await results_ws.handle(
                     message,
@@ -631,7 +657,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         # running by a dropped connection would hold a model, park a
         # worker, and -- worse -- keep serving a scene of a room whose
         # wearer walked out of range.
-        _tell_cartridges_the_stream_closed(websocket)
+        await _close_cartridge_streams(websocket, connection_token)
         if active_measurement is not None:
             _finalize_stream_measurement(active_measurement, end_reason="disconnect")
         session.client_disconnected()

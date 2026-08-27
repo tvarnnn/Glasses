@@ -133,6 +133,7 @@ def around(
     request: Request,
     at: float = Query(description="Centre of the window, unix seconds"),
     window_seconds: float = Query(default=900.0, ge=1.0, le=86400.0),
+    limit: int = Query(default=50, ge=1, le=200),
     retention_days: float | None = _RETENTION_DAYS,
 ) -> dict:
     """Documents observed within a window of an instant.
@@ -144,6 +145,7 @@ def around(
         _store(request, retention_days),
         when=at,
         window_seconds=window_seconds,
+        limit=limit,
         requested_days=retention_days,
     )
 

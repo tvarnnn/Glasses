@@ -1384,6 +1384,18 @@ Three of those deserve a sentence:
   200-document listing is 18 KB of verbatim first lines for a caller that
   asked no question. A null title must render as a description of the
   RECORD — "Untitled document" — never as an invented name.
+**`record_notes` carries the caveats once, at the envelope.** Five
+sentences used to be repeated on every document — the "in view, not
+read" qualification, the summary's provenance, the clock, the
+capture-side imagery lifetime, and the joinability of the frame
+reference. A 200-document listing was 488 KB with two thirds of it the
+same sentences two hundred times. They are keyed by the field they
+qualify: `observed_seconds`, `summary_withheld`, `timing`,
+`imagery_retention`, `joinable`. Render a document with `record_notes`
+beside it; none of them may be dropped, because each is a caveat and
+deleting a caveat to save bytes is the one saving this contract may not
+make.
+
 - **`summary` is NOT in the list.** The stored summary is the document's
   first forty words **verbatim** — an excerpt, not a paraphrase — and
   forty words per document across a list is exactly the bulk transfer
@@ -1573,6 +1585,70 @@ session stops has read something.
    `status` block is stat-gated and does not.
 9. **No capture timestamp.** Everything is `tower-receipt`. This is a
    cross-boundary blocker, not a Tower gap.
+
+---
+
+### 15.6 Key index — the nested names, spelled out
+
+A key that this document mentions only in prose is a key a consumer has
+to guess at, and a test that matched prose would not notice. These are
+the nested names on both cartridges' wires that are otherwise only
+implied by the block that contains them.
+
+**Inside every `count_limitations` and `recording_limitations` entry**
+
+| Key | Meaning |
+|---|---|
+| `limitation` | a short slug naming the class of limit — `size-floor`, `recall`, `field-of-view`, `noise-classes`, `departure-lag`, `detection-rate`, `no-validated-positive`, `resolution`, `resolution-remedy-is-not-a-fix` |
+| `detail` | the measurement, in a sentence a person can be shown |
+
+**Inside every `refused_relations` entry:** `relation` — the name of the
+relation that is refused. Inside every `refused_entity_fields` entry:
+`field` — the name of the entity field that is refused.
+
+**Inside `where`:** one entry per non-person reported class, each with
+`left`, `centre`, `right` and `unknown` — integer counts of confirmed
+tracks of that label on each side. `where_excludes` is the list of labels
+that never appear here, and is `["person"]`.
+
+**Inside a document `provenance` block**
+
+| Key | Meaning |
+|---|---|
+| `kind` | always `"frame-reference"`. A pointer into a recording, not a place |
+| `imagery_retention` | always `"capture-side"`, defined by `imagery_retention_note` |
+| `joinable` | always `true`, with `joinable_note`. This block locates a reading in a recording; the link is durable across sessions, unlike anything Scene Understanding publishes |
+
+**Inside `query`**, which echoes what was asked so a response is
+self-describing:
+
+| Key | Meaning |
+|---|---|
+| `kind` | one of `retrieval_kinds`, or `"document"` on the single-document route |
+| `limit` | the effective cap, after the route's own bound |
+| `text` | the search terms, on a `text` query |
+| `centre` | the instant an `observed_within` window is centred on |
+| `window_seconds` | the half-width of that window |
+| `document_id` | the id asked for, on the single-document route |
+
+**Inside `pagination`**
+
+| Key | Meaning |
+|---|---|
+| `supported` | always `false`. There is no cursor |
+| `bound` | `"limit"` — the name of the thing that does bound a listing |
+| `reason` | how to detect truncation on each query kind |
+
+**Inside `library.bytes`:** `journal`, `images` and `total`, in bytes.
+`journal` is the JSONL; `images` is the page-image directory, which is
+empty unless page images were explicitly enabled; `total` is their sum.
+`retention_applied` on the `library` block is always `false` — that count
+is unfiltered, which is why it is named `document_count_unfiltered`.
+
+**On the single-document response:** `document` is the record itself, and
+`pages` is the list of `PageObservation` views inside it. It is the only
+place either carries text.
+
 
 ---
 

@@ -150,14 +150,37 @@ class LiveSession:
     ) -> None:
         self._clock = clock
         self._follow_stream = bool(follow_stream)
-        # Whether THIS session was started by a stream. `stream_closed`
-        # stops only what `stream_opened` started, and that distinction
-        # is not pedantry: `ws.py` tears the stream down on ANY exit,
-        # including a disconnect from a client that never sent
-        # `stream_start`. Without this flag, an operator who started a
-        # session by hand would lose it the moment any phone connected
-        # and dropped.
-        self._started_by_stream = False
+        # WHICH connections started this session by streaming.
+        #
+        # A set, not a flag, and it took a second review to get here. A
+        # bool was wrong in both directions: it stayed True across a
+        # manual stop, so an operator's hand-started session was killed
+        # by the next phone that dropped -- verbatim the failure
+        # `stream_closed` claims to prevent -- and it carried no identity,
+        # so with two phones streaming, the first to disconnect stopped
+        # the session out from under the second.
+        #
+        # `ws.py` already carries a `connection_token` and hands it to
+        # `_stop_capture` as `owner=` for exactly this reason. The
+        # cartridge hooks now take the same token.
+        self._stream_owners: set = set()
+        # True while a lifecycle caller is on its way to releasing the
+        # engine. The WORKER reads it: without it, `_loop` returns the
+        # instant `_stopping` is set, and its `finally` released the
+        # engine while `stop()`'s flush was still inside it -- the same
+        # torn-down-under-a-live-call defect as before, arriving from the
+        # other thread. Found by the test written for the first version.
+        self._teardown_pending = False
+        # Serialises the lifecycle verbs against each other. SEPARATE
+        # from `_condition`, and deliberately: a flush may take a page of
+        # OCR and must not be run holding the lock `offer_frame` takes on
+        # the event loop -- but two callers must still not be inside
+        # teardown at once. Without this, a `pause()` whose flush was in
+        # flight and a concurrent `stop()` released the engine underneath
+        # it, because the second caller saw a state that was no longer
+        # RUNNING, skipped the flush and the join, and went straight to
+        # the release.
+        self._lifecycle = threading.Lock()
         self._load_overdue_s = load_overdue_s
         self._stop_join_timeout_s = stop_join_timeout_s
 
@@ -213,7 +236,14 @@ class LiveSession:
 
         The engine stays loaded: pausing to release a model would make
         Pause cost more than Stop, which is backwards.
+
+        Serialised against `stop()` by `_lifecycle`, so a `stop()` cannot
+        release the engine while this one's flush is still inside it.
         """
+        with self._lifecycle:
+            return self._pause_locked()
+
+    def _pause_locked(self) -> dict:
         with self._condition:
             engine = self._engine
             was_running = self._state in (STATE_RUNNING, STATE_STARTING)
@@ -278,7 +308,15 @@ class LiveSession:
         does with its RESULT is its own decision, and the two cartridges
         differ: a scene expires the moment nobody is looking, a document
         memory does not.
+
+        Held under `_lifecycle` for its whole duration, so a concurrent
+        `pause()` or `stop()` waits rather than releasing the engine that
+        this one's flush is still inside.
         """
+        with self._lifecycle:
+            return self._stop_locked()
+
+    def _stop_locked(self) -> dict:
         with self._condition:
             engine = self._engine
             thread = self._thread
@@ -289,6 +327,13 @@ class LiveSession:
             self._state = STATE_STOPPED
             self._pending = None
             self._thread = None
+            # Claimed BEFORE the flush, so the worker's own teardown
+            # stands down and lets this caller release after the join.
+            self._teardown_pending = True
+            # A manual stop disowns the stream. Without this the flag
+            # survived into the NEXT session -- one an operator started
+            # by hand -- and the next disconnect stopped it.
+            self._stream_owners.clear()
             self._on_stop_locked()
             self._condition.notify_all()
 
@@ -310,8 +355,10 @@ class LiveSession:
                 # because a silent one would be indistinguishable.
                 logger.warning(
                     "[Tower][%s] the session worker did not exit within "
-                    "%.1fs; it is inside a model load and has been "
-                    "abandoned. It will release its own engine.",
+                    "%.1fs; it is inside a model load or a frame, and has "
+                    "been abandoned. It will release its own engine, and "
+                    "anything it commits after this point is attributed "
+                    "to no session.",
                     self.name,
                     self._stop_join_timeout_s,
                 )
@@ -325,6 +372,7 @@ class LiveSession:
             invalidation.invalidate(self._release_engine)
 
         with self._condition:
+            self._teardown_pending = False
             return self._status_locked()
 
     # -- the frame path ------------------------------------------------
@@ -362,7 +410,7 @@ class LiveSession:
             self._pending = (raw_bytes, at, source_seq)
             self._condition.notify()
 
-    def stream_opened(self) -> None:
+    def stream_opened(self, owner=None) -> None:
         """The glasses began streaming. Start, if this session follows.
 
         The reason this hook exists is a defect an adversarial review
@@ -388,9 +436,9 @@ class LiveSession:
             return
         self.start()
         with self._condition:
-            self._started_by_stream = True
+            self._stream_owners.add(owner)
 
-    def stream_closed(self) -> None:
+    def stream_closed(self, owner=None) -> None:
         """The stream ended. Stop, but ONLY what the stream started.
 
         The symmetry matters more than the start: a session started by a
@@ -399,16 +447,21 @@ class LiveSession:
         Understanding -- keep serving a scene of a room whose wearer
         walked out of range.
 
-        The ownership check matters just as much in the other direction.
-        `ws.py` tears the stream down on ANY exit, including a disconnect
-        from a client that never sent `stream_start` at all, so an
-        unconditional stop here would let any passing connection end a
-        session an operator had started by hand for a physical test.
+        The ownership check matters just as much in the other direction,
+        and in two ways. `ws.py` tears the stream down on ANY exit,
+        including a disconnect from a client that never sent
+        `stream_start` at all -- so an unconditional stop would let any
+        passing connection end a session an operator started by hand for
+        a physical test. And with two phones streaming, the first to
+        disconnect must not stop the session out from under the second,
+        which is why this is a SET of owners and stops only when the last
+        one leaves.
         """
         with self._condition:
-            mine = self._started_by_stream
-            self._started_by_stream = False
-        if self._follow_stream and mine:
+            was_owner = owner in self._stream_owners
+            self._stream_owners.discard(owner)
+            last_one_out = was_owner and not self._stream_owners
+        if self._follow_stream and last_one_out:
             self.stop()
 
     def capture_started(self, capture_id) -> None:
@@ -507,6 +560,8 @@ class LiveSession:
         self._frames_skipped = 0
         self._frames_dropped_not_running = 0
         self._engine_label = None
+        # A fresh session owns nothing until a stream claims it.
+        self._stream_owners.clear()
         self._on_start_locked()
         self._invalidation = LoadInvalidation()
         self._thread = threading.Thread(
@@ -610,7 +665,14 @@ class LiveSession:
         try:
             self._loop(session_id, engine)
         finally:
-            invalidation.invalidate(self._release_engine)
+            with self._condition:
+                # A `stop()` that has already claimed the teardown will
+                # release after it has joined this thread. Releasing here
+                # would tear the engine down underneath the flush that
+                # stop is still running.
+                stop_will_release = self._teardown_pending
+            if not stop_will_release:
+                invalidation.invalidate(self._release_engine)
             with self._condition:
                 if self._session_id == session_id and self._thread is not None:
                     self._thread = None
@@ -655,6 +717,26 @@ class LiveSession:
                     if stale:
                         return
                     continue
+                if self._session_id != session_id:
+                    # An ABANDONED worker from a previous session. It has
+                    # already written something, and there is nowhere
+                    # honest to put that: publishing into the session
+                    # that is current now would credit session 2 with a
+                    # document session 1 recorded, and would produce a
+                    # status where `frames_observed` exceeds
+                    # `frames_offered` -- reproduced, in exactly that
+                    # shape. The divergence between the disk and the
+                    # counters is real either way; a log line is where it
+                    # belongs, not in another session's numbers.
+                    logger.warning(
+                        "[Tower][%s] an abandoned worker from session %s "
+                        "committed after session %s began; what it wrote "
+                        "is on disk and is counted by neither",
+                        self.name,
+                        session_id,
+                        self._session_id,
+                    )
+                    return
                 # `commits_during_consume` reaches here having ALREADY
                 # written something. Not publishing would not unwrite it;
                 # it would only make the counters disagree with the disk,

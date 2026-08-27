@@ -202,14 +202,27 @@ class DocumentStore:
                 logger.warning("document store: unparseable record skipped: %s", exc)
         return documents
 
-    def read_one(self, document_id: str) -> DocumentObservation | None:
-        for document in self.read_all():
+    def read_one(
+        self, document_id: str, *, include_expired: bool = False
+    ) -> DocumentObservation | None:
+        """One document, or None. Honours the retention window by default.
+
+        The default matters: a fetch by id is a READ, and a read that
+        ignored the window would be the whole retention bug again through
+        one route -- an id is easy to come by, because a listing hands
+        them out.
+        """
+        for document in self.read_all(include_expired=include_expired):
             if document.document_id == document_id:
                 return document
         return None
 
     def count(self, *, include_expired: bool = False) -> int:
-        return len(self.read_all())
+        # The keyword was accepted and dropped for one commit. A privacy
+        # opt-out that reports the wrong answer without failing is the
+        # same class of defect as the one that made reads honour the
+        # window in the first place.
+        return len(self.read_all(include_expired=include_expired))
 
     def bytes_used(self) -> dict:
         """Storage growth, observable rather than assumed."""
@@ -284,6 +297,14 @@ class DocumentStore:
     def purge(self, document_id: str | None = None) -> dict:
         """Really delete. Reports what it could NOT delete.
 
+        Reads with `include_expired=True` throughout, and that is not an
+        optimisation. Once reads began honouring the retention window, a
+        purge that used the filtered read could no longer SEE an expired
+        record's page images -- so it deleted the journal row, reported
+        `images_removed: 0` and `complete: true`, and left an unredacted
+        photograph of what the wearer read on disk with nothing left
+        anywhere that named it. A deletion path must see everything.
+
         A purge that cannot remove everything must never be presented as
         success -- `06-PRIVACY-DATA.md` requires real deletion, and a
         false claim of deletion is worse than an honest failure.
@@ -302,7 +323,7 @@ class DocumentStore:
             # before the rewrite, because afterwards nothing names them.
             targets = [
                 self._directory / page.image_relpath
-                for document in self.read_all()
+                for document in self.read_all(include_expired=True)
                 if document.document_id == document_id
                 for page in document.pages
                 if page.image_relpath

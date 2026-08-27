@@ -53,6 +53,19 @@ looked", and the store records both.
 
 NAMES THAT ARE PART OF THE CONTRACT
 
+WHY THE CAVEATS ARE AT THE ENVELOPE AND NOT ON EVERY RECORD
+
+`record_notes` carries, once, the five sentences that used to be repeated
+on every document: the "in view, not read" qualification, the summary's
+provenance, the clock, the capture-side imagery lifetime, and the
+joinability of the frame reference. They are constants, and a
+200-document listing was 488 KB with two thirds of it the same sentences
+two hundred times.
+
+They are hoisted, never dropped. Each is a caveat a client must be able
+to render, and deleting a caveat to save bytes is the one saving this
+contract may not make.
+
 The duration field is `observed_seconds`, and it must never be renamed to
 anything built on the word "viewing". `IOS-to-Tower.md` 3.3 asks for that
 by name and gives the reason: "appearing in the camera does not establish
@@ -145,6 +158,53 @@ IMAGERY_RETENTION_NOTE = (
 PRIVACY_TAG_VOCABULARY = ("document-text", "first-person")
 
 RETRIEVAL_KINDS = ("recent", "text", "observed_within")
+
+# The sentences that are the same on every record, carried ONCE.
+#
+# Measured before this: a document summary was 2,351 bytes of which 1,603
+# were these constants, so a 200-document listing was 488 KB with ~313 KB
+# of it the same five sentences two hundred times, against 12 KB of
+# actual titles. That is the argument the scene payload already made
+# against itself when it cut `refused_relations` to a first sentence and
+# a pointer; the document listing had never had that pass.
+#
+# They are hoisted rather than deleted. Every one of them is a caveat a
+# client must be able to render -- "in view", not "read"; the summary is
+# an excerpt; the capture pointer is durable and joinable -- and dropping
+# them to save bytes would be dropping the disclosure, which is the one
+# saving this contract may not make.
+RECORD_NOTES = {
+    "observed_seconds": (
+        "how long the region was in view. This platform cannot establish "
+        "that the wearer looked at it, noticed it, or read it"
+    ),
+    "summary_withheld": (
+        "the stored summary is the document's first forty words verbatim "
+        "-- an excerpt, not a paraphrase -- and is served with the "
+        "document, never in a listing. What a listing does carry is a "
+        "clipped title, and a search result additionally carries a "
+        "bounded snippet around the matched term as evidence; both are "
+        "capped, and the caps are published beside them. The rule is that "
+        "a listing must not become a bulk transfer of what a wearer read, "
+        "not that it carries no verbatim characters at all"
+    ),
+    "timing": (
+        "tower-receipt time: when this Tower received the frames, never "
+        "when the glasses captured them. There is no capture timestamp "
+        "anywhere on this wire"
+    ),
+    "imagery_retention": (
+        "capture-side: the frames this record points at live in the "
+        "capture store, whose lifetime this cartridge neither sets nor "
+        "enforces. Purging every document here leaves that imagery "
+        "exactly where it is"
+    ),
+    "joinable": (
+        "capture_id, page_source_seqs and observed_at together locate "
+        "this reading in a recording. The link is durable across "
+        "sessions, unlike anything Scene Understanding publishes"
+    ),
+}
 
 # How much verbatim text a SEARCH result may carry per match.
 #
@@ -346,7 +406,6 @@ def _provenance(document) -> dict:
         "world_id": document.world_id,
         "world_session_id": document.world_session_id,
         "imagery_retention": "capture-side",
-        "imagery_retention_note": IMAGERY_RETENTION_NOTE,
         # Said out loud rather than left for a reviewer to notice. This
         # block IS joinable: a capture id, frame sequence numbers and a
         # timestamp let a holder align this reading with a recording on
@@ -356,11 +415,6 @@ def _provenance(document) -> dict:
         # payload refuses to hand anyone, and the two cartridges differ
         # here on purpose. A document is a record; a scene is not.
         "joinable": True,
-        "joinable_note": (
-            "capture_id, page_source_seqs and observed_at together locate "
-            "this reading in a recording. The link is durable across "
-            "sessions, unlike anything Scene Understanding publishes"
-        ),
     }
 
 
@@ -376,11 +430,6 @@ def _timing(document) -> dict:
         "time_basis": TIME_BASIS,
         "source": document.timing_source,
         "assumed_frame_interval_s": document.assumed_frame_interval_s,
-        "note": (
-            "tower-receipt time: when this Tower received the frames, "
-            "never when the glasses captured them. There is no capture "
-            "timestamp anywhere on this wire"
-        ),
     }
 
 
@@ -417,17 +466,6 @@ def _summary_view(document) -> dict:
         "title_is_derived": True,
         "title_max_chars": TITLE_MAX_CHARS_ON_WIRE,
         "summary_available": bool(document.summary),
-        "summary_withheld_reason": (
-            "the stored summary is the document's first forty words "
-            "verbatim -- an excerpt, not a paraphrase -- and is served "
-            "with the document, never in a listing. What a listing does "
-            "carry is a clipped title, and a search result additionally "
-            "carries a bounded snippet around the matched term as "
-            "evidence; both are capped, and the caps are published beside "
-            "them. The rule is that a listing must not become a bulk "
-            "transfer of what a wearer read, not that it carries no "
-            "verbatim characters at all"
-        ),
         "confidence": document.confidence.value,
         "confidence_basis": "the weakest page read in this document",
         "observed_at": document.observed_at,
@@ -435,10 +473,6 @@ def _summary_view(document) -> dict:
         # NEVER `viewing_duration`. Appearing in the camera does not
         # establish that the wearer looked at it, noticed it, or read it.
         "observed_seconds": document.observed_seconds,
-        "observed_seconds_note": (
-            "how long the region was in view. This platform cannot "
-            "establish that the wearer looked at it or read it"
-        ),
         "pages_observed": document.pages_observed,
         "text_availability": _text_availability(document),
         "end_reason": document.end_reason,
@@ -515,12 +549,20 @@ def _envelope(requested_days: float | None) -> dict:
             "supported": False,
             "bound": "limit",
             "reason": (
-                "there is no cursor. `limit` is the only bound, and a "
-                "caller can detect truncation by comparing document_count "
-                "with documents_in_memory"
+                "there is no cursor. Every listing route takes a `limit` "
+                "and caps it, and the effective value is echoed in the "
+                "`query` block. Truncation is detectable on `recent` by "
+                "comparing document_count with documents_in_memory; on "
+                "`text` and `observed_within` those two differ because of "
+                "the query as well, so compare document_count with the "
+                "limit instead"
             ),
         },
         "privacy_tag_vocabulary": list(PRIVACY_TAG_VOCABULARY),
+        # The caveats every record carries, carried once. Each is keyed
+        # by the field it qualifies; a client renders `documents[i]` with
+        # `record_notes` beside it.
+        "record_notes": dict(RECORD_NOTES),
         "recording_limitations": [dict(entry) for entry in RECORDING_LIMITATIONS],
         "recording_measurement": dict(RECORDING_MEASUREMENT),
         "imagery_treatment": IMAGERY_NONE_RETAINED,
@@ -570,23 +612,36 @@ def recent_documents(store, *, limit: int = 10, requested_days=None) -> dict:
 
 
 def documents_around(
-    store, *, when: float, window_seconds: float = 900.0, requested_days=None
+    store,
+    *,
+    when: float,
+    window_seconds: float = 900.0,
+    limit: int = 50,
+    requested_days=None,
 ) -> dict:
     """Documents observed within a window of an instant.
 
     A RANGE, not an instant, and the distinction is iOS's: "this morning"
     and "around lunch" are approximate, and answering them exactly answers
     a different question.
+
+    Bounded, like its two siblings and for the same reason. This shipped
+    for one commit with no limit at all, while the envelope it returned
+    claimed `limit` was the only bound: 1,000 documents in a 24-hour
+    window measured 2.4 MB, on a sync handler that parses the whole
+    journal. An unbounded limit is a remote party choosing how much
+    memory this process uses.
     """
     memory = DocumentMemory(store)
     total = store.count()
-    documents = memory.around(when, window_seconds=window_seconds)
+    documents = memory.around(when, window_seconds=window_seconds)[:limit]
 
     payload = _envelope(requested_days)
     payload["query"] = {
         "kind": "observed_within",
         "centre": when,
         "window_seconds": window_seconds,
+        "limit": limit,
     }
     payload["answer"] = _answer_for(total, len(documents))
     payload["no_observation_note"] = _no_observation_note(total)

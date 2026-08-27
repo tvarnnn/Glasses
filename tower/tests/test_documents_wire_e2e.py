@@ -221,7 +221,8 @@ class TestTheListCarriesNoText:
             assert line not in encoded, f"the listing leaked {line!r}"
         assert "summary" not in document
         assert document["summary_available"] is True
-        assert document["summary_withheld_reason"]
+        assert payload["record_notes"]["summary_withheld"]
+        assert payload["record_notes"]["observed_seconds"]
 
     def test_the_excerpt_is_served_with_the_document_it_came_from(self, client):
         listing = client.get("/documents").json()
@@ -297,11 +298,18 @@ class TestProvenanceSurvivesToTheWire:
         _write_one_document(tmp_path)
         client = _client(monkeypatch, document_root=tmp_path)
 
-        timing = client.get("/documents").json()["documents"][0]["timing"]
+        payload = client.get("/documents").json()
+        timing = payload["documents"][0]["timing"]
 
         assert timing["time_basis"] == "tower-receipt"
         assert timing["source"] == "capture-journal"
-        assert "never when the glasses captured them" in timing["note"]
+        # The caveat is at the envelope, once, rather than repeated on
+        # every record -- but it must still be there, and a client must
+        # be able to find it from the field it qualifies.
+        assert (
+            "never when the glasses captured them"
+            in payload["record_notes"]["timing"]
+        )
 
     def test_no_filesystem_path_reaches_a_client(self, monkeypatch, tmp_path):
         import json

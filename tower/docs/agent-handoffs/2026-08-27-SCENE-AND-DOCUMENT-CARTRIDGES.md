@@ -279,7 +279,36 @@ the restored pre-fix behaviour before being kept.
 | M7 | **Search served 252 verbatim characters per match** inside an object promising it withheld them. | Snippet capped at 48 characters, title clipped to 60, both caps published, and the false absolute replaced with what is actually served. |
 | M8 | **`facing_wearer: 0` was reachable when every estimate had expired.** Orientation latches on one lifetime success; estimates age out at 6 s. | `null` with a reason when every person's estimate has expired. Zero is an answer; "never measured" is not. |
 
-### 5.3 Truthfulness of the published measurements
+### 5.3 A third review, on the fixes themselves — and it found more
+
+The first two reviews audited the implementation. A third audited the
+**fixes**, and that turned out to be where the remaining defects were.
+Every one below was introduced or left by the round-2 work.
+
+| # | Finding | Resolution |
+|---|---|---|
+| R1 | **`stream_closed` ran `stop()` inline on the event loop.** That reaches a flush (up to 2.4 s of OCR) and a 5 s bounded join. Measured at 5.00 s for a scene session whose phone dropped during a cold model load — and for that whole window the Tower answers no frames, no pings and no `/health`, on every connection. `main.py`'s lifespan and `routes/scene.py` both state this rule; the WS path was the third place and had it wrong. | `await asyncio.to_thread(...)`. `stream_opened` stays inline; it starts a thread and returns. |
+| R2 | **`_started_by_stream` was a bool, and was wrong in both directions.** It survived a manual stop, so an operator's hand-started session was killed by the next phone that dropped — verbatim the failure the hook claims to prevent. And it carried no identity, so with two phones streaming the first to disconnect stopped the session out from under the second. | A SET of connection tokens. `ws.py` already carries one and hands it to `_stop_capture` as `owner=`; the cartridge hooks now take the same token. Stops only when the last owner leaves, and a manual stop disowns the stream. |
+| R3 | **`purge(document_id)` orphaned page images and reported `complete: true`.** `prune_expired` got the `include_expired` opt-out when reads began filtering; `purge` did not, so it deleted the journal row and could no longer see the image the row named — an unredacted photograph of what the wearer read, permanently orphaned, behind a report saying the deletion was complete. Latent today because the only production caller builds an unwindowed store; a landmine placed by the fix, in the deletion path. | `include_expired=True` throughout `purge`. `read_one` was corrected in the other direction at the same time: a fetch by id is a READ and must honour the window, or the retention bug returns through the one route a listing hands out ids for. |
+| R4 | **A dwell could still span a capture switch.** Freezing the id on the dwell fixed the label and left a subtler version of the same lie: the dwell kept accepting frames from the new capture, and those could win the OCR slots. So a record could carry `capture_id: AAAA` with `page_source_seqs` naming frames from BBBB — and since `source_seq` restarts on a reconnect, that pointer resolves to a real but different frame. | A dwell ENDS when the lineage changes, exactly as it ends when the page changes. The test now asserts the invariant — no record pairs one capture's id with another's sequence numbers — rather than a document count. |
+| R5 | **Two concurrent lifecycle calls tore the engine down under a live flush.** A second `stop()` arriving after the first had set STOPPED skipped the flush and the join and went straight to the release. | A `_lifecycle` lock, separate from the condition so a flush is never held under the lock `offer_frame` takes on the event loop. |
+| R5b | **And the worker did the same thing from the other side** — found by the test written for R5. `_loop` returns the instant `_stopping` is set, and its `finally` released the engine while `stop()`'s flush was still inside it. | `_teardown_pending`, claimed by `stop()` before the flush; the worker stands down and lets the stop release after the join. |
+| R6 | **An abandoned worker published into a newer session.** Reproduced: session 2 reported a document session 1 recorded, and a status where `frames_observed` exceeded `frames_offered`. | An orphaned commit is logged and attributed to no session. The divergence between disk and counters is real either way; a log line is where it belongs, not in another session's numbers. |
+| R7 | **`/documents/around` was unbounded** while the envelope it returned claimed `limit` was the only bound. 1,000 documents in a 24-hour window measured 2.4 MB, on a sync handler that parses the whole journal. | A `limit`, capped at 200, echoed in `query` like its two siblings. The pagination `reason` now says how to detect truncation on each query kind, because the old advice only worked for `recent`. |
+| R8 | **`count(include_expired=...)` accepted the keyword and dropped it.** No production caller passed it, so it was a trap rather than a live bug — but it is a privacy opt-out that reports the wrong answer without failing. | One line. |
+| R9 | **68% of every document record was constant prose**, repeated per record: 2,351 bytes each, so a 200-document listing was 488 KB with ~313 KB of it the same five sentences two hundred times. | `record_notes` at the envelope, keyed by the field each qualifies. **Measured after: 249 KB, 1,218 bytes per record — 49% smaller with nothing dropped.** Hoisted, never deleted: every one is a caveat, and deleting a caveat to save bytes is the one saving this contract may not make. |
+
+### 5.4 And two tests that could not fail
+
+| # | Finding | Resolution |
+|---|---|---|
+| T1 | **`commits_during_consume` had no test that could fail.** The reviewer mutated the flag to `False` and the whole suite stayed green: the test that named the property waited for each frame to be observed before stopping, so nothing was ever in flight, and the document it counted came from the flush hook. | A test that holds a frame inside `_consume` and stops while it is there. |
+| T2 | **The documentation test matched substrings**, so twelve keys passed only because their names — `query`, `total`, `detail`, `pages`, `supported`, `bound` — are ordinary English words that appear in the prose. Adding two invented keys called `total` and `supported` left the file green. | A token match: the key must appear inside backticks or quotes, with word boundaries, optionally as the tail of a dotted path. It then rejected 22 real keys, all now written up in a new key index (§15.6). |
+
+All five round-3 behaviours were mutated back and the new tests
+**verified red** — nine failures across the file.
+
+### 5.5 Truthfulness of the published measurements
 
 Every one of the twelve figures the reviewers checked against the source
 research was **arithmetically correct and correctly attributed**. The
@@ -300,7 +329,7 @@ problems were in what surrounded them, and all were fixed:
   gate re-derivation it cites — a still is the remedy for RECOGNITION,
   and detection is the binding constraint. Split into two limitations.
 
-### 5.4 What the reviewers confirmed clean
+### 5.6 What the reviewers confirmed clean
 
 Scene privacy across eight lifecycle variants: no track id, box, pixel
 coordinate, per-person position, landmark evidence, face data or
@@ -408,7 +437,7 @@ To remove the offers from the declaration, revert the two
 
 ## 9. Gates
 
-**1,663 passed, 40 skipped, 0 failed** — the whole suite, corpus tests
+**1,669 passed, 40 skipped, 0 failed** — the whole suite, corpus tests
 included, in one run.
 
 Baseline before any change, on the same host: **1,512 passed, 40
@@ -427,7 +456,7 @@ lane. That flake surfaced twice during this run and passes in isolation
 | `test_scene_wire_e2e.py` | a frame on `/ws` becomes counts on a subscription; the stream lifecycle; what the payload may not say |
 | `test_documents_wire_e2e.py` | the three answers; no text in a listing; provenance; the capture session |
 | `test_live_cartridge_privacy.py` | a running session writes nothing; a web process cannot store page images |
-| `test_live_cartridge_regressions.py` | the five reviewer defects, seven of them proven red pre-fix |
+| `test_live_cartridge_regressions.py` | twelve reviewer defects across two rounds; sixteen of the twenty proven red against restored pre-fix behaviour |
 | `test_new_contracts_are_documented.py` | every key of every payload variant appears in the contract document |
 | `test_cartridge_live_benchmark_cli.py` | the benchmark stays callable and accounts for every frame |
 

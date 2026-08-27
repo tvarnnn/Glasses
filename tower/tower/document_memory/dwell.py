@@ -177,6 +177,22 @@ class DwellTracker:
             self._start(candidate, at, gray, source_seq, lineage)
             return None
 
+        if lineage != self._current.lineage:
+            # The frames stopped belonging to the recording this dwell
+            # started in. A reconnect re-arms the recorder, mints a new
+            # capture id, and `source_seq` restarts with it.
+            #
+            # Ending the dwell is the only honest answer. Keeping it open
+            # froze `capture_id` at the old capture while letting frames
+            # from the new one win the OCR slots -- so the published
+            # `page_source_seqs` resolved into the OLD journal and named
+            # completely different frames. Silent, plausible and wrong,
+            # which is worse than no pointer at all. Same reasoning
+            # `_is_same_region` applies to a different page.
+            finished = self._finish(END_REASON_LOST)
+            self._start(candidate, at, gray, source_seq, lineage)
+            return finished
+
         if at - self._current.last_seen_at > self._policy.max_frame_gap_s:
             # Too long since the last detection for this to be one
             # continuous reading -- a stalled stream, or a clock jump.

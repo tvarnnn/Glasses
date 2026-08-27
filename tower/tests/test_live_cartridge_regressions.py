@@ -314,6 +314,18 @@ class TestProvenanceBelongsToTheDwellThatEarnedIt:
     The `stream_stop` case was the commoner one: the id was nulled while
     the dwell stayed open, so a document arrived with real frame
     sequence numbers and no recording to resolve them against.
+
+    Freezing the id on the dwell fixed the LABEL and left a subtler
+    version of the same lie, which a second review found: the dwell kept
+    accepting frames from the new capture, and those frames could win the
+    OCR slots. So a document could carry `capture_id: AAAA` and a
+    `page_source_seqs` naming frames from BBBB -- and since `source_seq`
+    restarts on a reconnect, that pointer resolves to a real but
+    different frame in AAAA's journal. Silent, plausible, wrong.
+
+    A dwell now ENDS when the lineage changes, exactly as it ends when
+    the page changes. So the assertions below are about splitting: each
+    document names the capture its frames actually came from.
     """
 
     def _session(self, tmp_path):
@@ -333,50 +345,91 @@ class TestProvenanceBelongsToTheDwellThatEarnedIt:
             assert _await(lambda: session.status()["frames_observed"] > index)
             threading.Event().wait(0.1)
 
-    def test_a_capture_that_opens_mid_dwell_does_not_claim_the_reading(
-        self, tmp_path
-    ):
+    def _switch_midway(self, tmp_path, switch, *, frames=14, at=6):
         session = self._session(tmp_path)
-        frames = list(fx.document_frames(fx.TRANSFORMER_PAPER, 8))
+        rendered = list(fx.document_frames(fx.TRANSFORMER_PAPER, frames))
         try:
             session.start()
             assert _await(lambda: session.state == "running")
             session.capture_started("capture-AAAA")
-            self._read_one_page(
-                session,
-                frames,
-                midway=lambda: session.capture_started("capture-BBBB"),
-            )
+            for index, raw in enumerate(rendered):
+                if index == at:
+                    switch(session)
+                session.offer_frame(raw, source_seq=index)
+                assert _await(lambda: session.status()["frames_observed"] > index)
+                threading.Event().wait(0.1)
             session.stop()
         finally:
             session.stop()
+        return DocumentStore(tmp_path).read_all()
 
-        documents = DocumentStore(tmp_path).read_all()
-        assert len(documents) == 1
-        assert documents[0].capture_id == "capture-AAAA"
+    def test_no_document_ever_names_a_capture_its_frames_did_not_come_from(
+        self, tmp_path
+    ):
+        """The property, stated as the invariant rather than as a count.
+
+        Frames 0-5 belong to capture-AAAA and 6-13 to capture-BBBB.
+        Whatever the dwell logic does with that boundary, no record may
+        pair one capture's id with the other's sequence numbers -- that
+        is the pointer that resolves to the wrong frame.
+        """
+        documents = self._switch_midway(
+            tmp_path, lambda s: s.capture_started("capture-BBBB")
+        )
+
+        assert documents, "the reading produced no record at all"
+        for document in documents:
+            seqs = [
+                page.source_seq
+                for page in document.pages
+                if page.source_seq is not None
+            ]
+            assert seqs, f"{document.document_id} names no frame"
+            expected = "capture-AAAA" if max(seqs) < 6 else "capture-BBBB"
+            assert document.capture_id == expected, (
+                f"{document.capture_id} claims frames {seqs}"
+            )
+
+    def test_a_reading_that_spans_a_switch_is_split_rather_than_mislabelled(
+        self, tmp_path
+    ):
+        """And the mechanism, so a future change cannot satisfy the
+        invariant above by simply recording nothing."""
+        documents = self._switch_midway(
+            tmp_path, lambda s: s.capture_started("capture-BBBB")
+        )
+
+        captures = [document.capture_id for document in documents]
+        assert "capture-BBBB" in captures
+        assert len(documents) >= 1
 
     def test_a_capture_that_closes_mid_dwell_does_not_erase_the_lineage(
         self, tmp_path
     ):
-        session = self._session(tmp_path)
-        frames = list(fx.document_frames(fx.TRANSFORMER_PAPER, 8))
-        try:
-            session.start()
-            assert _await(lambda: session.state == "running")
-            session.capture_started("capture-AAAA")
-            self._read_one_page(
-                session,
-                frames,
-                midway=lambda: session.capture_stopped("capture-AAAA"),
-            )
-            session.stop()
-        finally:
-            session.stop()
+        """A `stream_stop` mid-reading: the commoner case.
 
-        documents = DocumentStore(tmp_path).read_all()
-        assert len(documents) == 1
-        assert documents[0].capture_id == "capture-AAAA"
-        assert [page.source_seq for page in documents[0].pages]
+        The frames before it belong to a real recording and must keep
+        saying so. The frames after it belong to none, and a document
+        made only of those must carry `capture_id: None` rather than
+        inheriting the previous capture -- a null is an honest answer and
+        a stale id is not.
+        """
+        documents = self._switch_midway(
+            tmp_path, lambda s: s.capture_stopped("capture-AAAA")
+        )
+
+        assert documents
+        for document in documents:
+            seqs = [
+                page.source_seq
+                for page in document.pages
+                if page.source_seq is not None
+            ]
+            assert seqs
+            expected = "capture-AAAA" if max(seqs) < 6 else None
+            assert document.capture_id == expected, (
+                f"{document.capture_id!r} claims frames {seqs}"
+            )
 
     def test_a_dwell_that_starts_after_the_switch_gets_the_new_capture(
         self, tmp_path
@@ -425,3 +478,207 @@ def test_a_record_with_no_usable_timestamp_is_treated_as_expired(
 
     assert Store._is_within_retention({"recorded_at": recorded_at}, 100.0) is False
     assert Store._is_within_retention({"recorded_at": recorded_at}, None) is True
+
+
+class TestWorkAlreadyCommittedIsAlwaysCounted:
+    """`commits_during_consume` had no test that could fail.
+
+    A review mutated the flag to False and the whole suite still passed:
+    the test that named the property waited for each frame to be observed
+    before stopping, so nothing was ever in flight. The document it
+    counted came from the flush hook, which increments directly.
+
+    This one holds a frame INSIDE `_consume` and stops while it is there.
+    """
+
+    def _session(self, tmp_path, gate, entered):
+        class Gated(DocumentLive):
+            def _consume(inner, engine, raw_bytes, received_at, source_seq):
+                result = super()._consume(engine, raw_bytes, received_at, source_seq)
+                if result.document_id is not None:
+                    # A document is on disk NOW. Hold here so the stop
+                    # lands while this result is in flight.
+                    entered.set()
+                    gate.wait(timeout=10.0)
+                return result
+
+        return Gated(
+            tmp_path,
+            policy=POLICY,
+            recogniser_factory=lambda: FixedTextRecogniser(
+                pages=[fx.page_regions(fx.TRANSFORMER_PAPER)]
+            ),
+        )
+
+    def test_a_document_in_flight_when_stop_lands_is_still_counted(self, tmp_path):
+        """Declining to publish does not unwrite. It only hides.
+
+        The failure this pins is a status that disagrees with the disk,
+        which is the one outcome nobody can debug from either side.
+        """
+        gate = threading.Event()
+        entered = threading.Event()
+        session = self._session(tmp_path, gate, entered)
+        # Two pages in sequence, so a dwell completes mid-stream rather
+        # than only at the flush.
+        frames = list(fx.document_frames(fx.TRANSFORMER_PAPER, 6))
+        frames += [fx.encode(fx.no_page_frame())] * 5
+        frames += list(fx.document_frames(fx.DEPTH_NOTES, 6))
+        try:
+            session.start()
+            assert _await(lambda: session.state == "running")
+            for index, raw in enumerate(frames):
+                # An EXPLICIT receipt time, 0.3 s apart. The dwell needs
+                # `min_seconds` of sustained viewing and reads it off
+                # this clock; letting it default to wall time made the
+                # test depend on how loaded the machine was, and it
+                # passed alone and failed in a full run.
+                session.offer_frame(
+                    raw, received_at=1000.0 + index * 0.3, source_seq=index
+                )
+                if entered.is_set():
+                    break
+                assert _await(lambda: session.status()["frames_observed"] > index)
+
+            assert entered.wait(timeout=15.0), "no document completed mid-stream"
+            stopper = threading.Thread(target=session.stop, daemon=True)
+            stopper.start()
+            threading.Event().wait(0.3)
+            gate.set()
+            stopper.join(timeout=15.0)
+        finally:
+            gate.set()
+            status = session.stop()
+
+        on_disk = len(DocumentStore(tmp_path).read_all())
+        assert on_disk >= 1
+        assert status["documents_recorded"] == on_disk, (
+            f"the session reported {status['documents_recorded']} documents "
+            f"and wrote {on_disk}"
+        )
+
+
+class TestOnlyTheStreamThatStartedASessionCanEndIt:
+    """`_started_by_stream` was a bool, and was wrong in both directions.
+
+    It survived a manual stop, so an operator's hand-started session was
+    killed by the next phone that dropped -- verbatim the failure the
+    hook claims to prevent. And it carried no identity, so with two
+    phones streaming the first to disconnect stopped the session out from
+    under the second.
+    """
+
+    def _scene(self):
+        class Stub:
+            def __init__(self):
+                self._detector = type("D", (), {"name": "stub"})()
+
+            def load(self):
+                pass
+
+            def release(self):
+                pass
+
+            def observe(self, frame, *, received_at=None):
+                return ("state", received_at)
+
+        return SceneLive(Stub, decode=lambda raw: raw, follow_stream=True)
+
+    def test_a_manual_stop_disowns_the_stream(self):
+        """The exact sequence that killed an operator's physical test."""
+        session = self._scene()
+        try:
+            session.stream_opened("phone-1")
+            assert _await(lambda: session.state == "running")
+            session.stop()
+
+            session.start()  # an operator, by hand. No stream started it.
+            assert _await(lambda: session.state == "running")
+            session.stream_closed("phone-1")
+
+            assert session.state == "running", (
+                "a disconnect ended a session the operator started"
+            )
+        finally:
+            session.stop()
+
+    def test_the_first_of_two_streams_to_leave_does_not_stop_the_session(self):
+        session = self._scene()
+        try:
+            session.stream_opened("phone-1")
+            session.stream_opened("phone-2")
+            assert _await(lambda: session.state == "running")
+
+            session.stream_closed("phone-1")
+            assert session.state == "running", "phone-2 lost its session"
+
+            session.stream_closed("phone-2")
+            assert _await(lambda: session.state == "stopped")
+        finally:
+            session.stop()
+
+    def test_a_connection_that_never_streamed_ends_nothing(self):
+        session = self._scene()
+        try:
+            session.stream_opened("phone-1")
+            assert _await(lambda: session.state == "running")
+
+            session.stream_closed("a-connection-that-never-streamed")
+
+            assert session.state == "running"
+        finally:
+            session.stop()
+
+
+class TestTeardownIsSerialised:
+    """A concurrent stop released the engine under another caller's flush.
+
+    Steps 3 and 4 of `stop()` were fixed; the concurrent-CALLER case was
+    not. A second `stop()` arriving after the first had set STOPPED saw a
+    state that was no longer running, skipped the flush and the join, and
+    went straight to the release -- while the first was still inside the
+    flush.
+    """
+
+    def test_a_second_stop_waits_for_the_first_ones_flush(self, tmp_path):
+        entered = threading.Event()
+        release = threading.Event()
+        torn_down_during_flush = []
+
+        class SlowFlush(DocumentLive):
+            def _on_pause(inner, engine):
+                entered.set()
+                release.wait(timeout=10.0)
+                if inner._engine is None:
+                    torn_down_during_flush.append(True)
+                super()._on_pause(engine)
+
+        session = SlowFlush(
+            tmp_path,
+            policy=POLICY,
+            recogniser_factory=lambda: FixedTextRecogniser(
+                pages=[fx.page_regions(fx.TRANSFORMER_PAPER)]
+            ),
+        )
+        try:
+            session.start()
+            assert _await(lambda: session.state == "running")
+            session.offer_frame(fx.encode(fx.no_page_frame()), source_seq=0)
+            assert _await(lambda: session.status()["frames_observed"] > 0)
+
+            first = threading.Thread(target=session.stop, daemon=True)
+            first.start()
+            assert entered.wait(timeout=10.0)
+            second = threading.Thread(target=session.stop, daemon=True)
+            second.start()
+            threading.Event().wait(0.3)
+            release.set()
+            first.join(timeout=15.0)
+            second.join(timeout=15.0)
+        finally:
+            release.set()
+            session.stop()
+
+        assert torn_down_during_flush == [], (
+            "the engine was released while a flush was still inside it"
+        )

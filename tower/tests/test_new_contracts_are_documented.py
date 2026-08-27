@@ -25,6 +25,7 @@ import base64
 import io
 import json
 import pathlib
+import re
 import threading
 
 import pytest
@@ -50,13 +51,38 @@ def _close_clients():
         _OPEN.pop().__exit__(None, None, None)
 
 
+def _is_documented(key: str, document: str) -> bool:
+    """Whether the contract names this key AS A KEY.
+
+    A bare substring search is not enough, and a review proved it: of the
+    153 keys on these wires, twelve passed only because their names --
+    `query`, `total`, `detail`, `pages`, `supported`, `bound` -- happen
+    to be ordinary English words that appear in the prose. Adding two
+    invented keys called `total` and `supported` to a payload left the
+    whole file green.
+
+    So the key must appear inside backticks or quotes, optionally as the
+    tail of a dotted path -- which is how `lifecycle.follows_stream` and
+    `library.bytes` are legitimately written up.
+    """
+    escaped = re.escape(key)
+    # Word boundaries on both sides, so `document` is not satisfied by
+    # `document_count_unfiltered` and `total` is not satisfied by
+    # `total_frames`. The surrounding character class allows a dotted
+    # or indexed prefix, which is how a nested key is legitimately
+    # written up.
+    inside_code = rf"`(?:[\w.\[\]]*\.)?{escaped}\b[\w.\[\]]*`"
+    quoted = rf'"{escaped}"'
+    return any(re.search(p, document) for p in (inside_code, quoted))
+
+
 def _undocumented(payload, document: str) -> list:
     missing = []
 
     def walk(node, path=""):
         if isinstance(node, dict):
             for key, value in node.items():
-                if key not in document:
+                if not _is_documented(key, document):
                     missing.append(f"{path}.{key}")
                 walk(value, f"{path}.{key}")
         elif isinstance(node, list):
