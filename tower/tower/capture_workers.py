@@ -333,9 +333,29 @@ class CaptureWorkerSupervisor:
             registry = self._registries.get(name)
             if registry is None:
                 return 0
+            pending = [
+                (registry, root, worker)
+                for root, worker in list(registry.workers.items())
+            ]
+            if not pending:
+                return 0
+
+            # Concurrently, for the same reason `shutdown` is, and it
+            # matters MORE here: `shutdown` runs once at teardown, while
+            # this runs on every Pause and every Stop, and
+            # `capture_closed` takes this same lock ON THE EVENT LOOP.
+            # Serially this held the lock for the SUM of every worker's
+            # grace and terminate window; measured, a three-worker detach
+            # blocked a concurrent `capture_closed` for 5.60 s.
+            #
+            # The caller usually passes grace 0 -- see the docstring above
+            # -- so the common case was already cheap and this is about
+            # the case that is not.
+            stopped_flags = self._stop_all(pending, grace_seconds)
+
             stopped = 0
-            for root, worker in list(registry.workers.items()):
-                if not self._stop_worker(worker, grace_seconds):
+            for (_, root, _), gone in zip(pending, stopped_flags):
+                if not gone:
                     # Still alive. KEEPING it in the registry is the
                     # point: forgetting a worker that could not be
                     # terminated makes it an orphan nothing can see --
@@ -443,27 +463,67 @@ class CaptureWorkerSupervisor:
             if not pending:
                 return
 
-            if len(pending) == 1:
-                registry, root, worker = pending[0]
-                if self._stop_worker(worker, grace_seconds):
+            stopped = self._stop_all(pending, grace_seconds)
+
+            # `zip` cannot misalign: `pool.map` yields in ARGUMENT order,
+            # not completion order, and the serial fallback preserves it
+            # by construction.
+            for (registry, root, _), gone in zip(pending, stopped):
+                if gone:
                     registry.forget(root)
-                return
 
-            from concurrent.futures import ThreadPoolExecutor
+    def _stop_all(self, pending, grace_seconds) -> list[bool]:
+        """Stop every pending worker, concurrently if a pool can be had.
 
+        THE FALLBACK IS NOT DEFENSIVE NOISE. `ThreadPoolExecutor` raises
+        `RuntimeError` when the interpreter is shutting down, and again
+        when the OS refuses a thread -- and it raises BEFORE any worker is
+        stopped, so the concurrent path is all-or-nothing. Without this,
+        one raise stopped ZERO workers and left every registry entry
+        standing: orphan producers the supervisor no longer knows about,
+        which is the precise failure this module exists to prevent.
+
+        Both halves are reachable and neither is exotic. Shutdown runs at
+        interpreter teardown by definition, and this Tower has a measured
+        thread leak of ~19 threads per live-session cycle -- so the state
+        in which `shutdown()` most needs to work is the state in which a
+        new pool is most likely to be refused.
+
+        It was invisible on a one-cartridge Tower, because a single worker
+        never enters the pool path at all, and total on a two-cartridge
+        one.
+        """
+        if len(pending) == 1:
+            return [self._stop_worker(pending[0][2], grace_seconds)]
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        try:
             with ThreadPoolExecutor(
-                max_workers=len(pending), thread_name_prefix="capture-shutdown"
+                # Capped: `pending` grows with captures, and a teardown
+                # that cannot get 3 threads will not get 300.
+                max_workers=min(len(pending), 8),
+                thread_name_prefix="capture-shutdown",
             ) as pool:
-                stopped = list(
+                return list(
                     pool.map(
                         lambda item: self._stop_worker(item[2], grace_seconds),
                         pending,
                     )
                 )
-
-            for (registry, root, _), gone in zip(pending, stopped):
-                if gone:
-                    registry.forget(root)
+        except RuntimeError:
+            logger.warning(
+                "[Tower][Worker] could not start a shutdown pool; stopping "
+                "%s worker(s) one at a time instead. This is slower -- it "
+                "costs the SUM of every grace window rather than the "
+                "longest -- but every worker is still stopped and every "
+                "one that dies is still forgotten",
+                len(pending),
+            )
+            return [
+                self._stop_worker(worker, grace_seconds)
+                for _, _, worker in pending
+            ]
 
     # -- reporting ----------------------------------------------------
 

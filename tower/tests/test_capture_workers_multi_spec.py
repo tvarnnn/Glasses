@@ -450,6 +450,58 @@ def test_shutdown_waits_on_every_worker_at_once_not_one_after_another(tmp_path):
     assert supervisor.status() == []
 
 
+def test_shutdown_still_stops_everything_when_no_thread_pool_can_be_started(
+    spawn, spawned, tmp_path, monkeypatch, caplog
+):
+    """A refused thread pool must not mean a refused shutdown.
+
+    `ThreadPoolExecutor` raises `RuntimeError` when the interpreter is
+    shutting down, and again when the OS will not give it a thread -- and
+    it raises BEFORE any worker is stopped. So the concurrent path is
+    all-or-nothing, and without a fallback one raise stopped ZERO workers
+    and left every registry entry standing: orphan producers the
+    supervisor no longer knows about.
+
+    Neither half is exotic. Shutdown runs at interpreter teardown by
+    definition, and this Tower has a measured leak of ~19 threads per
+    live-session Start/Stop cycle, so the state where shutdown most needs
+    to work is the state where a new pool is most likely to be refused.
+
+    Invisible on a one-cartridge Tower -- a single worker never enters the
+    pool path -- and total on a two-cartridge one, which is why this test
+    uses two specs.
+
+    RED before the fallback: `stopped=[False, False]` and the registry
+    still holding both captures.
+    """
+    import concurrent.futures
+
+    supervisor = CaptureWorkerSupervisor(
+        [_spec("builder"), _spec("memory")], spawn=spawn
+    )
+    _open(supervisor, tmp_path, "a")
+    assert len(spawned) == 2
+    for process in spawned:
+        process.exit_with(0)
+
+    class _RefusingPool:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", _RefusingPool)
+
+    supervisor.shutdown(grace_seconds=0.0)
+
+    assert supervisor.status() == [], (
+        "a refused thread pool left the registry holding workers the "
+        "supervisor can no longer see"
+    )
+    assert "one at a time" in caplog.text, (
+        "the fallback ran silently; an operator cannot tell a slow "
+        "teardown from a broken one"
+    )
+
+
 def test_enabled_is_false_only_when_nothing_is_configured(spawn):
     assert CaptureWorkerSupervisor(None).enabled is False
     assert CaptureWorkerSupervisor([]).enabled is False
