@@ -51,6 +51,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.config import DEFAULT_OBSERVATION_ROOT  # noqa: E402
 from tower.object_memory.relevance import PERSISTED_CLASSES  # noqa: E402
 from tower.object_memory.store import (  # noqa: E402
@@ -90,7 +91,9 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Query observed objects (read-only unless --purge-all)."
     )
-    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument(
+        "--root", type=artifact_root_arg, default=str(DEFAULT_ROOT)
+    )
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument("--last-seen", default=None, metavar="OBJECT_CLASS")
     parser.add_argument(

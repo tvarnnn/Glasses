@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import psutil  # noqa: E402
 
 from scripts import world_registration as wr  # noqa: E402
+from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.world_builder.store import WorldStore  # noqa: E402
 
 
@@ -186,11 +187,11 @@ def measure(root: Path, world_id: str, session_id: str, profile: bool,
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", type=Path)
+    ap.add_argument("--root", type=artifact_root_arg)
     ap.add_argument(
         "--roots",
         nargs="+",
-        type=Path,
+        type=artifact_root_arg,
         help="several world roots (e.g. one scratch root per replayed capture)",
     )
     ap.add_argument("--worlds", nargs="*", help="world ids; default = all")

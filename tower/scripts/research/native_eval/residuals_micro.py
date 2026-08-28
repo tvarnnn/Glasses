@@ -37,6 +37,7 @@ import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 from scripts import world_registration as wr  # noqa: E402
+from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.world_builder.store import WorldStore  # noqa: E402
 
 
@@ -104,7 +105,7 @@ def capture_observations(root: Path, world_id: str, session_id: str, want: int):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", required=True, type=Path)
+    ap.add_argument("--root", required=True, type=artifact_root_arg)
     ap.add_argument("--world", required=True)
     ap.add_argument("--session", required=True)
     ap.add_argument("--sets", type=int, default=25)

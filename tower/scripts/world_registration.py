@@ -62,6 +62,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.world_builder.geometry import (  # noqa: E402
     MIN_INLIERS,
     RANSAC_CONFIDENCE,
@@ -1783,7 +1784,9 @@ def main(argv=None) -> int:
             "--write, and never touches poses, points or support."
         )
     )
-    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument(
+        "--root", type=artifact_root_arg, default=str(DEFAULT_ROOT)
+    )
     parser.add_argument("--world", required=True, help="World id to register.")
     parser.add_argument(
         "--session",

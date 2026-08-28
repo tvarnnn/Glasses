@@ -58,6 +58,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.world_builder.intrinsics_store import IntrinsicsStore  # noqa: E402
 from tower.world_builder.records import CameraIntrinsics  # noqa: E402
 from tower.world_builder.schema import (  # noqa: E402
@@ -321,8 +322,8 @@ def main(argv=None) -> int:
     parser.add_argument("--frames", type=Path, help="Directory of board views.")
     parser.add_argument(
         "--root",
-        type=Path,
-        default=DEFAULT_WORLD_ROOT,
+        type=artifact_root_arg,
+        default=str(DEFAULT_WORLD_ROOT),
         help=(
             "World root holding the intrinsics store "
             f"(default: {DEFAULT_WORLD_ROOT}). Must match the --root the "

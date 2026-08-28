@@ -65,6 +65,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.capture import CaptureFollower, FRAMES_FILENAME  # noqa: E402
 from tower.capture_workers import (  # noqa: E402
     ATTACH_MODE_FROM_NOW,
@@ -176,7 +177,9 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Record which object categories were visible, and when."
     )
-    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument(
+        "--root", type=artifact_root_arg, default=str(DEFAULT_ROOT)
+    )
     parser.add_argument("--frames", type=Path, default=None)
     parser.add_argument("--follow-capture", type=Path, default=None)
     parser.add_argument(

@@ -35,6 +35,7 @@ from pathlib import Path
 # directly still needs the project root importable.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.experiments import (  # noqa: E402
     EXPERIMENTS,
     ExperimentSettings,
@@ -322,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("experiment", choices=sorted(EXPERIMENTS))
     parser.add_argument(
         "--root",
+        type=artifact_root_arg,
         default="data/captures",
         help="capture root (default: data/captures)",
     )

@@ -43,6 +43,7 @@ from scripts.world_builder_corpus_benchmark import (  # noqa: E402
     MAIN_WORLD_ROOT,
     journal_frames,
 )
+from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.world_builder.engine import WorldBuilderEngine  # noqa: E402
 from tower.world_builder.intrinsics_store import IntrinsicsStore  # noqa: E402
 from tower.world_builder.store import WorldStore  # noqa: E402
@@ -184,13 +185,13 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="mode", required=True)
 
     cold = sub.add_parser("cold-build", help="profile a from-scratch build()")
-    cold.add_argument("--root", required=True, type=Path)
+    cold.add_argument("--root", required=True, type=artifact_root_arg)
     cold.add_argument("--world", required=True)
     cold.add_argument("--session", required=True)
     cold.add_argument("--out", type=Path)
 
     reg = sub.add_parser("registration", help="profile world_registration.register")
-    reg.add_argument("--root", required=True, type=Path)
+    reg.add_argument("--root", required=True, type=artifact_root_arg)
     reg.add_argument("--world", required=True)
     reg.add_argument("--session", required=True)
     reg.add_argument("--source", type=Path, help="pinned world_registration.py")
