@@ -607,6 +607,42 @@ def test_a_traversing_world_id_cannot_escape_the_configured_root(
     assert response.status_code == 404, response.text[:200]
 
 
+def test_a_non_canonical_world_id_is_answered_under_its_real_name(
+    derived_world,
+):
+    """Contained is not the same as canonical.
+
+    `junk\\..\\<real>` names a world inside the root, so the containment
+    rule admits it -- correctly. But the reply must not echo the caller's
+    spelling, or two requests for one world answer with two different
+    identities, and the caller chooses how long that identity is.
+
+    Asserted at the ADAPTER, not over HTTP. An earlier version of this
+    test used `/worlds/junk/../<id>/...` and passed vacuously, because
+    httpx normalises `/../` out of a URL path before the request is ever
+    sent -- the route saw the plain id and the bug was untouched. A
+    BACKSLASH is what actually reaches the store on Windows, and the
+    adapter is where both builders assemble the payload.
+    """
+    from tower.results.world_builder_geometry import build_manifest, build_segment
+
+    store, world_id, session_id = derived_world
+
+    for spelling in (f"junk\\..\\{world_id}", f"junk/../{world_id}"):
+        manifest = build_manifest(store, spelling, session_id)
+        assert manifest is not None, spelling
+        assert manifest["world_id"] == world_id, spelling
+
+        # A chunk carries no `world_id` of its own -- it is addressed by
+        # the manifest that named it -- so the assertion here is only that
+        # the non-canonical spelling still RESOLVES to the same geometry.
+        chunk = build_segment(store, spelling, session_id, 0)
+        assert chunk is not None, spelling
+        assert chunk["content_hash"] == (
+            build_segment(store, world_id, session_id, 0)["content_hash"]
+        ), spelling
+
+
 def test_a_session_directory_that_is_a_junction_is_still_served(
     derived_world, tmp_path
 ):

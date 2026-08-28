@@ -432,6 +432,68 @@ def test_a_huge_unsubscribe_id_cannot_choose_our_reply_size():
     assert blob not in reply
 
 
+@pytest.mark.parametrize("field", ["world_id", "session_id"])
+def test_a_huge_world_or_session_id_cannot_choose_our_reply_size(field):
+    """The WORSE half, because this subscribe SUCCEEDS.
+
+    The first version of the echo guard bound four identifiers at the top
+    of the handler; `world_id` and `session_id` are declared eleven lines
+    below it, were checked for TYPE only, and were echoed verbatim.
+
+    Measured before the fix: 2,000,000 characters in, 4,001,438 bytes
+    back. And unlike a refusal, the string then persists on the
+    `Subscription` and inside `Subscription.target`, so `poll_once`
+    re-serialises it every 0.5 s for the life of the subscription, across
+    the send lock the frame path shares.
+    """
+    from tower.routes import results_ws
+
+    blob = "C" * 200_000
+    message = {
+        "type": "result_subscribe",
+        "cartridge": "world_builder",
+        "result_type": "status",
+        field: blob,
+    }
+
+    reply = _reply_to(
+        lambda sender: results_ws._subscribe(
+            message, _app_state_websocket(), sender, _NoChannel()
+        )
+    )
+
+    assert len(reply) < 4_000, (
+        f"a {len(blob)}-character {field} produced a {len(reply)}-character "
+        f"reply, and it would be re-sent on every poll"
+    )
+    assert blob not in reply
+
+
+@pytest.mark.parametrize("field", ["world_id", "session_id"])
+def test_an_absent_world_or_session_id_stays_absent(field):
+    """`None` is meaningful on both and must not become the string "None"."""
+    from tower.routes import results_ws
+
+    captured = {}
+
+    class _Channel:
+        def existing(self):
+            return None
+
+        def ensure(self, websocket, sender):
+            raise AssertionError("not reached in this test")
+
+    reply = _reply_to(
+        lambda sender: results_ws._subscribe(
+            {"type": "result_subscribe", "cartridge": "nope",
+             "result_type": "status", field: None},
+            _app_state_websocket(), sender, _Channel(),
+        )
+    )
+
+    assert "None" not in reply, reply[:200]
+
+
 def test_a_bounded_identifier_still_comes_back_whole():
     """The bound must not corrupt the ordinary case.
 

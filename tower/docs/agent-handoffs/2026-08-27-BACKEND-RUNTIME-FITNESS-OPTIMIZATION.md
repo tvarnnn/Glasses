@@ -6,9 +6,11 @@ identical to the remote before branching)
 **Date:** 2026-08-27
 **Status:** green, pushed, **not merged**. `ios/` untouched: 0 files.
 
-Nine commits. Four of them are security or resource-safety fixes for defects
-that were on nobody's list; two are performance; three are the corrections
-that reviewers found in the first six.
+Eleven commits. Four of them are security or resource-safety fixes for defects
+that were on nobody's list; two are performance; five are corrections that
+reviewers found in the ones before them — **including two regressions this
+lane introduced, and one fix that did nothing at all until a reviewer caught
+it.**
 
 **The headline is not a speedup.** It is that a whole-backend audit, run to
 the same standard as the native-hotpath lane, found **no case for a language
@@ -190,7 +192,7 @@ the one route in §7.1.
 
 # What was changed
 
-Nine commits. Each was implemented as the smallest change that removed the
+Eleven commits. Each was implemented as the smallest change that removed the
 harm, gated on the full suite, and reviewed.
 
 ## 7.1 Unauthenticated path traversal on the geometry routes — `bc9baa3`, `8601621`
@@ -493,7 +495,7 @@ neither the finding nor I had considered (§7.3, §16).
 
 ## 12. Optimize-in-place changes
 
-All nine commits are optimize-in-place. See §7.
+All eleven commits are optimize-in-place. See §7.
 
 ## 13. Native extractions
 
@@ -672,21 +674,78 @@ asked for a revert.**
 
 ## 30. Final system review
 
-Two final reviewers ran against HEAD; their reports are at
-`finalA/FINAL-A.md` and `finalB/FINAL-B.md` in the run scratch. Their findings
-are the first thing a successor should read.
+**Neither final reviewer gave a clean bill, and both top findings were
+regressions this lane had introduced.** That is the most useful thing in this
+section.
+
+**Reviewer B, F1 (HIGH) — the concurrent shutdown stopped NOTHING on a raise.**
+`ThreadPoolExecutor` raises `RuntimeError` when the interpreter is shutting
+down and when the OS refuses a thread, and it raises *before* any worker is
+stopped:
+
+```
+1 worker (fast path)   OK      stopped=[True]
+3 workers (pool path)  RAISED  stopped=[False,False,False]
+                               registry STILL HOLDS ['c0','c1','c2']
+```
+
+Invisible on a one-cartridge Tower, total on a two-cartridge one, and it
+compounds with the leak in §15 — the state where shutdown most needs to work
+is the state where a pool is most likely to be refused. **Fixed** with a
+logged serial fallback.
+
+**Reviewer A, F1 (HIGH) — two more identifiers bypassed the echo bound.**
+`world_id` and `session_id` are declared eleven lines below where the guard
+binds the other four, were type-checked only, and echoed verbatim: 2,000,000
+characters in, **4,001,438 bytes back**. Worse than the path that was fixed,
+because that subscribe SUCCEEDS — the string persists on the `Subscription`
+and in `Subscription.target`, so `poll_once` re-serialises it every 0.5 s for
+the life of the subscription. **This is precisely the "someone adds a ninth
+call site next to the guard" failure the guard's own comment predicts.**
+**Fixed**, with `None` preserved as absent.
+
+Also fixed from their reports: `detach()` made concurrent (a three-worker
+detach blocked `capture_closed` — which runs ON THE EVENT LOOP — for 5.60 s);
+the `world_id` whitelist replaced by the O(1) rule after Reviewer B showed the
+reasoning behind it was wrong, not merely expensive; `_read`'s canonicalisation
+made to actually work (**the first fix for it changed a local and did nothing,
+and the test written for it passed vacuously because httpx normalises `/../`
+out of a URL path**); `ResultHub._failures` genuinely pruned every pass; and a
+`39-179%%` literal in a single-argument `logger.info`, which applies no
+`%`-formatting and so reached the operator with the doubled sign — on the one
+line that exists to stop them capping torch threads into a regression.
+
+**Recorded, not fixed:** a fifth hard-coded scene-unavailable wording at
+`results/__init__.py:136` (currently unreachable); two HTTP surfaces that still
+echo unbounded ids; and Reviewer A's F7 — a walk whose socket stays open but
+quiet for over 15 minutes would lose its follower to the new idle bound, with
+no respawn. That last one is the sharpest open question about §7.5's value.
+
+Between them the reviewers exercised, rather than reasoned about: the four-hop
+Scene reason on all four surfaces under a torch block; the real spawned argv
+through both scripts' own parsers; a real follower returning after exactly
+3599 sleeps and chaining across a reconnect after 750 s of silence; 30 hostile
+path vectors with zero escapes; BM25 identical to 12 decimal places against
+`989c451^` over 400 page-length documents; sharpness bit-identical on 75 real
+frames; HTTP/socket byte-identity; VRAM returning to exactly 0.00; repeated
+app lifespan at **+0.00 threads, +0.00 handles, 0 children over 12 cycles**;
+and an independent full corpus benchmark reproducing all five pinned figures.
+
+Full reports: `finalA/FINAL-A.md`, `finalB/FINAL-B.md` in the run scratch.
 
 ## 31. Final test results
 
 | Check | Baseline | Final |
 |---|---|---|
-| Full Tower suite | 2160 passed, 64 skipped, 357.26 s | **2194 passed, 68 skipped, 385.77 s** |
+| Full Tower suite | 2160 passed, 64 skipped, 357.26 s | **2200 passed, 68 skipped, 344.42 s** |
 | `-m slow` | — | **23 passed, 10 skipped** |
 | `unified_cartridge_smoke.py` | — | **57/57** |
 | `unified_cartridge_smoke.py --with-models` | — | **69/69** |
 | World Builder corpus, 8 captures | pinned figures | **exact on all five** |
 
-34 net new tests. The 4 extra skips are new opt-in model tests.
+**40 net new tests**, every regression test proven RED against the defect it
+covers before the fix landed. The 4 extra skips are new opt-in model tests.
+The smoke figures match the integration report's 57/57 and 69/69 exactly.
 
 **One known flake, not re-run until green.**
 `test_result_channel_hostile.py::test_the_channel_survives_the_world_vanishing_mid_subscription`
@@ -744,6 +803,8 @@ stores; `OMP_WAIT_POLICY` (§18).
 ## 35. Commits
 
 ```
+<final> fix(results,geometry): the second final reviewer's findings, acted on
+b4d626e fix(capture,results): a refused thread pool must not mean a refused shutdown
 0a755d7 perf(cv-lab): exact cheaper sharpness, and auto picks the faster device per experiment
 4dd9f25 fix(runtime,contracts): bound an echoed identifier, shut down concurrently, and the reviewers' findings
 8601621 fix(security): complete the geometry containment -- world_id escapes too

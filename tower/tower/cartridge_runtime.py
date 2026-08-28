@@ -157,7 +157,9 @@ def _cap_torch_threads(settings) -> None:
             "use one thread per core. Measured at 4.12 cores for one scene "
             "session against 1.03 when capped at 2, with the same scene "
             "throughput -- but the cap is PROCESS-GLOBAL and costs the CV "
-            "Lab 39-179%% per frame ON THE EVENT LOOP (see config.py). "
+            # Single %, not %%. `logger.info` with no arguments applies no
+            # %-formatting at all, so "%%" reaches the operator literally.
+            "Lab 39-179% per frame ON THE EVENT LOOP (see config.py). "
             "Prefer 4 to 2 if this Tower shares its CPU"
         )
         return

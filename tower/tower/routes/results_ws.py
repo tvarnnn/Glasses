@@ -154,6 +154,28 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
         await _error(sender, ERR_MALFORMED, "'session_id' must be a string or absent")
         return
 
+    # These two are bounded HERE rather than with the pair above only
+    # because they are read here -- and that gap is exactly the failure
+    # the comment above predicts. The first version of this guard bound
+    # four fields at the top of the handler and these two were declared
+    # eleven lines further down, checked for TYPE and echoed verbatim.
+    #
+    # They are the WORSE half, because a subscribe carrying them
+    # SUCCEEDS. Measured: 2,000,000 characters in, 4,001,438 bytes back --
+    # the same 2.00x -- and then the string persists on the
+    # `Subscription` and inside `Subscription.target`, so `poll_once`
+    # re-serialises it every 0.5 s for the life of the subscription,
+    # across the send lock the frame path shares. Eight per connection.
+    #
+    # `None` survives as `None`: absent is a meaningful value on both, and
+    # `_echo_safe` would turn it into the string "None".
+    #
+    # Truncating before use is safe for the same reason it is above: a
+    # world id is a 32-character hex string, so a value long enough to be
+    # clipped is one no world was ever going to match.
+    world_id = None if world_id is None else _echo_safe(world_id)
+    session_id = None if session_id is None else _echo_safe(session_id)
+
     inputs = _declaration_inputs(websocket)
     offer = registry.find_offer(
         inputs["world_root"],

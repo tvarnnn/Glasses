@@ -124,6 +124,43 @@ def _is_current(store, world_id: str, session_id: str) -> bool:
     return store.derived_is_current(world_id, digest)
 
 
+def contained_world_id(store, world_id: str) -> str | None:
+    """This world's id as the store spells it, or None if it escapes.
+
+    Both geometry routes take `world_id` from an unauthenticated request,
+    and both reach the store through a path join. `world_id` is a PATH
+    parameter, so Starlette's `[^/]+` excludes a forward slash -- and on
+    Windows, the only platform this Tower ships on, a BACKSLASH is equally
+    a separator and is not excluded. `%5C` is decoded into the path before
+    routing, so it matches the route too.
+
+    CONTAINMENT FIRST, THEN CANONICAL, and the order is the whole
+    correctness of this function. Canonicalising first would turn
+    `..\\..\\elsewhere\\worlds\\secret` into `secret` and then happily
+    serve a LOCAL world of that name -- contained, but not the world that
+    was asked for, and silently so.
+
+    Canonical second, because `junk\\..\\<real>` genuinely names a world
+    inside the root and is admitted -- but the payload must answer under
+    the world's own id, or two requests for one world reply with two
+    different identities and a client caching on `world_id` holds both.
+    It also stops the caller choosing how long that identity is.
+
+    A whitelist over `list_world_ids()` did both of these by construction
+    and was replaced: it is a directory scan per request, MEASURED at
+    4.16 ms against 120 real worlds (69% of `_read`) and 167.7 ms at
+    2,000, growing with a directory that only grows. This is O(1).
+    """
+    worlds_root = store.world_dir("probe").parent
+    try:
+        if store.world_dir(world_id).parent.resolve() != worlds_root.resolve():
+            return None
+    except (OSError, ValueError):
+        # A path the OS will not parse -- a NUL byte, an over-long name.
+        return None
+    return store.world_dir(world_id).name
+
+
 def _read(store, world_id: str, session_id: str):
     """Return `(world, derived, grouped, current)` or `None` if absent.
 
@@ -185,11 +222,7 @@ def _read(store, world_id: str, session_id: str):
     # The base is asked of the store with a separator-free probe rather
     # than by writing "worlds" here, so this stays ignorant of the layout
     # `WorldStore` owns.
-    worlds_root = store.world_dir("probe").parent
-    try:
-        if store.world_dir(world_id).parent.resolve() != worlds_root.resolve():
-            return None
-    except (OSError, ValueError):
+    if contained_world_id(store, world_id) is None:
         return None
     try:
         world: World = store.read_world(world_id)
@@ -385,6 +418,13 @@ def _placement_fields(placement) -> dict:
 
 
 def build_manifest(store, world_id: str, session_id: str) -> dict | None:
+    # Rebound BEFORE anything reads it, because this function builds the
+    # payload from its own copy: canonicalising inside `_read` changed a
+    # local and left `world_id` in the reply exactly as the caller spelled
+    # it. Found by a reviewer, and the first fix for it did nothing.
+    world_id = contained_world_id(store, world_id)
+    if world_id is None:
+        return None
     read = _read(store, world_id, session_id)
     if read is None:
         return None
@@ -450,6 +490,9 @@ def build_segment(
     is 3,033 points, and because a closed segment is fetched exactly once
     that is a one-time cost rather than a per-revision one.
     """
+    world_id = contained_world_id(store, world_id)
+    if world_id is None:
+        return None
     read = _read(store, world_id, session_id)
     if read is None:
         return None
