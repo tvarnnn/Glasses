@@ -595,20 +595,66 @@ class TestJsonFormat:
 
 
 REAL_WORLD = "3dd986b1c2364d4b85de97152f2e39f4"
-REAL_ROOT = Path("data/world_builder")
+# Anchored to this file, not to the working directory. As
+# `Path("data/world_builder")` this resolved against whatever cwd pytest
+# happened to be launched from, so the corpus was found only when the
+# suite was run from `tower/` and from anywhere else the whole class
+# below skipped with the same message it uses for a host that genuinely
+# has no corpus. Those are different facts and only one of them is
+# benign.
+REAL_ROOT = Path(__file__).resolve().parents[1] / "data" / "world_builder"
+
+
+def _real_store():
+    store = WorldStore(REAL_ROOT)
+    if not store.world_path(REAL_WORLD).exists():
+        pytest.skip(f"world {REAL_WORLD} is not on this host")
+    return store
 
 
 @pytest.fixture(scope="module")
 def report():
-    """One registration run, shared by the checks below. ~40 s."""
-    store = WorldStore(REAL_ROOT)
-    if not store.world_path(REAL_WORLD).exists():
-        pytest.skip(f"world {REAL_WORLD} is not on this host")
+    """One registration run, shared by the checks below. ~5 s."""
+    store = _real_store()
     session_ids = store.list_session_ids(REAL_WORLD)
     try:
         return register(store, REAL_WORLD, session_ids[0])
     except SupportMissingError as error:
         pytest.skip(str(error))
+
+
+@pytest.fixture(scope="module")
+def report_without_the_span_prune():
+    """The same walk with the cheap pre-filter neutralised. ~10 s.
+
+    `pair_is_hopeless` refuses a pair on span/depth BEFORE it is matched,
+    so such a pair never reaches a directional solve and is recorded with
+    a reciprocity of NaN -- which the report emits as null. That is
+    correct and strictly safe: the prune is deliberately the SAME bar as
+    `admit()`'s own span clause, which sits AHEAD of the reciprocity
+    clause, so every pair the prune removes is a pair the gate would have
+    refused before it ever compared the two scales.
+
+    The side effect is that the pruned report contains no pair whose two
+    solves disagree -- not because the walk stopped containing any, but
+    because those pairs are now refused one clause earlier and never get
+    a number. Neutralising the prune puts them back, which is the only
+    way to exercise the reciprocity comparison against REAL evidence
+    rather than against a hand-built fit.
+    """
+    from scripts import world_registration as wr
+
+    store = _real_store()
+    session_ids = store.list_session_ids(REAL_WORLD)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            wr, "pair_is_hopeless",
+            lambda source, target, thresholds: None,
+        )
+        try:
+            return wr.register(store, REAL_WORLD, session_ids[0])
+        except SupportMissingError as error:
+            pytest.skip(str(error))
 
 
 @pytest.mark.slow
@@ -706,16 +752,130 @@ class TestTheRealWalk:
 
         Stated as a rule rather than as "(5,6) and (30,50) are refused",
         so it keeps its meaning when the segmentation changes underneath.
+
+        This used to open with `assert disagreeing` -- an EXISTENTIAL
+        claim that the real walk must forever contain a pair whose two
+        solves disagree. That is a claim about the corpus, not about the
+        gate, and it went false the moment `pair_is_hopeless` began
+        refusing those same pairs on span/depth before they were matched:
+        the walk still contains them, they simply no longer carry a
+        number. Asserting that bad evidence must keep existing makes a
+        safety test fail on a change that only ever made the pipeline
+        refuse EARLIER.
+
+        What the file needs from that assertion -- that this loop cannot
+        quietly pass over an empty list forever -- is now carried by
+        `test_the_reciprocity_clause_is_actually_evaluated` on this
+        report, and the real-corpus disagreement it used to rely on is
+        exercised for real by
+        `test_the_walk_still_contains_a_disagreeing_pair_and_refuses_it`.
         """
+        for pair in report["pairs"]:
+            if pair["reciprocity"] is None:
+                continue
+            if abs(pair["reciprocity"] - 1.0) > 0.10:
+                assert not pair["registered"], (
+                    f"pair {tuple(pair['pair'])} was admitted with a "
+                    f"reciprocity of {pair['reciprocity']}: its two "
+                    "independent solves disagree on scale"
+                )
+
+    def test_the_reciprocity_clause_is_actually_evaluated(self, report):
+        """The anti-vacuity guard for the test above.
+
+        That test filters on `reciprocity is not None`, because the
+        report emits null wherever `verdict.reciprocity` is not finite.
+        A pipeline that started returning NaN for every pair -- a solver
+        degrading, a refusal moved ahead of the comparison -- would empty
+        that filter, and the loop would then pass over nothing for as
+        long as anyone cared to run it. That is the regression shape most
+        likely to be mistaken for an improvement, so it is pinned here
+        rather than inferred.
+
+        Two things are asserted: the comparison is still REACHED on real
+        evidence at all, and nothing was admitted without going through
+        it. The second matters because `abs(nan - 1.0) > threshold` is
+        False -- a NaN reciprocity does not trip the refusal, it slips
+        past it -- so an admitted pair with a null reciprocity would mean
+        the gate had stopped checking.
+        """
+        finite = [p for p in report["pairs"] if p["reciprocity"] is not None]
+
+        assert finite, (
+            "no pair on the real walk reached the reciprocity comparison, "
+            "so the clause that refuses disagreeing pairs is no longer "
+            "evaluated against real evidence and the check above is a "
+            "no-op"
+        )
+        for pair in finite:
+            assert math.isfinite(pair["reciprocity"])
+
+        admitted = {tuple(p) for p in report["admitted_pairs"]}
+        for pair in report["pairs"]:
+            if tuple(pair["pair"]) in admitted:
+                assert pair["reciprocity"] is not None, (
+                    f"pair {tuple(pair['pair'])} was admitted without a "
+                    "finite reciprocity: a NaN does not trip the "
+                    "disagreement clause, it bypasses it"
+                )
+
+    def test_the_walk_still_contains_a_disagreeing_pair_and_refuses_it(
+        self, report_without_the_span_prune
+    ):
+        """The real-corpus disagreement, recovered from behind the prune.
+
+        With `pair_is_hopeless` neutralised, the pairs it removes reach a
+        directional solve and get their two scales compared -- which is
+        where this walk's disagreements live. (5,6), the pair the
+        research note records at a reciprocity of 0.63, is one of them.
+        Every such pair must still be refused.
+
+        Existential HERE and not on the pruned report, because here it is
+        a claim about the gate rather than about which clause happens to
+        fire first: with nothing pruned, every candidate pair is offered
+        to `admit()`, so if the walk contains disagreeing evidence at all
+        this is where it must show up.
+        """
+        report = report_without_the_span_prune
         disagreeing = [
             p for p in report["pairs"]
             if p["reciprocity"] is not None
             and abs(p["reciprocity"] - 1.0) > 0.10
         ]
 
-        assert disagreeing, "expected some pair whose two solves disagree"
+        assert disagreeing, (
+            "no pair on the unpruned real walk disagrees between its two "
+            "directions; the corpus that this property was measured on "
+            "no longer exercises it, so the check below proves nothing"
+        )
         for pair in disagreeing:
-            assert not pair["registered"]
+            assert not pair["registered"], (
+                f"pair {tuple(pair['pair'])} was admitted with a "
+                f"reciprocity of {pair['reciprocity']}"
+            )
+
+    def test_the_cheap_prune_admits_exactly_what_the_gate_admits(
+        self, report, report_without_the_span_prune
+    ):
+        """The prune must move a refusal earlier, never make one.
+
+        `pair_is_hopeless` exists for speed and shares `admit()`'s span
+        bar precisely so it cannot change a verdict. This is the check
+        that the sharing holds on the real walk: if the prune ever
+        removed a pair the gate would have taken, or stopped removing one
+        it should, these two sets would part. It is also what makes the
+        pruned report's silence about disagreeing pairs safe to accept --
+        the pairs it drops are dropped, not admitted unexamined.
+        """
+        pruned = {tuple(p) for p in report["admitted_pairs"]}
+        unpruned = {
+            tuple(p) for p in report_without_the_span_prune["admitted_pairs"]
+        }
+
+        assert pruned == unpruned, (
+            f"the prune changed a verdict: it admits {sorted(pruned)} where "
+            f"the gate alone admits {sorted(unpruned)}"
+        )
 
     def test_a_segment_that_stood_still_is_named_as_such(self, report):
         still = [r for r in report["segments"]
@@ -814,18 +974,6 @@ def test_rotation_disagreement_is_reported_even_when_it_passes():
     assert evidence.rotation_disagreement_deg < 1e-6
     verdict = admit(evidence, Thresholds())
     assert "rotation_disagreement_deg" in verdict.clauses
-
-
-def _segment_with_span(span):
-    """A stand-in segment whose cameras span  of the scene depth."""
-    import numpy as _np
-
-    class _Seg:
-        index = 0
-        span_over_depth = span
-        points = _np.zeros((10, 3))
-
-    return _Seg()
 
 
 def _segment_with_span(value):

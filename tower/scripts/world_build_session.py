@@ -239,9 +239,49 @@ def resolve_intrinsics(store: IntrinsicsStore, observed_size, *, frame_source):
 
 
 def follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls):
-    """Yield frames from a capture directory as the Tower writes them."""
+    """Yield frames from a capture directory as the Tower writes them.
+
+    THE SPLIT BELOW IS THE WHOLE POINT, AND IT IS NOT STYLE.
+
+    This used to be one generator function with the check as its first
+    statement. A `def` containing `yield` is a generator function, so
+    calling it runs NONE of the body -- the check did not execute until
+    something advanced the generator for the first time. `main()` calls
+    this at the frame-source step and does not advance it until after
+
+        store  = WorldStore(args.root)
+        engine = WorldBuilderEngine(store, ...)
+        world_id = args.world or engine.create_world(args.name)
+
+    so a session pointed at a capture directory that does not exist
+    MINTED A WORLD and only then exited nonzero. The world stayed.
+
+    That is the mechanism behind the empty worlds that accumulate with
+    install age: 86 of the 123 worlds in the corpus on this host hold a
+    `world.json` and no sessions. Every failed follow left one, and
+    nothing ever collected them.
+
+    Creating the world before the first frame is DELIBERATE and is
+    preserved -- `main()` says why: "a Tower whose phone has connected
+    but not yet sent a frame reports a world that exists and is empty
+    rather than no world at all." That claim is about a session that can
+    start. This function now refuses before `main()` reaches the store,
+    so a session that cannot start leaves nothing behind.
+
+    Validating in a plain function that RETURNS the generator is the
+    standard way to make a generator's preconditions eager. The
+    alternative -- moving the check up into `main()` -- would put the
+    precondition somewhere other than the thing it is a precondition
+    for, and the next caller would not get it.
+    """
     if not directory.exists():
         raise SystemExit(f"no capture directory at {directory}")
+    return _follow_capture(
+        directory, poll_seconds=poll_seconds, max_idle_polls=max_idle_polls
+    )
+
+
+def _follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls):
     follower = CaptureFollower(directory, poll_seconds=poll_seconds)
     for frame in follower.follow(max_idle_polls=max_idle_polls):
         yield ObservedFrame(
