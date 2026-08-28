@@ -381,7 +381,12 @@ class LiveSession:
             # locks in opposite orders in two threads is the deadlock
             # this repository has already paid for once -- see the note
             # on reentrancy in `tower/loading.py`.
-            invalidation.invalidate(self._release_engine)
+            #
+            # `engine` is the one captured in step 1, NOT `self._engine`.
+            # A Start that landed during the flush or the join has
+            # already installed its own, and releasing that one tore the
+            # next session away from its model. See `_release_engine`.
+            invalidation.invalidate(lambda: self._release_engine(engine))
 
         with self._condition:
             self._teardown_pending = False
@@ -634,18 +639,48 @@ class LiveSession:
         status.update(self._extra_status())
         return status
 
-    def _release_engine(self) -> None:
-        """Release whatever is installed. Runs under the latch's lock.
+    def _release_engine(self, engine) -> None:
+        """Release THE ENGINE THE CALLER CAPTURED. Under the latch's lock.
+
+        The argument is the whole fix. This used to read `self._engine`.
+
+        `stop()` captures `engine`, `thread` and `invalidation` together
+        in step 1, then spends steps 2-4 OUTSIDE `_condition` -- a flush
+        that may be a page of OCR, a join, a release. `start()` takes
+        only `_condition`, so a Start landing in that window sees the
+        STOPPED step 1 just wrote, stands up session 2, and installs
+        session 2's engine. Step 4 then released *that* one. Reproduced,
+        and it is three failures at once:
+
+            engine1 released : False   <- the stopping session's, LEAKED
+            engine2 released : True    <- the NEXT session's, torn down
+            session.state    : running
+            session._engine  : None
+
+        The last line is the one that hurts. `_loop` holds its engine as
+        a LOCAL, so the running session does not notice it was released;
+        every frame then raises inside `_consume` and is swallowed by "a
+        frame failed; the session continues". The session runs on,
+        `status()` still says `running`, and no field on the wire says
+        otherwise.
+
+        `self._engine` is cleared only when it still points AT the engine
+        being released. Clearing it unconditionally is exactly what tore
+        session 2 loose from its own model.
 
         Must not touch this object's condition: `LoadInvalidation` calls
         this while holding its own non-reentrant lock, and reaching back
         into the session lock from here is a lock-order inversion against
         `_run`, which takes the session lock and then publishes through
-        the latch.
+        the latch. The identity check needs no lock -- it is one
+        attribute read against a local, and a Start that installs a THIRD
+        engine between the read and the write is a session this call was
+        never entitled to disturb.
         """
-        engine, self._engine = self._engine, None
         if engine is None:
             return
+        if self._engine is engine:
+            self._engine = None
         try:
             self._teardown(engine)
         except Exception:
@@ -702,7 +737,10 @@ class LiveSession:
                 # stop is still running.
                 stop_will_release = self._teardown_pending
             if not stop_will_release:
-                invalidation.invalidate(self._release_engine)
+                # This worker's OWN engine, by name. The local, not
+                # `self._engine`: a later session may already have
+                # installed its own, and this worker has no claim on it.
+                invalidation.invalidate(lambda: self._release_engine(engine))
             with self._condition:
                 if self._session_id == session_id and self._thread is not None:
                     self._thread = None
