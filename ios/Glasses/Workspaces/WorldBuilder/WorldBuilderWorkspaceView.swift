@@ -111,6 +111,7 @@ struct WorldBuilderWorkspaceView: View {
                 availability: world.availability(isTowerReachable: isTowerReachable),
                 explanation: world.unavailableExplanation(isTowerReachable: isTowerReachable),
                 inspection: world.inspection,
+                sessionBinding: world.sessionBinding,
                 fragments: world.fragmentsModel,
                 geometryChunks: world.geometryChunks
             )

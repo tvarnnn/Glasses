@@ -56,7 +56,7 @@ struct FrameRateGate {
     /// exact-boundary case above. At 0.25 the worst-case *instantaneous*
     /// spacing is 0.75 intervals, while the mean rate stays on target because
     /// the deadline accumulates rather than resetting to "now".
-    static let tolerance = 0.25
+    nonisolated static let tolerance = 0.25
 
     /// Rate at which captured DAT frames are forwarded to the Tower.
     ///

@@ -17,8 +17,14 @@ import SwiftUI
 /// `docs/modules/WORLD-BUILD.md` forbids exactly that.
 ///
 /// So each fragment gets its own frame, its own scale, and its own box. When
-/// the Tower learns to register segments, `registered` flips, they share a
-/// frame, and this model merges them without the view changing.
+/// the Tower registers segments, `registered` flips and a `transform_to_world`
+/// arrives, and this model merges them without the view changing — but only
+/// the ones that name the **same** `reference_segment` under the same
+/// `frame_revision`. `registered: true` is a necessary condition and not a
+/// sufficient one: a Sim3 maps a segment into its reference's frame, and there
+/// is no global world frame, so two registered segments with different
+/// references are as unmergeable as two unregistered ones. See
+/// `hasSharedFrame`.
 struct WorldFragmentsModel: Equatable {
     let segments: [WorldSegmentSummary]
 
@@ -31,8 +37,15 @@ struct WorldFragmentsModel: Equatable {
     /// Only resolved segments with real bounds can be drawn. A resolved
     /// segment with no bounds is incoherent and is refused rather than framed
     /// by guess.
+    ///
+    /// The filter decides membership; `ranked` decides only the order they are
+    /// read in. The two are kept separate on purpose — see `ranked` — so that
+    /// a change to display order can never quietly change which fragments the
+    /// grid shows, or what `unresolvedCount` says about the rest.
     var fragments: [WorldSegmentSummary] {
-        segments.filter { $0.resolutionState == .resolved && $0.bounds != nil }
+        Self.ranked(
+            segments.filter { $0.resolutionState == .resolved && $0.bounds != nil }
+        )
     }
 
     /// Segments that hold keyframes and recovered nothing. Counted, never
@@ -41,9 +54,22 @@ struct WorldFragmentsModel: Equatable {
         segments.filter { $0.resolutionState == .unresolved }.count
     }
 
-    /// True once the Tower registers segments into one frame. False today.
+    /// True only when every segment here is placed **into the same frame**.
+    ///
+    /// `registered` on every row is not enough on its own. A Sim3 maps a
+    /// segment into the frame of its `reference_segment`, and there is no
+    /// global world frame to fall back into — so two registered segments that
+    /// name different references share no space, and drawing them together
+    /// would composite independent reconstructions exactly as drawing two
+    /// unregistered ones would. The same goes for two rows stamped with
+    /// different `frame_revision`s: a coordinate expressed in one gauge may not
+    /// be reinterpreted under another.
+    ///
+    /// `mayBeCompositedWith` is the one place that rule is written; this asks
+    /// it of every row against the first rather than restating it.
     var hasSharedFrame: Bool {
-        !segments.isEmpty && segments.allSatisfy(\.registered)
+        guard let first = segments.first else { return false }
+        return segments.allSatisfy { first.mayBeCompositedWith($0) }
     }
 
     /// Said out loud when the fragments on screen are real but behind. Not a
@@ -66,6 +92,65 @@ struct WorldFragmentsModel: Equatable {
 }
 
 extension WorldFragmentsModel {
+    /// Puts the most-mapped fragments first, and does it totally.
+    ///
+    /// ## Why the grid needs an order at all
+    ///
+    /// Manifest order is capture order, which says when a segment was walked
+    /// through and nothing about whether anything was recovered from it. That
+    /// was survivable while a walk produced tens of segments. It stops being
+    /// survivable as the Tower's segmentation gets finer — an unrestricted
+    /// version of it takes a real walk to hundreds of segments — because then
+    /// the parts of the room that actually reconstructed are scattered among
+    /// the parts that were barely seen, and the reader has to scan the whole
+    /// grid to find them.
+    ///
+    /// `point_count` is the Tower's own count of the points a segment
+    /// recovered, so ordering by it puts the fragments with the most recovered
+    /// geometry at the top. That is a statement about QUANTITY and nothing
+    /// else: a fragment above another has more points in it, not a better or
+    /// more trustworthy reconstruction. Nothing here, and nothing in the view,
+    /// may say otherwise.
+    ///
+    /// ## Why the tie-break is not optional
+    ///
+    /// `sorted(by:)` is not documented as stable, so two segments with equal
+    /// point counts could come back in either order — and in a `ForEach` that
+    /// is cards swapping places for no reason a reader can see. `segmentIndex`
+    /// is unique within a manifest (`docs/contracts/WORLD-BUILDER-GEOMETRY.md`
+    /// §2.1 defines it as identity within the session), so breaking ties on it
+    /// makes the order total: **one manifest has exactly one display order.**
+    ///
+    /// ## What this does NOT make stable, said plainly
+    ///
+    /// The order is a pure function of one manifest. It is **not** stable
+    /// across manifests, and during a live walk the manifest is refetched every
+    /// time the revision moves — 67 times in the two-minute P3 walk. The Tower
+    /// re-solves segments in place, so `point_count` for a segment that already
+    /// existed can change between polls, and the primary sort key changes with
+    /// it. A card can therefore move up the grid mid-walk.
+    ///
+    /// That is a real cost and it is accepted deliberately, not overlooked.
+    /// Capture order never moved an existing card, and the trade is that it
+    /// scatters the segments that actually reconstructed among the ones that
+    /// barely did — which is survivable at tens of segments and not survivable
+    /// at the hundreds the Tower's finer segmentation produces. Ranking is
+    /// worth more when the grid is read, which is after the walk, than the
+    /// movement costs while it is being built.
+    ///
+    /// **If that movement proves distracting on a real walk, the fix is not to
+    /// drop the ranking** — it is to rank only once the world stops changing,
+    /// or to animate the reorder so it reads as motion rather than as a
+    /// glitch. Neither is worth building before a wearer says it is a problem.
+    static func ranked(_ fragments: [WorldSegmentSummary]) -> [WorldSegmentSummary] {
+        fragments.sorted { lhs, rhs in
+            if lhs.pointCount != rhs.pointCount {
+                return lhs.pointCount > rhs.pointCount
+            }
+            return lhs.segmentIndex < rhs.segmentIndex
+        }
+    }
+
     /// Maps a segment-local `(x, z)` into that segment's OWN tile.
     ///
     /// Lifted off the view deliberately: this is the single place a shared
@@ -165,7 +250,7 @@ struct WorldFragmentsView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             FragmentCanvas(
                                 summary: segment,
-                                chunk: chunks[segment.contentHash]
+                                chunk: chunks[segment.cacheKey]
                             )
                             .frame(height: 120)
                             .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -173,7 +258,7 @@ struct WorldFragmentsView: View {
                             Text("\(segment.pointCount) points")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
-                            if let chunk = chunks[segment.contentHash], chunk.isSampled {
+                            if let chunk = chunks[segment.cacheKey], chunk.isSampled {
                                 Text("showing \(chunk.pointsSent) of \(chunk.pointsTotal)")
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)

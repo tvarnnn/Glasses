@@ -53,6 +53,19 @@ protocol WorldBuilderClient: CartridgeClient {
     /// Every state after the one `state` held when the view model was built.
     var stateUpdates: AnyPublisher<WorldModelState, Never> { get }
 
+    /// What this client has established about whether the world it is
+    /// reporting belongs to the capture the phone currently has open.
+    ///
+    /// Paired with `state` rather than folded into it because the two answer
+    /// different questions and change on different clocks. `state` is *what to
+    /// draw*; this is *why*, and a client with no transport under it honestly
+    /// has nothing to say about either — hence the `.none` default.
+    var sessionBinding: WorldSessionBinding { get }
+
+    /// Every binding after the one `sessionBinding` held when the view model
+    /// was built.
+    var bindingUpdates: AnyPublisher<WorldSessionBinding, Never> { get }
+
     /// Where the world's geometry can be fetched from, each time the Tower
     /// reports an address for it.
     ///
@@ -76,6 +89,15 @@ extension WorldBuilderClient {
     /// day a real client replaces this and a completed publisher would have
     /// already torn the subscription down.
     var stateUpdates: AnyPublisher<WorldModelState, Never> {
+        Empty(completeImmediately: false).eraseToAnyPublisher()
+    }
+
+    /// A client that is not watching a capture cannot be looking at the wrong
+    /// one. `.none` is the correct constant for every client with no transport,
+    /// and for a Release build, which has no capture control at all.
+    var sessionBinding: WorldSessionBinding { .none }
+
+    var bindingUpdates: AnyPublisher<WorldSessionBinding, Never> {
         Empty(completeImmediately: false).eraseToAnyPublisher()
     }
 
@@ -174,6 +196,12 @@ final class WorldBuilderViewModel: ObservableObject {
     /// there is no stored world to open.
     @Published private(set) var inspection: WorldInspectionMode = .live
 
+    /// Whether the world on screen belongs to the capture the phone has open.
+    ///
+    /// Republished rather than derived, for the reason `state` is: the client
+    /// owns the judgment, and a view model that recomputed it would be a second
+    /// answer able to disagree with the one the state was gated on.
+    @Published private(set) var sessionBinding: WorldSessionBinding
     /// The segments the Tower's manifest currently names, in the shape the
     /// gallery draws them.
     ///
@@ -184,12 +212,17 @@ final class WorldBuilderViewModel: ObservableObject {
     /// like a room and mean nothing.
     @Published private(set) var fragmentsModel = WorldFragmentsModel(segments: [])
 
-    /// The points and poses for those segments, keyed by content hash.
+    /// The points and poses for those segments, keyed by
+    /// `(content_hash, placement_hash)` — `WorldSegmentSummary.cacheKey`.
     ///
     /// Keyed by hash and not by index so that a segment re-solved under the
-    /// same index cannot be drawn from the previous solve's points. A segment
-    /// whose chunk failed to fetch is simply absent here, and `FragmentCanvas`
-    /// draws an empty tile for it rather than guessing.
+    /// same index cannot be drawn from the previous solve's points. Keyed by
+    /// **both** hashes so that a segment whose points did not move but whose
+    /// placement did cannot be drawn from the placement it used to have — the
+    /// failure that looks like nothing at all, because the fragment simply
+    /// sits in the wrong place forever. A segment whose chunk failed to fetch
+    /// is simply absent here, and `FragmentCanvas` draws an empty tile for it
+    /// rather than guessing.
     @Published private(set) var geometryChunks: [String: WorldSegmentChunk] = [:]
 
     private let client: any WorldBuilderClient
@@ -236,6 +269,7 @@ final class WorldBuilderViewModel: ObservableObject {
     ) {
         self.client = client
         self.state = client.state
+        self.sessionBinding = client.sessionBinding
         self.geometry = geometry
 
         client.stateUpdates
@@ -243,6 +277,10 @@ final class WorldBuilderViewModel: ObservableObject {
             .sink { [weak self] state in self?.state = state }
             .store(in: &cancellables)
 
+        client.bindingUpdates
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] binding in self?.sessionBinding = binding }
+            .store(in: &cancellables)
         client.geometryUpdates
             .receive(on: DispatchQueue.main)
             .sink { [weak self] coordinates in self?.fetchGeometry(at: coordinates) }
@@ -298,6 +336,7 @@ final class WorldBuilderViewModel: ObservableObject {
             // marker: clearing it then would make that newer fetch's own
             // result look superseded and be refetched from scratch.
             if revision == lastGeometryRevision { lastGeometryRevision = nil }
+            logGeometry("manifest FAILED world=\(worldID) revision=\(revision) — will retry on the next report")
             return
         }
 
@@ -313,24 +352,45 @@ final class WorldBuilderViewModel: ObservableObject {
         guard manifest.poseConvention.matchesThisBuild else {
             fragmentsModel = WorldFragmentsModel(segments: [])
             geometryChunks = [:]
+            logGeometry("manifest REFUSED — pose convention is not the one this build implements")
             return
         }
 
         // Everything the manifest still names is kept and everything else is
         // dropped, so a long walk does not accumulate superseded segments
         // forever. The cache and the published copy are rebuilt from the same
-        // list in the same pass: a hash held by one and not the other would
+        // list in the same pass: a key held by one and not the other would
         // either refetch what is already in hand or draw what is already gone.
-        await geometryStore.retainOnly(Set(manifest.segments.map(\.contentHash)))
+        //
+        // `cacheKey`, not `contentHash`: a registration pass moves every
+        // placement hash without moving a single content hash, so retaining by
+        // content alone would keep 51 chunks that no key in the new manifest
+        // can ever name again.
+        await geometryStore.retainOnly(Set(manifest.segments.map(\.cacheKey)))
+
+        logGeometry(
+            "manifest world=\(worldID) revision=\(revision) segments=\(manifest.segments.count) "
+                + "withPoints=\(manifest.segments.filter { $0.pointCount > 0 }.count) "
+                + "current=\(manifest.current)"
+        )
 
         var chunks: [String: WorldSegmentChunk] = [:]
+        var fetched = 0
+        var cacheHits = 0
         // A segment that could not be fetched is drawn as a blank tile — which
         // is honest — but the world must not be *left* that way. See the clear
         // at the end of this function.
         var anySegmentFailed = false
         for summary in manifest.segments {
-            if let cached = await geometryStore.chunk(forHash: summary.contentHash) {
-                chunks[summary.contentHash] = cached
+            // The cache hit that decides whether a placement change is ever
+            // seen. Keyed on `contentHash` this line is the whole bug: the
+            // content hash of a segment that gained a placement is unchanged
+            // BY DESIGN, so this would hit, the refetch below would be
+            // skipped, and the unplaced chunk would be drawn for the life of
+            // the world. `cacheKey` carries the placement half.
+            if let cached = await geometryStore.chunk(forKey: summary.cacheKey) {
+                chunks[summary.cacheKey] = cached
+                cacheHits += 1
                 continue
             }
             guard let chunk = try? await geometry.segment(
@@ -340,13 +400,20 @@ final class WorldBuilderViewModel: ObservableObject {
                 continue
             }
             await geometryStore.insert(chunk)
-            // Filed under the chunk's OWN hash, not the summary's. A rebuild
+            fetched += 1
+            // Filed under the chunk's OWN key, not the summary's. A rebuild
             // between the two requests returns different geometry under the
-            // same segment index, and filing it under the hash we asked for
+            // same segment index, and filing it under the key we asked for
             // would draw the new points inside the old segment's bounds. Filed
             // under its own, it simply does not match and is not drawn — which
             // is the honest outcome, and the next manifest resolves it.
-            chunks[chunk.contentHash] = chunk
+            //
+            // The key is composite, so this now also covers a REGISTRATION
+            // landing between the manifest and the chunk: the points are the
+            // same, the placement is not, and a chunk placed differently from
+            // the row that asked for it is exactly as unusable as one built
+            // from different points.
+            chunks[chunk.cacheKey] = chunk
         }
 
         // Checked again, for the same reason: the segment fetches above are the
@@ -371,6 +438,35 @@ final class WorldBuilderViewModel: ObservableObject {
         if anySegmentFailed, revision == lastGeometryRevision {
             lastGeometryRevision = nil
         }
+
+        logGeometry(
+            "segments drawn=\(chunks.count) fetched=\(fetched) cached=\(cacheHits) "
+                + "points=\(chunks.values.reduce(0) { $0 + $1.points.count })"
+                + (anySegmentFailed ? " SOME FAILED — will retry on the next report" : "")
+        )
+    }
+
+    /// The geometry pull, in the console.
+    ///
+    /// ## Why this exists, and what its absence cost
+    ///
+    /// This path had **no logging at all**, and it is the one that answers the
+    /// program's central physical question — *do fragments appear while the
+    /// wearer walks*. On the first real walk the phone produced 482 console
+    /// lines across seven subsystems and **not one of them said whether the
+    /// geometry manifest was ever fetched.** The status channel logs what the
+    /// Tower said; nothing logged what the phone then went and got. So P3 came
+    /// back unanswerable — not failed, unanswerable — and a walk is expensive
+    /// to repeat.
+    ///
+    /// Deliberately one line per *manifest*, not per segment: on a live walk
+    /// the revision moves every couple of seconds and a line per segment would
+    /// be ~50 prints a tick, which is the noise level that made the camera path
+    /// decimate its own logging.
+    private func logGeometry(_ message: String) {
+        #if DEBUG
+        print("[Glasses][Geometry] \(message)")
+        #endif
     }
 
     /// Why the cartridge is or is not usable, given the current connection.

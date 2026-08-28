@@ -36,6 +36,98 @@ struct CapturedFrame {
 }
 #endif
 
+#if DEBUG
+/// Which rung of DAT's resolution enum the *next* capture session requests.
+///
+/// ## Why this exists, and why it is DEBUG-only
+///
+/// `StreamingResolution` is a **fixed three-case enum chosen once**, in the
+/// `StreamConfiguration` handed to `session.addCamera(config:)`. It is not an
+/// adaptive ladder: nothing in DAT renegotiates it mid-stream, and the P3
+/// clean walk recorded **108 frames, every one 360x640, with zero variation**
+/// (`docs/evidence/2026-08-26-p3-clean-walk-console.txt`). The app had this
+/// value hardcoded to `.low`, so changing it required an edit and a rebuild.
+///
+/// That hardcoding blocks a measurement the Tower lane needs. Document
+/// Memory's word recall is **0.429-0.810 at 360x640 and 0.957-1.000 at
+/// 1280x720**, so its central premise cannot be tested at all without a way to
+/// raise the rung on a device. Meanwhile 720p is *actively harmful* to World
+/// Builder tracking — `min_sharpness = 25.0` is absolute and **73.3%** of 720p
+/// frames are rejected as blurred.
+///
+/// Those two facts do not reconcile at a single rung, and choosing between
+/// them is a cross-cartridge product decision that is not iOS's to make alone
+/// (see `docs/agent-handoffs/TOWER-LANE-HANDOFF-FROM-MAC.md` 2.3). So this is
+/// deliberately **a developer control, not a product setting**: it makes the
+/// experiment runnable without pre-empting the decision.
+///
+/// ## The privacy consequence, which is the one that actually matters
+///
+/// This was reviewed and the first draft of this comment was found to omit it.
+/// The rung is not merely an image-quality dial. `TowerClient.sendFrame` sends
+/// the frame at its full captured size with **no downscale anywhere**, and when
+/// the Tower's dataset recorder is armed it fsyncs those bytes to disk
+/// verbatim — its own manifest declares `retains_raw_imagery: true`,
+/// `redaction: "none"`, and the privacy tag `raw-imagery`. `.high` is **four
+/// times the pixels** of the default.
+///
+/// So raising the rung raises the fidelity of unredacted, first-person imagery
+/// of bystanders in a recording that persists. Face redaction does exist on the
+/// Tower now, but it is applied only to World Builder's keyframe corpus, in
+/// `_persist_keyframe`; the recorder's copy is written upstream of it and is
+/// never redacted, so both copies coexist on disk.
+///
+/// That is why the footer on this control says so in plain words rather than
+/// presenting the choice as OCR-versus-tracking, which is how it was first
+/// written and which is a complete-sounding account that omits the axis a
+/// person would most want to know about.
+///
+/// `.low` remains the default, so World Builder's physically-proven path is
+/// unchanged unless someone deliberately changes it.
+enum CaptureResolutionPreference: String, CaseIterable, Identifiable, Sendable {
+    case low
+    case medium
+    case high
+
+    /// The default, and the rung every existing measurement was taken at.
+    static let `default`: CaptureResolutionPreference = .low
+
+    var id: String { rawValue }
+
+    var streamingResolution: StreamingResolution {
+        switch self {
+        case .low: return .low
+        case .medium: return .medium
+        case .high: return .high
+        }
+    }
+
+    /// Short name for a picker segment.
+    var shortLabel: String {
+        switch self {
+        case .low: return "Low"
+        case .medium: return "Medium"
+        case .high: return "High"
+        }
+    }
+
+    /// The frame size **DAT itself declares** for this rung, rendered for
+    /// display.
+    ///
+    /// Read from `StreamingResolution.videoFrameSize` rather than written out
+    /// as a literal here. A hardcoded "360x640" would be this app asserting a
+    /// number it did not measure, and it would silently go stale the first
+    /// time the SDK changed a rung. What arrives on the wire is separately and
+    /// independently taken from the decoded buffer's format description in
+    /// `pixelDimensions(for:)` — so if the two ever disagree, the log will say
+    /// so rather than this label quietly winning.
+    var declaredSizeDescription: String {
+        let size = streamingResolution.videoFrameSize
+        return "\(size.width)x\(size.height)"
+    }
+}
+#endif
+
 @MainActor
 final class GlassesConnection: ObservableObject {
     @Published private(set) var registrationState: RegistrationState
@@ -60,6 +152,18 @@ final class GlassesConnection: ObservableObject {
     // (Glasses/StreamManager.swift, unrelated to DAT) which would otherwise
     // shadow MWDATCamera's type of the same name.
     @Published private(set) var cameraStreamState: MWDATCamera.StreamState = .stopped
+
+    /// The rung the **next** capture session will request.
+    ///
+    /// Deliberately not `private(set)`: the Developer Tools picker writes it.
+    /// Equally deliberately, changing it does **not** disturb a running
+    /// session. `StreamConfiguration` is consumed once, by
+    /// `session.addCamera(config:)`, and DAT exposes no way to renegotiate a
+    /// live stream — so a control that appeared to change the rung mid-capture
+    /// would be claiming something that did not happen (Rule 3, Truthful State
+    /// Only). The picker says "next session" because that is the truth.
+    @Published var captureResolution: CaptureResolutionPreference = .default
+
     @Published private(set) var frameCount: Int = 0
     /// The most recent frame decoded for Tower transmission, sampled down to
     /// `FrameRateGate.towerTargetFPS` by `frameRateGate` — not every frame,
@@ -187,9 +291,16 @@ final class GlassesConnection: ObservableObject {
         // createSession can throw DeviceSessionError.noEligibleDevice."
         let selector = AutoDeviceSelector(wearables: wearables)
         deviceSelector = selector
+        // `guard let self` **inside** the loop, not outside it. Outside, the
+        // guard promotes the weak capture to a strong reference held for the
+        // whole life of an unbounded `for await` — so `self` owns the task and
+        // the task owns `self`, the retain cycle is closed, and the
+        // `isolated deinit` below (which stops the camera and the device
+        // session) can never run. Inside, the strong reference lasts one
+        // iteration. `deviceStateTask` already does it this way.
         activeDeviceTask = Task { [weak self] in
-            guard let self else { return }
             for await activeDeviceId in selector.activeDeviceStream() {
+                guard let self else { return }
                 self.hasActiveDevice = activeDeviceId != nil
                 print("[Glasses][Camera] activeDeviceStream changed: \(String(describing: activeDeviceId)) (hasActiveDevice=\(self.hasActiveDevice))")
                 // A third chance at the read, not a guarantee of one:
@@ -208,8 +319,8 @@ final class GlassesConnection: ObservableObject {
         #endif
 
         registrationTask = Task { [weak self] in
-            guard let self else { return }
             for await state in wearables.registrationStateStream() {
+                guard let self else { return }
                 self.registrationState = state
                 #if DEBUG
                 print("[Glasses][Registration] state changed: \(state)")
@@ -218,8 +329,8 @@ final class GlassesConnection: ObservableObject {
         }
 
         deviceStreamTask = Task { [weak self] in
-            guard let self else { return }
             for await devices in wearables.devicesStream() {
+                guard let self else { return }
                 self.devices = devices
                 #if DEBUG
                 print("[Glasses][Devices] devicesStream changed: count=\(devices.count) ids=\(devices)")
@@ -488,6 +599,72 @@ final class GlassesConnection: ObservableObject {
         }
     }
 
+    /// Whether a capture session is **claimed at all**, including the states
+    /// `isCaptureEngaged` deliberately excludes.
+    ///
+    /// ## Why this is not `isCaptureEngaged`
+    ///
+    /// They answer different questions and they disagree in exactly the places
+    /// that matter here. `isCaptureEngaged` answers *"should the primary button
+    /// read Stop?"* — a question about whether capture is actively running. It
+    /// treats `.paused` and `.stopping` as not-engaged, which is right for a
+    /// button.
+    ///
+    /// This answers *"is a `DeviceSession` still held?"* — and during `.paused`
+    /// and `.stopping` the answer is **yes**. Those two states are where a
+    /// control gated on `isCaptureEngaged` would unlock while the session and
+    /// camera are both still alive:
+    ///
+    /// - **`.paused`** is not hypothetical. `07-PLATFORM-CONSTRAINTS.md` §146
+    ///   records it as device-initiated — a cap-touch or a thermal pause keeps
+    ///   the connection alive, stops delivery, and resumes to `.started` on its
+    ///   own. On that resume `beginCameraStream` returns immediately at its
+    ///   `guard camera == nil`, so a `StreamConfiguration` chosen while paused
+    ///   is **never read**, and no log line records that it was dropped.
+    /// - **`.stopping`** is set synchronously by `stopCameraSession()` while
+    ///   `deviceSession` stays non-nil until the `.stopped` callback runs
+    ///   `cleanupCameraSession()`. In that window `startCameraSession()` still
+    ///   refuses at its `guard deviceSession == nil`, so "next start" is a
+    ///   start the app is currently declining to perform.
+    ///
+    /// Both switches are exhaustive rather than `default`-terminated. Both DAT
+    /// enums are `@frozen`, so this cannot silently acquire an unhandled case —
+    /// and writing every case out is what makes a future reader confront
+    /// `.paused` instead of inheriting a `default` that quietly swallowed it,
+    /// which is how this defect was introduced in the first place.
+    var isCaptureSessionClaimed: Bool {
+        Self.isCaptureSessionClaimed(
+            session: deviceSessionState,
+            stream: cameraStreamState
+        )
+    }
+
+    /// The decision itself, lifted off the instance so it is testable.
+    ///
+    /// `deviceSessionState` and `cameraStreamState` are `private(set)` and are
+    /// driven by DAT callbacks, so a test cannot put a real `GlassesConnection`
+    /// into `.paused` — and `.paused` is precisely the case this exists to get
+    /// right. A pure function over the two states can be exercised across every
+    /// combination, which is the same reason `CartridgeAvailability.resolve` is
+    /// a static function rather than a method.
+    /// `nonisolated` because it touches no actor state — it is a function of
+    /// its two arguments and nothing else. Without it the enclosing
+    /// `@MainActor` propagates and a synchronous test cannot call it, which
+    /// would have pushed this decision back out of reach of the suite.
+    nonisolated static func isCaptureSessionClaimed(
+        session: DeviceSessionState,
+        stream: MWDATCamera.StreamState
+    ) -> Bool {
+        switch session {
+        case .starting, .started, .paused, .stopping: return true
+        case .idle, .stopped: break
+        }
+        switch stream {
+        case .starting, .streaming, .waitingForDevice, .paused, .stopping: return true
+        case .stopped: return false
+        }
+    }
+
     /// Creates and starts a `DeviceSession` via `AutoDeviceSelector`. Once the
     /// session reaches `.started`, the state observer starts the camera
     /// stream automatically — this is the only entry point the UI needs.
@@ -532,7 +709,12 @@ final class GlassesConnection: ObservableObject {
             deviceSessionState = .starting
             try session.start()
             print("[Glasses][Camera] session.start() called — createSession succeeded with an eligible device present")
-        } catch let error as DeviceSessionError {
+        } catch {
+            // Untyped: `createSession` and `start()` throw `DeviceSessionError`
+            // and nothing else, so `catch let error as DeviceSessionError` was
+            // a test the compiler proves is always true. The clause was already
+            // exhaustive — this function does not rethrow — so dropping the
+            // pattern changes nothing but the warning.
             print("[Glasses][Camera] session creation/start failed: \(error.localizedDescription)")
             errorMessage = error.localizedDescription
             deviceSession = nil
@@ -600,11 +782,21 @@ final class GlassesConnection: ObservableObject {
             return
         }
 
+        // Read from `captureResolution` rather than the former hardcoded
+        // `.low`. The default is still `.low`, so this is a no-op unless a
+        // developer deliberately changed it; see `CaptureResolutionPreference`
+        // for why the control exists and why it is not a product setting.
+        let requestedResolution = captureResolution
         let config = StreamConfiguration(
             videoCodec: VideoCodec.raw,
-            resolution: StreamingResolution.low,
+            resolution: requestedResolution.streamingResolution,
             frameRate: 24
         )
+        // Logged because the rung is otherwise invisible in the console, and
+        // every frame-dimension line below should be read against it. If the
+        // decoded dimensions disagree with the rung DAT declared, that is a
+        // finding and this pair of lines is what makes it visible.
+        print("[Glasses][Camera] requesting resolution \(requestedResolution.rawValue) (DAT declares \(requestedResolution.declaredSizeDescription))")
 
         do {
             guard let newCamera = try session.addCamera(config: config) else {
@@ -671,6 +863,16 @@ final class GlassesConnection: ObservableObject {
         }.store(in: streamTokenBag)
 
         stream.videoFramePublisher.listen { [weak self] frame in
+            // Sampled HERE, on DAT's callback thread, before the main-actor
+            // hop below. The `now` inside the Task carries main-actor queueing
+            // latency as well as transport latency, so it cannot be used to ask
+            // what clock the buffer's timestamp is on. Pure observation: the
+            // probe reads a timestamp and prints, and nothing downstream sees
+            // it. See FramePTSProbe.
+            FramePTSProbe.shared.record(
+                sampleBuffer: frame.sampleBuffer, hostNow: MonotonicClock.now
+            )
+
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 // One clock read serves both the gate and the log budgets.
@@ -742,6 +944,7 @@ final class GlassesConnection: ObservableObject {
 
     private func cleanupCameraSession() {
         print("[Glasses][Camera] session cleanup")
+        FramePTSProbe.shared.reportFinal(reason: "session cleanup")
         let hadCamera = camera != nil
         sessionTokenBag.clear()
         streamTokenBag.clear()

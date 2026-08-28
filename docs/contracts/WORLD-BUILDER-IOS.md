@@ -9,7 +9,8 @@
 **Living document.** It describes the boundary as it exists now.
 
 **Status:** implemented on both sides and exercised end to end over a real
-socket. Not yet exercised against the Ray-Ban camera — see
+socket. The Tower half has met the Ray-Ban camera; the iOS half of
+`world_builder.status/2026-08-25` has not yet been walked. See
 `docs/agent-handoffs/WORLD-BUILDER-INTEGRATION.md` for exactly what has and
 has not met hardware.
 
@@ -116,7 +117,9 @@ zero**.
 | `geometry.representation` | `geometry.representation` | CLEAN — opaque label, displayed verbatim, never parsed |
 | `geometry.element_count` | `geometry.elementCount` | CLEAN — shown only beside the label, never alone |
 | `geometry.is_incremental` | `geometry.isIncremental` | CLEAN — always `false`; a build replaces the whole tree |
-| `trajectory.pose_count` | `trajectory.poseCount` | CLEAN |
+| `trajectory.pose_count` | `trajectory.poseCount` | CLEAN — **meaning changed at `/2026-08-25`.** See §8 |
+| `trajectory.poses_anchor` *(payload block, not the snapshot)* | `trajectory.posesAnchor` | ADAPTER — see §8 |
+| `trajectory.poses_solved` / `poses_refused` / `segments` *(payload block)* | `trajectory.posesSolved` / `posesRefused` / `segments` | ADAPTER — see §8 |
 | `trajectory.path_length` / `_unit` / `scale` | `WorldTrajectoryReport` | ADAPTER — see §4 |
 | `persistence.state` / `revision` | `WorldPersistenceState` | CLEAN — `saved` is the only reachable state; `session` is unreachable by construction |
 
@@ -132,11 +135,19 @@ zero**.
 
 ### 2.4 Not consumed, and deliberately
 
-The payload's other ten blocks — `world`, `session`, `lifecycle`, `progress`,
-`tracking`, `calibration`, `scale`, `geometry`, `trajectory`, `persistence`,
-`artifacts` — are **Tower-native evidence** for the two halves above. iOS reads
-none of them. A reader looking for where they are consumed will correctly find
-that they are not.
+The payload's other blocks — `world`, `lifecycle`, `progress`, `tracking`,
+`calibration`, `scale`, `geometry`, `persistence`, `artifacts` — are
+**Tower-native evidence** for the two halves above. iOS reads none of them. A
+reader looking for where they are consumed will correctly find that they are
+not.
+
+**Two exceptions, added at `/2026-08-25`,** each for something the projection
+cannot carry:
+
+| Read | Keys | Why the projection cannot answer |
+|---|---|---|
+| `trajectory` | `poses_anchor`, `poses_solved`, `poses_refused`, `segments` | `world_snapshot.trajectory` keeps `pose_count` and drops these. They are what separates a walk that positioned 36 cameras from one that produced 36 segment origins and positioned none. §8 |
+| `session` | `capture_id`, `ended_at`, `frame_source` | Not a figure and never drawn as one. A `WorldSnapshot` describes a directory on the Tower's disk and cannot say *whose capture built it*. §9 |
 
 | Not consumed | Why |
 |---|---|
@@ -247,3 +258,126 @@ or "privacy-safe" — YuNet has measured false negatives on faces occluded past
 ~60% and rotated ~90°, and `retains_raw_imagery` stays **true**: bodies,
 clothing, room contents and any undetected face are still in the image. No
 imagery crosses to iOS, before or after redaction.
+
+---
+
+## 8. Positioned poses and segment anchors are different figures
+
+**This is why the identifier moved from `/2026-08-23` to `/2026-08-25`.** A
+field changed *meaning*; nothing was merely added.
+
+`trajectory.pose_count` was `keyframes - poses_refused`. The Tower's build
+counts a segment ANCHOR as neither solved nor refused, so that subtraction
+promoted every anchor to a camera position — and an anchor is definitional, not
+measured: identity rotation, zero translation.
+
+On the 2026-08-24 physical walk the manifest read `backend_id: "unposed",
+keyframes: 155, poses_solved: 0, poses_refused: 119, points: 0, segments: 36`.
+Nothing was reconstructed. The channel reported `pose_count: 36` and the phone
+displayed **"Camera poses: 36"**.
+
+| Tower now sends | Means |
+|---|---|
+| `pose_count` | poses carrying a position that is **evidence**: every solved pose, plus the anchor of each segment that solved something. `0` for a build with `poses_solved: 0`, whatever the anchor count |
+| `poses_anchor` | how many poses were anchors. **Reported beside the count, never folded into it** |
+| `segments` | tracking segments. A break means tracking was lost, and poses either side share no coordinate frame — which is why a path length is refused across more than one |
+
+**What iOS does with them.** `WorldTrajectoryReport` keeps all three separate
+and never adds any two. `WorldSummaryView` draws "Camera poses", "Segment
+origins" and "Segments" as three rows, and `isAnchorsOnly` — `poseCount == 0`
+with anchors present — adds the sentence *"No camera position was
+reconstructed. Each origin marks where tracking restarted, not where the camera
+was."* An uncalibrated walk therefore reads as **36 segment origins, no
+trajectory**, which is what happened.
+
+`0` and `null` stay different claims all the way to the screen: zero is "the
+Tower counted none", absent is "the Tower did not say", and only the second one
+omits the row.
+
+---
+
+## 9. Which capture the world on screen belongs to
+
+### The defect
+
+On 2026-08-24 the phone showed camera **LIVE** and **"Capture has ended."** at
+the same time, with frozen figures. Both halves were telling the truth about
+different machines: `cameraStreamState` is DAT's opinion of the phone-to-glasses
+link, and `WorldModelState` is the Tower's opinion of *a world directory on the
+Tower's disk*. Nothing asserted any relation between them.
+
+The WiFi had dropped past the resume grace, the follower had finalised and
+exited, and nine further captures were recorded that nothing was reading. Asked
+for "the world" with no `world_id`, the result channel answered with the most
+recently updated one — a finished world from earlier — which iOS faithfully
+rendered as `.finalized`.
+
+The Tower now attaches a builder to every capture automatically, one per capture
+lineage, which removes the *cause*. It does not remove the *class*: the result
+channel can still legitimately report a world that is not this session's.
+
+### The invariant iOS now enforces
+
+> No `WorldModelState` carrying a snapshot may be rendered as this session's
+> result unless iOS can establish that the snapshot belongs to the capture iOS
+> currently has open.
+
+`WorldSessionGate` (`ios/Glasses/Workspaces/WorldBuilder/WorldSession.swift`)
+is the one place that decides it, from two inputs: `TowerClient.isStreamingToTower`
+— true between a sent `stream_start` and its `stream_stop` — and the payload's
+`session` block.
+
+| Camera bracket | Tower says | `WorldSessionBinding` | iOS state |
+|---|---|---|---|
+| closed | anything | `.none` | the Tower's own state, unchanged |
+| open | no `session` at all | `.awaiting` | `.awaitingFirstUpdate` |
+| open | `receiving`, `ended_at: null`, `frame_source: "live-capture"`, a `capture_id` | `.bound(captureID:)` | `.receiving(snapshot)` |
+| open | anything else | `.foreign(captureID:)` | **`.awaitingFirstUpdate`** |
+
+One rule does the work: **a foreign snapshot while a bracket is open renders as
+"waiting", never as a result.**
+
+`.unsupported` and `.failed` pass through under every binding. They are reports
+about the *Tower* — "no world root is configured", "the builder died" — and the
+phone cannot establish whose builder died. Swallowing either into a spinner
+would hide a real fault behind an animation.
+
+### What this is not
+
+**It is not a capture-id comparison, because the phone does not know its own
+capture id.** The Tower mints it when `stream_start` arrives and does not report
+it; the `stream_started` message that would carry it is deliberately
+unimplemented Tower-side (`tower/docs/agent-handoffs/IOS-WORLD-BUILDER-INTEGRATION.md`
+§5), and iOS does not ask for a field it has no consumer for.
+
+What the phone *can* establish is **liveness**, and the three facts above are
+jointly sufficient for it: the builder is attached at the moment the id is
+minted, the result channel prefers a world whose writer lock is held by a
+running process, and `world_build_session.py --follow-capture` is the only path
+that records `frame_source: "live-capture"` with the capture directory's name.
+A snapshot missing any of them describes a capture that is over, replayed, or
+synthetic — none of which this phone opened.
+
+That is strictly weaker than an id comparison and strictly stronger than what
+shipped before, which was nothing. When `stream_started` lands, the equality
+check drops into `WorldSessionGate.binding` and nothing else moves.
+
+### What the wearer sees
+
+`.awaiting` and `.foreign` replace *"Waiting for the Tower's first world
+update…"* with **"Frames are reaching the Tower."** plus one of:
+
+- `.awaiting` — *"Nothing is building a world from them yet."*
+- `.foreign` — *"The world the Tower is reporting was built from a different
+  capture, so nothing here describes this session yet."*
+
+Both are claims the phone can support. That sentence is exactly what nobody
+could see on 2026-08-24.
+
+### Release builds
+
+`isStreamingToTower` is permanently `false` in Release — the two functions that
+set it are on the DEBUG-only frame path, and Release has no capture control on
+any screen. The binding is therefore permanently `.none` there, and the Tower's
+own state is the whole answer, which is correct: a build with no capture cannot
+be looking at the wrong one.

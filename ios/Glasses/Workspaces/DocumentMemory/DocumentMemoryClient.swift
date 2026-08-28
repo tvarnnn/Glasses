@@ -11,9 +11,11 @@ import Foundation
 /// ## A third interaction shape
 ///
 /// World Builder pushes a continuously current state. Experimental CV Lab takes
-/// a command and reports progress. This one answers point queries: nothing is
-/// current, everything is in response to a question. Three cartridges, three
-/// shapes — which is the concrete evidence that a generic
+/// a command and reports progress. Scene Understanding publishes a moment that
+/// is replaced wholesale. This one answers **point queries against something
+/// that persists**: nothing on screen is current, everything is in response to
+/// a question, and the answers outlive the session that produced them. Four
+/// cartridges, four shapes — which is the concrete evidence that a generic
 /// `CartridgeDataSource<Request, Response>` above all of them would be an
 /// abstraction over things that are not alike.
 ///
@@ -24,7 +26,6 @@ protocol DocumentMemoryClient: CartridgeClient {
     var state: DocumentMemoryState { get }
 
     /// Every state after the one `state` held when the view model was built.
-    /// See `WorldBuilderClient.stateUpdates`.
     var stateUpdates: AnyPublisher<DocumentMemoryState, Never> { get }
 
     /// Asks the Tower's document memory a question.
@@ -35,41 +36,510 @@ protocol DocumentMemoryClient: CartridgeClient {
     /// answer with a failure is how "we have no record" turns into "something
     /// went wrong".
     func search(_ query: DocumentQuery, origin: DocumentQueryOrigin) throws
+
+    // MARK: The capture session
+    //
+    // Defaulted below, so a test double that only answers queries does not have
+    // to implement a recorder it has no opinion about.
+
+    /// What the Tower's recorder is doing, or `nil` when nothing has said.
+    var session: DocumentSessionStatus? { get }
+    var sessionUpdates: AnyPublisher<DocumentSessionStatus?, Never> { get }
+    /// The outcome of the last verb sent. See `DocumentSessionOutcome` for why
+    /// this is not a `Bool`.
+    var lastSessionOutcome: DocumentSessionOutcome? { get }
+    /// Sends one of `start`, `pause`, `resume`, `stop`.
+    func send(_ action: DocumentMemoryContract.SessionAction)
+    /// Asks for the session over HTTP.
+    ///
+    /// Needed because the two transports are independent: a Tower reachable
+    /// over HTTP with no socket open still has a recorder, and a workspace that
+    /// could only learn about it from a subscription would show nothing.
+    func refreshSession()
 }
 
 extension DocumentMemoryClient {
     var stateUpdates: AnyPublisher<DocumentMemoryState, Never> {
         Empty(completeImmediately: false).eraseToAnyPublisher()
     }
+    var session: DocumentSessionStatus? { nil }
+    var sessionUpdates: AnyPublisher<DocumentSessionStatus?, Never> {
+        Empty(completeImmediately: false).eraseToAnyPublisher()
+    }
+    var lastSessionOutcome: DocumentSessionOutcome? { nil }
+    func send(_ action: DocumentMemoryContract.SessionAction) {}
+    func refreshSession() {}
 }
 
-/// The only Document Memory client that exists: the Tower keeps no document
-/// memory, and says so.
+// MARK: - The Tower-backed client
+
+/// The real Document Memory client.
+///
+/// ## Two transports, two contracts, one client
+///
+/// ```
+/// TowerClient                socket: document_memory.status/2026-08-27
+///     ↓ cartridgeResults        → what the recorder is doing, and what is on disk
+/// TowerDocumentMemoryClient
+///     ↓ DocumentMemoryHTTPClient   HTTP: document_memory.library/2026-08-27
+///                                  → the documents themselves
+/// ```
+///
+/// The split is the Tower's and it is deliberate: document text is the largest
+/// and most sensitive thing this platform holds, the result sender shares a
+/// send lock with the frame path, and a listing is pulled on demand rather than
+/// pushed at a phone that asked no question.
+///
+/// **The two identifiers are compared separately, at the two places they
+/// arrive.** A change to the status contract is not a change to the library
+/// contract, and a build that checked one string would refuse a working library
+/// because a session field moved.
+///
+/// ## Stop keeps documents
+///
+/// Nothing in this client clears a result when a session ends, and that is the
+/// point. A record of what was read is exactly as true after the session stops
+/// — and a dwell in progress is **flushed, not dropped**, so a stop can add a
+/// document rather than lose one. This is the deliberate opposite of
+/// `TowerSceneUnderstandingClient`, which discards on stop, on disconnect and
+/// on a session-id change. A document is a record; a scene is not.
+@MainActor
+final class TowerDocumentMemoryClient: DocumentMemoryClient {
+
+    let cartridgeID = "document-memory"
+
+    private(set) var state: DocumentMemoryState = .idle {
+        didSet {
+            guard state != oldValue else { return }
+            stateSubject.send(state)
+        }
+    }
+
+    private(set) var session: DocumentSessionStatus? {
+        didSet {
+            guard session != oldValue else { return }
+            sessionSubject.send(session)
+        }
+    }
+
+    private(set) var lastSessionOutcome: DocumentSessionOutcome?
+
+    var stateUpdates: AnyPublisher<DocumentMemoryState, Never> {
+        stateSubject.eraseToAnyPublisher()
+    }
+    var sessionUpdates: AnyPublisher<DocumentSessionStatus?, Never> {
+        sessionSubject.eraseToAnyPublisher()
+    }
+
+    private let stateSubject = PassthroughSubject<DocumentMemoryState, Never>()
+    private let sessionSubject = PassthroughSubject<DocumentSessionStatus?, Never>()
+
+    private let tower: TowerClient
+    private let http: DocumentMemoryHTTPClient
+    private var cancellables: Set<AnyCancellable> = []
+
+    private var subscriptionID: String?
+    private var isSubscribing = false
+    /// Resubscribes spent on this connection, and the cap.
+    ///
+    /// `channel_failed` and `consumer_too_slow` are the two errors the Tower
+    /// sends **unsolicited**, after which the subscription is gone and a new
+    /// `result_subscribe` is the only way to resume — the Tower says exactly
+    /// that in the message text. Clearing the flags without resubscribing
+    /// leaves the socket up, the cartridge silent, and nothing to retrigger it:
+    /// `subscribeIfPossible()` is only reached from the declaration sink and
+    /// from going `.online`, and neither fires on a mid-connection error.
+    ///
+    /// `consumer_too_slow` is not exotic — it fires when this phone does not
+    /// accept a result inside the send timeout, which is a backgrounded or
+    /// thermally-throttled phone, i.e. the normal state of a device on a walk.
+    ///
+    /// Bounded rather than unlimited, and matched to `TowerWorldBuilderClient`
+    /// deliberately: a Tower that closes a subscription three times on one
+    /// connection is not going to be fixed by a fourth attempt, and an
+    /// unbounded retry against the Tower's 8-subscription cap is how a client
+    /// starves its own siblings.
+    private var resubscribesUsed = 0
+    private static let resubscribeBudget = 3
+    /// The query in flight, so a late answer to a superseded question cannot
+    /// overwrite a newer one.
+    private var inFlight: Int = 0
+
+    init(tower: TowerClient, http: DocumentMemoryHTTPClient = DocumentMemoryHTTPClient()) {
+        self.tower = tower
+        self.http = http
+
+        // `.receive(on:)` on both: a `@Published` publisher fires from
+        // `willSet`, so a sink that reads the property it was notified about
+        // sees the value *before* the change. `TowerWorldBuilderClient`
+        // documents the same trap at length.
+        tower.$status
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] status in self?.connectionChanged(to: status) }
+            .store(in: &cancellables)
+
+        tower.$cartridgeDeclaration
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.subscribeIfPossible() }
+            .store(in: &cancellables)
+
+        tower.cartridgeResults
+            .sink { [weak self] event in self?.handle(event) }
+            .store(in: &cancellables)
+    }
+
+    // MARK: Availability
+
+    /// Resolved against the Tower's live declaration, from the **HTTP**
+    /// contract.
+    ///
+    /// The library is what this workspace is for, so the library's offer is
+    /// what decides whether the workspace can do anything. The subscription
+    /// offer is checked separately, where the subscription is opened — the two
+    /// are keyed on the same variable on this Tower and could still disagree on
+    /// another, and folding them together would let a missing recorder read as
+    /// a missing library.
+    func availability(isTowerReachable: Bool) -> CartridgeAvailability {
+        CartridgeAvailability.resolve(
+            declared: declaredLibraryContract,
+            supported: [DocumentMemoryContract.libraryIdentifier],
+            isTowerReachable: isTowerReachable,
+            // This build has a Document Memory client, so a silent socket means
+            // "nobody has asked yet", not "this Tower will never do it".
+            knownToThisBuild: true
+        )
+    }
+
+    private var declaredLibraryContract: CartridgeContract? {
+        guard
+            let offer = tower.cartridgeDeclaration?
+                .httpContract(forTowerCartridge: DocumentMemoryContract.towerCartridge)
+        else { return nil }
+        // `available` is honoured, and it was not before.
+        //
+        // `TowerHTTPContractOffer` carries six fields and only `contract` was
+        // ever read here, so with `TOWER_DOCUMENT_ROOT` unset this resolved
+        // `.available`, enabled the search field, and let the query fail with a
+        // 404 -- while the Tower's own sentence naming the variable that would
+        // fix it was decoded and never shown. Every other cartridge checks this
+        // flag at subscribe time; the library is fetched rather than subscribed,
+        // so it had no equivalent gate.
+        //
+        // The reason travels to the screen through `clientReason` rather than
+        // being lost here, so a person is told what the Tower said and not
+        // merely that nothing is available.
+        guard offer.available else { return nil }
+        return CartridgeContract(cartridgeID: cartridgeID, identifier: offer.contract)
+    }
+
+    /// The Tower's own words for why the library cannot be served, when it has
+    /// declared the contract and marked it unavailable.
+    ///
+    /// Surfaced so the reason survives `declaredLibraryContract` returning nil
+    /// -- it names the `TOWER_` variable that would fix it, which nothing local
+    /// can.
+    var libraryUnavailableReason: String? {
+        guard
+            let offer = tower.cartridgeDeclaration?
+                .httpContract(forTowerCartridge: DocumentMemoryContract.towerCartridge),
+            !offer.available
+        else { return nil }
+        return offer.unavailableReason
+    }
+
+    // MARK: Queries
+
+    /// Runs a query, and publishes whatever came back — including the two
+    /// answers that are not lists.
+    ///
+    /// Throws only when the request cannot be made at all. `.notFound` and
+    /// `.noObservation` are **results**, and the whole design of this cartridge
+    /// turns on their not being failures.
+    func search(_ query: DocumentQuery, origin: DocumentQueryOrigin) throws {
+        let availability = availability(isTowerReachable: tower.status == .online)
+        guard availability.isAvailable else {
+            // A local refusal, and attributed locally: the Tower reported
+            // nothing here and there may not even be a socket open.
+            throw CartridgeFailure(
+                kind: .notSupported,
+                message: availability.explanation(cartridgeName: "Document Memory")
+                    ?? "This Tower serves no document memory."
+            )
+        }
+
+        inFlight += 1
+        let token = inFlight
+        state = .searching(query)
+
+        Task { [http] in
+            do {
+                let response = try await Self.run(query, using: http)
+                await MainActor.run { self.apply(response, query: query, origin: origin, token: token) }
+            } catch let error as DocumentMemoryFetchError {
+                await MainActor.run { self.apply(error, token: token) }
+            } catch {
+                await MainActor.run {
+                    self.apply(DocumentMemoryFetchError.transport(error.localizedDescription), token: token)
+                }
+            }
+        }
+    }
+
+    /// Which route answers which query.
+    ///
+    /// `.semantic` goes to the **literal** route, which is what the Tower's own
+    /// `semantic_retrieval_alternative` says to do: it computes no embedding,
+    /// and routing free text nowhere would leave the app's primary input path
+    /// with no Tower route at all. The caveat that the match was lexical
+    /// travels with the answer — see `DocumentQuery.matchingCaveat` — because a
+    /// description missing is not evidence the document was never seen.
+    nonisolated static func run(
+        _ query: DocumentQuery, using http: DocumentMemoryHTTPClient
+    ) async throws -> DocumentLibraryResponse {
+        switch query {
+        case .recent(let limit):
+            return try await http.recent(limit: limit)
+        case .text(let text), .semantic(let text):
+            return try await http.search(text: text)
+        case .observedWithin(let interval):
+            // A centre and a half-width, which is the shape the route takes.
+            // The interval stays an interval up to this line, so an approximate
+            // question is never collapsed to an instant on the way.
+            let centre = interval.start.timeIntervalSince1970 + interval.duration / 2
+            return try await http.around(at: centre, windowSeconds: interval.duration / 2)
+        }
+    }
+
+    private func apply(
+        _ response: DocumentLibraryResponse,
+        query: DocumentQuery,
+        origin: DocumentQueryOrigin,
+        token: Int
+    ) {
+        guard token == inFlight else { return }
+        do {
+            state = .results(
+                try DocumentQueryResult(
+                    query: query,
+                    origin: origin,
+                    documents: response.documents,
+                    evidence: response.answer.evidence,
+                    response: response
+                )
+            )
+        } catch {
+            // A `matched` answer with no documents. The safe direction from a
+            // broken payload is a failure, never a stronger claim than the
+            // Tower made — and never `.notFound`, whose sentence is a definite
+            // negative about the wearer's own memory.
+            state = .failed(CartridgeFailure.wrapping(error))
+        }
+    }
+
+    private func apply(_ error: DocumentMemoryFetchError, token: Int) {
+        guard token == inFlight else { return }
+        switch error {
+        case .noDocumentRootConfigured(let detail):
+            // A configuration answer, and never an answer about a document.
+            // `.unsupported` rather than `.failed` so the workspace says "this
+            // Tower keeps no documents" with the variable named, rather than
+            // "the search failed".
+            state = .unsupported(reason: detail)
+        default:
+            state = .failed(error.failure)
+        }
+    }
+
+    // MARK: The capture session
+
+    /// Sends a verb and reads the state that came back.
+    ///
+    /// **The reply's status code is not consulted for success**, because on
+    /// this cartridge it cannot mean it: a resume on a stopped session answers
+    /// 200 with `state: "stopped"` and no refusal field. What moved, if
+    /// anything, is in `DocumentSessionOutcome`.
+    func send(_ action: DocumentMemoryContract.SessionAction) {
+        Task { [http] in
+            do {
+                let reported = try await http.sendSession(action)
+                await MainActor.run {
+                    self.session = reported
+                    self.lastSessionOutcome = .of(action, reported: reported)
+                }
+            } catch let error as DocumentMemoryFetchError {
+                await MainActor.run { self.lastSessionOutcome = .failed(error.failure) }
+            } catch {
+                await MainActor.run {
+                    self.lastSessionOutcome = .failed(CartridgeFailure.wrapping(error))
+                }
+            }
+        }
+    }
+
+    /// Fetches the session once, over HTTP.
+    ///
+    /// Useful before a subscription exists — a Tower reachable over HTTP but
+    /// with no socket open still has a recorder, and a workspace that could
+    /// only learn about it from the socket would show nothing.
+    func refreshSession() {
+        Task { [http] in
+            let reported = try? await http.sessionStatus()
+            await MainActor.run { if let reported { self.session = reported } }
+        }
+    }
+
+    // MARK: The subscription
+
+    private func connectionChanged(to status: TowerStatus) {
+        guard status == .online else {
+            subscriptionID = nil
+            isSubscribing = false
+            // A fresh connection gets a fresh budget: the cap exists to stop a
+            // hopeless retry loop within one socket, not to remember a bad
+            // socket forever.
+            resubscribesUsed = 0
+            // The session status describes a socket that is gone, so it stops
+            // being current. **The query result is deliberately not cleared:**
+            // a document the Tower recorded is exactly as true with the socket
+            // down, and clearing it would be this app discarding a record the
+            // Tower kept.
+            session = nil
+            return
+        }
+        subscribeIfPossible()
+    }
+
+    private func subscribeIfPossible() {
+        guard tower.status == .online, subscriptionID == nil, !isSubscribing else { return }
+        guard
+            let offer = tower.cartridgeDeclaration?
+                .offer(forTowerCartridge: DocumentMemoryContract.towerCartridge)
+        else { return }
+        // The **status** identifier, compared here and nowhere else. The
+        // library identifier is compared on every HTTP response.
+        guard
+            offer.contract == DocumentMemoryContract.statusIdentifier,
+            offer.resultType == DocumentMemoryContract.resultType,
+            offer.available
+        else { return }
+
+        isSubscribing = true
+        tower.subscribeToResults(
+            cartridge: offer.cartridge,
+            resultType: offer.resultType,
+            contract: offer.contract
+        )
+    }
+
+    private func handle(_ event: CartridgeResultEvent) {
+        switch event {
+        case .declaration:
+            break
+
+        case .subscribed(let ack):
+            guard ack.cartridge == DocumentMemoryContract.towerCartridge else { return }
+            subscriptionID = ack.subscriptionID
+            isSubscribing = false
+
+        case .unsubscribed(let id):
+            guard id == subscriptionID else { return }
+            subscriptionID = nil
+
+        case .result(let envelope):
+            guard envelope.cartridge == DocumentMemoryContract.towerCartridge else { return }
+            guard envelope.isSnapshot else { return }
+            guard let status = DocumentMemoryDecoder.status(from: envelope.payload) else { return }
+            session = status.session
+
+        case .failed(let error):
+            guard error.cartridge == DocumentMemoryContract.towerCartridge
+                || (error.subscriptionID != nil && error.subscriptionID == subscriptionID)
+            else { return }
+            if error.closesSubscription {
+                subscriptionID = nil
+                isSubscribing = false
+                // The Tower closed this subscription and its own message says to
+                // subscribe again to resume. Nothing else will: `subscribeIfPossible()`
+                // is reached only from the declaration sink and from going `.online`,
+                // and the socket is still up, so without this the cartridge goes
+                // permanently silent on a live connection.
+                guard resubscribesUsed < Self.resubscribeBudget else {
+                    state = .failed(
+                        CartridgeFailure(
+                                kind: .transport,
+                                message: """
+                                    The Tower closed this cartridge's result subscription \
+                                    \(Self.resubscribeBudget) times on one connection. \
+                                    Reconnecting is what resolves it.
+                                    """
+                        )
+                    )
+                    return
+                }
+                resubscribesUsed += 1
+                subscribeIfPossible()
+                return
+            }
+            // Any error of ours ends an in-flight subscribe attempt.
+            //
+            // `closesSubscription` answers a different question -- "is an
+            // ESTABLISHED subscription now gone?" -- and is true for only two
+            // reasons. Using it alone to clear `isSubscribing` left the flag
+            // stuck `true` for every other refusal, and `subscribeIfPossible()`
+            // guards on `!isSubscribing`, so **the cartridge never retried for
+            // the life of the connection**.
+            //
+            // That is reachable on transients, not just on permanent faults:
+            // the Tower sends `snapshot_failed` INSTEAD of `result_subscribed`
+            // when the first snapshot raises, which is exactly the case that
+            // must recover. `contract_mismatch`, `unknown_cartridge`,
+            // `cartridge_unavailable` and `too_many_subscriptions` all behaved
+            // the same way.
+            //
+            // Clearing it unconditionally is correct because the Tower answers
+            // a `result_subscribe` with either an ack or an error: once an
+            // error of ours arrives, nothing is in flight any more.
+            isSubscribing = false
+            // The recorder's status stops being current, and nothing about the
+            // library changes: an error on the status channel says nothing
+            // about what is on disk.
+            session = nil
+        }
+    }
+}
+
+// MARK: - The stub, for a Tower that declares nothing
+
+/// The client for a Tower that has declared no document library.
 ///
 /// It holds **no sample documents**. A handful of plausible rows would make the
 /// workspace look finished and would be indistinguishable, on screen, from real
 /// memories of the wearer's own documents — the single most misleading fixture
 /// this app could ship. Test fixtures live in the test target, where they can
 /// never reach a device.
+///
+/// ## The sentence that used to be here, and why it was deleted
+///
+/// > "The Tower keeps no document memory, so there is nothing to search. This
+/// > app sends camera frames to the Tower while a session is running; it reads
+/// > no text from them and receives none back."
+///
+/// The first clause is a claim about what the Tower **stores**, and it is now
+/// false: the Tower has a document store, a journal, six routes and a typed
+/// contract. The last clause is false too — a search receives titles, snippets
+/// and, on one route, page text. Leaving it up would have told a person their
+/// Tower keeps no record of what they read while it was keeping one.
+///
+/// What replaced it says only what is observable from here: **this** Tower has
+/// declared nothing. It makes no claim about what any Tower stores, because
+/// this app has no channel through which it could know that.
 @MainActor
 final class UnavailableDocumentMemoryClient: DocumentMemoryClient {
-    /// ## What this sentence is careful not to claim
-    ///
-    /// It says nothing about what the Tower **stores**. This app has no channel
-    /// through which it could know that, so a reassurance would be a fabricated
-    /// claim about the other machine (Rule 3).
-    ///
-    /// It is also careful about the frames. Saying "no document text has left
-    /// this app" is true — no OCR runs here — but on a screen about documents a
-    /// reader takes it to mean the *documents* stayed on the phone, and they do
-    /// not: full camera frames go to the Tower, and
-    /// `docs/06-PRIVACY-DATA.md` treats a document appearing in frame as "a
-    /// standing risk of the input modality, not an edge case". So the sentence
-    /// says plainly what leaves.
     static let reason = """
-        The Tower keeps no document memory, so there is nothing to search. This \
-        app sends camera frames to the Tower while a session is running; it \
-        reads no text from them and receives none back.
+        This Tower has not declared a document library, so there is nothing to \
+        search. That is a statement about what this Tower offers, not about \
+        what you have read.
         """
 
     let cartridgeID = "document-memory"
@@ -81,11 +551,13 @@ final class UnavailableDocumentMemoryClient: DocumentMemoryClient {
     /// Always throws, for the same reason the Experimental CV client does: a
     /// silent no-op leaves a search field that appears to work and returns
     /// nothing, which a person reads as "I have no documents" rather than as
-    /// "this is not built".
+    /// "this Tower has none to offer".
     func search(_ query: DocumentQuery, origin: DocumentQueryOrigin) throws {
         throw CartridgeFailure(kind: .notSupported, message: Self.reason)
     }
 }
+
+// MARK: - View model
 
 /// Publishes Document Memory state into SwiftUI.
 ///
@@ -93,6 +565,8 @@ final class UnavailableDocumentMemoryClient: DocumentMemoryClient {
 @MainActor
 final class DocumentMemoryViewModel: ObservableObject {
     @Published private(set) var state: DocumentMemoryState
+    @Published private(set) var session: DocumentSessionStatus?
+    @Published private(set) var lastSessionOutcome: DocumentSessionOutcome?
 
     /// What the person has typed. Owned here rather than in the view so a query
     /// can also arrive from somewhere that has no text field — the origin
@@ -108,10 +582,23 @@ final class DocumentMemoryViewModel: ObservableObject {
     init(client: any DocumentMemoryClient) {
         self.client = client
         self.state = client.state
+        self.session = client.session
+        self.lastSessionOutcome = client.lastSessionOutcome
 
         client.stateUpdates
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in self?.state = state }
+            .store(in: &cancellables)
+
+        client.sessionUpdates
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] session in
+                self?.session = session
+                // Pulled from the client rather than published separately: the
+                // outcome and the status change together, and two publishers
+                // would let a view render a new state beside an old verdict.
+                self?.lastSessionOutcome = self?.client.lastSessionOutcome
+            }
             .store(in: &cancellables)
     }
 
@@ -129,6 +616,11 @@ final class DocumentMemoryViewModel: ObservableObject {
     }
 
     private var clientReason: String? {
+        // The declaration's own reason outranks any local state: it names the
+        // `TOWER_` variable that would fix it, which no state here can.
+        if let reason = (client as? TowerDocumentMemoryClient)?.libraryUnavailableReason {
+            return reason
+        }
         switch state {
         case .unsupported(let reason): return reason
         case .failed(let failure): return failure.message
@@ -139,11 +631,16 @@ final class DocumentMemoryViewModel: ObservableObject {
     /// Submits whatever is in `queryText`.
     ///
     /// Typed text becomes a `.semantic` query rather than a `.text` one: a
-    /// person asking "the parking notice from this morning" is describing a
-    /// document, not quoting it, and routing that through substring matching
-    /// would return nothing and look like an empty memory. Which of the two the
-    /// Tower can actually serve is its decision — this states what the user
-    /// meant, not how to satisfy it.
+    /// person asking "the parking notice from this morning" is **describing** a
+    /// document, not quoting it, and recording that as a literal query would
+    /// lose the distinction the answer needs.
+    ///
+    /// What the Tower does with it is a separate question, and the answer is
+    /// "matches it literally" — `semantic_retrieval` is `false` and its own
+    /// `semantic_retrieval_alternative` says to route free text to the literal
+    /// route. So the client sends it there and the workspace shows
+    /// `DocumentQuery.matchingCaveat` on the answer. This states what the user
+    /// meant; the client states how it was satisfied.
     func submitTypedQuery() {
         let trimmed = queryText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -158,5 +655,24 @@ final class DocumentMemoryViewModel: ObservableObject {
         } catch {
             lastRequestFailure = CartridgeFailure.wrapping(error)
         }
+    }
+
+    /// The most recent documents, which is the question a workspace opens on.
+    func showRecent(limit: Int = 20) {
+        submit(.recent(limit: limit), origin: .appText)
+    }
+
+    func send(_ action: DocumentMemoryContract.SessionAction) {
+        client.send(action)
+    }
+
+    /// Called when the workspace appears.
+    ///
+    /// Deliberately **not** a poll. The subscription pushes the session twice a
+    /// second while it is open; this is the one-shot that covers the case where
+    /// it is not, and repeating it on a timer would re-parse the Tower's
+    /// journal on a schedule nobody asked for.
+    func refreshSession() {
+        client.refreshSession()
     }
 }

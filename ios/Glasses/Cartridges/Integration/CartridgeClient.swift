@@ -42,14 +42,23 @@ enum TowerCapabilities {
 
     /// Contracts declared by a local table rather than by the Tower.
     ///
-    /// **Empty, and that remains the whole truth for Experimental CV Lab,
-    /// Document Memory and Scene Understanding** — the Tower lists all three
-    /// under `not_offered`, which the contract is explicit must never be read
-    /// as an offer.
+    /// **Still empty, and now empty for a better reason than before.**
     ///
-    /// World Builder is deliberately *not* here. Its contract is declared over
-    /// the wire, and duplicating it as a compile-time constant would create a
-    /// second answer that could disagree with the Tower's.
+    /// This used to say the table was "the whole truth for Experimental CV Lab,
+    /// Document Memory and Scene Understanding", because the Tower listed all
+    /// three under `not_offered`. That premise is gone: the unified Tower
+    /// declares all three over the wire, and `not_offered` is `[]`.
+    ///
+    /// What survives is the *rule*, which was always the point — a contract
+    /// this app can reach is declared by the Tower, never hardcoded here.
+    /// Duplicating one as a compile-time constant creates a second answer that
+    /// can disagree with the Tower's, and the disagreement would be silent.
+    ///
+    /// **Object Memory is the deliberate exception, and it is not here either.**
+    /// It is undeclared on purpose (the Tower's own §9), reached entirely over
+    /// HTTP, and a `result_subscribe` for it is refused `unknown_cartridge`.
+    /// Adding it to this table would be inventing a declaration the Tower
+    /// pointedly declined to make.
     static let declared: [String: CartridgeContract] = [:]
 
     /// Contract identifiers this build implements.
@@ -59,15 +68,57 @@ enum TowerCapabilities {
     /// `CartridgeAvailability.unsupportedContract` exists to represent. A Tower
     /// offering `world_builder.status/2026-09-…` would land there rather than
     /// being decoded on a guess.
-    static let supported: Set<String> = [WorldBuilderResultContract.identifier]
+    ///
+    /// ## Why this went from one entry to five
+    ///
+    /// The test that pinned this set to a single element said, in its own
+    /// words, that a second contract appearing "is still a review and not a
+    /// silent widening". That review happened: four Tower lanes were unified on
+    /// 2026-08-27, `GET /cartridges` went from one offer to four with
+    /// `not_offered` empty, and each cartridge got a client that decodes its
+    /// contract rather than a stub that refuses it.
+    ///
+    /// `document_memory` contributes **two** identifiers because the Tower
+    /// declares two, deliberately: `status` is small and pushed on the socket,
+    /// `library` is bulk text pulled over HTTP. They govern different
+    /// transports with different failure modes, and a change to one is not a
+    /// change to the other — collapsing them here would lose exactly that.
+    ///
+    /// **`world_builder.geometry/2026-08-25` is deliberately absent.** It is
+    /// HTTP-only and compared for equality inside `WorldGeometryDecoder`, and
+    /// this set is consulted against *subscription* offers. Adding it would
+    /// make a fetch-only contract look subscribable.
+    static let supported: Set<String> = [
+        WorldBuilderResultContract.identifier,
+        ExperimentalCVContract.status,
+        SceneUnderstandingContract.identifier,
+        DocumentMemoryContract.statusIdentifier,
+        DocumentMemoryContract.libraryIdentifier
+    ]
 
     /// This app's catalog id → the Tower's name for the same cartridge.
     ///
     /// The two vocabularies are genuinely different (`"world-build"` against
-    /// `"world_builder"`), and the mapping is here rather than in the client so
-    /// that a second cartridge cannot invent a different convention for it.
+    /// `"world_builder"`, `"experimental-cv"` against `"experimental_cv"`), and
+    /// the mapping is here rather than in the client so that a second cartridge
+    /// cannot invent a different convention for it.
+    ///
+    /// **This dictionary is load-bearing in a way that is easy to miss.**
+    /// `declaredContract(for:in:)` returns `nil` for any cartridge absent from
+    /// it, so availability resolves `.noContract` and the phase is forced to
+    /// `.unsupported` — *no matter what the Tower declared*. A cartridge with a
+    /// complete client, a correct decoder and a live offer still shows a person
+    /// "nothing here" until its name appears on this list.
+    ///
+    /// **Object Memory is absent deliberately**, and that is not an oversight
+    /// to be tidied up. The Tower does not declare it, instructs clients to
+    /// "learn nothing about it from the declaration", and refuses a
+    /// subscription for it. It is reached over HTTP by its own client.
     static let towerCartridgeNames: [String: String] = [
-        "world-build": WorldBuilderResultContract.towerCartridge
+        "world-build": WorldBuilderResultContract.towerCartridge,
+        ExperimentalCVContract.catalogID: ExperimentalCVContract.towerCartridge,
+        "scene-understanding": SceneUnderstandingContract.towerCartridge,
+        "document-memory": DocumentMemoryContract.towerCartridge
     ]
 
     static func declaredContract(for cartridgeID: String) -> CartridgeContract? {
@@ -89,10 +140,27 @@ enum TowerCapabilities {
     ) -> CartridgeContract? {
         guard
             let declaration,
-            let towerName = towerCartridgeNames[cartridgeID],
-            let offer = declaration.offer(forTowerCartridge: towerName)
+            let towerName = towerCartridgeNames[cartridgeID]
         else { return nil }
-        return CartridgeContract(cartridgeID: cartridgeID, identifier: offer.contract)
+        if let offer = declaration.offer(forTowerCartridge: towerName) {
+            return CartridgeContract(cartridgeID: cartridgeID, identifier: offer.contract)
+        }
+        // A capability the Tower serves over HTTP rather than by subscription.
+        //
+        // Checked **second, never first**: a cartridge declaring both (Document
+        // Memory declares `status` on the socket and `library` over HTTP) must
+        // resolve to its subscription, because that is the surface this app's
+        // result channel binds to. Preferring the HTTP entry would hand the
+        // subscribing client a library identifier it cannot subscribe with.
+        //
+        // Reached at all because a fetch-only cartridge is genuinely available
+        // — a Tower serving `/documents` can answer questions about documents.
+        // Resolving that to `.noContract` would tell a person the cartridge
+        // does not exist while its route is answering.
+        if let http = declaration.httpContract(forTowerCartridge: towerName) {
+            return CartridgeContract(cartridgeID: cartridgeID, identifier: http.contract)
+        }
+        return nil
     }
 
     /// Availability for one cartridge, given the current connection.
@@ -120,7 +188,12 @@ enum TowerCapabilities {
             declared: declaredContract(for: cartridgeID, in: declaration)
                 ?? declaredContract(for: cartridgeID),
             supported: supported,
-            isTowerReachable: isTowerReachable
+            isTowerReachable: isTowerReachable,
+            // A cartridge is "known to this build" exactly when it has a Tower
+            // name here — that map is what makes a declaration for it legible
+            // at all. Object Memory is deliberately absent and reaches its own
+            // availability over HTTP, which is why it is not special-cased.
+            knownToThisBuild: towerCartridgeNames[cartridgeID] != nil
         )
     }
 }

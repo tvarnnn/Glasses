@@ -61,6 +61,13 @@ struct WorldCanvasView: View {
     /// dead dependency, so removing it cost nothing.
     let explanation: String
     var inspection: WorldInspectionMode = .live
+    /// What the client established about whose world this is.
+    ///
+    /// It changes no figure and hides nothing — the gate in
+    /// `TowerWorldBuilderClient` has already decided what `state` may be. All
+    /// this does is let the waiting state say *why* it is waiting, which is
+    /// the sentence nobody could see on 2026-08-24.
+    var sessionBinding: WorldSessionBinding = .none
 
     /// The segments the Tower's manifest names, and their points and poses.
     ///
@@ -130,9 +137,12 @@ struct WorldCanvasView: View {
             // going out and the Tower really has not answered yet.
             HStack(spacing: 10) {
                 ProgressView()
-                Text("Waiting for the Tower's first world update…")
+                Text(waitingHeadline)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+            }
+            if let detail = waitingDetail {
+                detailText(detail)
             }
 
         case .receiving(let snapshot):
@@ -141,16 +151,33 @@ struct WorldCanvasView: View {
             fragmentGallery
 
         case .finalizing(let snapshot):
-            // Progress is honest here — the Tower is genuinely working — but
-            // the badge must not say "live", because no new observations are
-            // arriving and the camera may already be off.
-            HStack(spacing: 10) {
-                ProgressView()
-                Text(snapshot.name.map { "Finishing \($0)…" } ?? "Finishing the world…")
-                    .font(.headline)
-            }
+            // ## No spinner here, and the reason is not style
+            //
+            // This drew a `ProgressView` beside "Finishing the world…" under a
+            // comment reading *"Progress is honest here — the Tower is
+            // genuinely working"*. **The Tower says it cannot know that.**
+            //
+            // `tower/tower/results/world_builder.py` is explicit: the writer
+            // lock is released before `build()` is called, and `build()` emits
+            // no event and writes nothing until it finishes, so *"a build in
+            // progress is indistinguishable on disk from one that never started
+            // and from one that crashed"*. Its `build_in_progress` field is
+            // `null` for exactly that reason, and the Tower spells out that
+            // `null` is not `False` because `False` would itself be a claim.
+            //
+            // This app's own client already knew. `TowerWorldBuilderClient`
+            // says this state means *"the stored figures are not the final
+            // figures", **not** "a process is working right now"*. Two comments
+            // in this repo contradicted each other and the pixels followed the
+            // wrong one — an animating spinner is the strongest possible
+            // assertion that work is underway, made from a fact that cannot
+            // support it. If the builder crashed, this span forever.
+            //
+            // What is true and worth saying is the staleness, which is what the
+            // state actually means.
+            headline(snapshot.name ?? "World", systemImage: "cube")
             WorldSummaryView(snapshot: snapshot, isLive: false)
-            detailText("Capture has ended. The Tower is still working, so these figures may still change.")
+            detailText("Capture has ended and these figures are not final. The Tower does not report whether a build is running, so this app cannot say whether one is.")
             fragmentGallery
 
         case .finalized(let snapshot):
@@ -161,6 +188,43 @@ struct WorldCanvasView: View {
         case .failed(let failure):
             headline("World building failed", systemImage: "exclamationmark.triangle.fill")
             detailText(failure.message)
+        }
+    }
+
+    /// What the wait is, in the two cases the phone can tell apart.
+    private var waitingHeadline: String {
+        switch sessionBinding {
+        case .none, .bound:
+            return "Waiting for the Tower's first world update…"
+        case .awaiting, .foreign:
+            return "Frames are reaching the Tower."
+        }
+    }
+
+    /// The sentence that was missing on 2026-08-24, when the phone showed a
+    /// frozen world beside a live camera and nothing said which capture the
+    /// figures belonged to.
+    ///
+    /// Both strings are claims the phone can actually support. `.foreign` means
+    /// a snapshot arrived and described a capture that is not this one, so the
+    /// stronger sentence is earned. `.awaiting` means a capture is open and the
+    /// Tower has resolved no session for it at all — which is true in the
+    /// seconds after Start, and stays true if nothing ever attaches a builder.
+    private var waitingDetail: String? {
+        switch sessionBinding {
+        case .none, .bound:
+            return nil
+        case .awaiting:
+            return "Nothing is building a world from them yet."
+        case .foreign:
+            // "Could not be matched", not "is a different capture". Both the
+            // 2026-08-24 case (a world finished an hour ago) and the narrow one
+            // where this phone's own capture ended before DAT reported the stop
+            // arrive here, and only the weaker sentence is true of both.
+            return """
+                The world it is reporting could not be matched to this \
+                session's capture, so nothing here describes it yet.
+                """
         }
     }
 
@@ -285,6 +349,36 @@ struct WorldSummaryView: View {
     private var trajectoryRows: some View {
         if let poses = snapshot.trajectory.poseCount {
             row("Camera poses", "\(poses)")
+        }
+        // Beside the count, never folded into it. `world_builder.status/2026-08-25`
+        // exists because the two were being added: an anchor is a segment's
+        // origin — identity rotation, zero translation — and 36 of them are not
+        // 36 camera positions. Shown whenever the Tower reported any, so a walk
+        // that positioned 41 cameras across 3 segments reads as both figures.
+        if let anchors = snapshot.trajectory.posesAnchor {
+            row("Segment origins", "\(anchors)")
+        }
+        if let segments = snapshot.trajectory.segments {
+            row("Segments", "\(segments)")
+        }
+        if snapshot.trajectory.isAnchorsOnly {
+            // The uncalibrated outcome, said plainly. No intrinsics exist for
+            // this camera yet, so the backend that solves poses withholds every
+            // one — and "0 camera poses, 36 segment origins" is a true and
+            // uninterpretable pair without this line.
+            caption("""
+                No camera position was reconstructed. Each origin marks where \
+                tracking restarted, not where the camera was.
+                """)
+        } else if let segments = snapshot.trajectory.segments, segments > 1 {
+            // Why there is no path length beside these figures. The Tower
+            // refuses one across a segment break, because poses either side of
+            // it share no coordinate frame.
+            caption("""
+                Tracking restarted \(segments - 1) time\(segments == 2 ? "" : "s"). \
+                Distances either side of a restart are not comparable, so the \
+                Tower reports no path length.
+                """)
         }
         if snapshot.trajectory.labelledFigureDisplayable, let length = snapshot.trajectory.pathLength {
             // The Tower's unit, always. `labelledFigureDisplayable` refuses

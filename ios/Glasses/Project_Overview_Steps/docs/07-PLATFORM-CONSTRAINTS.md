@@ -287,7 +287,60 @@ Constraint sources: multi-view geometry, ML monocular depth, known-size object p
 
 **Limitation:** Tower receipt time must not be treated as camera capture time.
 
-**Confirmed:** `VideoFrame.sampleBuffer` is a `CMSampleBuffer`, which carries a presentation timestamp via standard CoreMedia APIs. **Not confirmed from available DAT sources:** whether that timestamp reflects on-glasses capture time, phone-side arrival time, or something else — DAT's docs describe `VideoFrame` as containing "the raw video buffer" without itemizing a documented timestamp semantic beyond the standard `CMSampleBuffer` fields. This is an open question (see Unresolved Questions below) — do not assume PTS-equals-capture-time without confirming against Apple/DAT documentation or empirical measurement.
+**RESOLVED 2026-08-26 by direct measurement — the PTS is a capture-side timestamp.** DAT's documentation still says nothing about it, so this was measured rather than read: 1,084 frames from the real Ray-Bans over 45 s, timestamps sampled on DAT's callback thread *before* the main-actor hop, compared against `mach_absolute_time`.
+
+| | mean | **sd** | min | max |
+|---|---|---|---|---|
+| `d_pts` (PTS deltas) | 0.041666 s | **0.00238** | 0.03332 | 0.05006 |
+| `d_host` (arrival deltas) | 0.041598 s | **0.01684** | 0.00246 | 0.12006 |
+| residual (`d_pts − d_host`) | 0.000068 s | **0.01689** | −0.07839 | 0.03927 |
+
+The argument is the jitter, not the offset. A stable offset proves nothing — a phone-side stamp applied on arrival produces one too. What separates the two is that an arrival stamp *inherits* transport delay, so `d_pts` would track `d_host` and the residual would collapse to ~0. Instead **residual_sd / d_host_sd = 1.003**: the residual is entirely arrival jitter and the PTS carries none of it. **`d_pts_sd / d_host_sd = 0.141`** — PTS deltas sit on a tight grid at exactly 1/24 s (24.000 fps) while arrivals scatter from 2.5 ms bursts to 120 ms stalls. A clock that stays regular while delivery is irregular is upstream of the delivery.
+
+The epoch says the same thing independently: `pts_timescale = 1000000` (microseconds), `pts_epoch = 0`, and the first frame read **424.72 s** against a host uptime of **519,597 s**. Not the phone's clock, and already ~7 minutes into its own epoch when the stream opened — so not stream-relative-from-zero either.
+
+**What this does and does not license.**
+
+- **Do** use the PTS for *relative* ordering and inter-frame intervals within one stream session. It is the only regular time base available and it is clean.
+- **Do not** treat it as comparable to any phone or Tower clock without an offset estimate. The offset is ~519,172.68 s and is a property of this boot pair, not a constant.
+- **Do not** assume it survives a reconnect. Whether the epoch is device-persistent or per-session is **not** established (see Unresolved Questions). World Builder chains captures across reconnects, so this matters before any use there.
+- **Drift is not established.** The least-squares slope wandered −4772 → −662 → +701 → +167 ppm as the window grew — noise, not convergence, since the offset spread (132 ms) is dominated by arrival jitter. The offset *mean* held within ~8 ms across nine windows, so the clocks are closely rate-matched, but no ppm figure should be quoted from a 45 s run.
+
+Measured with `ios/Glasses/FramePTSProbe.swift` (DEBUG-only, pure observation). Delete that file to remove the experiment.
+
+### 9.1 The capture clock stops when the camera does — measured 2026-08-26
+
+**Do not use the PTS to measure elapsed time across a stream stop.** It is
+monotonic across one, which is exactly what makes this dangerous: nothing
+looks broken.
+
+| Event | wall gap | clock advanced | ratio |
+|---|---|---|---|
+| pause → resume | 17.86 s | 17.80 s | 99.7 % |
+| pause → resume | 39.165 s | 39.165 s | 100.0 % |
+| **stop → start** | **25.95 s** | **7.19 s** | **28 %** |
+| **stop → start** | **192.70 s** | **~10.95 s** | **5.7 %** |
+
+A *pause* keeps the camera subsystem alive and the clock runs through it,
+matching wall time to ~5 ppm. A *stop* tears the subsystem down and the clock
+freezes. Note the two stop rows: the gaps differ by 7.4x and the advance
+barely moves (7.19 s vs ~10.95 s). What survives is a fixed teardown-and-
+startup tail at each end — **not elapsed time, and not proportional to it.**
+
+The epoch itself is durable: it does not reset on a stop, and it does not
+reset when the *app process* restarts (observed continuing across a rebuild
+and relaunch). It belongs to the glasses or to the DAT daemon, not to the app
+or to the stream session.
+
+**Consequence for World Builder.** The Tower chains captures across a
+reconnect into one lineage. If any consumer ever derives a duration, a rate,
+or a gap from PTS across that boundary, it will silently understate the
+dropout by an unbounded amount — a five-minute WiFi outage would read as about
+ten seconds. Elapsed time across a reconnect must come from the Tower's own
+receipt clock, which is what `time_basis: "tower-receipt"` already records.
+
+**Safe uses:** ordering and inter-frame intervals *within* one continuous
+streaming session. **Unsafe:** anything spanning a stop.
 
 **Affected modules:** World Builder, Object Memory (temporal memory), Environmental Memory, any tracking/multi-frame reasoning.
 
@@ -488,7 +541,10 @@ No specific SLAM, SfM, Gaussian Splatting, or depth-model implementation is sele
 
 ## Unresolved Questions Requiring Future Investigation
 
-- **`VideoFrame`/`CMSampleBuffer` timestamp semantics** (Limitation 9): whether the presentation timestamp reflects on-glasses capture time or phone-side arrival time is not confirmed by available DAT documentation. Needs direct empirical measurement or a more specific `search_dat_docs` answer once frame-transport work begins.
+- **~~`VideoFrame`/`CMSampleBuffer` timestamp semantics~~ — ANSWERED 2026-08-26.** It is a capture-side clock; the measurement and its limits are in Limitation 9. **Two narrower questions remain open:**
+  - **~~Is the PTS epoch device-persistent or per-stream-session?~~ — ANSWERED 2026-08-26. Neither.** See Limitation 9.1: the clock free-runs through a *pause* but freezes for most of a *stop*, so it stays monotonic across a reconnect while understating the gap. **This is the one to know about before using PTS for anything spanning a dropout.**
+  - **~~What is the actual clock drift?~~ — BOUNDED 2026-08-26 at ~5 ppm.** Not from the 45 s stream, where arrival jitter swamped it, but from a clean bracket across a 39.165 s pause: the two clocks disagreed by 0.19 ms. The earlier three-figure ppm values were jitter, not drift.
+  - **Still open: does the clock survive the glasses powering off?** Every measurement so far kept them awake. A cold boot would distinguish "camera-subsystem uptime" from "device uptime" and would say whether the epoch is stable for a whole wearing session.
 - **Doff-specific session behavior** (Limitation 4): DAT's documented session-interruption causes cover fold/hinge-close explicitly; whether doff (without folding) has a distinct, separately-documented effect on `DeviceSessionState` versus what Mock Device Kit's `doff()` simulates is not confirmed.
 - **Real BLE-Classic bandwidth figures** (Limitation 2): the adaptive ladder's behavior is documented qualitatively; actual achieved FPS/resolution/latency under real conditions is explicitly a V0.7 measurement milestone, not yet performed.
 

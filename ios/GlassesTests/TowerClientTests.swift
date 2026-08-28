@@ -10,6 +10,8 @@
 //
 
 import Combine
+import Network
+import os
 import UIKit
 import XCTest
 
@@ -1165,6 +1167,252 @@ final class TowerClientTests: XCTestCase {
         client.disconnect()
     }
 
+    /// The declaration survives a reconnect and does NOT survive a retarget.
+    ///
+    /// Keeping it across a drop is deliberate — what a Tower can do belongs to
+    /// its build, not to one socket, and clearing it would turn every dropped
+    /// connection into "this will never work" when the truth is "cannot reach
+    /// it". That reasoning stops at the endpoint: a *different* Tower's
+    /// capabilities are not this one's. Left standing, the stale declaration
+    /// races the new connection's own `cartridges` reply and can drive the
+    /// first `result_subscribe` with the previous Tower's contract.
+    func testTheDeclarationDoesNotFollowTheClientToADifferentTower() async throws {
+        let first = try MockTowerServer()
+        let firstPort = try await first.start()
+        first.onText = { text in
+            guard text.contains("\"ping\"") || text.contains("cartridges") else { return }
+            if text.contains("\"ping\"") {
+                first.send(text: #"{"type":"pong"}"#)
+            } else {
+                first.send(text: """
+                    {"type":"cartridges",
+                     "envelope_contract":"cartridge_results.envelope/2026-08-23",
+                     "cartridges":[{"cartridge":"world_builder","result_type":"status",
+                        "contract":"world_builder.status/2026-08-25","available":true,
+                        "unavailable_reason":null,"snapshot_only":true}],
+                     "not_offered":[]}
+                    """)
+            }
+        }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: firstPort))
+        let declared = await waitUntil { client.cartridgeDeclaration != nil }
+        XCTAssertTrue(declared, "the first Tower never declared anything")
+
+        // A drop, not a retarget: the declaration must survive this.
+        first.stop()
+        _ = await waitUntil { client.status != .online }
+        XCTAssertNotNil(
+            client.cartridgeDeclaration,
+            "a dropped connection cleared what the Tower can do, which is a different claim"
+        )
+
+        // A different endpoint. The previous Tower's answer must not follow.
+        let second = try MockTowerServer()
+        let secondPort = try await second.start()
+        defer { second.stop() }
+        XCTAssertNotEqual(firstPort, secondPort, "the two mock servers shared a port")
+
+        client.connect(to: url(port: secondPort))
+        XCTAssertNil(
+            client.cartridgeDeclaration,
+            "the previous Tower's declaration followed the client to a different Tower"
+        )
+
+        client.disconnect()
+    }
+
+    /// A connect that never completes must terminate, not hang forever.
+    ///
+    /// `validateConnection` bounded the pong at 6 s and left the `send` beside
+    /// it — which cannot return until TCP connect and the HTTP Upgrade have
+    /// finished, so it *is* the connect leg — with no deadline at all. A peer
+    /// that accepts the TCP connection and never upgrades parked the client in
+    /// `.connecting` permanently: `fail(_:task:)` was never reached, so the
+    /// reconnect schedule never advanced and the attempt budget was never
+    /// spent. Nothing tried again, and nothing said so.
+    ///
+    /// Found while decomposing a real 9-second reconnect on a physical walk,
+    /// ~8.5 s of which was spent in `.connecting`.
+    ///
+    /// The listener here is deliberately **plain TCP** — no
+    /// `NWProtocolWebSocket` in its stack — so it completes the handshake's
+    /// first half and then simply never speaks.
+    func testAConnectThatNeverUpgradesFailsInsteadOfHangingForever() async throws {
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        let listener = try NWListener(using: parameters)
+        let queue = DispatchQueue(label: "SilentTCPListener")
+
+        // Accepted and then ignored: started so the TCP handshake completes,
+        // and never written to, so the upgrade cannot.
+        let accepted = OSAllocatedUnfairLock(initialState: [NWConnection]())
+        listener.newConnectionHandler = { connection in
+            connection.start(queue: queue)
+            accepted.withLock { $0.append(connection) }
+        }
+
+        let port: UInt16 = try await withCheckedThrowingContinuation { continuation in
+            // Locked rather than a captured `var`: `stateUpdateHandler` runs on
+            // the listener's queue, and a continuation resumed twice traps.
+            let resumed = OSAllocatedUnfairLock(initialState: false)
+            listener.stateUpdateHandler = { state in
+                let claim = resumed.withLock { already -> Bool in
+                    if already { return false }
+                    already = true
+                    return true
+                }
+                switch state {
+                case .ready:
+                    guard let port = listener.port else { return }
+                    if claim { continuation.resume(returning: port.rawValue) }
+                case .failed(let error):
+                    if claim { continuation.resume(throwing: error) }
+                default:
+                    break
+                }
+            }
+            listener.start(queue: queue)
+        }
+        defer { listener.cancel() }
+
+        let client = TowerClient(metrics: SenderMetrics(), handshakeLegTimeout: 1)
+        client.connect(to: url(port: port))
+
+        let reachedConnecting = await waitUntil { client.status == .connecting }
+        XCTAssertTrue(reachedConnecting, "the client never began connecting")
+
+        let terminated = await waitUntil(timeout: 8) {
+            if case .failed = client.status { return true }
+            return false
+        }
+        XCTAssertTrue(
+            terminated,
+            "the client is still connecting to a peer that will never answer — the connect leg is unbounded"
+        )
+
+        client.disconnect()
+    }
+
+    /// The Tower's per-frame vocabulary is six keys, not three.
+    ///
+    /// `tower/tower/routes/ws.py:148-155` builds every `frame_result` with
+    /// `seq`, `processing_ms`, **`result_value`, `result_label` and
+    /// `stage_ms`** — all five unconditional — then adds `mean_intensity` and
+    /// `metrics` only when the experiment produced them. `ExperimentResult`
+    /// (`tower/tower/experiments/__init__.py:106-117`) is where those fields
+    /// come from.
+    ///
+    /// This app decoded three of them and dropped the rest, and the doc
+    /// comment on `TowerFrameResult` asserted that three *was* the whole
+    /// vocabulary. `result_label` is the experiment's own headline answer, so
+    /// what was being discarded was the only thing the Tower says about what
+    /// it *concluded*, as opposed to how long it took.
+    func testTheWholeFrameResultVocabularyIsDecodedNotJustTheTimings() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        // Shaped exactly as `ws.py` builds it, including the optional pair.
+        server.send(text: #"{"type":"frame_result","seq":11,"processing_ms":8.5,"result_value":0.73,"result_label":"baseline","stage_ms":{"decode":2.0,"infer":6.5},"mean_intensity":0.42,"metrics":{"edges":1024.0}}"#)
+
+        let arrived = await waitUntil { client.latestFrameResult?.sequence == 11 }
+        XCTAssertTrue(arrived)
+
+        let result = try XCTUnwrap(client.latestFrameResult)
+        XCTAssertEqual(result.processingMs ?? -1, 8.5, accuracy: 0.0001)
+        XCTAssertEqual(result.meanIntensity ?? -1, 0.42, accuracy: 0.0001)
+
+        XCTAssertEqual(result.resultValue ?? -1, 0.73, accuracy: 0.0001,
+                       "the experiment's headline number was dropped")
+        XCTAssertEqual(result.resultLabel, "baseline",
+                       "the experiment's own name for its answer was dropped")
+        XCTAssertEqual(result.stageMs, ["decode": 2.0, "infer": 6.5],
+                       "the per-stage timings were dropped")
+        XCTAssertEqual(result.metrics, ["edges": 1024.0],
+                       "the additive measurement channel was dropped")
+
+        client.disconnect()
+    }
+
+    /// The two optional keys are genuinely optional, and their absence must
+    /// not be read as zero.
+    ///
+    /// `ws.py:156-165` omits `mean_intensity` when the experiment reported
+    /// none and omits `metrics` entirely when empty — "an experiment whose
+    /// headline says everything does not pay for an empty object on every
+    /// frame". Absent is not `0.0`.
+    func testTheOptionalHalfOfAFrameResultIsAbsentRatherThanZero() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        server.send(text: #"{"type":"frame_result","seq":3,"processing_ms":1.0,"result_value":2.0,"result_label":"edges","stage_ms":{}}"#)
+        let arrived = await waitUntil { client.latestFrameResult?.sequence == 3 }
+        XCTAssertTrue(arrived)
+
+        let result = try XCTUnwrap(client.latestFrameResult)
+        XCTAssertNil(result.meanIntensity, "an omitted intensity is unknown, not dark")
+        XCTAssertTrue(result.metrics.isEmpty)
+        XCTAssertTrue(result.stageMs.isEmpty)
+        XCTAssertEqual(result.resultLabel, "edges")
+
+        client.disconnect()
+    }
+
+    /// A reply belongs to the socket that carried it.
+    ///
+    /// `teardownConnection` already clears everything else scoped to one
+    /// connection — the send window, `lastSendFrameAt`, `isStreamingToTower` —
+    /// and says of the last of those that leaving it set across a teardown
+    /// "would be a lie". `latestFrameResult` was cleared only by
+    /// `sendStreamStart`/`sendStreamStop`, so a socket that dropped mid-capture
+    /// left the dead connection's reading on screen under the caption "latest
+    /// Tower reply" (`HomeWorkspaceView.swift`) — for the whole outage, and
+    /// permanently once the reconnect budget is spent.
+    func testAFrameResultDoesNotOutliveTheSocketThatCarriedIt() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        let becameOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(becameOnline)
+
+        // Mid-capture: a bracket is open, so nothing else would clear this.
+        client.sendStreamStart()
+        server.send(text: #"{"type":"frame_result","seq":5,"processing_ms":1.0,"result_value":1.0,"result_label":"baseline","stage_ms":{},"mean_intensity":0.5}"#)
+        let arrived = await waitUntil { client.latestFrameResult != nil }
+        XCTAssertTrue(arrived)
+
+        // The socket drops under it. `autoReconnect` is off by default, so this
+        // settles rather than racing a retry.
+        server.stop()
+        let dropped = await waitUntil { client.status != .online }
+        XCTAssertTrue(dropped, "the client did not notice the socket close")
+
+        XCTAssertNil(
+            client.latestFrameResult,
+            "a reading from a dead socket was still being offered as the latest Tower reply"
+        )
+
+        client.disconnect()
+    }
+
     // MARK: - Cartridge integration: runtime ownership
 
     /// Building and discarding every cartridge view model must not disturb the
@@ -1188,7 +1436,7 @@ final class TowerClientTests: XCTestCase {
     /// the view models own, which is the half of a cartridge switch that can be
     /// tested without a view hierarchy. The other half (SwiftUI actually tearing
     /// a workspace down, and the camera surviving it) needs DAT and a device,
-    /// and no mock `WearablesInterface` exists. The structural argument stands
+    /// and `ScriptedWearables` covers the DAT half separately (see `ConnectionLifetimeTests`). The structural argument stands
     /// in for it — no view model is handed a `GlassesConnection`, and
     /// `ContentView` passes one to World Builder only — and it is a
     /// Simulator/device check.
@@ -1346,7 +1594,23 @@ final class TowerClientTests: XCTestCase {
     // MARK: - 20. The result channel
 
     private static let worldBuilderContract = "world_builder.status/2026-08-25"
+    private static let experimentalCVContract = "experimental_cv.status/2026-08-27"
 
+    /// The declaration a **live** Tower sends, byte for byte in shape.
+    ///
+    /// ## This fixture was wrong, and it was wrong in the direction that hides
+    ///
+    /// It declared one cartridge and put `document_memory` under `not_offered`
+    /// with the reason *"no contract offered"* — which was true of the Tower it
+    /// was written against and is false of the Tower that runs today. Captured
+    /// from `GET /cartridges` on a running Tower, the declaration is **four
+    /// cartridges, `not_offered: []`, and one `http_contracts` entry**. Every
+    /// cartridge in that build with a wire contract now offers it; `not_offered`
+    /// being empty is a *claim*, not an absence.
+    ///
+    /// A fixture that keeps a cartridge in `not_offered` is a test asserting
+    /// that the app behaves correctly against a Tower nobody runs, which is the
+    /// most comfortable kind of green there is.
     private var declarationJSON: String {
         """
         {"type":"cartridges",
@@ -1354,8 +1618,25 @@ final class TowerClientTests: XCTestCase {
          "cartridges":[{"cartridge":"world_builder","result_type":"status",
                         "contract":"\(Self.worldBuilderContract)",
                         "available":true,"unavailable_reason":null,
+                        "snapshot_only":true},
+                       {"cartridge":"scene_understanding","result_type":"live",
+                        "contract":"scene_understanding.live/2026-08-27",
+                        "available":true,"unavailable_reason":null,
+                        "snapshot_only":true},
+                       {"cartridge":"document_memory","result_type":"status",
+                        "contract":"document_memory.status/2026-08-27",
+                        "available":true,"unavailable_reason":null,
+                        "snapshot_only":true},
+                       {"cartridge":"experimental_cv","result_type":"status",
+                        "contract":"\(Self.experimentalCVContract)",
+                        "available":true,"unavailable_reason":null,
                         "snapshot_only":true}],
-         "not_offered":[{"cartridge":"document_memory","reason":"no contract offered"}]}
+         "not_offered":[],
+         "http_contracts":[{"cartridge":"document_memory",
+                            "contract":"document_memory.library/2026-08-27",
+                            "entry_route":"/documents","available":true,
+                            "unavailable_reason":null,
+                            "why_not_a_subscription":"document text is bulk and is the most sensitive data this platform holds"}]}
         """
     }
 
@@ -1449,9 +1730,35 @@ final class TowerClientTests: XCTestCase {
             client.cartridgeDeclaration?.envelopeContract,
             "cartridge_results.envelope/2026-08-23"
         )
-        // `not_offered` is for operators. Reading presence there as an offer is
-        // the mistake the contract names, so it is not decoded at all.
-        XCTAssertNil(client.cartridgeDeclaration?.offer(forTowerCartridge: "document_memory"))
+        // The four cartridges a live Tower declares, and the one HTTP contract
+        // beside them.
+        //
+        // This assertion used to read `XCTAssertNil(offer(forTowerCartridge:
+        // "document_memory"))`, on the grounds that `not_offered` is for
+        // operators and presence there must never be read as an offer. The
+        // reasoning is still right and the assertion had stopped being: a live
+        // Tower offers Document Memory outright, so the nil was asserting that
+        // this client drops an offer it is now sent. The reasoning is preserved
+        // where it belongs — `TowerCartridgeDeclaration` still does not decode
+        // `not_offered` at all — and what is checked here is what arrives.
+        XCTAssertEqual(client.cartridgeDeclaration?.offers.count, 4)
+        XCTAssertNotNil(client.cartridgeDeclaration?.offer(forTowerCartridge: "document_memory"))
+        XCTAssertNotNil(client.cartridgeDeclaration?.offer(forTowerCartridge: "scene_understanding"))
+        let cvOffer = client.cartridgeDeclaration?.offer(forTowerCartridge: "experimental_cv")
+        XCTAssertEqual(cvOffer?.contract, Self.experimentalCVContract)
+        XCTAssertEqual(cvOffer?.resultType, "status")
+        XCTAssertEqual(cvOffer?.available, true)
+        // The fixture also carries the live declaration's single
+        // `http_contracts` entry. It is deliberately **not** asserted on here:
+        // Document Memory's library route is that cartridge's contract, and
+        // what this test owns is that a subscription offer decodes correctly
+        // beside it. The `offers.count` above is the assertion that the extra
+        // top-level key disturbed nothing.
+        //
+        // A cartridge the Tower says nothing about is still absent, which is
+        // the half of the old assertion that was about this client rather than
+        // about that Tower.
+        XCTAssertNil(client.cartridgeDeclaration?.offer(forTowerCartridge: "object_memory"))
 
         client.disconnect()
     }
@@ -1702,6 +2009,1026 @@ final class TowerClientTests: XCTestCase {
 
         client.disconnect()
     }
+
+    // MARK: - 21. The Tower's dataset-recorder state, read from /health
+
+    // The Tower has reported `capture.armed` / `capture.recording` /
+    // `frames_written` on `GET /health` since 2026-08-22 and this app read
+    // none of it, so "is the Tower writing my frames to disk right now?" was
+    // unanswerable from the phone. It matters more than completeness: while
+    // the recorder is armed the Tower fsyncs every received frame **unredacted**
+    // (`tower/tower/capture.py` declares `retains_raw_imagery: true`,
+    // `redaction: "none"`).
+    //
+    // These are decode tests against real payload shapes rather than tests
+    // against a running Tower, matching how the project pins contract
+    // fixtures elsewhere. The thing being defended is not "does HTTP work" —
+    // it is that a field the Tower did not send never becomes a confident
+    // `false` or `0` on a screen a person reads to answer a privacy question.
+
+    /// The exact body a live Tower returned this session, whitespace aside.
+    private static let liveHealthPayload = """
+        {"status":"ok","service":"glasses-tower","version":"0.1.0",
+         "module_state":"active","module_id":"experimental-cv",
+         "capture":{"armed":true,"recording":false,
+                    "capture_id":"ab10cb203cf048e58cf2f79a120a54a4",
+                    "frames_written":1343,"bytes_written":27303448},
+         "capture_workers":{"enabled":true,"workers":[]}}
+        """
+
+    private func healthData(_ json: [String: Any]) throws -> Data {
+        try JSONSerialization.data(withJSONObject: json)
+    }
+
+    func testTheLiveHealthPayloadDecodesFieldByField() throws {
+        let health = try TowerHealthDecoder.health(from: Data(Self.liveHealthPayload.utf8))
+
+        XCTAssertEqual(health.status, "ok")
+        XCTAssertEqual(health.service, "glasses-tower")
+        XCTAssertEqual(health.version, "0.1.0")
+        XCTAssertEqual(health.moduleState, "active")
+        XCTAssertEqual(health.moduleID, "experimental-cv")
+
+        guard case .present(let capture) = health.capture else {
+            return XCTFail("the live payload carries a capture object: \(health.capture)")
+        }
+        XCTAssertEqual(capture.armed, true)
+        XCTAssertEqual(capture.recording, false)
+        XCTAssertEqual(capture.captureID, .present("ab10cb203cf048e58cf2f79a120a54a4"))
+        XCTAssertEqual(capture.framesWritten, 1343)
+        XCTAssertEqual(capture.bytesWritten, 27303448)
+        XCTAssertNil(capture.error)
+
+        guard case .present(let workers) = health.captureWorkers else {
+            return XCTFail("the live payload carries a worker object: \(health.captureWorkers)")
+        }
+        XCTAssertEqual(workers.enabled, true)
+        // A real, sent, empty array — so a real `0`, which is exactly the
+        // value the rest of these tests refuse to invent.
+        XCTAssertEqual(workers.workerCount, 0)
+        XCTAssertNil(workers.error)
+    }
+
+    /// An older Tower, or one whose health route grows a different shape,
+    /// simply does not mention capture. That must not read as "not recording".
+    func testCaptureKeyAbsentEntirelyIsUnreportedRatherThanFalseOrZero() throws {
+        let health = try TowerHealthDecoder.health(
+            from: healthData([
+                "status": "ok", "service": "glasses-tower", "version": "0.1.0",
+                "module_state": "active", "module_id": "experimental-cv",
+            ])
+        )
+
+        XCTAssertEqual(health.capture, .unreported)
+        XCTAssertEqual(health.captureWorkers, .unreported)
+        XCTAssertNil(health.capture.value?.armed)
+        XCTAssertNil(health.capture.value?.recording)
+        XCTAssertNil(health.capture.value?.framesWritten)
+    }
+
+    /// `capture: null` is the Tower saying something specific — no recorder is
+    /// registered at all — and it is not the same statement as saying nothing.
+    /// `tower/tower/routes/health.py` documents the difference; collapsing the
+    /// two would make "we are definitely not recording" indistinguishable from
+    /// "this build never told us".
+    func testAnExplicitNullCaptureIsAnAnswerAndNotSilence() throws {
+        let health = try TowerHealthDecoder.health(
+            from: healthData([
+                "status": "ok", "capture": NSNull(), "capture_workers": NSNull(),
+            ])
+        )
+
+        XCTAssertEqual(health.capture, .absent)
+        XCTAssertEqual(health.captureWorkers, .absent)
+        XCTAssertNotEqual(health.capture, .unreported)
+    }
+
+    /// The Tower's own error path sends `{"armed": true, "error": "unavailable"}`
+    /// — armed, and everything else unknown. Nothing there may become a zero.
+    func testFramesWrittenAbsentIsNilAndNotZero() throws {
+        let health = try TowerHealthDecoder.health(
+            from: healthData([
+                "status": "ok",
+                "capture": ["armed": true, "error": "unavailable"],
+            ])
+        )
+
+        guard case .present(let capture) = health.capture else {
+            return XCTFail("an object arrived, so it is present: \(health.capture)")
+        }
+        XCTAssertEqual(capture.armed, true)
+        XCTAssertEqual(capture.error, "unavailable")
+        XCTAssertNil(capture.recording, "an unsent `recording` must not read as not-recording")
+        XCTAssertNil(capture.framesWritten, "an unsent count must not read as zero frames written")
+        XCTAssertNil(capture.bytesWritten)
+        // Not `.absent`: the Tower's error branch omits the key entirely, which
+        // is silence about the id rather than a statement that no recording is
+        // open.
+        XCTAssertEqual(capture.captureID, .unreported)
+    }
+
+    /// `capture_id: null` is a positive statement, not a withheld field.
+    ///
+    /// `tower/tower/routes/health.py` always emits the key whenever it emits a
+    /// `capture` object at all, and sends `null` for it in exactly one
+    /// situation: a recorder is registered and has not opened a recording yet.
+    /// The Tower's `.error` branch is the only one that omits the key, and that
+    /// omission means something else entirely — the Tower could not read its
+    /// own recorder.
+    ///
+    /// Reading both as one Swift `nil` reproduces the `unreported`-vs-`absent`
+    /// conflation `TowerReported` exists to prevent, one level down at the
+    /// field, and puts "The Tower did not say" on screen for an answer the
+    /// Tower gave clearly.
+    func testANullCaptureIDIsNoRecordingYetRatherThanASilentTower() throws {
+        let notOpened = try TowerHealthDecoder.health(
+            from: healthData([
+                "capture": [
+                    "armed": true, "recording": false, "capture_id": NSNull(),
+                    "frames_written": 0, "bytes_written": 0,
+                ]
+            ])
+        )
+        let unsaid = try TowerHealthDecoder.health(
+            from: healthData(["capture": ["armed": true, "error": "unavailable"]])
+        )
+        let opened = try TowerHealthDecoder.health(
+            from: healthData([
+                "capture": ["armed": true, "recording": true, "capture_id": "ab10cb20"]
+            ])
+        )
+
+        XCTAssertNotEqual(
+            notOpened.capture.value?.captureID,
+            unsaid.capture.value?.captureID,
+            "a recorder that has opened no recording reads the same as a Tower that withheld the field"
+        )
+        XCTAssertNotEqual(opened.capture.value?.captureID, notOpened.capture.value?.captureID)
+
+        XCTAssertEqual(opened.capture.value?.captureID, .present("ab10cb20"))
+        XCTAssertEqual(notOpened.capture.value?.captureID, .absent)
+        XCTAssertEqual(unsaid.capture.value?.captureID, .unreported)
+
+        // The two counts beside it are deliberately *not* changed to match.
+        // The Tower always sends them on success and sends `0` when there is no
+        // recording, so for them a single `nil` carries a single meaning.
+        XCTAssertEqual(notOpened.capture.value?.framesWritten, 0)
+        XCTAssertEqual(notOpened.capture.value?.bytesWritten, 0)
+        XCTAssertNil(unsaid.capture.value?.framesWritten)
+    }
+
+    /// A `capture_id` that is neither a string nor a null. The Tower spoke and
+    /// this app could not read it, which is a third thing again.
+    func testACaptureIDOfTheWrongShapeIsUnreadable() throws {
+        let wrongShape = try TowerHealthDecoder.health(
+            from: healthData(["capture": ["armed": true, "capture_id": 7]])
+        )
+        let unsaid = try TowerHealthDecoder.health(
+            from: healthData(["capture": ["armed": true]])
+        )
+        XCTAssertNotEqual(
+            wrongShape.capture.value?.captureID,
+            unsaid.capture.value?.captureID,
+            "an unreadable answer reads the same as no answer"
+        )
+        XCTAssertEqual(wrongShape.capture.value?.captureID, .unreadable)
+    }
+
+    /// The one distinction the whole feature exists for.
+    func testArmedAndIdleIsDistinguishableFromArmedAndRecording() throws {
+        let idle = try TowerHealthDecoder.health(
+            from: healthData(["capture": ["armed": true, "recording": false, "frames_written": 0]])
+        )
+        let recording = try TowerHealthDecoder.health(
+            from: healthData(["capture": ["armed": true, "recording": true, "frames_written": 12]])
+        )
+
+        XCTAssertEqual(idle.capture.value?.armed, true)
+        XCTAssertEqual(idle.capture.value?.recording, false)
+        XCTAssertEqual(recording.capture.value?.recording, true)
+        XCTAssertNotEqual(idle.capture, recording.capture)
+        // A sent zero is a fact, and stays one.
+        XCTAssertEqual(idle.capture.value?.framesWritten, 0)
+    }
+
+    /// The fourth case, and the only one of `TowerReported`'s four with no test
+    /// until now — which mattered because it is also the only one that renders
+    /// its own distinct sentence ("Answered in a shape this app cannot read").
+    ///
+    /// A `capture` that is neither an object nor a null is the Tower speaking
+    /// and this app failing to understand. That is not silence (`.unreported`)
+    /// and it is not "there is no recorder" (`.absent`), and a screen answering
+    /// a privacy question must not merge it into either.
+    func testACaptureOfTheWrongShapeIsUnreadableRatherThanSilenceOrAbsence() throws {
+        let health = try TowerHealthDecoder.health(
+            from: Data(#"{"capture": "unavailable", "capture_workers": 7}"#.utf8)
+        )
+
+        XCTAssertEqual(health.capture, .unreadable)
+        XCTAssertEqual(health.captureWorkers, .unreadable)
+        XCTAssertNotEqual(health.capture, .unreported, "an unreadable answer became silence")
+        XCTAssertNotEqual(health.capture, .absent, "an unreadable answer became a registered nothing")
+        XCTAssertNil(health.capture.value, "an unreadable answer yielded a value to draw")
+    }
+
+    func testGarbageIsAFailureRatherThanASilentlyEmptySuccess() {
+        XCTAssertThrowsError(try TowerHealthDecoder.health(from: Data("not json".utf8))) { error in
+            XCTAssertEqual(error as? TowerHealthFetchError, .undecodable)
+        }
+        XCTAssertThrowsError(try TowerHealthDecoder.health(from: Data())) { error in
+            XCTAssertEqual(error as? TowerHealthFetchError, .undecodable)
+        }
+    }
+
+    /// Well-formed JSON that is not an object at all. It parses, so the
+    /// failure has to be the decoder's own decision rather than the parser's.
+    func testATopLevelArrayIsAFailureRatherThanAnEmptyHealth() {
+        XCTAssertThrowsError(try TowerHealthDecoder.health(from: Data("[1,2,3]".utf8))) { error in
+            XCTAssertEqual(error as? TowerHealthFetchError, .undecodable)
+        }
+    }
+
+    // MARK: Transport, and the four states a screen has to be able to draw
+
+    private func stubbedHealthClient(status: Int = 200, body: Data) -> TowerHealthHTTPClient {
+        stubbedHealthClient { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil
+            )!
+            return (response, body)
+        }
+    }
+
+    /// The same client, over a stub that never produces a response at all —
+    /// the shape a Tower that is not there has. Separate from the one above
+    /// because a thrown `URLError` and a returned `HTTPURLResponse` are the two
+    /// different things `TowerHealthFetchError` exists to keep apart, and one
+    /// helper that did both would take an argument nobody could read.
+    private func stubbedHealthClient(
+        failingWith error: URLError
+    ) -> TowerHealthHTTPClient {
+        stubbedHealthClient { _ in throw error }
+    }
+
+    private func stubbedHealthClient(
+        _ handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data)
+    ) -> TowerHealthHTTPClient {
+        ObjectMemoryStubProtocol.requestedURLs = []
+        ObjectMemoryStubProtocol.requestedRequests = []
+        ObjectMemoryStubProtocol.handler = handler
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ObjectMemoryStubProtocol.self]
+        return TowerHealthHTTPClient(
+            baseURL: URL(string: "http://tower.test")!,
+            session: URLSession(configuration: configuration)
+        )
+    }
+
+    /// Rule 15. A read with no ceiling is a spinner nobody can end.
+    ///
+    /// Asserted against **the request that actually ran**, not against the
+    /// client's own `timeout` property. Reading the property back only proves
+    /// the literal it was initialised with is still there; the deadline is only
+    /// real if it reaches the `URLRequest`, and dropping `timeoutInterval:` from
+    /// `health()` would leave the call inheriting `URLSession`'s 60-second
+    /// default with the property still reading 10.
+    func testTheHealthReadIsBounded() async {
+        defer { ObjectMemoryStubProtocol.handler = nil }
+        let client = TowerClient()
+        client.healthClient = stubbedHealthClient(body: Data(Self.liveHealthPayload.utf8))
+
+        client.refreshHealth()
+        await expect("the fetch never settled: \(client.healthState)") {
+            if case .fetched = client.healthState { return true }
+            return false
+        }
+
+        guard let request = ObjectMemoryStubProtocol.requestedRequests.first else {
+            return XCTFail("no request reached the stub")
+        }
+        XCTAssertEqual(
+            request.timeoutInterval, 10,
+            "the health read ran without the deadline the client claims to set"
+        )
+        // Same reasoning, same request: a health answer served out of a URL
+        // cache would report a recorder as idle after it had started writing.
+        XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalCacheData)
+        // And the value the client is configured with, so the two cannot drift
+        // apart silently. Matches `ObjectMemoryHTTPClient.timeout` deliberately.
+        XCTAssertEqual(TowerHealthHTTPClient().timeout, 10)
+    }
+
+    func testNothingIsFetchedUntilSomebodyAsks() {
+        XCTAssertEqual(TowerClient().healthState, .notFetched)
+    }
+
+    func testAnAnsweredFetchSettlesIntoTheFetchedState() async {
+        defer { ObjectMemoryStubProtocol.handler = nil }
+        let client = TowerClient()
+        client.healthClient = stubbedHealthClient(body: Data(Self.liveHealthPayload.utf8))
+
+        client.refreshHealth()
+        await expect("the fetch never settled: \(client.healthState)") {
+            if case .fetched = client.healthState { return true }
+            return false
+        }
+
+        guard case .fetched(let health, _) = client.healthState else { return }
+        XCTAssertEqual(health.capture.value?.recording, false)
+        XCTAssertEqual(ObjectMemoryStubProtocol.requestedURLs.first?.path, "/health")
+    }
+
+    /// Failure is a state. It must be reachable, and it must not look like
+    /// "nobody has asked yet".
+    ///
+    /// The body is the **live payload**, which decodes perfectly. That is the
+    /// whole point: an earlier version of this test sent `"nope"`, which is not
+    /// JSON, so the decoder threw `.undecodable` on its own and the test passed
+    /// with the HTTP status guard deleted. A Tower that refuses the question is
+    /// not a Tower that answered it, and only the status guard in
+    /// `TowerHealthHTTPClient.health()` can tell the difference here — without
+    /// it this settles into `.fetched` and the screen reports a recorder state
+    /// read out of a 503.
+    func testARefusedFetchBecomesAVisibleFailureAndNotSilence() async {
+        defer { ObjectMemoryStubProtocol.handler = nil }
+        let client = TowerClient()
+        client.healthClient = stubbedHealthClient(
+            status: 503, body: Data(Self.liveHealthPayload.utf8)
+        )
+
+        client.refreshHealth()
+        await expect("a refusal never surfaced: \(client.healthState)") {
+            if case .failed = client.healthState { return true }
+            return false
+        }
+        XCTAssertNotEqual(client.healthState, .notFetched)
+
+        guard case .failed(let error, _) = client.healthState else { return }
+        // `.transport`, not `.undecodable`: the answer was readable and the
+        // Tower declined to give one. Naming the wrong case here would send a
+        // reader looking for a decoding bug that does not exist.
+        guard case .transport(let description) = error else {
+            return XCTFail("a refusal was reported as a disagreement about the answer: \(error)")
+        }
+        XCTAssertTrue(
+            description.contains("503"),
+            "the refusal did not say what the Tower actually answered: \(description)"
+        )
+    }
+
+    /// The other half of the split, and the one with no test at all until now:
+    /// a request that never completes.
+    ///
+    /// `.transport` is the only case that is evidence about the network, and
+    /// nothing anywhere produced it — every failing path in this file went
+    /// through the decoder. A Tower that is switched off is the ordinary
+    /// failure this screen exists to name, so it gets a test that reaches it
+    /// the way it is actually reached: no response, an error from the URL
+    /// loading system.
+    func testATowerThatNeverAnswersIsATransportFailureAndNotADecodeProblem() async {
+        defer { ObjectMemoryStubProtocol.handler = nil }
+        let client = TowerClient()
+        client.healthClient = stubbedHealthClient(failingWith: URLError(.cannotConnectToHost))
+
+        client.refreshHealth()
+        await expect("an unreachable Tower never surfaced: \(client.healthState)") {
+            if case .failed = client.healthState { return true }
+            return false
+        }
+
+        guard case .failed(let error, _) = client.healthState else { return }
+        guard case .transport(let description) = error else {
+            return XCTFail("an unreachable Tower was reported as an unreadable answer: \(error)")
+        }
+        XCTAssertFalse(
+            description.isEmpty,
+            "the failure state carried no reason, which is the silence it exists to prevent"
+        )
+    }
+
+    /// A body that arrived and could not be read is a disagreement about the
+    /// answer, not a failure to get one — the same split
+    /// `ObjectMemoryHTTPClient` keeps, and for the same reason.
+    func testAnUnreadableAnswerIsUndecodableRatherThanTransport() async {
+        defer { ObjectMemoryStubProtocol.handler = nil }
+        let client = TowerClient()
+        client.healthClient = stubbedHealthClient(body: Data("<html>hi</html>".utf8))
+
+        client.refreshHealth()
+        await expect("the unreadable answer never settled: \(client.healthState)") {
+            if case .failed = client.healthState { return true }
+            return false
+        }
+        guard case .failed(let error, _) = client.healthState else { return }
+        XCTAssertEqual(error, .undecodable)
+    }
+
+    // MARK: - 22. The CV Lab's control plane, and the staleness gate
+    //
+    // Every fixture below is a message captured from a **live Tower** at
+    // 127.0.0.1:8765 over a raw WebSocket — the replies to `cv_lab_status`,
+    // `cv_lab_start`, `cv_lab_pause`, `cv_lab_resume` and `cv_lab_stop`, the
+    // refusals for an unknown experiment and a stale run, and the
+    // `frame_result` / `frame_error` a real frame produced. Nothing here is a
+    // guess at a shape.
+
+    /// A `cv_lab_status` reply, trimmed to the keys this client reads.
+    ///
+    /// The catalog and the run block are decoded by the cartridge, not here —
+    /// this file passes the document through undecoded — so the fixture carries
+    /// enough of them to prove the pass-through and no more.
+    private func cvLabStatusJSON(
+        runID: String?,
+        state: String = "running",
+        acceptedCommand: String? = nil,
+        requestID: String? = nil
+    ) -> String {
+        let run = runID.map { "\"\($0)\"" } ?? "null"
+        let accepted = acceptedCommand.map { ",\"accepted_command\":\"\($0)\"" } ?? ""
+        let request = requestID.map { ",\"request_id\":\"\($0)\"" } ?? ""
+        return """
+            {"type":"cv_lab_status",
+             "control_contract":"experimental_cv.control/2026-08-27",
+             "contract":"experimental_cv.status/2026-08-27"\(request)\(accepted),
+             "status":{"contract":"experimental_cv.status/2026-08-27",
+               "tower_instance_id":"f863dcc35bce",
+               "lifecycle":{"state":"\(state)","reason":null,
+                            "since":1787833032.19,"run_id":\(run)},
+               "available":[],"selected":"edge_detection",
+               "source":{"clients_connected":1,"receiving_frames":true,
+                         "last_frame_at":1787833032.32,"frames_offered_total":2,
+                         "frames_rejected_before_lab":0,"idle_after_s":5.0}}}
+            """
+    }
+
+    /// A `frame_result` with the `cv_lab` block a Tower running a Lab attaches.
+    private func frameResultJSON(seq: Int, runID: String, resultSeq: Int) -> String {
+        """
+        {"type":"frame_result","seq":\(seq),"processing_ms":0.33,
+         "result_value":0.107,"result_label":"edge_density",
+         "stage_ms":{"decode":0.17,"blur":0.04,"canny":0.11,"summarize":0.006},
+         "cv_lab":{"contract":"experimental_cv.frame_result/2026-08-27",
+           "tower_instance_id":"f863dcc35bce","run_id":"\(runID)",
+           "result_seq":\(resultSeq),"experiment_id":"edge_detection",
+           "experiment_name":"Edge detection","provenance":"measured",
+           "backend":"opencv","device":null,"device_requested":"auto",
+           "result_label":"edge_density","processing_ms":0.33,
+           "tower_received_at":1787833032.32,"time_basis":"tower-receipt"}}
+        """
+    }
+
+    private func collectCVLabEvents(_ client: TowerClient) -> CVLabEventRecorder {
+        let recorder = CVLabEventRecorder()
+        recorder.cancellable = client.cvLabEvents.sink { recorder.record($0) }
+        return recorder
+    }
+
+    /// The five commands, on the socket, shaped as the Tower parses them.
+    ///
+    /// **There is no HTTP surface for any of these**, so this is the only place
+    /// they can be got wrong. `experiment_id` on a start and `run_id` on the
+    /// other three are the fields the Tower refuses on — `malformed_request`
+    /// for a missing or wrong-typed one — so their presence is the assertion.
+    func testEveryCVLabCommandGoesOutOnTheSocketInTheTowersShape() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = attachRecorder(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+        _ = await waitForDiscovery(recorder)
+
+        client.sendCVLabStatusRequest(requestID: "cv-1")
+        client.sendCVLabStart(experimentID: "edge_detection", requestID: "cv-2")
+        client.sendCVLabPause(runID: "f863dcc35bce-2", requestID: "cv-3")
+        client.sendCVLabResume(runID: "f863dcc35bce-2", requestID: "cv-4")
+        client.sendCVLabStop(runID: "f863dcc35bce-2", requestID: "cv-5")
+
+        await expect {
+            recorder.all.compactMap(self.decode)
+                .filter { ($0["type"] as? String)?.hasPrefix("cv_lab_") == true }
+                .count == 5
+        }
+
+        let sent = recorder.all.compactMap(decode)
+            .filter { ($0["type"] as? String)?.hasPrefix("cv_lab_") == true }
+        XCTAssertEqual(
+            sent.compactMap { $0["type"] as? String },
+            ["cv_lab_status", "cv_lab_start", "cv_lab_pause", "cv_lab_resume", "cv_lab_stop"]
+        )
+        XCTAssertEqual(sent[1]["experiment_id"] as? String, "edge_detection")
+        // Sent on all three of the commands that take one, because a stale id
+        // is refused rather than applied to whichever run is current — which is
+        // the difference between a refusal and somebody else's run being
+        // stopped.
+        for index in 2...4 {
+            XCTAssertEqual(sent[index]["run_id"] as? String, "f863dcc35bce-2")
+        }
+        for (index, message) in sent.enumerated() {
+            XCTAssertEqual(message["request_id"] as? String, "cv-\(index + 1)")
+        }
+        // Nothing that is not a command went out on the CV Lab's account, and
+        // in particular no `result_subscribe` carrying a mutation: commands
+        // never travel on the result channel.
+        XCTAssertFalse(
+            recorder.all.contains { $0.contains("result_subscribe") && $0.contains("cv_lab") }
+        )
+
+        client.disconnect()
+    }
+
+    /// A `request_id` longer than the Tower's bound is dropped **locally**.
+    ///
+    /// The Tower drops an oversized one without refusing the command — verified
+    /// against the live Tower, which answered a 65-character id with a reply
+    /// carrying no `request_id` at all. That is the worst shape of failure for
+    /// a client matching replies to buttons: the command applies and the answer
+    /// cannot be attributed. So this client declines to send one it knows will
+    /// be dropped, rather than discovering the loss on the reply.
+    ///
+    /// Dropped, never truncated: a truncated id is a *different* id, and one
+    /// that could collide with another button's.
+    func testAnOversizedRequestIDIsDroppedBeforeItReachesTheWire() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = attachRecorder(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+        _ = await waitForDiscovery(recorder)
+
+        let atTheBound = String(repeating: "x", count: 64)
+        let overTheBound = String(repeating: "x", count: 65)
+        client.sendCVLabStatusRequest(requestID: atTheBound)
+        client.sendCVLabStatusRequest(requestID: overTheBound)
+
+        await expect {
+            recorder.all.compactMap(self.decode)
+                .filter { $0["type"] as? String == "cv_lab_status" }
+                .count == 2
+        }
+        let sent = recorder.all.compactMap(decode)
+            .filter { $0["type"] as? String == "cv_lab_status" }
+        XCTAssertEqual(sent[0]["request_id"] as? String, atTheBound, "the bound is inclusive")
+        XCTAssertNil(sent[1]["request_id"], "an oversized request_id reached the wire")
+        // And the command still went, because dropping the id must not drop the
+        // request — that is what the Tower does, and doing otherwise here would
+        // make the two sides disagree about whether anything was asked.
+        XCTAssertEqual(sent.count, 2)
+
+        client.disconnect()
+    }
+
+    /// `accepted_command` is the field that tells an answer from a push.
+    ///
+    /// Both arrive as `cv_lab_status`, and a client that read every arriving
+    /// document as an answer would report "started" on every two-second
+    /// heartbeat. Verified against the live Tower: a plain read comes back with
+    /// no `accepted_command`, and each command echoes its own name.
+    func testAPushedStatusIsDistinguishableFromAnAnswerToACommand() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        let events = collectCVLabEvents(client)
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+
+        server.send(text: cvLabStatusJSON(runID: "f863dcc35bce-2"))
+        server.send(
+            text: cvLabStatusJSON(
+                runID: "f863dcc35bce-2", acceptedCommand: "cv_lab_start", requestID: "cv-2"
+            )
+        )
+        await expect { events.all.count >= 2 }
+
+        guard case .status(let pushed) = events.all[0] else {
+            return XCTFail("expected a status, got \(events.all[0])")
+        }
+        XCTAssertNil(pushed.acceptedCommand, "a pushed document claimed to answer a command")
+        XCTAssertNil(pushed.requestID)
+
+        guard case .status(let answer) = events.all[1] else {
+            return XCTFail("expected a status, got \(events.all[1])")
+        }
+        XCTAssertEqual(answer.acceptedCommand, "cv_lab_start")
+        XCTAssertEqual(answer.requestID, "cv-2")
+        // The document is passed through undecoded, for the reason
+        // `CartridgeResultEnvelope.payload` is: this client owns the transport
+        // and the cartridge owns the contract.
+        XCTAssertEqual(answer.status["selected"] as? String, "edge_detection")
+        XCTAssertEqual(answer.runID, "f863dcc35bce-2")
+
+        client.disconnect()
+    }
+
+    /// The eight refusals reach a consumer with their reason-specific extras.
+    ///
+    /// Every one of them means the request did not take effect, so what matters
+    /// is that the refusal arrives *whole*: `available` on an unknown
+    /// experiment and `current_run_id` on a stale run are what let a client say
+    /// something useful instead of "something went wrong". Both fixtures are
+    /// live Tower replies.
+    func testARefusalArrivesWithItsExtrasAndItsUnchangedDocument() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        let events = collectCVLabEvents(client)
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+
+        server.send(text: """
+            {"type":"cv_lab_error","control_contract":"experimental_cv.control/2026-08-27",
+             "reason":"unknown_experiment","message":"this Tower has no experiment 'nope'",
+             "command":"cv_lab_start","request_id":"cv-2",
+             "status":{"lifecycle":{"state":"running","run_id":"f863dcc35bce-1"}},
+             "available":["baseline","depth","edge_detection"]}
+            """)
+        server.send(text: """
+            {"type":"cv_lab_error","control_contract":"experimental_cv.control/2026-08-27",
+             "reason":"stale_run",
+             "message":"run 'bogus-99' is not the current run; the Lab is now on 'f863dcc35bce-1'",
+             "command":"cv_lab_pause","request_id":"cv-5",
+             "status":{"lifecycle":{"state":"running","run_id":"f863dcc35bce-1"}},
+             "current_run_id":"f863dcc35bce-1"}
+            """)
+        await expect { events.all.count >= 2 }
+
+        guard case .refused(let unknown) = events.all[0] else {
+            return XCTFail("expected a refusal, got \(events.all[0])")
+        }
+        XCTAssertEqual(unknown.reason, "unknown_experiment")
+        XCTAssertEqual(unknown.command, "cv_lab_start")
+        XCTAssertEqual(unknown.available, ["baseline", "depth", "edge_detection"])
+        XCTAssertNotNil(unknown.status, "a refusal arrived without the document it must carry")
+
+        guard case .refused(let stale) = events.all[1] else {
+            return XCTFail("expected a refusal, got \(events.all[1])")
+        }
+        XCTAssertEqual(stale.reason, "stale_run")
+        XCTAssertEqual(stale.currentRunID, "f863dcc35bce-1")
+
+        // A refusal is not a connection failure. The socket the camera streams
+        // over must survive every one of them.
+        XCTAssertEqual(client.status, .online)
+
+        client.disconnect()
+    }
+
+    /// `frame_error` reaches a consumer instead of being logged and discarded.
+    ///
+    /// It had **no case at all**: every one fell through to `default:` as an
+    /// unknown message type. A paused Lab, an arming model and an undecodable
+    /// frame were therefore indistinguishable from silence.
+    ///
+    /// And it is not a failure. Nothing about the connection, the send window
+    /// or the reply counters may move — a Lab paused for five minutes has not
+    /// failed hundreds of times.
+    func testAFrameErrorIsDeliveredAndCostsTheFramePathNothing() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let metrics = SenderMetrics()
+        let client = TowerClient(metrics: metrics)
+        let events = collectCVLabEvents(client)
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+        let repliesBefore = metrics.snapshot.frameResults
+
+        server.send(text: """
+            {"type":"frame_error","seq":90,"reason":"cv_lab_paused",
+             "message":"the CV Lab is paused; send cv_lab_resume to continue"}
+            """)
+        await expect { client.latestFrameRefusal != nil }
+
+        XCTAssertEqual(client.latestFrameRefusal?.reason, "cv_lab_paused")
+        XCTAssertEqual(client.latestFrameRefusal?.sequence, 90)
+        guard case .frameRefused(let refusal) = events.all.last else {
+            return XCTFail("the refusal never reached a consumer: \(events.all)")
+        }
+        XCTAssertEqual(refusal.reason, "cv_lab_paused")
+        XCTAssertEqual(client.status, .online, "a refused frame took down the connection")
+        XCTAssertEqual(
+            metrics.snapshot.frameResults, repliesBefore,
+            "a refusal was counted as a reply"
+        )
+
+        client.disconnect()
+    }
+
+    /// A frame that failed validation before its `seq` was readable reports a
+    /// null sequence rather than an invented one.
+    func testAFrameErrorWithNoSequenceIsDecodedRatherThanDropped() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+
+        server.send(text: """
+            {"type":"frame_error","seq":null,"reason":"invalid_frame",
+             "message":"malformed frame message, missing fields: ['seq']"}
+            """)
+        await expect { client.latestFrameRefusal != nil }
+        XCTAssertNil(client.latestFrameRefusal?.sequence)
+        XCTAssertEqual(client.latestFrameRefusal?.reason, "invalid_frame")
+
+        client.disconnect()
+    }
+
+    /// >>> The staleness rule. <<<
+    ///
+    /// A `frame_result` whose `cv_lab.run_id` is not the run being watched is
+    /// discarded, and the run being watched is learned from the **status
+    /// document** — never from a result, which would let a stale reply nominate
+    /// itself as the run to watch and then match.
+    func testAResultFromAnotherRunIsDiscardedRatherThanShown() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+        client.sendStreamStart()
+
+        server.send(text: cvLabStatusJSON(runID: "f863dcc35bce-2"))
+        await expect { client.watchedCVLabRunID == "f863dcc35bce-2" }
+
+        server.send(text: frameResultJSON(seq: 60, runID: "f863dcc35bce-2", resultSeq: 2))
+        await expect { client.latestFrameResult != nil }
+        XCTAssertEqual(client.latestFrameResult?.cvLab?.resultSeq, 2)
+
+        // A result from the run that was replaced. Structurally impossible on
+        // the Tower's side within one connection — the old experiment is
+        // released before the new run id is published — which is exactly why
+        // the client-side rule exists: it covers the case the Tower cannot,
+        // a reconnect to a restarted Tower whose run numbering starts again.
+        server.send(text: frameResultJSON(seq: 90, runID: "f863dcc35bce-1", resultSeq: 99))
+        await expect { client.staleFrameResultCount == 1 }
+        XCTAssertEqual(
+            client.latestFrameResult?.cvLab?.resultSeq, 2,
+            "a result from another run replaced the one being watched"
+        )
+
+        client.disconnect()
+    }
+
+    /// A reply with no `cv_lab` block is passed through, gate or no gate.
+    ///
+    /// A Tower running no Lab attaches no provenance and has therefore made no
+    /// claim about which run a result belongs to. Discarding those would drop
+    /// every result from such a Tower — the gate is for contradicting a claim,
+    /// not for requiring one.
+    func testAResultWithNoProvenanceBlockIsNotGatedOut() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+        client.sendStreamStart()
+
+        server.send(text: cvLabStatusJSON(runID: "f863dcc35bce-2"))
+        await expect { client.watchedCVLabRunID == "f863dcc35bce-2" }
+
+        server.send(
+            text: #"{"type":"frame_result","seq":1,"mean_intensity":0.5,"processing_ms":1.0}"#
+        )
+        await expect { client.latestFrameResult != nil }
+        XCTAssertNil(client.latestFrameResult?.cvLab)
+        XCTAssertEqual(client.staleFrameResultCount, 0)
+
+        client.disconnect()
+    }
+
+    /// A run that changes takes its reading with it.
+    ///
+    /// A run is the unit of provenance, and the Tower makes the same move on
+    /// its side: starting a different experiment mints a new run and takes the
+    /// previous one's figures out of the document. Leaving the last reading on
+    /// screen across a switch would put the old experiment's number under the
+    /// new experiment's name.
+    func testAdoptingANewRunDropsThePreviousRunsReading() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+        client.sendStreamStart()
+
+        server.send(text: cvLabStatusJSON(runID: "f863dcc35bce-2"))
+        await expect { client.watchedCVLabRunID == "f863dcc35bce-2" }
+        server.send(text: frameResultJSON(seq: 30, runID: "f863dcc35bce-2", resultSeq: 1))
+        await expect { client.latestFrameResult != nil }
+
+        server.send(
+            text: cvLabStatusJSON(
+                runID: "f863dcc35bce-3", state: "starting", acceptedCommand: "cv_lab_start"
+            )
+        )
+        await expect { client.watchedCVLabRunID == "f863dcc35bce-3" }
+        XCTAssertNil(
+            client.latestFrameResult,
+            "the previous run's reading survived a switch to a new experiment"
+        )
+
+        client.disconnect()
+    }
+
+    /// The run change this phone did **not** cause.
+    ///
+    /// ## Why the test above is not enough
+    ///
+    /// `testAdoptingANewRunDropsThePreviousRunsReading` drives the change with a
+    /// `cv_lab_status` message — and the Tower sends that **only in reply to a
+    /// command on the same connection** (`tower/routes/cv_lab_ws.py`). There is
+    /// no unsolicited push. So that test covers exactly the case where this
+    /// phone started the new run itself.
+    ///
+    /// The Lab has **one slot shared by every connection, and last start wins**.
+    /// When a second operator — or the bench's own `cv_lab_smoke.py` — starts a
+    /// different experiment, the only thing that reaches this app is a
+    /// `cartridge_result` on the subscription. That path did not feed the gate,
+    /// and the consequences were entirely silent:
+    ///
+    ///  - every following `frame_result` carried the new run and was discarded,
+    ///    so the counter the product screen reads froze while frames were being
+    ///    answered normally;
+    ///  - the held reading was never cleared, so the card kept showing the
+    ///    **previous experiment's figures** under the new experiment's name.
+    ///
+    /// Reproduced against a live Tower during review. This is the regression.
+    func testARunStartedByAnotherClientIsAdoptedFromTheSubscription() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        // Constructed and retained: the client is what listens to the result
+        // channel and feeds the gate. Without it this test would pass against
+        // the bug, because nothing would be subscribed.
+        let lab = TowerExperimentalCVClient(tower: tower)
+        withExtendedLifetime(lab) {}
+        tower.connect(to: url(port: port))
+        await expect { tower.status == .online }
+        tower.sendStreamStart()
+
+        // This phone's own run, learned the ordinary way.
+        server.send(text: cvLabStatusJSON(runID: "f863dcc35bce-6"))
+        await expect { tower.watchedCVLabRunID == "f863dcc35bce-6" }
+        server.send(text: frameResultJSON(seq: 30, runID: "f863dcc35bce-6", resultSeq: 1))
+        await expect { tower.latestFrameResult != nil }
+
+        // Somebody else starts a different experiment. The Tower pushes the new
+        // document on the SUBSCRIPTION, and sends this phone no `cv_lab_status`.
+        server.send(text: cvLabStatusOnSubscriptionJSON(runID: "f863dcc35bce-7"))
+        await expect { tower.watchedCVLabRunID == "f863dcc35bce-7" }
+
+        XCTAssertNil(
+            tower.latestFrameResult,
+            """
+            the previous experiment's reading survived a run change this phone \
+            did not cause -- it would sit on screen under the new experiment's name
+            """
+        )
+
+        // And the new run's results are accepted rather than discarded.
+        server.send(text: frameResultJSON(seq: 60, runID: "f863dcc35bce-7", resultSeq: 1))
+        await expect { tower.latestFrameResult != nil }
+
+        tower.disconnect()
+    }
+
+    /// The CV Lab's status document as it arrives on the **result channel**,
+    /// which is the only way a run change caused by another client is seen.
+    private func cvLabStatusOnSubscriptionJSON(runID: String) -> String {
+        """
+        {"type":"cartridge_result",
+         "envelope_contract":"cartridge_results.envelope/2026-08-23",
+         "subscription_id":"sub-cv","cartridge":"experimental_cv","result_type":"status",
+         "contract":"experimental_cv.status/2026-08-27",
+         "seq":2,"revision":"r2","revision_changed":true,
+         "coalesced":0,"cursor_status":null,"snapshot":true,
+         "tower_sent_at":1787463092.958,"time_basis":"tower-receipt",
+         "payload":{"contract":"experimental_cv.status/2026-08-27",
+           "tower_instance_id":"f863dcc35bce",
+           "lifecycle":{"state":"running","reason":null,
+                        "since":1787833032.19,"run_id":"\(runID)"},
+           "available":[],"selected":"optical_flow",
+           "source":{"clients_connected":2,"receiving_frames":true,
+                     "last_frame_at":1787833032.32,"frames_offered_total":9,
+                     "frames_rejected_before_lab":0,"idle_after_s":5.0}}}
+        """
+    }
+
+    /// The three clear points, asserted as three.
+    ///
+    /// The held run id has the same lifetime as the held reading —
+    /// `sendStreamStart()`, `sendStreamStop()` and teardown — because a run id
+    /// that outlived a bracket would gate the next bracket's replies against a
+    /// run that ended and discard every one of them.
+    func testTheRunWatchIsClearedAtTheSameThreePointsAsTheReading() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+
+        // 1. stream_stop.
+        client.sendStreamStart()
+        server.send(text: cvLabStatusJSON(runID: "f863dcc35bce-2"))
+        await expect { client.watchedCVLabRunID != nil }
+        client.sendStreamStop()
+        XCTAssertNil(client.watchedCVLabRunID, "a stream_stop left the run watch standing")
+
+        // 2. stream_start. A fresh bracket must not inherit the previous one's
+        // run any more than it inherits the previous one's reply.
+        server.send(text: cvLabStatusJSON(runID: "f863dcc35bce-2"))
+        await expect { client.watchedCVLabRunID != nil }
+        client.sendStreamStart()
+        XCTAssertNil(client.watchedCVLabRunID, "a stream_start inherited the previous bracket's run")
+
+        // 3. teardown. The only one of the three that runs in a Release build,
+        // and the one that covers a reconnect to a restarted Tower.
+        server.send(text: cvLabStatusJSON(runID: "f863dcc35bce-2"))
+        await expect { client.watchedCVLabRunID != nil }
+        client.disconnect()
+        XCTAssertNil(client.watchedCVLabRunID, "a teardown left the run watch standing")
+    }
+
+    /// The frame path keeps working through every CV Lab message.
+    ///
+    /// The same guarantee the result channel makes, extended to the control
+    /// plane: a status, a refusal and a frame refusal in a row leave `status`,
+    /// the stream bracket and the send window exactly where they were.
+    func testTheControlPlaneCannotDisturbTheFramePath() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient(metrics: SenderMetrics())
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+        client.sendStreamStart()
+        XCTAssertTrue(client.isStreamingToTower)
+
+        server.send(text: cvLabStatusJSON(runID: "f863dcc35bce-2"))
+        server.send(text: """
+            {"type":"cv_lab_error","control_contract":"experimental_cv.control/2026-08-27",
+             "reason":"internal_error","message":"the CV Lab could not answer that request",
+             "command":"cv_lab_start","status":{"lifecycle":{"state":"running","run_id":"f863dcc35bce-2"}}}
+            """)
+        server.send(text: """
+            {"type":"frame_error","seq":90,"reason":"cv_lab_starting",
+             "message":"the CV Lab is arming an experiment; frames are refused until it is ready"}
+            """)
+        await expect { client.latestFrameRefusal?.reason == "cv_lab_starting" }
+
+        XCTAssertEqual(client.status, .online)
+        XCTAssertTrue(client.isStreamingToTower, "the control plane closed the stream bracket")
+        XCTAssertEqual(client.maxFramesInFlight, TowerClient.defaultMaxFramesInFlight)
+
+        client.disconnect()
+    }
+}
+
+/// Collects CV Lab control-plane events in arrival order.
+///
+/// A class for the reason `EventRecorder` is one: a `sink` appends from an
+/// escaping closure, and `@MainActor` because that is where `TowerClient`
+/// publishes.
+@MainActor
+final class CVLabEventRecorder {
+    private(set) var all: [CVLabEvent] = []
+    var cancellable: AnyCancellable?
+
+    func record(_ event: CVLabEvent) { all.append(event) }
 }
 
 /// Thread-safe capture of every text message a MockTowerServer receives, so

@@ -42,8 +42,31 @@ import Foundation
 /// vocabulary becomes a plugin framework.
 enum CartridgePhase: String, Equatable, Sendable, CaseIterable {
     /// The Tower cannot do this at all — no module runtime, or no declared
-    /// contract for this cartridge. Today this is the only reachable phase for
-    /// every cartridge in the app.
+    /// contract for this cartridge.
+    ///
+    /// This was once documented as "the only reachable phase for every
+    /// cartridge in the app", and that has stopped being true. A live Tower
+    /// declares `world_builder.status/2026-08-25` on `GET /cartridges` and this
+    /// build implements it, so World Builder resolves past this case and
+    /// reaches `.live`/`.settled` with real data. Object Memory reaches its own
+    /// states over HTTP without passing through here at all.
+    ///
+    /// **It is no longer the answer for any cartridge with Tower code behind
+    /// it.** That sentence has now been rewritten twice by the same force, and
+    /// the pattern is worth naming: each time a Tower lane finished, a case
+    /// documented as "the permanent state of things" turned out to describe a
+    /// Tuesday. As of the 2026-08-27 unification the Tower declares four
+    /// contracts, `not_offered` is `[]`, and Experimental CV Lab, Document
+    /// Memory and Scene Understanding all resolve past this case with clients
+    /// that decode them.
+    ///
+    /// What it is still the honest answer for: the three cartridges with no
+    /// Tower code anywhere (Visual Q&A, Accessibility, Environmental Memory),
+    /// and any Tower that genuinely has not heard of a cartridge.
+    ///
+    /// **Object Memory does not pass through here**, and its absence is not an
+    /// oversight — it is undeclared on the socket by the Tower's own design and
+    /// reaches its states over HTTP.
     case unsupported
     /// The capability exists but the Tower cannot be reached right now.
     ///
@@ -54,6 +77,19 @@ enum CartridgePhase: String, Equatable, Sendable, CaseIterable {
     /// strings distinguished them before this case existed; the headline and
     /// the glyph did not, which is most of what a person actually reads.
     case disconnected
+    /// The Tower does this, under an agreement this build cannot read.
+    ///
+    /// Separate from `unsupported` for exactly the reason `disconnected` is
+    /// separate from it, one level up: the two call for **opposite** responses.
+    /// `unsupported` is "this Tower may never do this", and there is nothing a
+    /// person can do about it. This one is "this Tower already does this and
+    /// the app is behind", which a person can act on immediately — and
+    /// rendering it as "Nothing yet" tells someone a feature does not exist
+    /// when in fact they are one update away from it.
+    ///
+    /// The explanation string always distinguished them. The headline and the
+    /// glyph — which is most of what anyone actually reads — did not.
+    case needsUpdate
     /// The capability exists but nothing has been asked of it yet.
     case idle
     /// Something is genuinely in flight and the Tower has not answered.
@@ -78,7 +114,7 @@ enum CartridgePhase: String, Equatable, Sendable, CaseIterable {
     var mayCarryData: Bool {
         switch self {
         case .live, .settled: return true
-        case .unsupported, .disconnected, .idle, .waiting, .failed: return false
+        case .unsupported, .disconnected, .needsUpdate, .idle, .waiting, .failed: return false
         }
     }
 

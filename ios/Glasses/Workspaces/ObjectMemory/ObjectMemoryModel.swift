@@ -50,7 +50,7 @@ import Foundation
 /// that a Tower which changed what its data *means* — the most breaking change
 /// this contract can carry — fails a decode in one place instead of quietly
 /// rendering under the old wording.
-enum ObjectMemoryContract {
+nonisolated enum ObjectMemoryContract {
     static let identifier = "object_memory.observations/2026-08-26"
 
     static let categoryClaim = "category-was-visible-once"
@@ -86,7 +86,7 @@ enum ObjectMemoryContract {
 ///
 /// None of these is a calibrated probability. They are an interpretation of
 /// detector output.
-enum ObjectMemoryConfidence: String, Equatable, Sendable, CaseIterable {
+nonisolated enum ObjectMemoryConfidence: String, Equatable, Sendable, CaseIterable {
     case unknown
     case low
     case medium
@@ -117,7 +117,7 @@ enum ObjectMemoryConfidence: String, Equatable, Sendable, CaseIterable {
 /// covered (`tower/object_memory/engine.py` divides by width and height in that
 /// order). It says where in the *picture*, and the only rendering allowed for
 /// it is one that says so.
-struct FrameReference: Equatable, Sendable {
+nonisolated struct FrameReference: Equatable, Sendable {
     /// The capture this frame belongs to. `nil` when the record carries no
     /// capture provenance at all — an older record, not a zeroth session.
     let sessionID: String?
@@ -155,12 +155,60 @@ struct FrameReference: Equatable, Sendable {
 
 // MARK: - Observation
 
+/// Which policy tier admitted a record, and what a second opinion said.
+///
+/// The old class list was `("laptop", "cell phone")`, chosen from a score
+/// histogram — which describes the detector's opinion of itself. Reading the
+/// crops found a ceiling fan detected as `airplane` at 0.99, a white door as
+/// `refrigerator` at 0.95, and the three highest-scoring `remote` sightings in
+/// 18,821 frames all laptop keyboards. So the list became a policy with tiers,
+/// and this is the record's own note of which one let it through.
+///
+/// A `remembered` record was written on the detector's word. A `verify` record
+/// was written **only because something agreed**, and `verification` names
+/// which model and how strongly — so the record stays auditable and can be
+/// re-evaluated when the model changes.
+nonisolated struct ObservationVerification: Equatable, Sendable {
+    /// Whether the verifier agreed. A verifier can only refuse or confirm: a
+    /// verdict naming anything else is recorded as evidence and changes
+    /// nothing.
+    let agrees: Bool
+    /// What was put to it.
+    let proposed: String?
+    /// What the verifier would have called it. **Not** used to relabel the
+    /// record, and not shown as the record's class.
+    let label: String?
+    /// A similarity, from a model whose threshold was fitted to 94 crops from
+    /// one home. **Not a calibrated probability**, and worded as one nowhere.
+    let score: Double?
+    /// Which model. The field that makes this auditable rather than
+    /// reassuring.
+    let model: String?
+    let reason: String?
+
+    init(
+        agrees: Bool,
+        proposed: String?,
+        label: String?,
+        score: Double?,
+        model: String?,
+        reason: String?
+    ) {
+        self.agrees = agrees
+        self.proposed = proposed
+        self.label = label
+        self.score = score
+        self.model = model
+        self.reason = reason
+    }
+}
+
 /// One record: a category was visible once, and this is when.
 ///
 /// Every field is what the Tower sent. Nothing is derived, nothing is
 /// defaulted, and no two records are related to each other — there is no
 /// instance identity in this cartridge and this type must never grow one.
-struct ObjectObservation: Equatable, Identifiable, Sendable {
+nonisolated struct ObjectObservation: Equatable, Identifiable, Sendable {
     /// One of the envelope's `recorded_classes`. A **category**.
     let objectClass: String
     /// The interpretation of the strength fields, and the one a consumer should
@@ -186,6 +234,36 @@ struct ObjectObservation: Equatable, Identifiable, Sendable {
     /// The frame reference. Not a location. See `FrameReference`.
     let frame: FrameReference
 
+    /// The handle the imagery routes take: 16 hex characters, **derived** from
+    /// `session_id`, `object_class` and `observed_at` rather than minted — so
+    /// records written before the field existed have one, permanently, with no
+    /// migration.
+    ///
+    /// Optional here even though the contract says every record carries it,
+    /// and the asymmetry is deliberate. A record without a handle is a record
+    /// whose picture cannot be asked for; refusing the *whole listing* over
+    /// one such record would take a wearer's entire memory off screen to
+    /// protect them from a missing thumbnail. So the picture is simply not
+    /// offered for that row, and everything else about it is still shown.
+    ///
+    /// **Not an object identity.** It identifies a sighting, and two sightings
+    /// of `laptop` are still not evidence about the same laptop.
+    let observationID: String?
+    /// When the sighting stopped. `observedAt` says when it started and never
+    /// moves; this accumulates. `nil` on a record written before sightings had
+    /// duration — never `0`, which would claim a sighting of no length.
+    let lastSeenAt: Date?
+    /// How many frames the sighting spanned. Same `nil` rule.
+    let frameCount: Int?
+    /// `remembered` — written on the detector's word — or `verify`, written
+    /// only because something agreed. `nil` on a record written before tiers
+    /// existed.
+    let tier: String?
+    /// What a second opinion said, or `nil` when nothing was asked — which is
+    /// the ordinary case for a `remembered` class on a default Tower, where
+    /// the verifier ships **off**.
+    let verification: ObservationVerification?
+
     init(
         objectClass: String,
         confidence: ObjectMemoryConfidence,
@@ -197,7 +275,12 @@ struct ObjectObservation: Equatable, Identifiable, Sendable {
         moduleID: String,
         retentionTag: String,
         privacyTags: [String],
-        frame: FrameReference
+        frame: FrameReference,
+        observationID: String? = nil,
+        lastSeenAt: Date? = nil,
+        frameCount: Int? = nil,
+        tier: String? = nil,
+        verification: ObservationVerification? = nil
     ) {
         self.objectClass = objectClass
         self.confidence = confidence
@@ -210,14 +293,27 @@ struct ObjectObservation: Equatable, Identifiable, Sendable {
         self.retentionTag = retentionTag
         self.privacyTags = privacyTags
         self.frame = frame
+        self.observationID = observationID
+        self.lastSeenAt = lastSeenAt
+        self.frameCount = frameCount
+        self.tier = tier
+        self.verification = verification
     }
 
-    /// A list identity, composed from the sighting's own coordinates.
+    /// A list identity: the Tower's own handle when the record carries one,
+    /// and otherwise composed from the sighting's own coordinates.
+    ///
+    /// The two agree by construction — `observation_id` is derived from
+    /// `session_id`, `object_class` and `observed_at`, which is what the
+    /// fallback below joins — so preferring the wire's value costs nothing and
+    /// means a row's identity and its imagery handle are the same string on
+    /// every record that has one.
     ///
     /// **Not an object identity.** Two rows with different ids are two
     /// sightings, and two sightings of `laptop` are still not evidence about
     /// the same laptop. This exists so `ForEach` can tell two *rows* apart.
     var id: String {
+        if let observationID { return observationID }
         var parts: [String] = [objectClass, String(observedAt.timeIntervalSince1970)]
         parts.append(frame.sessionID ?? "no-capture")
         if let frameSeq = frame.frameSeq {
@@ -243,7 +339,7 @@ struct ObjectObservation: Equatable, Identifiable, Sendable {
 /// `effectiveDays == nil` is **unbounded**, reachable only when the store
 /// itself was written unbounded. It is never `0`: zero days would mean "nothing
 /// is visible", which is the opposite claim.
-struct ObjectMemoryRetention: Equatable, Sendable {
+nonisolated struct ObjectMemoryRetention: Equatable, Sendable {
     let requestedDays: Double?
     let effectiveDays: Double?
     let clamped: Bool
@@ -261,7 +357,7 @@ struct ObjectMemoryRetention: Equatable, Sendable {
 
 /// The header both endpoints carry, including the three claims that limit what
 /// any of it may be rendered as.
-struct ObjectMemoryEnvelope: Equatable, Sendable {
+nonisolated struct ObjectMemoryEnvelope: Equatable, Sendable {
     let contract: String
     let claim: String
     let identity: String
@@ -273,6 +369,20 @@ struct ObjectMemoryEnvelope: Equatable, Sendable {
     let retention: ObjectMemoryRetention
     /// The class the request narrowed to. `nil` on an unfiltered listing.
     let objectClass: String?
+    /// Where the pictures are — the three URL **templates**, under
+    /// `object_memory.imagery/2026-08-27`.
+    ///
+    /// **A descriptor, not an availability claim.** Its presence says the
+    /// routes exist; it says nothing about whether any particular record has a
+    /// picture behind it, which only `/imagery` can answer per record.
+    ///
+    /// Optional because it is additive: a Tower on the same observations
+    /// contract that predates the imagery routes sends no `imagery` block, and
+    /// refusing its payload over a missing descriptor would take a working
+    /// memory off screen to protect a feature that was never offered. `nil`
+    /// means no pictures are offered anywhere, which the workspace renders as
+    /// itself rather than as an error.
+    let imagery: ObjectMemoryImageryRoutes?
 
     init(
         contract: String,
@@ -281,7 +391,8 @@ struct ObjectMemoryEnvelope: Equatable, Sendable {
         absenceMeans: String,
         recordedClasses: [String],
         retention: ObjectMemoryRetention,
-        objectClass: String?
+        objectClass: String?,
+        imagery: ObjectMemoryImageryRoutes? = nil
     ) {
         self.contract = contract
         self.claim = claim
@@ -290,6 +401,7 @@ struct ObjectMemoryEnvelope: Equatable, Sendable {
         self.recordedClasses = recordedClasses
         self.retention = retention
         self.objectClass = objectClass
+        self.imagery = imagery
     }
 
     /// Whether a class is one the cartridge ever writes. Used to tell the two
@@ -302,7 +414,7 @@ struct ObjectMemoryEnvelope: Equatable, Sendable {
 // MARK: - Answers
 
 /// `GET /object-memory/observations`.
-struct ObservationListing: Equatable, Sendable {
+nonisolated struct ObservationListing: Equatable, Sendable {
     let envelope: ObjectMemoryEnvelope
     /// Newest first by `observed_at`, as the Tower sorted them. Not re-sorted
     /// here: a second opinion about ordering is a second thing that can be
@@ -336,7 +448,7 @@ struct ObservationListing: Equatable, Sendable {
 /// `observed`, never `present`. There is no 404 case: "no record of a laptop"
 /// answered as Not Found reads as "there is no laptop", which is a claim about
 /// the world this cartridge cannot make.
-struct LastSeenAnswer: Equatable, Sendable {
+nonisolated struct LastSeenAnswer: Equatable, Sendable {
     let envelope: ObjectMemoryEnvelope
     /// The class that was asked about, echoed by the Tower.
     let objectClass: String
@@ -457,7 +569,7 @@ enum ObjectMemoryAnswer: Equatable, Sendable {
 /// - A **row that will not decode**, which drops the whole payload rather than
 ///   silently shrinking the answer. `WorldGeometryDecoder` makes the same
 ///   choice for the same reason.
-enum ObjectMemoryDecoder {
+nonisolated enum ObjectMemoryDecoder {
 
     /// `nil` when the payload is not this contract at all.
     ///
@@ -496,7 +608,17 @@ enum ObjectMemoryDecoder {
             // Null on an unfiltered listing, and an Optional here rather than
             // "" — the two mean different things and only one of them is what
             // the Tower said.
-            objectClass: json["object_class"] as? String
+            objectClass: json["object_class"] as? String,
+            // Additive, and therefore Optional rather than required. It was
+            // being **dropped on decode** until 2026-08-27, which is why iOS
+            // showed a wearer `Frame reference: capture 22e9d428…, frame 3410`
+            // and never the frame itself. A block that is present and
+            // malformed still decodes to `nil` here rather than failing the
+            // whole envelope: a listing that cannot show pictures is a
+            // degraded screen, and a listing that shows nothing is a wearer
+            // being told they have no memory.
+            imagery: (json["imagery"] as? [String: Any])
+                .flatMap(ObjectMemoryImageryDecoder.routes(from:))
         )
     }
 
@@ -582,7 +704,36 @@ enum ObjectMemoryDecoder {
             moduleID: moduleID,
             retentionTag: retentionTag,
             privacyTags: privacyTags,
-            frame: frame
+            frame: frame,
+            // All additive, all Optional, and none of them defaulted to a
+            // number. `frame_count: nil` is "the record predates sightings
+            // having a length"; a 0 would claim a sighting that spanned no
+            // frames, which is not a thing that can have happened.
+            observationID: json["observation_id"] as? String,
+            lastSeenAt: (json["last_seen_at"] as? Double).map(Date.init(timeIntervalSince1970:)),
+            frameCount: json["frame_count"] as? Int,
+            tier: json["tier"] as? String,
+            verification: (json["verification"] as? [String: Any])
+                .flatMap(self.verification(from:))
+        )
+    }
+
+    /// What a second opinion said. `nil` when the block is absent — the
+    /// ordinary case — and also `nil` when it is present and unreadable,
+    /// because a verification this app cannot parse is one it must not
+    /// characterise, and "nothing was asked" is the weaker and safer of the
+    /// two things it could say.
+    static func verification(from json: [String: Any]) -> ObservationVerification? {
+        // A real Bool. This is the one field in the block that carries a
+        // verdict, and a `1` decoded as absent would drop an agreement.
+        guard let agrees = json["agrees"] as? Bool else { return nil }
+        return ObservationVerification(
+            agrees: agrees,
+            proposed: json["proposed"] as? String,
+            label: json["label"] as? String,
+            score: json["score"] as? Double,
+            model: json["model"] as? String,
+            reason: json["reason"] as? String
         )
     }
 

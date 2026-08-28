@@ -11,7 +11,7 @@ import Foundation
 /// currently remote, reached over Tailscale; this hardcoded address is
 /// expected to change across sessions/networks until a discovery or
 /// configuration mechanism is designed.
-enum TowerConfiguration {
+nonisolated enum TowerConfiguration {
     static let webSocketURL = URL(string: "ws://100.110.156.55:8000/ws")!
 
     /// The same Tower, over HTTP. Geometry is fetched here rather than over the

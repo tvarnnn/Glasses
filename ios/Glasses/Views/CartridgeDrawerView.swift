@@ -16,7 +16,10 @@ import SwiftUI
 /// still exactly `ping`, `pong`, `frame`, `frame_result`, `stream_start`,
 /// `stream_stop`.
 ///
-/// That is why a row can be tappable while its badge still reads "Future".
+/// The two were once fully independent, which is how a row came to be tappable
+/// while its badge read "Future". They are no longer: a cartridge with nothing
+/// to open cannot be `.readyToTest`, and one that ships a workspace is never
+/// `.notBuilt`. `CartridgeCatalogTests` pins that in both directions.
 /// The badge describes the *module's* position on the Tower roadmap; being
 /// tappable describes whether *this app* ships a screen for it. Only cartridges
 /// with a workspace are tappable — the rest stay exactly as they were, with no
@@ -44,26 +47,54 @@ struct CartridgeDrawerView: View {
                 }
 
                 Section {
-                    ForEach(Cartridge.catalog) { cartridge in
-                        if cartridge.workspace != nil {
+                    // Every catalog entry, in catalog order, and — critically —
+                    // the openability decision is read off the row rather than
+                    // re-derived here. `Cartridge.selectable` is defined as the
+                    // openable rows of this same list, so the drawer and the
+                    // rest of the app cannot come to different conclusions
+                    // about what may be opened.
+                    ForEach(Cartridge.drawerRows) { row in
+                        switch row {
+                        case .openable(let cartridge, _):
                             Button {
                                 selectedCartridgeID = cartridge.id
                                 dismiss()
                             } label: {
                                 CartridgeRow(
-                                    cartridge: cartridge,
+                                    row: row,
                                     isSelected: selectedCartridgeID == cartridge.id
                                 )
                             }
                             .buttonStyle(.plain)
-                        } else {
-                            CartridgeRow(cartridge: cartridge, isSelected: false)
+                        case .informational:
+                            CartridgeRow(row: row, isSelected: false)
                         }
                     }
                 } header: {
                     Text("Modules")
                 } footer: {
-                    Text("Opening a cartridge changes this app's workspace. It does not start anything on the Tower — the Tower has no module runtime yet, so every badge below still reflects the roadmap rather than something you can run.")
+                    // The middle clause of this footer used to read: "It does
+                    // not start anything on the Tower — the Tower chooses what
+                    // it runs at startup and this app cannot ask it for
+                    // anything else."
+                    //
+                    // That was true when written and is now false in the worst
+                    // direction. This build sends `cv_lab_start`,
+                    // `POST /documents-session/start` and
+                    // `POST /cartridges/object_memory/session/start`, and three
+                    // workspaces draw a Start control.
+                    //
+                    // It is not merely stale — it is the sentence a person
+                    // reads *before* deciding whether opening a screen can make
+                    // the Tower begin recording. Telling someone the app cannot
+                    // ask the Tower for anything, on a build that can ask it to
+                    // start keeping what its camera sees, is the one direction
+                    // this claim must never be wrong in.
+                    //
+                    // What survives is the true and useful half: opening a
+                    // cartridge is not itself a start. The recording verbs are
+                    // deliberate and live inside the workspace.
+                    Text("Opening a cartridge changes this app's workspace. Opening one does not start anything on the Tower by itself — but some workspaces can, and they say so where the control is. Badges describe this app: \u{201C}Ready to test\u{201D} means there is something here to try, not that the Tower you are connected to is serving it right now. Each workspace says what that Tower can actually do.")
                         .padding(.top, 4)
                 }
             }
@@ -109,10 +140,14 @@ private struct HomeRow: View {
 }
 
 private struct CartridgeRow: View {
-    let cartridge: Cartridge
+    /// The row, not the cartridge: openability arrives already decided rather
+    /// than being worked out again here. The hint below is the second half of
+    /// that decision and comes from the same place.
+    let row: CartridgeDrawerRow
     let isSelected: Bool
 
-    private var isOpenable: Bool { cartridge.workspace != nil }
+    private var cartridge: Cartridge { row.cartridge }
+    private var isOpenable: Bool { row.isOpenable }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -128,12 +163,22 @@ private struct CartridgeRow: View {
             Spacer(minLength: 8)
 
             VStack(alignment: .trailing, spacing: 6) {
+                // Tinted for exactly one status, so the drawer answers "which
+                // of these can I try?" in a glance rather than after reading
+                // eight identical capsules. Colour is not the only carrier —
+                // the badge still spells the status out — because a tint alone
+                // would be invisible to a reader who cannot distinguish it.
                 Text(cartridge.status.badge)
                     .font(.caption2.weight(.semibold))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(Color(.tertiarySystemFill), in: .capsule)
-                    .foregroundStyle(.secondary)
+                    .background(
+                        cartridge.status.isProminent
+                            ? AnyShapeStyle(Color.accentColor.opacity(0.18))
+                            : AnyShapeStyle(Color(.tertiarySystemFill)),
+                        in: .capsule
+                    )
+                    .foregroundStyle(cartridge.status.isProminent ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
 
                 if isSelected {
                     Image(systemName: "checkmark")
@@ -147,8 +192,10 @@ private struct CartridgeRow: View {
         .contentShape(.rect)
         .accessibilityElement(children: .combine)
         // Two different truths, so two different hints. An unopenable row is
-        // informational exactly as it always was.
-        .accessibilityHint(isOpenable ? "Opens this workspace" : "No workspace in this app yet")
+        // informational exactly as it always was. The strings live on the row
+        // beside the decision that picks between them, so a row cannot be
+        // untappable while announcing that it opens something.
+        .accessibilityHint(row.accessibilityHint)
         // An openable row is already inside a `Button`, so only selection needs
         // stating. A row without a workspace gets no traits at all, which is
         // what makes it read as informational rather than actionable.
