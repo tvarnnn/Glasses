@@ -206,6 +206,62 @@ class TestTheWorkerIsReused:
             "the worker is not being reused"
         )
 
+    def test_rapid_cycling_does_not_strand_parked_workers(self):
+        """The window between `done.set()` and the worker going un-busy.
+
+        Found by re-reading the fix rather than by a failing test, which
+        is why it is written down rather than only fixed.
+
+        `stop()` waits on the session's completion Event. The worker sets
+        that Event in its `finally` and only THEN reacquires its own
+        condition to mark itself free. So a `stop()` could return, and
+        the next `start()` call `submit()`, while the worker it is about
+        to reuse still read as busy. `submit()` refuses, a replacement is
+        minted, and the original parks forever -- never reused, never
+        exited. One stranded thread per occurrence, which is WORSE than
+        the per-session thread this class replaced, because that one at
+        least exited.
+
+        Two changes close it: the worker clears `_busy` BEFORE signalling
+        the session done, so anything that observes the Event also
+        observes the worker free; and a worker that is replaced anyway is
+        RETIRED rather than left parked, so the fallback costs at most
+        one exiting thread instead of one immortal one.
+
+        HONEST STATUS: THIS TEST PASSED BEFORE THE FIX TOO. 40 rapid
+        cycles did not hit the window even once, and it is easy to see
+        why -- between `done.set()` and the next `submit()` the stopping
+        thread still has to run step 4's teardown and two lock
+        acquisitions, which is ample time for the worker to mark itself
+        free. So this is a window removed by reading, not a failure
+        reproduced. It is closed anyway because the fix is a free
+        reordering of two statements, and because "unlikely" stops being
+        a defence the moment a loaded host preempts the worker in exactly
+        the wrong microsecond -- which is the same argument the module
+        already makes about the flush window it DOES reproduce.
+
+        Kept as a stress guard rather than sold as a reproduction.
+        """
+        idents = []
+
+        class Recording(_Engine):
+            def load(self):
+                idents.append(threading.get_ident())
+
+        session = SceneLive(Recording, decode=lambda raw: raw)
+        for _ in range(40):
+            session.start()
+            assert _await_state(session, STATE_RUNNING)
+            session.stop()
+
+        assert len(idents) == 40
+        assert len(set(idents)) == 1, (
+            f"40 rapid cycles ran on {len(set(idents))} distinct worker "
+            "threads. Every extra one is a parked thread that will never "
+            "be reused and never exit, holding its OpenMP team for the "
+            "life of the process"
+        )
+
     def test_a_wedged_load_is_abandoned_and_the_next_start_still_runs(self):
         """The one virtue of a thread per session, kept.
 

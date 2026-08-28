@@ -190,11 +190,25 @@ class _SessionWorker:
             try:
                 run(session_id, invalidation)
             finally:
-                done.set()
+                # FREE FIRST, SIGNAL SECOND, and the order is the point.
+                #
+                # `stop()` waits on `done`. If `done` were set first, a
+                # `stop()` could return -- and the next `start()` call
+                # `submit()` -- while this worker still read as busy.
+                # `submit()` would refuse, a replacement would be minted,
+                # and this one would park forever: never reused, never
+                # exited. That is WORSE than the thread-per-session this
+                # class replaced, because that one at least exited.
+                #
+                # Nothing is lost by freeing first: a job submitted in
+                # this window simply lands in `_job` and is picked up on
+                # the next pass round the loop.
                 with self._condition:
                     self._busy = False
-                    if self._retired:
-                        return
+                    retired = self._retired
+                done.set()
+                if retired:
+                    return
 
 
 def decode_frame(raw_bytes):
@@ -740,6 +754,14 @@ class LiveSession:
             # No worker yet, or the one we had is still inside a session
             # that was abandoned. Either way this session gets its own,
             # exactly as every session did before workers were reused.
+            if worker is not None:
+                # RETIRE the one being replaced. Dropping the reference
+                # alone would leave it parked on its condition for the
+                # life of the process -- reachable by nothing, waiting
+                # for work that can never arrive, holding its OpenMP
+                # team. Retiring lets it finish and exit, which is what
+                # a per-session thread did.
+                worker.retire()
             worker = _SessionWorker(label)
             self._worker = worker
             worker.submit(job)
