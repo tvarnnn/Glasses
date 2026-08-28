@@ -3,7 +3,7 @@
 **Branch:** `hardening/post-mvp-runtime-v1`
 **Worktree:** `C:\Users\tvllo\Projects\Glasses-worktrees\post-mvp-hardening`
 **Date:** 2026-08-28
-**Status:** IN PROGRESS — this document is written as the run proceeds.
+**Status:** complete. Green, pushed, not merged. `ios/` untouched: 0 files.
 
 ---
 
@@ -12,7 +12,7 @@
 | | |
 |---|---|
 | Branch created from | `35a2418` (`main`, = `origin/main` at the time) |
-| Rebased onto | `768cecf` (pending — see §3) |
+| Rebased onto | `768cecf` (clean) |
 | `ios/` files changed | **0** |
 
 ### 1.1 The branch-reconciliation run, and the collision
@@ -578,7 +578,7 @@ tests/test_unified_lifecycle_regressions.py
 All three originally-red tests are green, and failure (A) is green by way of
 `tower-dc`'s work on `main` rather than anything done here.
 
-## 6b. The reviewer's findings, and what they cost
+## 6a. The reviewer's findings, and what they cost
 
 An independent reviewer attacked the three red-test fixes **by mutation** rather
 than by reading, and found two places where the suite had quietly stopped
@@ -647,7 +647,7 @@ symlink and junction evasion of the containment check; and the
 `_segment_with_span` removal (the surviving definition was already the one in
 effect, and no call site reads `.points`).
 
-## 6a. Judge 1 on the live-session worker
+## 6b. Judge 1 on the live-session worker
 
 Driven to **1,200 cycles**, far past this lane's 12:
 
@@ -820,10 +820,20 @@ worktree, every cycle confirmed to reach `running`:
 | before, 12 cycles | 29 -> **257** | **+19.00**, twelve for twelve | +38/cycle | +8.0 MB/cycle |
 | after, 12 cycles | 29 -> **49** | **+0 from cycle 2 on** | flat at 450 | flat |
 | after, 30 cycles | 29 -> **49** | **+0 from cycle 2 on** | flat at 450 | flat |
+| after, 50 cycles | 29 -> **49** | **+0 from cycle 2 on** | flat at 450 | flat |
 
 All of the residual +20 is cycle 1 — one OpenMP team and one worker — and that
-cost is **constant**. Before the fix, 30 cycles would have reached ~599
+cost is **constant**. Before the fix, 50 cycles would have reached ~979
 threads; a judge's 1,200-cycle run reached 22,845 threads and 8.8 GB.
+
+RSS is constant too, and the three run lengths are the evidence: it settles at
+**~700 MB whether the run is 12, 30 or 50 cycles** (699.1 / 708.6 / 704.4),
+oscillating a few MB either way with no trend. Before the fix it was climbing
++8.0 MB per cycle and had reached 790.6 MB by cycle 12 with no sign of
+stopping.
+
+`update_sighting`'s scaling table in §10 was taken the same way and is the
+other half of the resource picture.
 
 ## 8. Changes explicitly refused
 
@@ -856,15 +866,19 @@ threads; a judge's 1,200-cycle run reached 22,845 threads and 8.8 GB.
   `pool_size x torch_threads` (~250 MB one-time at `max_workers=32`), currently
   unbooked. Found by Judge 2, not acted on.
 * The two-converter refinement to the artifact-root guard (§4.1).
-* `OMP_WAIT_POLICY=passive` (§10), `process()` on the event loop, capture
-  recorder I/O, capture retention, and Object Memory store scaling — see §10.
+* `OMP_WAIT_POLICY=passive` — measured thoroughly and **refused** (§10a). One
+  experiment would settle it: Scene and a CV Lab experiment driven
+  CONCURRENTLY through a real websocket at 12 fps, both policies, comparing
+  `frames_skipped` and Scene's p95.
+* `process()` on the event loop, capture recorder I/O, capture retention, and
+  Object Memory store scaling — see §10.
 
 ## 10. The other deferred candidates, and their disposition
 
 | # | Candidate | Status |
 |---|---|---|
 | 1 | Live-session torch thread pool | **FIXED** (§5.5, §7) |
-| 2 | `OMP_WAIT_POLICY=passive` | measured INDEPENDENT of the leak (§5.1a); CPU A/B outstanding |
+| 2 | `OMP_WAIT_POLICY=passive` | measured across four workloads; **DEFERRED, not shipped** (§10a) |
 | 3 | Synchronous `process()` on the event loop | **STILL PRESENT**, characterised, not re-measured |
 | 4 | Capture recorder I/O | **STILL PRESENT**, shape confirmed |
 | 5 | Capture retention / unredacted data | **CONFIRMED and quantified** (§5.2) |
@@ -891,20 +905,182 @@ batching trades it away rather than improving it. `append_jsonl`'s heal-a-torn
 -line read is per-append by design. **KEEP_AS_IS is the likely correct answer**
 and nothing here contradicts it.
 
-**Finding 7 — Object Memory.** Confirmed by inspection: `update_sighting`
-reads every raw record and calls `_rewrite_locked(raw_records)` — a full
-rewrite per sighting update — and `all_observations` re-parses the whole file
-per call with no cache. At today's 64 records neither is a product problem.
-Whether it threatens anything at reachable scale is a measurement this lane did
-not take, and the store's own docstring already names the trigger to revisit:
-"Rewriting this file wholesale during prune/purge/upgrade is acceptable
-precisely because the file is expected to stay small; that assumption is the
-trigger to revisit."
+**Finding 7 — Object Memory. Confirmed AND measured.**
 
-## 10a. Final verification
+| records | `append` ms | `update_sighting` ms | `all_observations` ms | file KB |
+|---|---|---|---|---|
+| 64 (today) | 0.427 | 1.902 | 0.611 | 39 |
+| 250 | 0.414 | 3.395 | 1.757 | 153 |
+| 1,000 | 0.410 | 9.324 | 6.564 | 611 |
+| 4,000 | 0.419 | 36.787 | 30.531 | 2,445 |
+| 16,000 | 0.406 | **157.444** | **148.507** | 9,779 |
+
+Three things fall out, and one contradicts the grouping in the previous report:
+
+* **`append` is O(1)** — 0.41 ms flat across a 250x range. `append_jsonl` is a
+  genuine append, exactly as §5.3 found for Document Memory. Nothing to fix.
+* **`update_sighting` is O(n)**, 1.9 -> 157 ms: it reads every raw record and
+  rewrites the file whole.
+* **`all_observations` is O(n)**, 0.61 -> 149 ms, re-parsed per call.
+
+**Not product-threatening today, and the trigger is now a number rather than a
+feeling.** At today's 64 records both cost under 2 ms. The interesting
+threshold is ~4,000 records, where `update_sighting` reaches 37 ms — a
+meaningful fraction of the 83.3 ms frame interval — and 16,000, where it
+exceeds the whole interval. It does NOT block the Tower's event loop, because
+the producer is a separate process, so the failure mode is a producer falling
+behind rather than a dropped frame.
+
+Reaching 4,000 needs a great deal of walking inside a 30-day retention window,
+against 64 accumulated so far. **KEEP_AS_IS is correct now**; the store's own
+docstring already names the assumption ("the file is expected to stay small;
+that assumption is the trigger to revisit") and this puts a figure on it.
+
+**If it ever needs fixing, the fix is not SQLite.** Both costs are one full
+read of a file that is 611 KB at 1,000 records; an in-memory cache keyed on
+`(size, mtime_ns)` — the pattern `results/world_builder.py` already uses — or
+an index over the three fields `update_sighting` matches on removes them with
+no migration and no format change.
+
+## 10a. `OMP_WAIT_POLICY=passive` — measured across four workloads
+
+The previous lane recorded a Scene session going from 18.6 cores to 2.29 and
+host CPU from 100% to 32% under `passive`, called it "a promising separate
+lever, unvalidated for correctness", and did not ship it. This lane validated
+it, and the answer is not the one the headline implies.
+
+**Arm order alternated, medians of two runs each, same host, `tower.__file__`
+asserted into the worktree.**
+
+### The paced frame path — the number that flatters it
+
+`cartridge_live_benchmark.py`, Scene, 1,845 real corpus frames at the measured
+delivery rate of 12 fps:
+
+| | default | passive | ratio |
+|---|---|---|---|
+| CPU cores | **17.93** | **1.74** | **0.10** |
+| observed fps | 11.97 | 11.97 | 1.00 |
+| frames observed / offered | 1845 / 1845 | 1845 / 1845 | 1.00 |
+| **frames skipped** | **0** | **0** | — |
+| `offer_frame` median | 0.012 ms | 0.014 ms | 1.15 |
+| `offer_frame` p95 | 0.024 ms | 0.032 ms | 1.35 |
+| RSS growth | 10.1 MB | 10.3 MB | 1.02 |
+
+A **10.3x CPU reduction with byte-identical throughput and not one dropped
+frame.** The event-loop cost rises 15-35% and is measured in *microseconds*.
+
+**One number in that harness must not be quoted.**
+`worker_service_ms_mean` reads 1497.7 -> 145.6 ms, which looks like a 10x
+throughput win and is not one: it is computed as `cpu_seconds / frames`, so it
+divides CPU spread across ~18 cores by the frame count. It is the CPU figure
+restated, and the benchmark's own docstring mislabels it as "how long the
+cartridge occupies its thread".
+
+### The saturated path — the number that condemns it
+
+Back-to-back `ssdlite320` inference with no idle gap, 60 inferences after 10
+warm-ups:
+
+| | default | passive |
+|---|---|---|
+| median | 28.2 / 29.1 ms | **44.4 / 47.4 ms** |
+| p95 | 32.0 / 32.1 ms | 48.1 / 50.5 ms |
+| throughput | 34.0 / 35.2 per s | 21.5 / 22.7 per s |
+| CPU cores | 17.9 | 2.5 |
+
+**+57% to +63% per inference**, reproducible across both pairs. Spin-waiting is
+not free to remove: a sleeping team has to be woken for every parallel region,
+and at 12 fps that cost is hidden by the idle gap while at saturation it is
+not.
+
+### Depth — the workload that decided the previous refusal
+
+The runtime-fitness lane **refused** capping torch threads because depth went
+19.73 -> 55.01 ms (+179%) and pushed **20% of frames past the entire 83.3 ms
+delivered interval**. `passive` is held to the same bar:
+
+| | default | passive |
+|---|---|---|
+| median | 28.7 / 29.7 ms | 49.0 / 48.2 ms (+65%) |
+| max | 41.2 / 33.5 ms | 52.2 / 51.2 ms |
+| **over the 83.3 ms interval** | **0/40** | **0/40** |
+| CPU cores | 17.2 / 17.9 | 3.4 / 3.8 |
+
+**`passive` is materially safer than the cap that was refused.** It costs about
+the same proportion of latency but leaves 31 ms of headroom against the frame
+interval where the cap left none.
+
+### World Builder — the subsystem whose figures are pinned exactly
+
+`world_builder_benchmark.py`, every stage, both policies:
 
 ```
-Full Tower suite     2240 passed, 58 skipped, 1 xfailed in 311.12s   exit 0
+build.estimate_window.mean_ms      65.70 -> 65.33   (1.00)
+build.ms_per_keyframe               8.21 ->  8.17   (0.99)
+preprocessing.*                    every ratio 0.87-1.10 on sub-0.1 ms filters
+```
+
+**Unaffected, on every stage.** That is the result this experiment most needed:
+World Builder is the largest subsystem in the backend and its corpus figures
+reproduce exactly, so a process-wide switch that perturbed it would have been
+disqualifying. Its hot path is OpenCV and compiled numerics with their own
+threading, not torch's OpenMP, which is why.
+
+### Both cartridges — and the limitation of that run
+
+`--cartridge both`, Scene and Document Memory, 1,280 frames each:
+
+| | default | passive |
+|---|---|---|
+| Scene CPU cores | 17.897 | **1.755** |
+| Scene frames observed / skipped | 1280 / 0 | 1280 / 0 |
+| Document CPU cores | 0.264 | 0.218 |
+| Document frames observed / skipped | 1280 / 0 | 1280 / 0 |
+| both observed fps | 11.97 | 11.97 |
+
+**This is NOT the concurrency test it looks like.** The harness drives the two
+cartridges one after the other — two `runs` entries, 106.9 s of wall clock
+each — so it measures both cartridges *in one process*, not both *at once*.
+The genuinely concurrent case is still unmeasured, and it is the one the
+integration report already flags: finding 10, "the CV Lab can cost Scene its
+entire frame-time margin".
+
+### Verdict: **DEFER. Do not ship in this lane.**
+
+Not because the numbers are bad — they are the best in this report — but
+because of what they do and do not cover.
+
+**What decides it is that the product is not CPU-bound today.** Both arms
+delivered 1,845 frames with **zero** skipped, at an identical 11.97 fps, in
+every configuration measured. The 10.3x saving buys *headroom*, not product
+behaviour. Headroom is worth having, and it is not worth a **process-wide
++65% frame latency** bought on measurements that never ran two torch cartridges
+at the same time — on the one axis a previous report already names as able to
+consume Scene's whole margin.
+
+There is also no narrow scope available. `OMP_WAIT_POLICY` is read when the
+OpenMP runtime initialises, before torch finishes importing, so it can only be
+a process-wide startup setting. "Only for the Scene worker" is not reachable.
+
+**The honest asymmetry, stated so a successor can overturn this cheaply:** the
+theory says passive should *help* the concurrent case, not hurt it — under the
+default, one Scene session already claims 17.9 of 20 cores, so two torch
+cartridges oversubscribe badly, while under passive each wants under 4. If that
+is measured and holds, the case flips and this should ship.
+
+**The one experiment that would settle it:** drive Scene and a CV Lab
+experiment *concurrently* through a real websocket at 12 fps under both
+policies, and compare `frames_skipped` and Scene's p95. If passive does not
+raise either, ship it as a startup default with the latency cost documented.
+
+This is a stronger recommendation than the previous lane's, on far more
+evidence, and it is still a refusal.
+
+## 10b. Final verification
+
+```
+Full Tower suite     2241 passed, 58 skipped, 1 xfailed in 305.11s   exit 0
 pip check            No broken requirements found.
 tower.__file__       ...\Glasses-worktrees\post-mvp-hardening\tower\tower\__init__.py
 torch                2.13.0+cu132
@@ -917,8 +1093,9 @@ git status           clean but for this document
 **Zero failures.** The one xfail is integration finding 15, strict and
 deliberate (§9).
 
-The reviewer's independent baseline on this branch before the last two commits
-was `2233 passed, 58 skipped`; the seven extra passes are the tests added since.
+The reviewer's independent baseline on this branch before the last three
+commits was `2233 passed, 58 skipped`; the eight extra passes are the tests
+added since.
 
 **World count in the worktree's default root: 6 before the run, 6 after.** That
 is the check that matters for §5.1 — before the fix, a full suite incremented
