@@ -14,3 +14,7 @@
 /sc/
 /sc2/
 /wb-scratch/
+
+.Rhistory
+__pycache__/
+*.pyc
