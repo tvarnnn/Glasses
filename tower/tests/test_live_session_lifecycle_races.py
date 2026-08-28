@@ -47,7 +47,7 @@ class _Engine:
     def load(self):
         return None
 
-    def observe(self, frame, received_at, source_seq):
+    def observe(self, frame, received_at=None, source_seq=None):
         return None
 
     def release(self):
@@ -128,6 +128,186 @@ class TestAStopStillFlushing:
             "still reports running and carries no field that says so"
         )
         assert session.state == STATE_RUNNING
+
+
+class TestTheWorkerIsReused:
+    """The per-session thread, and the OpenMP team it stranded.
+
+    torch's ATen parallel backend is OpenMP here. The first ATen call on
+    any thread spins up a team of `cores - 1`, and **that team is not
+    reclaimed when the thread exits** -- so a `threading.Thread` per
+    session cost +19 OS threads, ~+7 MB RSS and +38 handles on every
+    Start/Stop, linear, with no plateau. Twelve cycles took a real Tower
+    from 29 to 257 threads.
+    """
+
+    def test_repeated_sessions_do_not_grow_the_os_thread_count(self):
+        """The leak itself, as a property rather than as a number.
+
+        A REAL ATen CALL IS REQUIRED AND IS THE WHOLE POINT. A pure
+        Python stub engine creates no OpenMP team, so this test would
+        pass against the broken code and prove nothing. That is the
+        trap this docstring exists to stop the next person falling into.
+
+        Cycle 1 is excluded from the comparison deliberately: the first
+        session legitimately creates one team and one worker, and that
+        cost is CONSTANT. What must not grow is cycle 2 onwards.
+        """
+        torch = pytest.importorskip("torch")
+        psutil = pytest.importorskip("psutil")
+
+        class TorchEngine(_Engine):
+            def load(self):
+                with torch.inference_mode():
+                    torch.nn.functional.conv2d(
+                        torch.randn(1, 1, 16, 16), torch.randn(1, 1, 3, 3)
+                    )
+
+        session = SceneLive(TorchEngine, decode=lambda raw: raw)
+        process = psutil.Process()
+
+        def cycle():
+            session.start()
+            assert _await_state(session, STATE_RUNNING)
+            session.stop()
+
+        cycle()
+        settled = process.num_threads()
+        for _ in range(7):
+            cycle()
+
+        assert process.num_threads() == settled, (
+            f"seven further Start/Stop cycles moved the OS thread count "
+            f"from {settled} to {process.num_threads()}. Each session is "
+            "stranding an OpenMP team that outlives its thread"
+        )
+
+    def test_two_sessions_run_on_the_same_worker(self):
+        """Reuse, asserted directly, so a silent regression is visible.
+
+        The count test above would also pass if a fresh thread happened
+        to create no team. This one cannot: it reads the thread identity.
+        """
+        idents = []
+
+        class Recording(_Engine):
+            def load(self):
+                idents.append(threading.get_ident())
+
+        session = SceneLive(Recording, decode=lambda raw: raw)
+        for _ in range(3):
+            session.start()
+            assert _await_state(session, STATE_RUNNING)
+            session.stop()
+
+        assert len(idents) == 3
+        assert len(set(idents)) == 1, (
+            f"three sessions ran on {len(set(idents))} different threads; "
+            "the worker is not being reused"
+        )
+
+    def test_a_wedged_load_is_abandoned_and_the_next_start_still_runs(self):
+        """The one virtue of a thread per session, kept.
+
+        A worker stuck inside a model load cannot be interrupted --
+        nothing in Python can. It must never delay the next Start. The
+        reused worker is RETIRED rather than waited on, and the next
+        session mints a fresh one, which is exactly what happened on
+        every cycle before the worker was reused.
+        """
+        wedged = threading.Event()
+        entered = threading.Event()
+        built = []
+
+        class Wedging(_Engine):
+            def load(self):
+                if not built:
+                    built.append(self)
+                    entered.set()
+                    assert wedged.wait(20), "the test never released the load"
+
+        session = SceneLive(Wedging, decode=lambda raw: raw, stop_join_timeout_s=0.3)
+
+        session.start()
+        assert entered.wait(10), "the first load never started"
+        began = time.monotonic()
+        session.stop()
+        assert time.monotonic() - began < 5.0, "stop() waited out a wedged load"
+
+        session.start()
+        assert _await_state(session, STATE_RUNNING, timeout=10.0), (
+            "a session wedged in a model load blocked the next Start; the "
+            "worker was waited on instead of retired"
+        )
+        wedged.set()
+
+    def test_a_stop_does_not_wait_for_the_next_sessions_work(self):
+        """Step 3 must wait on THIS session, never on the worker.
+
+        The single way worker reuse goes wrong. If step 3 asks "is the
+        worker idle?" instead of "is my session done?", a Stop racing a
+        Start waits out the whole `STOP_JOIN_TIMEOUT_S` on session 2's
+        load -- measured at 5.01 s, on a path reached from a websocket
+        disconnect -- and then abandons the healthy worker session 2 is
+        running on.
+        """
+        session = _session(_BlockingFlush)
+        session.start()
+        assert _await_state(session, STATE_RUNNING)
+
+        stopper = threading.Thread(target=session.stop, name="http-stop")
+        stopper.start()
+        assert session.flush_entered.wait(10)
+
+        session.start()
+        assert _await_state(session, STATE_RUNNING)
+
+        began = time.monotonic()
+        session.release_flush.set()
+        stopper.join(15)
+        assert not stopper.is_alive()
+        assert time.monotonic() - began < 3.0, (
+            "stop() waited on the worker rather than on its own session, "
+            "so it paid its full bound for session 2's work"
+        )
+
+    def test_a_reused_worker_produces_the_same_results_as_a_fresh_one(self):
+        """What pays for the new risk.
+
+        Session 2's `_create` now runs on a thread that previously ran
+        session 1's `_consume`. torch's per-thread state is grad mode and
+        RNG; this asserts the observable consequence rather than the
+        mechanism.
+        """
+        seen = []
+
+        class Counting(_Engine):
+            def observe(self, frame, received_at=None, source_seq=None):
+                seen.append((self.ident, frame))
+                # NOT None: `SceneLive._publish` treats None as "the
+                # frame would not decode" and undoes the base's
+                # `frames_observed` increment, so a None-returning stub
+                # makes this test unable to see its own frame.
+                return object()
+
+        session = SceneLive(Counting, decode=lambda raw: raw)
+        for _ in range(3):
+            session.start()
+            assert _await_state(session, STATE_RUNNING)
+            session.offer_frame(b"frame", source_seq=1)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if session.status()["frames_observed"] == 1:
+                    break
+                time.sleep(0.005)
+            assert session.status()["frames_observed"] == 1
+            session.stop()
+
+        assert len(seen) == 3
+        assert len({ident for ident, _ in seen}) == 3, (
+            "each session must observe through its OWN engine even though "
+            "they share a worker thread"
+        )
 
 
 class TestStopThenStart:

@@ -103,6 +103,100 @@ LOAD_OVERDUE_S = 120.0
 STOP_JOIN_TIMEOUT_S = 5.0
 
 
+class _SessionWorker:
+    """One thread that runs session bodies, one at a time, and PARKS.
+
+    THE ONLY REASON THIS EXISTS IS THAT AN OPENMP TEAM OUTLIVES THE
+    THREAD THAT CREATED IT.
+
+    Measured on this host, torch's ATen parallel backend is OpenMP with
+    `omp_get_max_threads() == 20`. The first ATen call on any thread
+    spins up a team of 19, and that team is **not reclaimed when the
+    thread exits** -- every thread in the experiment below was joined:
+
+        one fresh thread per inference   8 threads -> +152 OS threads
+        one reused thread, 8 inferences  1 thread  ->  +19 OS threads
+
+    A `threading.Thread` per session therefore cost +19 OS threads,
+    ~+7 MB RSS and +38 handles on EVERY Start/Stop, linear, with no
+    plateau: 12 cycles took a real Tower from 29 to 257 threads, and 400
+    cycles reach 7,645 threads and 3.35 GB. There is no torch API that
+    returns them; reuse is the only lever.
+
+    A cycle is not a wearer pressing a button. `scene_autostart` defaults
+    on and `ws.py` drives `stream_opened`/`stream_closed` from the socket,
+    so an app backgrounding, a deliberate `stream_stop` or a spell out of
+    range is a full Start/Stop with a fresh engine load.
+
+    **The worker never exits voluntarily, and that is load-bearing.** An
+    "exit when idle for N minutes" worker would be the bug again with a
+    timer on it: the thread would go and its team would stay. It parks on
+    its condition instead, for the life of the process.
+
+    **A worker that will not come back is RETIRED, not waited on.** That
+    keeps the one virtue of a thread per session: an abandoned worker --
+    wedged in a model load that cannot be interrupted -- must never block
+    the next Start. `retire()` lets it finish and exit on its own; the
+    session mints a fresh worker and carries on. So the residual growth
+    is proportional to ABANDONMENTS rather than to cycles, and the
+    abandoned path behaves exactly as it did before this class existed.
+    """
+
+    def __init__(self, label: str) -> None:
+        self._condition = threading.Condition(threading.Lock())
+        self._job = None
+        self._busy = False
+        self._retired = False
+        self.thread = threading.Thread(
+            target=self._serve, name=label, daemon=True
+        )
+        self.thread.start()
+
+    def submit(self, job) -> bool:
+        """Hand this worker one session body. False if it cannot take it.
+
+        False is not an error and is the ordinary answer for a worker
+        still inside an abandoned session. The caller mints a fresh one,
+        which is what happened on every cycle before this class existed.
+        """
+        with self._condition:
+            if self._busy or self._retired or self._job is not None:
+                return False
+            self._job = job
+            self._busy = True
+            self._condition.notify()
+            return True
+
+    def retire(self) -> None:
+        """Take no further work; exit once the current body returns."""
+        with self._condition:
+            self._retired = True
+            self._condition.notify()
+
+    def _serve(self) -> None:
+        while True:
+            with self._condition:
+                while self._job is None and not self._retired:
+                    self._condition.wait()
+                if self._job is None:
+                    return
+                run, session_id, invalidation, done, label = self._job
+                self._job = None
+            # Renamed per session, because the module's own diagnostic
+            # promise is that a stack dump says which cartridge is inside
+            # a model load. A worker that outlives its session cannot
+            # carry that in its constructor.
+            threading.current_thread().name = label
+            try:
+                run(session_id, invalidation)
+            finally:
+                done.set()
+                with self._condition:
+                    self._busy = False
+                    if self._retired:
+                        return
+
+
 def decode_frame(raw_bytes):
     """JPEG bytes to a BGR array, or None. Used by whoever wants pixels.
 
@@ -196,6 +290,13 @@ class LiveSession:
         self._engine = None
         self._thread: threading.Thread | None = None
         self._invalidation: LoadInvalidation | None = None
+        # The parked worker, reused across sessions. See `_SessionWorker`
+        # for why a thread per session cost +19 OS threads every cycle.
+        # None until the first Start, and None again after one has been
+        # retired for not coming back.
+        self._worker: _SessionWorker | None = None
+        # Signalled when the CURRENT session's body returns.
+        self._session_done: threading.Event | None = None
         # The single slot. `(raw_bytes, received_at, source_seq)`, or None.
         self._pending = None
         self._stopping = False
@@ -333,6 +434,7 @@ class LiveSession:
             engine = self._engine
             thread = self._thread
             invalidation = self._invalidation
+            done = self._session_done
             was_active = self._state in (STATE_RUNNING, STATE_STARTING)
             # Step 1. Nothing new enters the engine after this line.
             self._stopping = True
@@ -355,11 +457,21 @@ class LiveSession:
             # event loop.
             self._safely(self._on_pause, engine, what="stop")
 
-        if thread is not None and thread is not threading.current_thread():
+        if done is not None and thread is not threading.current_thread():
             # Step 3. Before the release, so nothing is torn down under a
             # forward pass that is still running.
-            thread.join(timeout=self._stop_join_timeout_s)
-            if thread.is_alive():
+            #
+            # WAITS ON THIS SESSION, NOT ON THE WORKER. It used to join
+            # the thread, which worked only because the thread WAS the
+            # session -- one per Start, gone at the end. A reused worker
+            # outlives the session, so joining it would mean waiting for
+            # whatever it is doing NOW. Measured: with a Start racing
+            # this Stop, an idleness-based wait cost `stop()` its entire
+            # 5.01 s bound on a path that runs from a websocket
+            # disconnect, and abandoned the healthy worker that session 2
+            # was loading on. Scoped to the session, the same race costs
+            # 0.00 s.
+            if not done.wait(timeout=self._stop_join_timeout_s):
                 # It is inside a model load, which cannot be interrupted.
                 # The latch below guarantees it installs nothing and
                 # releases what it built, so this is a delay in
@@ -374,6 +486,13 @@ class LiveSession:
                     self.name,
                     self._stop_join_timeout_s,
                 )
+                # Retire it rather than wait on it. This is what keeps
+                # the one virtue of a thread per session: a worker wedged
+                # in a load that cannot be interrupted must never delay
+                # the next Start. It finishes, releases its own engine
+                # through its own latch, and exits; the next Start mints
+                # a fresh one.
+                self._retire_worker(thread)
 
         if invalidation is not None:
             # Step 4. Closed OUTSIDE the condition: `invalidate` takes
@@ -599,13 +718,32 @@ class LiveSession:
         self._stream_owners.clear()
         self._on_start_locked()
         self._invalidation = LoadInvalidation()
-        self._thread = threading.Thread(
-            target=self._run,
-            args=(self._session_id, self._invalidation),
-            name=f"tower-{self.name}-session-{self._session_id}",
-            daemon=True,
+        # Signalled by the worker when THIS session's body returns.
+        # `stop()` waits on this rather than joining a thread, because a
+        # reused worker outlives the session and "the thread exited" has
+        # stopped meaning "session 1 is out of `_consume`". Captured in
+        # step 1 alongside the engine, so a Stop can never end up waiting
+        # on the NEXT session's work -- which is the single way the
+        # worker reuse goes wrong, and was measured costing `stop()` its
+        # entire 5 s bound on the stream-close path.
+        self._session_done = threading.Event()
+        label = f"tower-{self.name}-session-{self._session_id}"
+        job = (
+            self._run,
+            self._session_id,
+            self._invalidation,
+            self._session_done,
+            label,
         )
-        self._thread.start()
+        worker = self._worker
+        if worker is None or not worker.submit(job):
+            # No worker yet, or the one we had is still inside a session
+            # that was abandoned. Either way this session gets its own,
+            # exactly as every session did before workers were reused.
+            worker = _SessionWorker(label)
+            self._worker = worker
+            worker.submit(job)
+        self._thread = worker.thread
 
     def _status_locked(self) -> dict:
         now = self._clock()
@@ -638,6 +776,20 @@ class LiveSession:
         }
         status.update(self._extra_status())
         return status
+
+    def _retire_worker(self, thread) -> None:
+        """Give up on the worker running *thread*; the next Start gets a new one.
+
+        Only if it is still the current one. A Start that raced this Stop
+        may already have minted a replacement -- or been handed this same
+        worker back because it had gone idle in the meantime -- and
+        retiring THAT would abandon a healthy session for a timeout that
+        was not about it.
+        """
+        worker = self._worker
+        if worker is not None and worker.thread is thread:
+            self._worker = None
+            worker.retire()
 
     def _release_engine(self, engine) -> None:
         """Release THE ENGINE THE CALLER CAPTURED. Under the latch's lock.
