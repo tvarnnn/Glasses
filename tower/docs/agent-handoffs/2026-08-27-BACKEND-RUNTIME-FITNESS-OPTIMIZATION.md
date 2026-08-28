@@ -32,7 +32,7 @@ traversal and a cartridge that advertised itself as usable when it was not.
 
 | | |
 |---|---|
-| HEAD | `0a755d7` |
+| HEAD | `278f508` |
 | Pushed | `origin/optimization/backend-runtime-fitness-v1` |
 | Working tree | clean |
 | `ios/` files changed | **0** |
@@ -803,7 +803,7 @@ stores; `OMP_WAIT_POLICY` (§18).
 ## 35. Commits
 
 ```
-<final> fix(results,geometry): the second final reviewer's findings, acted on
+278f508 fix(results,geometry): the final reviewers' findings, and the report
 b4d626e fix(capture,results): a refused thread pool must not mean a refused shutdown
 0a755d7 perf(cv-lab): exact cheaper sharpness, and auto picks the faster device per experiment
 4dd9f25 fix(runtime,contracts): bound an echoed identifier, shut down concurrently, and the reviewers' findings
