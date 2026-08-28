@@ -623,38 +623,49 @@ def report():
         pytest.skip(str(error))
 
 
+# The two clauses that sit AHEAD of reciprocity in `admit()`, relaxed to
+# their floor. Nothing is monkeypatched: `pair_is_hopeless` reads
+# `thresholds.min_span_over_depth` itself, so dropping that to 0.0
+# neutralises the cheap pre-filter through the gate's own configuration.
+RECIPROCITY_IS_DECISIVE = Thresholds(min_cameras=2, min_span_over_depth=0.0)
+
+
 @pytest.fixture(scope="module")
-def report_without_the_span_prune():
-    """The same walk with the cheap pre-filter neutralised. ~10 s.
+def report_where_reciprocity_decides():
+    """The same walk, with every clause AHEAD of reciprocity relaxed. ~10 s.
 
-    `pair_is_hopeless` refuses a pair on span/depth BEFORE it is matched,
-    so such a pair never reaches a directional solve and is recorded with
-    a reciprocity of NaN -- which the report emits as null. That is
-    correct and strictly safe: the prune is deliberately the SAME bar as
-    `admit()`'s own span clause, which sits AHEAD of the reciprocity
-    clause, so every pair the prune removes is a pair the gate would have
-    refused before it ever compared the two scales.
+    THIS FIXTURE EXISTS BECAUSE THE FIRST VERSION OF IT PROVED LESS THAN
+    IT CLAIMED, and a reviewer caught it by mutation.
 
-    The side effect is that the pruned report contains no pair whose two
-    solves disagree -- not because the walk stopped containing any, but
-    because those pairs are now refused one clause earlier and never get
-    a number. Neutralising the prune puts them back, which is the only
-    way to exercise the reciprocity comparison against REAL evidence
-    rather than against a hand-built fit.
+    `admit()` evaluates its clauses in order: finite scale, cameras,
+    span/depth, THEN reciprocity, then rotation, ambiguity, reprojection.
+    On the shipped thresholds the three pairs on this walk whose two
+    directions disagree are all refused before reciprocity is ever
+    compared -- (1,50) and (12,46) on `cameras` (2 < 3), (5,6) on
+    `span_over_depth` (0.043 < 0.09). So a test that merely asserted
+    "these disagreeing pairs are not admitted" passed with the
+    reciprocity gate DISABLED ENTIRELY: setting
+    `max_reciprocity_error=10.0` left every real-walk test green and
+    reddened only three synthetic ones.
+
+    Relaxing `min_cameras` and `min_span_over_depth` moves reciprocity to
+    the front of the queue, and then the walk refuses those three pairs
+    ON RECIPROCITY, in its own words:
+
+        (1, 50)  0.89440  "the two directions disagree on scale by 1.12x"
+        (5,  6)  0.70716  "... by 1.41x"
+        (12,46)  1.35588  "... by 1.36x"
+
+    Relaxing changes no verdict: the admitted set is `[[4,5],[5,32]]`
+    here exactly as it is on the shipped thresholds, which is asserted
+    below rather than assumed.
     """
-    from scripts import world_registration as wr
-
     store = _real_store()
     session_ids = store.list_session_ids(REAL_WORLD)
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(
-            wr, "pair_is_hopeless",
-            lambda source, target, thresholds: None,
-        )
-        try:
-            return wr.register(store, REAL_WORLD, session_ids[0])
-        except SupportMissingError as error:
-            pytest.skip(str(error))
+    try:
+        return register(store, REAL_WORLD, session_ids[0], RECIPROCITY_IS_DECISIVE)
+    except SupportMissingError as error:
+        pytest.skip(str(error))
 
 
 @pytest.mark.slow
@@ -763,12 +774,21 @@ class TestTheRealWalk:
         safety test fail on a change that only ever made the pipeline
         refuse EARLIER.
 
-        What the file needs from that assertion -- that this loop cannot
-        quietly pass over an empty list forever -- is now carried by
-        `test_the_reciprocity_clause_is_actually_evaluated` on this
-        report, and the real-corpus disagreement it used to rely on is
-        exercised for real by
-        `test_the_walk_still_contains_a_disagreeing_pair_and_refuses_it`.
+        HONEST STATUS ON THE SHIPPED THRESHOLDS: this loop's body runs
+        ZERO times on today's corpus. The only two finite reciprocities
+        here are 1.03890 and 0.95582, both well inside the 0.10 band, so
+        there is nothing for it to refuse. It is kept because it is the
+        property, and because it costs nothing to keep a rule that will
+        matter the moment the corpus changes -- but it is NOT where this
+        clause is proven. That is
+        `test_a_disagreeing_pair_is_refused_on_reciprocity_itself`, which
+        moves reciprocity to the front of `admit()`'s queue so the real
+        walk exercises it decisively, and the three synthetic tests in
+        `TestFitQualityCannotAdmit`.
+
+        Said out loud because the first version of this file implied the
+        opposite, and a reviewer had to disable the reciprocity gate
+        entirely to discover that every real-walk test stayed green.
         """
         for pair in report["pairs"]:
             if pair["reciprocity"] is None:
@@ -819,24 +839,22 @@ class TestTheRealWalk:
                     "disagreement clause, it bypasses it"
                 )
 
-    def test_the_walk_still_contains_a_disagreeing_pair_and_refuses_it(
-        self, report_without_the_span_prune
+    def test_a_disagreeing_pair_is_refused_on_reciprocity_itself(
+        self, report_where_reciprocity_decides
     ):
-        """The real-corpus disagreement, recovered from behind the prune.
+        """The real corpus refusing a pair ON RECIPROCITY, in its own words.
 
-        With `pair_is_hopeless` neutralised, the pairs it removes reach a
-        directional solve and get their two scales compared -- which is
-        where this walk's disagreements live. (5,6), the pair the
-        research note records at a reciprocity of 0.63, is one of them.
-        Every such pair must still be refused.
+        The version of this test that shipped first asserted only that
+        the disagreeing pairs were not admitted -- and a reviewer showed
+        that assertion held with `max_reciprocity_error` set to 10.0,
+        i.e. with the clause switched off, because `cameras` and
+        `span_over_depth` refuse all three of them first.
 
-        Existential HERE and not on the pruned report, because here it is
-        a claim about the gate rather than about which clause happens to
-        fire first: with nothing pruned, every candidate pair is offered
-        to `admit()`, so if the walk contains disagreeing evidence at all
-        this is where it must show up.
+        So this asserts the REASON, not just the outcome. With the two
+        cheaper clauses relaxed to their floor, reciprocity is what
+        decides, and the message the gate writes says so.
         """
-        report = report_without_the_span_prune
+        report = report_where_reciprocity_decides
         disagreeing = [
             p for p in report["pairs"]
             if p["reciprocity"] is not None
@@ -844,37 +862,53 @@ class TestTheRealWalk:
         ]
 
         assert disagreeing, (
-            "no pair on the unpruned real walk disagrees between its two "
-            "directions; the corpus that this property was measured on "
-            "no longer exercises it, so the check below proves nothing"
+            "no pair on the real walk disagrees between its two directions "
+            "even with the cheaper clauses relaxed; the corpus this "
+            "property was measured on no longer exercises it, and the "
+            "checks below prove nothing"
         )
         for pair in disagreeing:
             assert not pair["registered"], (
                 f"pair {tuple(pair['pair'])} was admitted with a "
                 f"reciprocity of {pair['reciprocity']}"
             )
+            assert "directions disagree on scale" in pair["reason"], (
+                f"pair {tuple(pair['pair'])} was refused for "
+                f"{pair['reason']!r} rather than on reciprocity, so this "
+                "test is not exercising the clause it names"
+            )
 
-    def test_the_cheap_prune_admits_exactly_what_the_gate_admits(
-        self, report, report_without_the_span_prune
+    def test_the_cheap_clauses_change_no_verdict(
+        self, report, report_where_reciprocity_decides
     ):
-        """The prune must move a refusal earlier, never make one.
+        """`pair_is_hopeless` and its two neighbours move refusals, never make them.
 
-        `pair_is_hopeless` exists for speed and shares `admit()`'s span
-        bar precisely so it cannot change a verdict. This is the check
-        that the sharing holds on the real walk: if the prune ever
-        removed a pair the gate would have taken, or stopped removing one
-        it should, these two sets would part. It is also what makes the
-        pruned report's silence about disagreeing pairs safe to accept --
-        the pairs it drops are dropped, not admitted unexamined.
+        The prune exists for speed and shares `admit()`'s span bar
+        precisely so it cannot change an outcome; `min_cameras` and
+        `min_span_over_depth` are the clauses ahead of reciprocity. If
+        relaxing them admitted anything new -- or the prune ever dropped
+        a pair the gate would have taken -- these two runs would part.
+
+        This is also what makes the shipped report's SILENCE about
+        disagreeing pairs safe to accept: the pairs it never scores are
+        dropped, not admitted unexamined.
         """
-        pruned = {tuple(p) for p in report["admitted_pairs"]}
-        unpruned = {
-            tuple(p) for p in report_without_the_span_prune["admitted_pairs"]
+        shipped = {tuple(p) for p in report["admitted_pairs"]}
+        relaxed = {
+            tuple(p) for p in report_where_reciprocity_decides["admitted_pairs"]
         }
 
-        assert pruned == unpruned, (
-            f"the prune changed a verdict: it admits {sorted(pruned)} where "
-            f"the gate alone admits {sorted(unpruned)}"
+        assert shipped == relaxed, (
+            f"the cheap clauses changed a verdict: shipped admits "
+            f"{sorted(shipped)} where the relaxed gate admits {sorted(relaxed)}"
+        )
+        assert (
+            report["reference_segment"]
+            == report_where_reciprocity_decides["reference_segment"]
+        )
+        assert (
+            report["points_registered"]
+            == report_where_reciprocity_decides["points_registered"]
         )
 
     def test_a_segment_that_stood_still_is_named_as_such(self, report):
