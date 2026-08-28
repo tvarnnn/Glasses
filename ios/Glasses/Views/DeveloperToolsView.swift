@@ -33,6 +33,7 @@ struct DeveloperToolsView: View {
                 senderSection
                 deviceHealthSection
                 mockDeviceSection
+                captureResolutionSection
                 rawStateSection
                 towerSection
                 placeholderSection
@@ -207,6 +208,58 @@ struct DeveloperToolsView: View {
         }
     }
 
+    // MARK: Capture resolution
+
+    /// Chooses the rung the next capture session requests.
+    ///
+    /// This exists so a Document Memory experiment can be run on a device
+    /// without an edit-and-rebuild. The app hardcoded `.low`, and Document
+    /// Memory's premise cannot be tested at 360x640 — its word recall is
+    /// 0.429-0.810 there against 0.957-1.000 at 1280x720. Raising the rung
+    /// globally is not the answer either: 73.3% of 720p frames fall below
+    /// World Builder's absolute `min_sharpness` and are rejected as blurred.
+    /// That conflict is a cross-cartridge decision, so this stays a developer
+    /// control rather than becoming a product setting. See
+    /// `docs/agent-handoffs/TOWER-LANE-HANDOFF-FROM-MAC.md` 2.3.
+    ///
+    /// The picker is disabled on `isCaptureSessionClaimed` rather than on
+    /// `isCaptureEngaged`, and the difference is the whole point.
+    /// `StreamConfiguration` is consumed once by `addCamera(config:)` and DAT
+    /// offers no way to renegotiate a live stream, so the control must be
+    /// locked whenever a session is *held* — not merely whenever capture is
+    /// actively running. `isCaptureEngaged` is false during `.paused` and
+    /// `.stopping`, and a change accepted in either window is silently dropped
+    /// by `beginCameraStream`'s `guard camera == nil` while this panel goes on
+    /// displaying the rung that was never requested. That is exactly the state
+    /// the UI asserts and the system does not hold.
+    private var captureResolutionSection: some View {
+        Section {
+            Picker("Next session", selection: $glasses.captureResolution) {
+                ForEach(CaptureResolutionPreference.allCases) { rung in
+                    Text(rung.shortLabel).tag(rung)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(glasses.isCaptureSessionClaimed)
+
+            LabeledContent("DAT declares", value: glasses.captureResolution.declaredSizeDescription)
+        } header: {
+            Text("Capture Resolution")
+        } footer: {
+            Text(captureResolutionFooter)
+        }
+    }
+
+    /// Says which of the two situations the reader is in, rather than one
+    /// sentence covering both. A footer that explains the disabled case while
+    /// the control is enabled reads as a control that is broken.
+    private var captureResolutionFooter: String {
+        if glasses.isCaptureSessionClaimed {
+            return "A capture session is still held — including while it is paused or stopping. DAT fixes the resolution when the stream is created and cannot renegotiate it, so changing this now could not take effect. Stop capture and wait for it to finish."
+        }
+        return "Applies when capture next starts, and resets to Low when the app relaunches. Low is the rung every existing measurement was taken at. Raising it harms World Builder tracking and helps Document Memory's OCR — but the axis that matters most is privacy: frames reach the Tower at this resolution and are never downscaled, and while the Tower's dataset recorder is armed every one is written to disk unredacted. A higher rung means more identifiable bystanders in that recording. It is a developer control, not a product setting."
+    }
+
     // MARK: Raw state
 
     private var rawStateSection: some View {
@@ -248,10 +301,205 @@ struct DeveloperToolsView: View {
             // information here, not a discrepancy, but only if the label says
             // which is which.
             LabeledContent("Frame Results (this bracket)", value: "\(tower.frameResultCount)")
+
+            towerHealthRows
+
+            Button(isCheckingHealth ? "Checking…" : "Check Tower State") {
+                tower.refreshHealth()
+            }
+            .disabled(isCheckingHealth)
         } header: {
             Text("Tower")
         } footer: {
-            Text("The endpoint is compiled in and read-only. A configurable endpoint is a separate task.")
+            Text(Self.towerFooter)
+        }
+    }
+
+    private var isCheckingHealth: Bool {
+        if case .fetching = tower.healthState { return true }
+        return false
+    }
+
+    /// A constant, hoisted off the view so it is not rebuilt on every render of
+    /// a sheet that redraws at the Tower's reply rate while it is open.
+    private static let towerFooter =
+        "The endpoint is compiled in and read-only. A configurable endpoint is a separate task. Everything below \"Frame Results\" is the Tower's own answer to GET /health at the moment the button was pressed — nothing polls, so it does not update on its own. \"\(Self.notSaid)\" means the field was missing from that answer, which is not a no and is not a zero. The dataset recorder is armed by the Tower's own TOWER_CAPTURE_ROOT setting when the Tower starts, and there is no way to arm or stop it from this app — which is why there is no control here, only a reading. While it is recording, every frame this phone sends is written to the Tower's disk unredacted."
+
+    // MARK: What the Tower says about itself
+
+    /// The wording for a field the Tower's health report did not contain.
+    ///
+    /// Not "—", and never "No" or "0". The question these rows exist to answer
+    /// is "is the Tower writing my frames to disk right now?", and a missing
+    /// field rendered as a reassuring `false` would answer it wrongly in the
+    /// one direction that matters.
+    private static let notSaid = "The Tower did not say"
+
+    /// The Tower's own state, in the four states this app can be in about it.
+    ///
+    /// "Nobody has asked", "we are asking", "here is what it said" and "we
+    /// asked and could not find out" are four different things, and a screen
+    /// that draws the first and the last the same way has turned a failure
+    /// into silence. Each gets its own rows.
+    @ViewBuilder private var towerHealthRows: some View {
+        switch tower.healthState {
+        case .notFetched:
+            LabeledContent("Tower State", value: "Not checked")
+
+        case .fetching:
+            LabeledContent("Tower State", value: "Checking…")
+
+        case .failed(let error, let at):
+            LabeledContent("Tower State", value: "Could not be read")
+            LabeledContent("Why") {
+                Text(Self.explain(error))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.trailing)
+            }
+            LabeledContent("Asked At", value: Self.clockTime(at))
+
+        case .fetched(let health, let at):
+            LabeledContent("Service", value: Self.serviceText(health))
+            LabeledContent("Module", value: Self.moduleText(health))
+            captureRows(health.capture)
+            workerRows(health.captureWorkers)
+            LabeledContent("Asked At", value: Self.clockTime(at))
+        }
+    }
+
+    /// The dataset recorder, which is the reason any of this is on screen.
+    ///
+    /// The three non-`present` cases are kept apart deliberately: "no recorder
+    /// is registered" is the Tower stating a fact about itself and is the only
+    /// one of the three that means the frames are definitely not being kept.
+    @ViewBuilder
+    private func captureRows(_ capture: TowerReported<TowerCaptureState>) -> some View {
+        switch capture {
+        case .unreported:
+            LabeledContent("Dataset Recorder", value: Self.notSaid)
+        case .absent:
+            LabeledContent("Dataset Recorder", value: "None registered")
+        case .unreadable:
+            LabeledContent("Dataset Recorder", value: "Answered in a shape this app cannot read")
+        case .present(let state):
+            LabeledContent(
+                "Dataset Recorder",
+                value: Self.said(state.armed, yes: "Armed", no: "Not armed")
+            )
+            LabeledContent(
+                "Recording Now",
+                value: Self.said(state.recording, yes: "Yes — writing to disk", no: "No")
+            )
+            captureIDRow(state.captureID)
+            LabeledContent(
+                "Frames Written", value: state.framesWritten.map(String.init) ?? Self.notSaid
+            )
+            LabeledContent("Bytes Written", value: Self.bytesText(state.bytesWritten))
+            if let error = state.error {
+                // Sits beside an "Armed" that is still true: the Tower knows a
+                // recorder is registered and could not read the rest.
+                LabeledContent("Recorder Fault", value: error)
+            }
+        }
+    }
+
+    /// The recording the counts belong to — and the three different answers a
+    /// single Optional used to render as two.
+    ///
+    /// A `capture_id` of `null` is the Tower stating that its recorder has not
+    /// opened a recording yet, and it always sends the key when it sends a
+    /// `capture` object at all. Drawing that as "\(Self.notSaid)" told the
+    /// reader the Tower withheld the id when the Tower had answered plainly —
+    /// which is the field-level version of the mistake `TowerReported` exists
+    /// to prevent, on the one screen built to answer a privacy question.
+    @ViewBuilder
+    private func captureIDRow(_ captureID: TowerReported<String>) -> some View {
+        switch captureID {
+        case .unreported:
+            LabeledContent("Recording ID", value: Self.notSaid)
+        case .absent:
+            LabeledContent("Recording ID", value: "No recording opened yet")
+        case .unreadable:
+            LabeledContent("Recording ID", value: "Answered in a shape this app cannot read")
+        case .present(let id):
+            LabeledContent("Recording ID", value: id)
+        }
+    }
+
+    /// Whether anything on the Tower is following the capture. `Enabled` with
+    /// no workers is correct between walks and wrong during one, which is why
+    /// the count is shown rather than folded into a yes/no.
+    @ViewBuilder
+    private func workerRows(_ workers: TowerReported<TowerCaptureWorkers>) -> some View {
+        switch workers {
+        case .unreported:
+            LabeledContent("Capture Followers", value: Self.notSaid)
+        case .absent:
+            LabeledContent("Capture Followers", value: "None registered")
+        case .unreadable:
+            LabeledContent("Capture Followers", value: "Answered in a shape this app cannot read")
+        case .present(let state):
+            LabeledContent(
+                "Capture Followers",
+                value: Self.said(state.enabled, yes: "Enabled", no: "Disabled")
+            )
+            LabeledContent(
+                "Followers Running", value: state.workerCount.map(String.init) ?? Self.notSaid
+            )
+            if let error = state.error {
+                LabeledContent("Follower Fault", value: error)
+            }
+        }
+    }
+
+    /// `nil` is the Tower's silence and gets said as such — the whole point of
+    /// keeping the field optional all the way from the wire to this row.
+    private static func said(_ flag: Bool?, yes: String, no: String) -> String {
+        guard let flag else { return notSaid }
+        return flag ? yes : no
+    }
+
+    private static func serviceText(_ health: TowerHealth) -> String {
+        guard let service = health.service else { return notSaid }
+        guard let version = health.version else { return service }
+        return "\(service) \(version)"
+    }
+
+    private static func moduleText(_ health: TowerHealth) -> String {
+        guard let id = health.moduleID else { return health.moduleState ?? notSaid }
+        guard let state = health.moduleState else { return id }
+        return "\(id) — \(state)"
+    }
+
+    private static func bytesText(_ bytes: Int?) -> String {
+        guard let bytes else { return notSaid }
+        return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+
+    /// The date, not just the clock time.
+    ///
+    /// Nothing ever clears `healthState`: it is written only by
+    /// `refreshHealth()` and is never reset on disconnect, reconnect, teardown
+    /// or backgrounding, and `TowerClient` lives for the app's lifetime. So a
+    /// reading taken yesterday afternoon survives intact, and with the date
+    /// omitted it rendered identically to one taken five minutes ago — on the
+    /// one screen built to answer "is the Tower writing my frames to disk
+    /// **right now**?".
+    ///
+    /// A relative "3 minutes ago" would read better and would need a timer to
+    /// stay true; a stamp that is simply complete needs nothing and cannot go
+    /// stale, because it never claimed to be current in the first place.
+    private static func clockTime(_ date: Date) -> String {
+        date.formatted(date: .abbreviated, time: .standard)
+    }
+
+    private static func explain(_ error: TowerHealthFetchError) -> String {
+        switch error {
+        case .undecodable:
+            return "The Tower answered, and the answer could not be read as a health report. Nothing is shown rather than something guessed."
+        case .transport(let description):
+            return "The Tower did not answer: \(description)"
         }
     }
 

@@ -1,9 +1,16 @@
-"""A facing estimate that costs 744 ms must carry its age.
+"""A facing estimate whose cost depends on the device must carry its age.
 
-The whole reason orientation runs at a cadence rather than per frame is
-that it costs 23x the detector on this CPU. That makes every estimate
-stale by construction, and a consumer that cannot see how stale is being
-told something false with a true-looking shape.
+Orientation runs at a cadence rather than per frame, and the estimates it
+produces are stale by construction. The original reason -- "it costs 23x
+the detector on this CPU" -- was measured on CPU with synthetic input and
+is now known to be wrong in both directions: 43.4 ms on CUDA (1.43x the
+detector) and 956.4 ms on CPU (29.1x), against a delivered frame interval
+of 83.5 ms rather than the ~300 ms the docs assumed.
+
+The age field survives that correction because CPU is still the default
+device at 11.5x the frame interval, and because `age_estimate`'s clamp
+guards a clock bug no GPU touches. A consumer that cannot see how stale
+an estimate is being told something false with a true-looking shape.
 
 These tests use `FixedPoseEstimator`, so the keypoint visibility pattern
 -- and therefore the correct facing state -- is chosen here rather than
@@ -15,7 +22,12 @@ import pytest
 
 from tower.confidence import Confidence
 from tower.scene.detect import FixedDetector
-from tower.scene.engine import SceneEngine
+from tower.scene.engine import (
+    DELIVERED_FRAME_INTERVAL_S,
+    ORIENTATION_FRAME_STRIDE,
+    ORIENTATION_INTERVAL_S,
+    SceneEngine,
+)
 from tower.scene.orientation import (
     MAX_ESTIMATE_AGE_S,
     FixedPoseEstimator,
@@ -55,7 +67,11 @@ def _engine(pose, interval=2.0):
 
 class TestTheEstimateIsRunAtACadence:
     def test_it_does_not_run_on_every_frame(self):
-        """744 ms per frame is 2.5x the interval the glasses deliver."""
+        """Explicitly at the old 2.0 s interval, not the default.
+
+        Pinned here so this test keeps testing the cadence MECHANISM
+        rather than whatever the cadence constant currently is.
+        """
         pose = FixedPoseEstimator([[(BoundingBox(*PERSON_BOX), FACING)]])
         engine = _engine(pose, interval=2.0)
 
@@ -318,3 +334,66 @@ class TestAgeIsPerTrackNotPerRun:
         person = state.of_class("person")[0]
         assert person.facing.state == FACING_UNKNOWN
         assert person.facing_estimated_at is None
+
+
+class TestTheCadenceIsDerivedNotGuessed:
+    """The cadence constant must show its arithmetic.
+
+    `ORIENTATION_INTERVAL_S` was 2.0 s, justified by a 744 ms per-call
+    cost against a "~300 ms" delivered frame interval. Measurement on 754
+    real corpus frames disproved both numbers: the call is 43.4 ms on
+    CUDA (956.4 ms on CPU) and the corpus's own `frames.jsonl` puts the
+    delivered interval at 83.5 ms, not 300 ms.
+
+    So these tests pin the cadence to the frame interval it is derived
+    FROM, not to a literal. A successor who changes one of the two must
+    change the other deliberately, and a successor who restores 2.0 s
+    finds out here why that was never a free choice.
+    """
+
+    def test_the_delivered_frame_interval_is_the_measured_one(self):
+        """83.5 ms == 12.0 fps, from the corpus receipt timestamps."""
+        assert DELIVERED_FRAME_INTERVAL_S == pytest.approx(0.0835)
+        assert 1.0 / DELIVERED_FRAME_INTERVAL_S == pytest.approx(12.0, abs=0.05)
+
+    def test_the_cadence_is_a_whole_number_of_delivered_frames(self):
+        """Not a round-looking literal -- a stride times the interval."""
+        assert ORIENTATION_FRAME_STRIDE == int(ORIENTATION_FRAME_STRIDE)
+        assert ORIENTATION_INTERVAL_S == pytest.approx(
+            ORIENTATION_FRAME_STRIDE * DELIVERED_FRAME_INTERVAL_S
+        )
+
+    def test_the_stride_is_one_tracker_confirmation_window(self):
+        """The reason the stride is 3 and not some other small number.
+
+        `TrackerPolicy.min_hits` is how many consecutive frames a track
+        must be seen before it is confirmed at all. Estimating facing
+        more often than a track can be confirmed buys nothing; estimating
+        it less often means a track can be confirmed, reported and
+        dropped without its facing ever being measured once.
+        """
+        assert ORIENTATION_FRAME_STRIDE == TrackerPolicy.min_hits
+
+    def test_the_two_second_cadence_would_fail_this_derivation(self):
+        """The constant this replaced, checked rather than described.
+
+        2.0 s is 24 delivered frames -- eight confirmation windows, and
+        four times the 6.0 s expiry away from a fresh reading. It is not
+        a stride the derivation can produce.
+        """
+        old_stride = 2.0 / DELIVERED_FRAME_INTERVAL_S
+
+        assert old_stride > TrackerPolicy.min_hits
+        assert ORIENTATION_INTERVAL_S != pytest.approx(2.0)
+        assert ORIENTATION_INTERVAL_S < MAX_ESTIMATE_AGE_S / 10
+
+    def test_the_measured_call_fits_inside_the_cadence_on_cuda(self):
+        """43.4 ms median, 50.6 ms p95, into a ~250 ms window.
+
+        Orientation's share of wall clock drops from 52% if it ran per
+        frame to under a fifth at this cadence, which is what leaves the
+        detector's own 30.4 ms room inside the 83.5 ms budget.
+        """
+        cuda_p95_s = 0.0506
+
+        assert cuda_p95_s < ORIENTATION_INTERVAL_S / 4

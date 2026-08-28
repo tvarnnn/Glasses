@@ -20,7 +20,69 @@ def health(request: Request) -> dict:
         "module_state": container.state.value,
         "module_id": container.descriptor.id,
         "capture": _capture_state(request.app),
+        "capture_workers": _worker_state(request.app),
+        "cartridge_sessions": _session_state(request.app),
     }
+
+
+def _session_state(app) -> dict | None:
+    """What each controllable cartridge was asked to do, and what happened.
+
+    Separate from `capture_workers`, and the separation is the point:
+    that block reports processes, this one reports INTENT. An operator
+    debugging "the phone says it is remembering and the store is not
+    growing" needs to see both, because the answer is the gap between
+    them.
+
+    Never raises. /health is how an operator learns the Tower is unwell;
+    it must not itself fail because a subsystem is broken.
+    """
+    sessions = getattr(app.state, "cartridge_sessions", None)
+    if not sessions:
+        return None
+    state = {}
+    for cartridge, session in sessions.items():
+        try:
+            state[cartridge] = session.snapshot()
+        except Exception:
+            logger.exception(
+                "[Tower][Health] could not read the %s session", cartridge
+            )
+            state[cartridge] = {"error": "unavailable"}
+    return state
+
+
+def _worker_state(app) -> dict | None:
+    """Whether anything is turning captures into anything.
+
+    Answers "why isn't World Builder changing?" from another machine.
+    The Tower is normally operated over Tailscale, where a server-side
+    log line is invisible, and on 2026-08-24 the only way to establish
+    that nothing was following the capture was to notice that no world
+    directory had appeared.
+
+    `enabled: false` -- nothing is configured to follow a capture.
+    `workers: []` with `enabled: true` -- configured, nothing running
+    right now, which is correct between walks and wrong during one.
+
+    `configured` names WHICH workers this Tower knows how to run, which
+    `enabled` cannot: with more than one spec, "something is configured"
+    stopped being an answer to "is a builder configured". A worker that
+    appears in `configured` and never in `workers` during a walk is the
+    shape of every failure this block exists to make visible.
+    """
+    supervisor = getattr(app.state, "capture_workers", None)
+    if supervisor is None:
+        return None
+    try:
+        return {
+            "enabled": supervisor.enabled,
+            "configured": list(supervisor.worker_names()),
+            "workers": supervisor.status(),
+        }
+    except Exception:
+        logger.exception("[Tower][Health] could not read worker state")
+        return {"error": "unavailable"}
 
 
 def _capture_state(app) -> dict | None:

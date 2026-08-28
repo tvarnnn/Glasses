@@ -95,6 +95,9 @@ struct CartridgeStatePanel: View {
         // headline and the icon are what a person actually reads first, and
         // they used to say the same thing for both.
         case .disconnected: return "Not connected"
+        // Names the action, because there is one. The other empty states are
+        // all "wait"; this is the only one a person can end themselves.
+        case .needsUpdate: return "Update needed"
         case .idle: return "Not started"
         case .waiting: return "Waiting"
         case .live: return "Working"
@@ -110,6 +113,7 @@ struct CartridgeStatePanel: View {
         // user can act on, and those two do not.
         case .unsupported, .idle: return "circle.dashed"
         case .disconnected: return "wifi.slash"
+        case .needsUpdate: return "arrow.down.circle"
         case .waiting: return "clock"
         case .live: return "dot.radiowaves.left.and.right"
         case .settled: return "checkmark.circle"

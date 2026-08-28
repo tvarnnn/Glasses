@@ -8,9 +8,17 @@ and on acceptance persists one keyframe. It never calls a geometry
 backend.
 
 ``build()`` runs at stop time, reads the persisted keyframe journal back,
-and does the expensive reconstruction. It is never reachable from the
-frame path, which is what keeps a multi-second reconstruction off the
-event loop.
+and writes the reconstruction. It is never reachable from the frame
+path, which is what keeps a multi-second write off the event loop.
+
+It used to be a full re-solve as well -- re-reading every keyframe,
+re-decoding every JPEG and re-detecting features on all N -- which made
+a walk rebuilt every k keyframes cost O(N^2/k), so asking for MORE live
+updates cost more than the walk. It now extends one live solve as each
+keyframe is accepted (see _LiveSolve) and a rebuild is a flush. The
+from-scratch path is still here and still correct: it is what a cold
+rebuild, a re-derive, and any keyframe set this engine did not itself
+observe fall back to.
 
 That split is also why live-versus-offline is a *driver* choice rather
 than an architecture choice: the offline script calls exactly the same
@@ -101,6 +109,62 @@ class BuildResult:
     diagnostics: dict = field(default_factory=dict)
 
 
+# How many consecutive segments may produce NOTHING before a solve break
+# stops being allowed to start another one.
+#
+# Two earlier rules were measured and refused, both for the same reason.
+#
+# `MIN_SOLVED_BEFORE_RESTART = 2` (restart only if the broken chain had
+# solved two poses) leaves the cascade fully intact for the case that
+# matters most: when the SEED PAIR fails the chain has solved nothing --
+# the anchor is not a solved pose -- so no threshold >= 1 is ever met.
+# Measured on capture 4fea31e2, one seed-pair failure stranded 48 of 50
+# keyframes.
+#
+# `MIN_KEYFRAMES_BEFORE_RESTART` (wait for N keyframes) fails for a
+# subtler reason: `chain_broken` is an EDGE. Decline the restart at that
+# instant and no second opportunity ever arrives, however many keyframes
+# accumulate. Swept at 3, 4, 6 and 8 it reproduced the solved-pose
+# numbers exactly and never recovered 4fea31e2.
+#
+# Delay is the wrong axis anyway. Once a chain is broken every further
+# keyframe in that segment is refused without geometry, so waiting buys
+# nothing -- the only real question is whether restarting is worth it.
+#
+# It is worth it unless the region has already proven unmappable. A
+# segment that ends having solved NOTHING is that evidence. At 1, a
+# restart is allowed unless the segment immediately before it produced
+# nothing -- so a region that is building geometry restarts freely, and
+# genuinely untrackable footage stops after one wasted attempt instead of
+# shattering into dozens of two-keyframe shards.
+#
+# THE VALUE IS CHOSEN ON MARGINAL EFFICIENCY, measured over the pinned
+# eight. Every larger cap buys more geometry and costs more fragments,
+# monotonically, with no knee -- so the question is what each added
+# fragment card is worth:
+#
+#   cap   segments   solved   points   poses per ADDED segment
+#     -        127      346    47429   (baseline)
+#     1        230      591    75369   2.38
+#     2        306      695    86230   1.95
+#     3        360      749    91130   1.73
+#  none        470      863   107005   1.51
+#
+# The return declines monotonically, so 1 is where a fragment card buys
+# the most reconstruction.
+#
+# What settled it against a larger cap: REGISTRATION IS INVARIANT across
+# the whole range. On e1c52b9f, caps of 1, 2 and none all produce exactly
+# the same registered cluster -- 3 segments, 5603 points, the same two
+# admitted pairs. The extra fragments buy raw geometry, not cross-segment
+# coherence, so paying more fragment cards for them is a bad trade while
+# the viewer cannot rank or collapse them.
+#
+# The larger caps remain available and are worth revisiting the moment
+# fragments can be ranked: the uncapped variant is +517 solved poses over
+# baseline and grows the largest single coherent piece 28656 -> 32756.
+MAX_BARREN_SEGMENTS = 1
+
 class WorldBuilderEngine:
     def __init__(
         self,
@@ -129,7 +193,14 @@ class WorldBuilderEngine:
         self._tracker: FrameTracker | None = None
         self._events: EventLog | None = None
         self._segment_index = 0
+        self._segment_solved = 0
+        self._barren_segments = 0
+        self._segments_used: set[int] = set()
         self._rejected: dict[str, int] = {}
+        # Survives stop_session() on purpose: the usual order is
+        # observe... stop_session() build(), and throwing the solve away
+        # at stop would put the whole cost straight back.
+        self._live: _LiveSolve | None = None
 
     # -- lifecycle -----------------------------------------------------
 
@@ -188,8 +259,15 @@ class WorldBuilderEngine:
             self._store, world_id, session.session_id, clock=self._clock
         )
         self._segment_index = 0
+        # Reset with its sibling. start_session resets every other piece
+        # of per-session state; leaving this one behind let a new
+        # session inherit a restart budget the previous one earned.
+        self._segment_solved = 0
+        self._barren_segments = 0
+        self._segments_used: set[int] = set()
         self._rejected = {}
         self._events.append("session_started", {"frame_source": frame_source})
+        self._open_live_solve(session)
         return session.session_id
 
     def observe(
@@ -230,6 +308,16 @@ class WorldBuilderEngine:
             self._tracker.reset()
             self._selector.note_lost()
             self._segment_index += 1
+            # A new segment starts with nothing solved. Without this the
+            # restart budget would be inherited from the segment that
+            # just died.
+            self._segment_solved = 0
+            # A tracking loss is not evidence that the region is
+            # unmappable -- the wearer moved too fast, that is all. It
+            # must not spend the restart budget.
+            self._barren_segments = 0
+            if self._live is not None:
+                self._live.close_segment(self._segment_index)
             self._note_rejected(decision.reason)
             self._events.append(
                 "tracking_lost", {"segment_index": self._segment_index}
@@ -240,7 +328,7 @@ class WorldBuilderEngine:
             self._note_rejected(decision.reason)
             return self._result(decision.outcome, decision.reason)
 
-        keyframe = self._persist_keyframe(
+        keyframe, image_bytes = self._persist_keyframe(
             gray_shape=gray.shape,
             raw_bytes=raw_bytes,
             received_at=received_at,
@@ -251,12 +339,83 @@ class WorldBuilderEngine:
             motion=motion,
             reason=decision.reason,
         )
+        chain_broke_pending = False
+        if self._live is not None:
+            # The REDACTED bytes, because those are what landed on disk
+            # and therefore what build() decodes. Feeding `gray` here
+            # would solve against pixels no rebuild can ever reproduce --
+            # redaction costs about 9% of the point cloud when a face is
+            # in frame, so the two would quietly disagree. `is` because
+            # redact() hands back the very object it was given whenever
+            # it changed nothing, which is the overwhelmingly common case
+            # and makes this free.
+            step = self._live.extend(
+                keyframe.keyframe_id,
+                gray if image_bytes is raw_bytes else decode_gray(image_bytes),
+            )
+            if step is not None and step.pose.status == POSE_STATUS_SOLVED:
+                self._segment_solved += 1
+            if (
+                step is not None
+                and step.chain_broken
+                and self._barren_segments < MAX_BARREN_SEGMENTS
+            ):
+                # The solve chain failed on this keyframe. Everything
+                # after it shares no coordinate frame with what came
+                # before -- which is precisely what a segment boundary
+                # means here, and what the comment on the tracking-loss
+                # increment above already says.
+                #
+                # Without this, `chain.broken` latches and every later
+                # keyframe in the segment is refused WITHOUT ORB
+                # detection, matching, or any geometry attempted.
+                # Measured on capture 22e9d428: 354 refusals from 26
+                # decisions, 328 cascade, 0 of 26 segments ever
+                # recovering. classical.py has claimed for a long time
+                # that "the engine turns this into a new segment"; it did
+                # not, and this makes the claim true.
+                #
+                # The tracker keeps its reference. Tracking is healthy;
+                # only the solve failed, and discarding the reference
+                # would manufacture a tracking loss out of a geometry
+                # failure -- measured at 424 -> 389 solved poses when the
+                # reference is genuinely lost here.
+                #
+                # Honest note: inserting a reset at THIS line is an
+                # equivalent mutation, because set_reference() below runs
+                # unconditionally and re-establishes it. The invariant is
+                # real and worth stating; this position does not enforce
+                # it. The test asserts the outcome (the tracker still has
+                # a reference), not this line.
+                # A segment that ends having solved nothing is evidence
+                # the region is unmappable; a run of them stops further
+                # restarts. One that produced geometry clears the count.
+                self._barren_segments = (
+                    self._barren_segments + 1 if self._segment_solved == 0 else 0
+                )
+                self._segment_index += 1
+                self._segment_solved = 0
+                self._live.close_segment(self._segment_index)
+                chain_broke_pending = True
+
+        self._segments_used.add(keyframe.segment_index)
         self._tracker.set_reference(gray)
         self._selector.note_accepted()
         self._session = replace(
             self._session,
             keyframes_accepted=self._session.keyframes_accepted + 1,
         )
+        if chain_broke_pending:
+            # AFTER the keyframe it belongs to. `tracking_lost` always
+            # precedes the keyframes of the segment it announces, because
+            # that branch returns before persisting. This one cannot: the
+            # breaker was already stamped with the OLD index. Emitting it
+            # first inverted the convention, so a consumer rebuilding
+            # segmentation from the journal misattributed exactly one
+            # keyframe per break.
+            self._events.append(
+                "solve_chain_broken", {"segment_index": self._segment_index}
+            )
         self._events.append(
             "keyframe_accepted",
             {
@@ -288,7 +447,10 @@ class WorldBuilderEngine:
             frames_observed=session.frames_observed,
             keyframes_accepted=session.keyframes_accepted,
             rejected_by_reason=dict(self._rejected),
-            segments=self._segment_index + 1,
+            # Distinct indices that received a keyframe, NOT the
+            # high-water mark -- see _segments_used. This is the same
+            # quantity build() reports, so the two cannot disagree.
+            segments=len(self._segments_used),
             end_reason=reason,
         )
         self._session = None
@@ -311,7 +473,15 @@ class WorldBuilderEngine:
         session = self._store.read_session(world_id, session_id)
         keyframes = self._store.read_keyframes(world_id, session_id)
         _require_matching_resolution(session, keyframes)
-        selection = select_backend(self._backend_name, session.intrinsics)
+        # Silent here, deliberately. `_open_live_solve` already announced
+        # this at session start, where an operator can still act on it,
+        # and build() now runs once per rebuild -- so announcing here
+        # turns one actionable warning into one per rebuild. The
+        # selection itself is unchanged and still recorded on the
+        # session below.
+        selection = select_backend(
+            self._backend_name, session.intrinsics, announce=False
+        )
         backend = selection.backend
         backend.prepare(session.intrinsics)
 
@@ -344,34 +514,132 @@ class WorldBuilderEngine:
         # doubles, triples, and so on.
         self._store.clear_edges(world_id, session_id)
 
+        # Segment -> (keyframe ids fed, estimate). Empty for a cold
+        # rebuild, a different session, or a live solve that gave up.
+        solved_live = self._live_estimates(world_id, session_id, session, backend)
+
         poses_solved = poses_refused = 0
+        # `poses_refused` alone reads as N independent judgments about the
+        # world. It is not: once any pose in a segment is refused the
+        # chain latches and every later keyframe is refused WITHOUT ORB
+        # detection, matching, or any geometry being attempted. Measured
+        # on the real 33-segment world from capture 22e9d428: 354
+        # refusals, 26 root decisions, 328 cascaded, and 0 of 26 segments
+        # ever recovered. "26 chains died once" and "354 frames were each
+        # judged ungeometric" are different bugs with different fixes.
+        poses_refused_root = poses_refused_cascaded = 0
+        refusal_degeneracy: dict[str, int] = {}
+        refusals_by_segment: dict[int, dict] = {}
+        # Counted, not derived by subtraction. `keyframes - poses_refused`
+        # silently promotes every anchor to a camera position, and an
+        # anchor is definitional rather than measured: identity rotation,
+        # zero translation, by construction. On the 2026-08-24 physical
+        # walk that arithmetic turned 36 origin markers into "36 camera
+        # poses" on the phone while poses_solved was zero.
+        #
+        # An anchor IS a real position when the chain it anchors resolved
+        # -- it is that segment's origin, and dropping it would
+        # under-report every segment by one. So the rule is per segment,
+        # and it needs the per-segment solve count to state.
+        poses_anchor = 0
+        poses_positioned = 0
         total_points = 0
+        # Per segment, so a specific unreadable fragment can be chased
+        # without re-running the walk. Summed for the manifest.
+        discards_by_segment: dict[int, dict[str, int]] = {}
+        total_triangulated = 0
         segments = sorted({keyframe.segment_index for keyframe in keyframes})
 
         pose_rows: list[dict] = []
         point_rows: list[list[float]] = []
+        # [segment_index, frame_index, feature_index, point_index] per row.
+        # Flat integers rather than dicts: this table is several times
+        # longer than points.json's and carries no names worth repeating a
+        # few hundred thousand times.
+        support_rows: list[list[int]] = []
 
         for segment in segments:
             members = [k for k in keyframes if k.segment_index == segment]
             if not members:
                 continue
-            window = [
-                KeyframeInput(
-                    keyframe_id=keyframe.keyframe_id,
-                    image_gray=self._load_gray(world_id, session_id, keyframe),
-                )
-                for keyframe in members
-            ]
-            estimate = backend.estimate_window(window)
+            member_ids = tuple(keyframe.keyframe_id for keyframe in members)
+            carried = solved_live.get(segment)
+            if carried is not None and carried[0] == member_ids:
+                # The flush. Nothing is re-read, re-decoded or re-solved;
+                # this is the same estimate estimate_window() would
+                # return, which tests/test_world_builder_incremental.py
+                # pins bit-for-bit.
+                estimate = carried[1]
+            else:
+                # Whatever this engine did not observe itself: a cold
+                # rebuild, a re-derive, a session whose journal no longer
+                # matches what was fed. Ids are compared rather than
+                # counted because a matching count with different
+                # keyframes is exactly the failure worth catching.
+                window = [
+                    KeyframeInput(
+                        keyframe_id=keyframe.keyframe_id,
+                        image_gray=self._load_gray(world_id, session_id, keyframe),
+                    )
+                    for keyframe in members
+                ]
+                estimate = backend.estimate_window(window)
 
-            for keyframe, pose in zip(members, estimate.poses):
+            segment_solved = 0
+            segment_anchors = 0
+            first_refusal_index = None
+            first_refusal_degeneracy = None
+            solved_after_refusal = 0
+            for position, (keyframe, pose) in enumerate(
+                zip(members, estimate.poses)
+            ):
                 if pose.status == POSE_STATUS_SOLVED:
                     poses_solved += 1
-                elif pose.status != POSE_STATUS_ANCHOR:
+                    segment_solved += 1
+                elif pose.status == POSE_STATUS_ANCHOR:
+                    poses_anchor += 1
+                    segment_anchors += 1
+                else:
                     poses_refused += 1
+                    if first_refusal_index is None:
+                        first_refusal_index = position
+                        first_refusal_degeneracy = pose.degeneracy
+                        poses_refused_root += 1
+                        refusal_degeneracy[pose.degeneracy] = (
+                            refusal_degeneracy.get(pose.degeneracy, 0) + 1
+                        )
+                    else:
+                        poses_refused_cascaded += 1
+                if (
+                    pose.status == POSE_STATUS_SOLVED
+                    and first_refusal_index is not None
+                ):
+                    # Cannot happen while the chain latches. Counted anyway,
+                    # so that if a recovery mechanism is ever added its
+                    # effect is visible instead of being invisible.
+                    solved_after_refusal += 1
                 pose_rows.append(
                     self._pose_row(keyframe, pose, segment)
                 )
+            # An anchor counts as a position only if something in its
+            # segment actually solved against it. A lone anchor in a
+            # segment that resolved nothing is an origin marker for an
+            # empty coordinate frame.
+            poses_positioned += segment_solved
+            if segment_solved:
+                poses_positioned += segment_anchors
+
+            if first_refusal_index is not None:
+                refusals_by_segment[segment] = {
+                    "first_refusal_index": first_refusal_index,
+                    "degeneracy": first_refusal_degeneracy,
+                    # Keyframes the segment held but never attempted
+                    # geometry for, because the chain had already latched.
+                    "abandoned_keyframes": (
+                        len(members) - first_refusal_index - 1
+                    ),
+                    "recovered": solved_after_refusal > 0,
+                }
 
             for previous, current, pose in zip(
                 members, members[1:], estimate.poses[1:]
@@ -396,6 +664,17 @@ class WorldBuilderEngine:
                     ),
                 )
 
+            segment_discards = estimate.diagnostics.get("points_discarded") or {}
+            discards_by_segment[segment] = {
+                "low_parallax": int(segment_discards.get("low_parallax", 0)),
+                "high_reprojection": int(
+                    segment_discards.get("high_reprojection", 0)
+                ),
+            }
+            total_triangulated += int(
+                estimate.diagnostics.get("points_triangulated", 0)
+            )
+
             if estimate.points is not None:
                 # Tagged with the segment that produced them. Segments do
                 # NOT share a coordinate frame or a unit, so concatenating
@@ -406,6 +685,23 @@ class WorldBuilderEngine:
                     for xyz in estimate.points.xyz.tolist()
                 )
                 total_points += len(estimate.points)
+
+                # Which 2-D feature in which keyframe produced which of
+                # those points. Tagged with the same segment, and BOTH
+                # indices stay segment-local: `frame_index` is a position
+                # within this segment's ordered keyframes, so it joins
+                # against the poses this loop just appended, and
+                # `point_index` is a position within this segment's
+                # points, so it joins against the rows just above. Neither
+                # is a session-wide ordinal -- a segment is the only frame
+                # of reference the two share, since segments do not share
+                # a coordinate frame either.
+                support = estimate.points.support_views
+                if support is not None:
+                    support_rows.extend(
+                        [segment, frame, feature, point]
+                        for frame, feature, point in support.tolist()
+                    )
 
         backend.release()
 
@@ -445,6 +741,7 @@ class WorldBuilderEngine:
             session_id,
             poses=pose_rows,
             points=point_rows,
+            support=support_rows,
             manifest={
                 "schema_version": world.schema_version,
                 "input_digest": compute_input_digest(keyframes),
@@ -454,7 +751,37 @@ class WorldBuilderEngine:
                 "keyframes": len(keyframes),
                 "poses_solved": poses_solved,
                 "poses_refused": poses_refused,
+                # Split, because the total conflates a decision with its
+                # consequences. root + cascaded == poses_refused, always.
+                "poses_refused_root": poses_refused_root,
+                "poses_refused_cascaded": poses_refused_cascaded,
+                # Over ROOT refusals only -- the cascaded ones carry the
+                # root's label and would trebly count one decision.
+                "refusal_degeneracy_counts": refusal_degeneracy,
+                # Both reported. Suppressing the anchors would replace one
+                # misleading number with a missing one; a reader should be
+                # able to see "36 segment origins and no trajectory",
+                # which is a precise description of an uncalibrated walk.
+                "poses_anchor": poses_anchor,
+                "poses_positioned": poses_positioned,
                 "points": total_points,
+                # What was triangulated but refused, and why. Stated
+                # rather than left to be inferred: a consumer seeing only
+                # the surviving points cannot otherwise tell a sparse
+                # world from a heavily filtered one, and those call for
+                # different responses from whoever is wearing the glasses.
+                # Zero is written explicitly -- absent would mean "this
+                # build predates the counter", which is a different fact.
+                "points_discarded": {
+                    "low_parallax": sum(
+                        d["low_parallax"] for d in discards_by_segment.values()
+                    ),
+                    "high_reprojection": sum(
+                        d["high_reprojection"]
+                        for d in discards_by_segment.values()
+                    ),
+                },
+                "points_triangulated": total_triangulated,
                 "segments": len(segments),
                 "scale_state": scale_state,
             },
@@ -471,9 +798,66 @@ class WorldBuilderEngine:
             segments=len(segments),
             scale_state=scale_state,
             downgraded_from=selection.downgraded_from,
+            diagnostics={
+                "points_discarded_by_segment": discards_by_segment,
+                "refusals_by_segment": refusals_by_segment,
+            },
         )
 
     # -- internals -----------------------------------------------------
+
+    def _open_live_solve(self, session) -> None:
+        """Start the solve that observe() will extend.
+
+        Backend selection is deterministic in (name, intrinsics), so the
+        instance chosen here is the same one build() would choose; build()
+        re-checks both anyway before trusting anything this produces.
+        """
+        if self._live is not None:
+            self._live.release()
+            self._live = None
+        try:
+            selection = select_backend(self._backend_name, session.intrinsics)
+            backend = selection.backend
+            backend.begin(session.intrinsics)
+        except Exception:
+            # A live solve is an optimisation. Losing it must never cost
+            # the session its keyframes -- build() still has the
+            # from-scratch path, and it will raise there, loudly, with
+            # the whole journal in hand.
+            logger.exception(
+                "[Tower][WorldBuilder] live geometry unavailable for session "
+                "%s; build() will solve from scratch",
+                session.session_id,
+            )
+            return
+        self._live = _LiveSolve(
+            world_id=session.world_id,
+            session_id=session.session_id,
+            backend=backend,
+            intrinsics=session.intrinsics,
+            segment_index=self._segment_index,
+        )
+
+    def _live_estimates(self, world_id, session_id, session, backend) -> dict:
+        """What the live solve has, if it is still the right answer.
+
+        Every one of these is a way the carried solve could be answering
+        a question nobody asked: a different world, a different session,
+        intrinsics rewritten since the session opened, or a backend
+        selection that has since changed. Any of them and the whole thing
+        is discarded rather than partially believed.
+        """
+        live = self._live
+        if live is None or not live.usable:
+            return {}
+        if live.world_id != world_id or live.session_id != session_id:
+            return {}
+        if live.intrinsics != session.intrinsics:
+            return {}
+        if live.backend_id != backend.capabilities.backend_id:
+            return {}
+        return live.estimates()
 
     def _pose_row(self, keyframe, pose, segment) -> dict:
         """Convert a backend pose into the persisted T_world_camera contract.
@@ -534,7 +918,7 @@ class WorldBuilderEngine:
     def _persist_keyframe(
         self, *, gray_shape, raw_bytes, received_at, source_seq, wire_seq,
         tx_seq, quality, motion, reason,
-    ) -> Keyframe:
+    ) -> tuple[Keyframe, bytes]:
         session = self._session
         filename = f"{source_seq:08d}.jpg"
 
@@ -592,7 +976,9 @@ class WorldBuilderEngine:
             # configured. A redactor that is present but failing must not
             # leave the session claiming its imagery was filtered.
             self._session = replace(self._session, redaction=redaction.label)
-        return keyframe
+        # The bytes as well as the record: they are what the live solve
+        # must see, because they are what a rebuild will read back.
+        return keyframe, image_bytes
 
     def _note_rejected(self, reason: str) -> None:
         self._rejected[reason] = self._rejected.get(reason, 0) + 1
@@ -604,6 +990,117 @@ class WorldBuilderEngine:
             keyframe_id=keyframe_id,
             frames_observed=self._session.frames_observed,
             keyframes_accepted=self._session.keyframes_accepted,
+        )
+
+
+class _LiveSolve:
+    """One geometry solve carried across observe() calls.
+
+    The whole reason this class exists is a cost measurement. build()
+    re-solved from scratch every time, at roughly O(N^1.2) in the backend
+    alone -- 303 ms for 32 keyframes and 641 ms for 64, extrapolating to
+    about 2 s at the 155 keyframes of the 2026-08-24 physical walk, plus
+    a JPEG decode per keyframe on top. A walk rebuilt every k keyframes
+    therefore paid O(N^2/k): 5.9 s of backend work over 64 keyframes at
+    --rebuild-every 4, against 0.8 s for the same walk extended. Turning
+    the live updates UP made the whole session slower, which is why the
+    cadence defaulted to zero and why nothing appeared until a walk had
+    ended.
+
+    A segment gets exactly one solve, and it never crosses a
+    tracking_lost: segments do not share a coordinate frame or a unit,
+    they are independent windows today, and they must stay so. Closing a
+    segment freezes its estimate and resets the backend.
+
+    Nothing here is allowed to cost the session a keyframe. Every backend
+    call is guarded, and a solve that fails simply stops offering
+    answers; build() then does what it always did.
+    """
+
+    def __init__(self, *, world_id, session_id, backend, intrinsics, segment_index):
+        self.world_id = world_id
+        self.session_id = session_id
+        self.backend = backend
+        self.intrinsics = intrinsics
+        self.backend_id = backend.capabilities.backend_id
+        self.usable = True
+        self._segment_index = segment_index
+        self._open: list[str] = []
+        self._frozen: dict[int, tuple[tuple[str, ...], object]] = {}
+
+    def extend(self, keyframe_id: str, gray):
+        """Extend the open solve and return the backend's Extension.
+
+        The return value was previously discarded. It carries
+        `chain_broken`, the signal that lets the engine split a segment
+        when the solve fails instead of refusing every later keyframe in
+        it without looking.
+        """
+        if not self.usable:
+            return None
+        try:
+            step = self.backend.extend(
+                KeyframeInput(keyframe_id=keyframe_id, image_gray=gray)
+            )
+        except Exception:
+            self._give_up("extending")
+            return None
+        self._open.append(keyframe_id)
+        return step
+
+    def close_segment(self, segment_index: int) -> None:
+        if not self.usable:
+            return
+        try:
+            if self._open:
+                self._frozen[self._segment_index] = (
+                    tuple(self._open),
+                    self.backend.snapshot(),
+                )
+            self.backend.reset()
+        except Exception:
+            self._give_up("closing a segment of")
+            return
+        self._open = []
+        self._segment_index = segment_index
+
+    def estimates(self) -> dict:
+        """Frozen segments plus a live view of the open one.
+
+        Non-destructive: a mid-walk rebuild reads this and the walk keeps
+        extending the same solve afterwards. If it were destructive,
+        watching a world build would change the world.
+        """
+        if not self.usable:
+            return {}
+        carried = dict(self._frozen)
+        if self._open:
+            try:
+                carried[self._segment_index] = (
+                    tuple(self._open),
+                    self.backend.snapshot(),
+                )
+            except Exception:
+                self._give_up("snapshotting")
+                return {}
+        return carried
+
+    def release(self) -> None:
+        self.usable = False
+        try:
+            self.backend.release()
+        except Exception:
+            logger.exception("[Tower][WorldBuilder] backend release failed")
+
+    def _give_up(self, doing: str) -> None:
+        self.usable = False
+        self._frozen = {}
+        self._open = []
+        logger.exception(
+            "[Tower][WorldBuilder] live geometry gave up %s session %s; "
+            "build() will solve from scratch",
+            doing,
+            self.session_id,
         )
 
 

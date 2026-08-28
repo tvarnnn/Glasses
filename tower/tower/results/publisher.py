@@ -574,6 +574,24 @@ class ResultHub:
             for subscription in channel._subscriptions.values():
                 targets[subscription.target] = subscription
 
+        # Forget the failure counts of targets nobody is watching any
+        # more. `_failures` was pruned on success and on escalation, but
+        # not when a subscription simply went away, so a target that
+        # failed once and was then unsubscribed left an entry forever.
+        #
+        # It is small and it is genuinely unbounded: `Subscription.target`
+        # includes the client-chosen `world_id` and `session_id`, so a
+        # connection can mint distinct targets at will. Bounded now by the
+        # live subscriptions rather than by the client's imagination. The
+        # comment at the field says "pruned every pass"; this is what
+        # makes that true.
+        if len(self._failures) > len(targets):
+            self._failures = {
+                target: count
+                for target, count in self._failures.items()
+                if target in targets
+            }
+
         for target, sample in targets.items():
             try:
                 snapshot = await asyncio.to_thread(

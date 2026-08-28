@@ -15,7 +15,14 @@ the correct count is known independently of the tracker.
 import pytest
 
 from tower.scene.records import BoundingBox, Detection
-from tower.scene.tracking import Tracker, TrackerPolicy, detections_from_boxes
+from tower.scene.tracking import (
+    DELIVERED_FRAME_INTERVAL_S,
+    MAX_ABSENCE_S,
+    Tracker,
+    TrackerPolicy,
+    detections_from_boxes,
+    frames_in,
+)
 
 POLICY = TrackerPolicy(min_iou=0.25, min_hits=3, max_misses=5)
 
@@ -42,8 +49,11 @@ class TestOneThingIsCountedOnce:
     def test_a_person_walking_across_the_view_stays_one_track(self):
         """Association must survive real motion.
 
-        At the ~3.3 fps the glasses deliver, a walking person moves a long
-        way between frames -- which is why the IoU floor is permissive.
+        The IoU floor is permissive because a box that moves 30 px
+        between frames still has to associate. Measured on the corpus at
+        the real 12.0 fps, the 1st percentile of same-object
+        consecutive-frame IoU is 0.525 for `person` and 0.386 for `cell
+        phone`; this synthetic step is harsher than either.
         """
         tracker = Tracker(POLICY)
         frames = [[_person((x, 100, x + 100, 400))] for x in range(0, 300, 30)]
@@ -233,3 +243,186 @@ class TestBoundingBoxGeometry:
 
     def test_a_degenerate_box_does_not_divide_by_zero(self):
         assert BoundingBox(5, 5, 5, 5).iou(BoundingBox(0, 0, 10, 10)) == 0.0
+
+
+class TestTheSharedDetectorIsAdaptedNotAdopted:
+    """The platform reports a 4-tuple; this cartridge reports a BoundingBox.
+
+    The conversion is the whole of what `scene/detect.py`'s adapter does
+    now that the loader itself is shared, so it is worth an assertion of
+    its own. An x/y transposition here would be invisible everywhere
+    except in a relationship that came out mirrored.
+    """
+
+    def test_the_box_keeps_its_corner_order(self):
+        from tower.detection import Detection as PlatformDetection
+        from tower.scene.detect import to_scene_detection
+
+        converted = to_scene_detection(
+            PlatformDetection(label="cup", score=0.77, box=(1.0, 2.0, 30.0, 40.0))
+        )
+
+        assert converted.label == "cup"
+        assert converted.score == 0.77
+        assert isinstance(converted.box, BoundingBox)
+        assert (converted.box.x0, converted.box.y0) == (1.0, 2.0)
+        assert (converted.box.x1, converted.box.y1) == (30.0, 40.0)
+        assert converted.box.width == 29.0
+        assert converted.box.height == 38.0
+
+    def test_the_converted_detection_still_renders(self):
+        """`to_json_dict` is why this cartridge keeps its own type at all."""
+        from tower.detection import Detection as PlatformDetection
+        from tower.scene.detect import to_scene_detection
+
+        rendered = to_scene_detection(
+            PlatformDetection(label="chair", score=0.5, box=(0.0, 0.0, 2.0, 2.0))
+        ).to_json_dict()
+
+        assert rendered["label"] == "chair"
+        assert rendered["box"] == {"x0": 0.0, "y0": 0.0, "x1": 2.0, "y1": 2.0}
+
+
+class TestTheThresholdsAreDerivedNotGuessed:
+    """Every threshold must show its arithmetic, or its measurement.
+
+    `max_misses = 5` was justified in this module as "roughly 1.5 seconds
+    of absence" against an assumed ~3.3 fps. The corpus's own journals
+    put the delivered rate at 12.0 fps, so the number bought 0.42 s --
+    short enough that a person walking behind a doorframe was dropped and
+    recounted as a new person, which is the one failure the counting
+    requirement exists to prevent.
+
+    The sweep behind these values is in
+    `docs/superpowers/research/2026-08-26-tracker-retune.md`: 9,145 real
+    corpus frames, the shipped detector, every constant swept.
+    """
+
+    def test_the_tracker_knows_the_measured_frame_interval(self):
+        """83.5 ms == 12.0 fps, from the corpus receipt timestamps.
+
+        The tracker owns this constant rather than importing it from the
+        engine, because two of its three thresholds are now derived from
+        it and the engine imports the tracker, not the other way round.
+        """
+        assert DELIVERED_FRAME_INTERVAL_S == pytest.approx(0.0835)
+        assert 1.0 / DELIVERED_FRAME_INTERVAL_S == pytest.approx(12.0, abs=0.05)
+
+    def test_the_miss_budget_is_an_absence_in_seconds(self):
+        """An occlusion is a wall-clock duration, so the budget is one.
+
+        This is the whole defect: a miss budget written as a frame count
+        silently changes meaning when the frame rate does.
+        """
+        assert TrackerPolicy.max_misses == frames_in(MAX_ABSENCE_S)
+        assert MAX_ABSENCE_S == pytest.approx(1.0)
+
+    def test_the_old_budget_would_not_survive_this_derivation(self):
+        """5 frames is 0.42 s at the real rate, not the 1.5 s claimed."""
+        assert 5 * DELIVERED_FRAME_INTERVAL_S < 0.5
+        assert TrackerPolicy.max_misses > 5
+        assert TrackerPolicy.max_misses * DELIVERED_FRAME_INTERVAL_S == (
+            pytest.approx(1.0, abs=0.01)
+        )
+
+    def test_the_confirmation_streak_is_frames_and_not_a_duration(self):
+        """min_hits counts evidence, so it does NOT scale with the rate.
+
+        A detector's false positives are per frame, not per second, so
+        this one is a frame count by nature and the 3.6x rate error did
+        not corrupt it. The sweep confirms 3 from both sides: 4
+        regresses count stability under detector dropout (0.774 at 40%
+        against 0.965), and 2 doubles the frames on which a track the
+        detector was never confident about is counted.
+        """
+        assert TrackerPolicy.min_hits == 3
+
+    def test_the_iou_floor_admits_the_motion_the_corpus_actually_shows(self):
+        """The 1st percentile of same-object consecutive-frame IoU.
+
+        Measured per label on 9,145 corpus frames. The floor has to sit
+        below all of them or a real object loses its own track.
+        """
+        measured_p1 = {"person": 0.525, "laptop": 0.613, "cell phone": 0.386}
+
+        assert TrackerPolicy.min_iou < min(measured_p1.values())
+
+
+class TestAnOcclusionIsNotANewPerson:
+    """The failure the corrected budget exists to prevent.
+
+    Counting holds through dropout because a confirmed track survives it.
+    A track that does NOT survive comes back with a new `track_id` and is
+    counted as somebody new -- so the miss budget is the constant that
+    protects the headline capability, and it was the one that was wrong.
+    """
+
+    @staticmethod
+    def _occlude(policy, absent_frames):
+        tracker = Tracker(policy)
+        box = (100, 100, 200, 400)
+        at = 0.0
+        for _ in range(6):
+            tracker.update([_person(box)], at=at)
+            at += DELIVERED_FRAME_INTERVAL_S
+        original = tracker.tracks[0].track_id
+
+        for _ in range(absent_frames):
+            tracker.update([], at=at)
+            at += DELIVERED_FRAME_INTERVAL_S
+        tracker.update([_person(box)], at=at)
+
+        return original, tracker
+
+    def test_a_person_hidden_for_most_of_a_second_keeps_their_track_id(self):
+        absent = int(0.9 / DELIVERED_FRAME_INTERVAL_S)
+        original, tracker = self._occlude(TrackerPolicy(), absent)
+
+        assert [track.track_id for track in tracker.tracks] == [original]
+        assert tracker.count("person") == 1
+
+    def test_the_old_budget_recounted_exactly_that_person(self):
+        """Not a hypothetical: the same script, the shipped constant."""
+        absent = int(0.9 / DELIVERED_FRAME_INTERVAL_S)
+        original, tracker = self._occlude(TrackerPolicy(max_misses=5), absent)
+
+        assert tracker.tracks[0].track_id != original
+
+    def test_someone_who_genuinely_leaves_is_still_dropped(self):
+        """The other side of the trade, which is real and is bounded.
+
+        A budget large enough to bridge an occlusion is also large enough
+        to keep claiming somebody is in the room after they have gone.
+        That window is exactly `MAX_ABSENCE_S`, and it must be a window
+        rather than a licence.
+        """
+        tracker = Tracker()
+        at = 0.0
+        for _ in range(6):
+            tracker.update([_person((100, 100, 200, 400))], at=at)
+            at += DELIVERED_FRAME_INTERVAL_S
+        assert tracker.count("person") == 1
+
+        for _ in range(TrackerPolicy.max_misses + 1):
+            tracker.update([], at=at)
+            at += DELIVERED_FRAME_INTERVAL_S
+
+        assert tracker.count("person") == 0
+        assert tracker.tracks == []
+
+    def test_the_stale_window_is_a_second_and_no_longer(self):
+        """One frame before the budget runs out they are still counted."""
+        tracker = Tracker()
+        at = 0.0
+        for _ in range(6):
+            tracker.update([_person((100, 100, 200, 400))], at=at)
+            at += DELIVERED_FRAME_INTERVAL_S
+
+        for _ in range(TrackerPolicy.max_misses):
+            tracker.update([], at=at)
+            at += DELIVERED_FRAME_INTERVAL_S
+
+        assert tracker.count("person") == 1, "still inside the budget"
+        assert at - 6 * DELIVERED_FRAME_INTERVAL_S == pytest.approx(
+            MAX_ABSENCE_S, abs=0.01
+        )

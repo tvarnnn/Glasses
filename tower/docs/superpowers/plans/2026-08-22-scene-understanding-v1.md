@@ -102,21 +102,36 @@ or away; one ear means profile.
 
 **Measured cost, and it decides the design:**
 
-| Model | Per frame, CPU |
+> **SUPERSEDED 2026-08-26.** The figures in this section were measured on
+> CPU with synthetic input and named no device. They are wrong. Measured
+> on 754 real corpus frames
+> (`docs/superpowers/research/2026-08-26-scene-understanding-measurements.md`):
+> detection **30.4 ms CUDA / 32.9 ms CPU**, keypoints **43.4 ms CUDA /
+> 956.4 ms CPU**. The delivered frame interval is **83.5 ms (12.0 fps)**
+> from the corpus journals, not ~300 ms. So orientation is **1.43× the
+> detector on CUDA** (29.1× on CPU) and **0.52× the frame interval on
+> CUDA** (11.5× on CPU). The optional-stage, off-by-default, cadenced,
+> age-carrying decision below all survive — the cadence CONSTANT does
+> not, and is now 3 delivered frames (~250 ms) rather than 2.0 s. This
+> also resolves the conflict between this plan's 744 ms and the v1
+> report's 798 ms: both were CPU-with-synthetic-input, both optimistic,
+> and neither said so.
+
+| Model | Per frame, CPU (as recorded here in 2026-08-22 — superseded) |
 |---|---|
 | `ssdlite320_mobilenet_v3_large` (detection) | **32 ms** |
 | `keypointrcnn_resnet50_fpn` (keypoints) | **744 ms** |
 
-744 ms is **23× the detector** and **2.5× the ~300 ms interval the
-glasses deliver**. It cannot run per frame, and pretending otherwise
-would produce a "current" scene state that is two frames stale before it
-is computed.
+744 ms was recorded as **23× the detector** and **2.5× the ~300 ms
+interval the glasses deliver**, and the conclusion drawn was that it
+cannot run per frame, because pretending otherwise would produce a
+"current" scene state that is two frames stale before it is computed.
 
 **Decision: orientation is an optional stage, OFF by default, run at a
 bounded cadence on person tracks only, and every estimate carries its
-age.** A person's facing does not change every 300 ms, so a one- or
-two-second-old estimate is still useful — but only if the consumer can
-see how old it is.
+age.** A person's facing does not change in 83 ms, so a several-frame-old
+estimate is still useful — but only if the consumer can see how old it
+is.
 
 **And it is never called gaze.** The field is `appears_facing_wearer`.
 `07-PLATFORM-CONSTRAINTS.md` Limitation 8 is explicit that the camera

@@ -345,11 +345,28 @@ class TestDegeneracyCriterionEvidence:
 
 
 class TestBackendSelection:
-    def test_auto_without_intrinsics_picks_the_unposed_backend(self):
+    def test_auto_without_intrinsics_picks_the_unposed_backend_loudly(self):
+        """AUTO landing on unposed is reported, like every other route to it.
+
+        This used to assert `not was_downgraded`, on the reasoning that
+        AUTO choosing the only backend it CAN choose is a selection
+        rather than a downgrade. That reasoning is defensible and it cost
+        a night: on the 2026-08-24 physical walk AUTO landed here, the
+        session recorded `downgraded_from: null`, and the world came back
+        with 155 keyframes, zero poses and zero points with nothing
+        anywhere saying why.
+
+        The sibling test below already says a silent downgrade "would
+        leave an operator with an empty map and no way to learn that
+        calibration was the reason". That was true of this path too, and
+        the two tests now agree.
+        """
         selection = select_backend(BACKEND_AUTO, CameraIntrinsics.unknown())
 
         assert isinstance(selection.backend, UnposedBackend)
-        assert not selection.was_downgraded
+        assert selection.was_downgraded
+        assert selection.downgraded_from == BACKEND_CLASSICAL
+        assert "intrinsics" in selection.downgrade_reason
 
     def test_auto_with_intrinsics_picks_the_classical_backend(self, intrinsics):
         selection = select_backend(BACKEND_AUTO, intrinsics)
@@ -566,3 +583,64 @@ class TestMultiFrameTrajectory:
         for pose in estimate.poses[1:]:
             assert pose.status != POSE_STATUS_SOLVED
             assert pose.translation is None
+
+
+class TestHomographyRatioRefusesRatherThanReadingGarbage:
+    """r_H must never return a number RANSAC did not produce.
+
+    When neither model can be fitted, OpenCV 5 returns model=None and
+    leaves the mask buffer UNWRITTEN rather than zeroing it. Summing it
+    then yields whatever was in that memory, which looks like a perfectly
+    ordinary integer and so never raised.
+
+    The trigger is real and was measured on this corpus: capture
+    22e9d428, keyframes 00000345 x 00001824. Keyframe B holds only FIVE
+    ORB features, the Lowe test still returns 242 matches because each of
+    A's 1,321 features picks a nearest neighbour among those five, and
+    those 242 matches land on 3 distinct locations. F needs 8 points in
+    general position and H needs 4; three support neither.
+
+    Observed before the fix: uint8 mask, 46 distinct values, sum 9552 on
+    242 elements -- a binary mask over 242 elements cannot exceed 242.
+    Non-deterministic across FRESH processes (30/40, 34/40 and 37/40
+    corrupt in three separate runs) and self-healing within a warm one,
+    which is why it survived so long and why it would have been miserable
+    to debug later.
+    """
+
+    def _degenerate_pair(self):
+        """242 correspondences on 3 distinct locations -- the real shape."""
+        anchors = np.array(
+            [[100.0, 100.0], [200.0, 140.0], [150.0, 260.0]], dtype=np.float32
+        )
+        points_a = np.repeat(anchors, 81, axis=0)[:242]
+        points_b = np.repeat(anchors[::-1], 81, axis=0)[:242]
+        return points_a, points_b
+
+    def test_a_pair_that_fits_no_model_returns_none(self):
+        value = homography_ratio(*self._degenerate_pair())
+        assert value is None, (
+            f"expected a refusal, got {value!r}. A ratio here means the mask "
+            "was read without checking whether RANSAC produced a model."
+        )
+
+    def test_it_is_a_ratio_or_nothing_never_an_arbitrary_number(self):
+        """The invariant, stated so any future edit has to keep it."""
+        for _ in range(20):
+            value = homography_ratio(*self._degenerate_pair())
+            assert value is None or 0.0 <= value <= 1.0, (
+                f"r_H escaped [0, 1]: {value!r}"
+            )
+
+    def test_a_healthy_pair_still_produces_a_ratio(self, scene, camera_matrix):
+        """The fix must refuse the degenerate case WITHOUT refusing the
+        working one, or it has just disabled the field."""
+        window = _window(scene, camera_matrix, ss.strafe(2, step=0.12))
+        first, second = (
+            detect_and_describe(frame.image_gray) for frame in window[:2]
+        )
+        points_a, points_b = match_descriptors(
+            first[0], first[1], second[0], second[1]
+        )
+        value = homography_ratio(points_a, points_b)
+        assert value is not None and 0.0 <= value <= 1.0

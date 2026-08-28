@@ -18,7 +18,7 @@ camera cannot establish that anyone looked at anything. The field is
 `appears_facing_wearer`, and it stays that even when it is inconvenient.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from tower.confidence import Confidence
 
@@ -120,10 +120,13 @@ class Detection:
 class FacingEstimate:
     """Coarse head/body orientation, and how stale it is.
 
-    `age_seconds` is not optional decoration. Estimating this costs ~744 ms
-    on this CPU, so it runs at a bounded cadence rather than per frame,
-    and a consumer that cannot see the age would treat a two-second-old
-    answer as current.
+    `age_seconds` is not optional decoration. Estimating this costs
+    ~956 ms on CPU and ~43 ms on CUDA, so it runs at a bounded cadence
+    rather than per frame, and a consumer that cannot see the age would
+    treat a stale answer as current. The gap between those two numbers is
+    why the field cannot be dropped now that a fast device exists: the
+    same payload crosses the wire from both, and only the age says which
+    one produced it.
     """
 
     state: str = FACING_UNKNOWN
@@ -183,6 +186,27 @@ class Track:
     # estimate's age, or a reading from ten seconds ago reports as one
     # second old and never expires.
     facing_estimated_at: float | None = None
+
+    def snapshot(self) -> "Track":
+        """A copy that will still be true in a second's time.
+
+        `Track` is mutable and the tracker rewrites it in place on every
+        frame -- `box`, `score`, `last_seen_at`, `hits`, `streak`,
+        `misses`, `is_confirmed` -- so a `SceneState` that referenced the
+        tracker's own objects was a live view wearing a timestamp. Held
+        for one publish tick it serialised old scalars beside new track
+        values: a state stamped `frames_observed: 3` reporting `hits: 8`.
+
+        Shallow is deep enough, and that is a property worth stating
+        rather than assuming: `BoundingBox` and `FacingEstimate` are both
+        frozen, so the only mutable thing reachable from a track is the
+        track. If either ever stops being frozen this must copy it too.
+
+        Not `copy()`: the name says WHY. This is the moment the state is
+        cut loose from the tracker, and it is the only place that
+        happens.
+        """
+        return replace(self)
 
     @property
     def age_seconds(self) -> float:

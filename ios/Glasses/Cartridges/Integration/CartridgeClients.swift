@@ -50,19 +50,47 @@ final class CartridgeClients {
     let experimentalCV: any ExperimentalCVClient
     let documentMemory: any DocumentMemoryClient
     let sceneUnderstanding: any SceneUnderstandingClient
+    /// The one client whose default is **not** an unavailable stub.
+    ///
+    /// Object Memory's Tower half exists and answers over HTTP, and its client
+    /// discovers that by asking rather than by being told over the socket — so
+    /// there is no declaration to wait for and nothing for a stub to stand in
+    /// for. Constructed here rather than in the workspace because an answer
+    /// must survive a cartridge switch, which destroys the view's
+    /// `@StateObject`.
+    ///
+    /// It opens nothing on construction. No request is made until a person
+    /// asks a question.
+    let objectMemory: any ObjectMemoryClient
 
-    /// Defaults are the unavailable clients, which is the whole truth of the
-    /// current system. Injection points exist so a test can substitute one
-    /// without reaching through `ProjectManager`.
+    /// Defaults are the unavailable clients. **That is no longer the whole
+    /// truth of the system for any of the five, and these defaults are now a
+    /// test convenience rather than a description of the product.**
+    ///
+    /// Every cartridge here has a Tower-backed client as of the 2026-08-27
+    /// unification, and `ProjectManager` constructs all of them. The stubs stay
+    /// for two reasons: a test needs to assert what a workspace does when a
+    /// Tower declares nothing, and a stub is the only honest answer at the
+    /// moment before a connection exists. They are kept deliberately dull — a
+    /// stub that says "this Tower has declared no contract" cannot go stale,
+    /// where the strings they used to carry (*"the Tower does not analyse
+    /// scenes yet"*, *"the Tower keeps no document memory"*) became false the
+    /// day the Tower gained those cartridges, and nothing forced anyone to
+    /// notice.
+    ///
+    /// Injection points exist so a test can substitute one without reaching
+    /// through `ProjectManager`.
     init(
         worldBuilder: (any WorldBuilderClient)? = nil,
         experimentalCV: (any ExperimentalCVClient)? = nil,
         documentMemory: (any DocumentMemoryClient)? = nil,
-        sceneUnderstanding: (any SceneUnderstandingClient)? = nil
+        sceneUnderstanding: (any SceneUnderstandingClient)? = nil,
+        objectMemory: (any ObjectMemoryClient)? = nil
     ) {
         self.worldBuilder = worldBuilder ?? UnavailableWorldBuilderClient()
         self.experimentalCV = experimentalCV ?? UnavailableExperimentalCVClient()
         self.documentMemory = documentMemory ?? UnavailableDocumentMemoryClient()
         self.sceneUnderstanding = sceneUnderstanding ?? UnavailableSceneUnderstandingClient()
+        self.objectMemory = objectMemory ?? TowerObjectMemoryClient()
     }
 }

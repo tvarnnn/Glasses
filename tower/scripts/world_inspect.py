@@ -24,6 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.world_builder.inspect import WorldView, render_text  # noqa: E402
 from tower.world_builder.store import WorldStore  # noqa: E402
 
@@ -134,7 +135,9 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Inspect a saved World Builder world (read-only)."
     )
-    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument(
+        "--root", type=artifact_root_arg, default=str(DEFAULT_ROOT)
+    )
     parser.add_argument("--world", help="World id to inspect.")
     parser.add_argument(
         "--list", action="store_true", help="List world ids and exit."

@@ -6,7 +6,7 @@ something does not exist, it says so and says why.
 
 **Envelope contract:** `cartridge_results.envelope/2026-08-23`
 **Producers offered:** World Builder `status`, contract
-`world_builder.status/2026-08-23`. Nothing else. See §9.
+`world_builder.status/2026-08-25`. Nothing else. See §9.
 
 **Audience.** Whoever implements the iOS consumer. You should be able to
 write it from this document without reading Tower's Python. If you find
@@ -71,7 +71,7 @@ asserts they cannot drift. **The phone does not need it.**
     {
       "cartridge": "world_builder",
       "result_type": "status",
-      "contract": "world_builder.status/2026-08-23",
+      "contract": "world_builder.status/2026-08-25",
       "available": true,
       "unavailable_reason": null,
       "snapshot_only": true
@@ -132,7 +132,7 @@ subscription open.
   "type": "result_subscribe",
   "cartridge": "world_builder",
   "result_type": "status",
-  "contract": "world_builder.status/2026-08-23",
+  "contract": "world_builder.status/2026-08-25",
   "world_id": null,
   "session_id": null,
   "since_revision": null
@@ -162,7 +162,7 @@ counter that moved would be a bug.
   "subscription_id": "sub-1",
   "cartridge": "world_builder",
   "result_type": "status",
-  "contract": "world_builder.status/2026-08-23",
+  "contract": "world_builder.status/2026-08-25",
   "snapshot_only": true,
   "world_id": null,
   "session_id": null,
@@ -203,7 +203,7 @@ cartridge-specific part.
   "subscription_id": "sub-1",
   "cartridge": "world_builder",
   "result_type": "status",
-  "contract": "world_builder.status/2026-08-23",
+  "contract": "world_builder.status/2026-08-25",
   "seq": 4,
   "revision": "e252f739c1cdedab",
   "revision_changed": true,
@@ -351,8 +351,16 @@ phone. This is additive; the six existing message types never trigger it.
 | Subscriptions per connection | **8** | a remote party must not grow a server-side dict at will |
 | Pending snapshots per subscription | **1** | there is no queue. A new snapshot replaces the pending one |
 | Snapshot size | fixed arity, measured **< 8 KB** | a test asserts the payload contains no unbounded list |
-| Send timeout | **2 s** | a consumer that does not accept a result within this has its subscription closed. It is also the longest a `frame_result` can queue behind a result send, because both take the connection's send lock — which is why it is 2 and not 5 |
-| Lock wait | **2 s** | bounded separately from the send, so a slow frame send cannot consume a result's budget and cause a spurious drop |
+| Send timeout | **1 s** (`SEND_TIMEOUT_S`) | a consumer that does not accept a result within this has its subscription closed. It is also the longest a `frame_result` can queue behind a result send, because both take the connection's send lock |
+| Lock wait | **1 s** (`LOCK_TIMEOUT_S`) | bounded separately from the send, so a slow frame send cannot consume a result's budget and cause a spurious drop |
+| Lock wait **+** send, together | **2 s** (`TOTAL_SEND_TIMEOUT_S`) | the ceiling a client should budget against |
+
+> These three read **2 s / 2 s / 5 s** in this table until 2026-08-27,
+> along with a justification ("which is why it is 2 and not 5") for a
+> value that had already changed. A client budgeting against 5 s gets
+> `consumer_too_slow` and a closed subscription at 1 s, re-subscribes,
+> and loops. Read the constants in `tower/results/publisher.py`.
+
 | Poll interval | **0.5 s** | how often the Tower re-reads disk |
 | Heartbeat | **2 s** | how often an unchanged snapshot is re-sent |
 
@@ -414,21 +422,114 @@ The envelope is generic; payloads are not. To add a cartridge:
 
 Nothing in the envelope, publisher, registry or routes changes. The
 subscription, ordering, coalescing, reconnect and error machinery is
-already generic and already tested.
+already generic and already tested — the Experimental CV Lab was added
+without touching any of it.
 
-**Why the other three are not offered yet**
+**Two lists, because there are two transports.** `cartridges` is what
+can be SUBSCRIBED to. `http_contracts` is what can be FETCHED, and it
+exists because iOS caches a declaration — a contract discoverable only by
+making a call is one a phone cannot plan around. Each entry carries
+`cartridge`, `contract`, `entry_route`, `available`, `unavailable_reason`
+and `why_not_a_subscription`.
 
-| Cartridge | Reason |
-|---|---|
-| Experimental CV Lab | its per-frame results already reach the client on `frame_result`. A typed contract wants the experiment registry, provenance and baseline work in `IOS-to-Tower.md` §2.1–2.3, which is a design decision, not a transport one |
-| Document Memory | implemented and queryable by CLI, but no contract is offered. Also gated by the resolution finding in `TOWER-TO-IOS.md` §6.8 |
-| Scene Understanding | implemented as a **live in-process state that persists nothing**. There is no file for this channel to read, and giving it one would pre-empt Environmental Memory's whole reason to exist. It needs the live-module path, not this one |
+Only Document Memory's library is listed today. World Builder's geometry
+and Object Memory's observations are the same shape and are not declared;
+their identifiers live in adapter modules rather than in `contracts.py`,
+and `registry.py` must stay cartridge-blind, so those two lanes own that
+move.
+
+**What is offered, as of the 2026-08-27 unification**
+
+| Cartridge | Result type | Contract | Section |
+|---|---|---|---|
+| World Builder | `status` | `world_builder.status/2026-08-25` | §10 |
+| Experimental CV Lab | `status` | `experimental_cv.status/2026-08-27` | `EXPERIMENTAL-CV-LAB.md` |
+| Scene Understanding | `live` | `scene_understanding.live/2026-08-27` | §14 |
+| Document Memory | `status` | `document_memory.status/2026-08-27` | §15 |
+
+**`not_offered` is now EMPTY, and that is a claim.** Three cartridges
+left that list on 2026-08-27 — Scene Understanding, Document Memory and
+the Experimental CV Lab — and none of them left it because they got
+better. Document Memory's detector still fires on essentially nothing at
+the geometry the glasses deliver. They left because their limits became
+things the PAYLOAD STATES, which is what an offer is for. A cartridge
+belongs in `not_offered` only while it can say nothing at all; one that
+can say "I have observed nothing, and here is precisely why" belongs in
+`cartridges`, available or not.
+
+**Object Memory is in NEITHER list, and that is the one deliberate gap.**
+It has a store, read routes, imagery routes and a live control surface at
+`/cartridges/{cartridge}/session` — but no entry in `registry.declare()`.
+Declaring it breaks a pinned iOS test
+(`testTheTowerDeclaresOnlyTheWorldBuilderContract`), so the socket
+declaration waits for the iOS lane to take both halves in one change. The
+Tower side is about four lines. This is a decision for a human and must
+not be closed by an integrator noticing the asymmetry; a client that
+needs Object Memory today reaches it over HTTP and learns nothing about
+it from the declaration.
+
+**One shared signature, reconciled.** `declare()`, `find_offer()` and
+`known_cartridges()` take `world_root` positionally and everything else
+KEYWORD-ONLY with a default: `document_root`, `scene_enabled`, `cv_lab`.
+The defaults are the safety property — a caller that has not been taught
+about a cartridge gets it declared UNAVAILABLE rather than silently
+offered as working, so forgetting to thread a value through under-promises
+(iOS renders "connect") instead of promising a channel the Tower cannot
+serve. `cv_lab` is **duck-typed and never imported** — anything with an
+`availability()` returning `(available, reason)` — because
+`test_the_result_channel_core_is_cartridge_blind` forbids the registry
+from importing a cartridge, and this time the surface is a wire contract.
+
+Callers do not assemble those arguments by hand. `registry.declaration_inputs(app_state)`
+is the single reader of declaration state off an app, used by `GET
+/cartridges` and by `{"type": "cartridges"}` alike. Two call sites each
+reaching for their own subset of `app.state` is exactly how the two
+surfaces would come to disagree, and the disagreement would be invisible
+until a phone hit the one that was wrong.
+
+**A live cartridge does not fit steps 1–4 above, and Scene Understanding
+is the case.** It persists nothing by design — enforced, not intended —
+so there is no file for a reader to read. The resolution was to keep the
+separation that matters rather than the mechanism: the live half is
+`tower/scene/live.py`, which owns a worker thread and a model and is
+constructed by `tower/cartridge_runtime.py`; the results package is handed
+the session object and may only call `status()` and `latest()` on it.
+`test_the_result_channel_never_writes` forbids a call named `observe` or
+`build` anywhere under `tower/results/`, which mechanically prevents that
+handle from becoming a second frame path.
+
+So step 1 gains a clause: a cartridge that produces live state passes a
+SESSION OBJECT into `make_snapshot_for`, and the adapter projects it. A
+cartridge with a store still passes a root. The CV Lab is the third
+shape: a live object that is neither a store nor a frame consumer, passed
+as `cv_lab` and read the same read-only way.
+
+**Experimental CV Lab is now offered** — `experimental_cv` / `status`,
+contract `experimental_cv.status/2026-08-27`, documented separately in
+`EXPERIMENTAL-CV-LAB.md`. It is the first producer in this package that
+reads **live in-process state** rather than files another process wrote,
+and that is worth knowing before adding a third:
+
+- Step 1 above still holds, and `tower/results/experimental_cv.py` is
+  still the only file allowed to know what a CV Lab is.
+- The channel is still **read-only**. It reports the Lab; it cannot
+  start, stop or configure one. Commands travel on their own messages
+  (`cv_lab_start` and friends), deliberately not here — a mutation on a
+  reporting surface is a place the next cartridge's author would look for
+  one.
+- What is new is **concurrency**. A World Builder snapshot is read from
+  disk by `asyncio.to_thread` while nothing in this process is writing
+  it. A CV Lab snapshot is read from a worker thread while the event loop
+  is mutating the object, so the LAB takes a lock around every state
+  transition and around building its document. A future live producer
+  must do the same; the hub offers no such guarantee and should not,
+  because it holds no state of its own.
 
 ---
 
 ## 10. World Builder `status` payload
 
-Contract: `world_builder.status/2026-08-23`.
+Contract: `world_builder.status/2026-08-25`.
 
 ### 10.0 If you implement nothing else, implement this
 
@@ -662,7 +763,8 @@ asserted without the figures to show for it.
 | Field | Notes |
 |---|---|
 | `current`, `built_from_keyframes`, `keyframes_now`, `stale_reason` | as for geometry |
-| `pose_count` | poses carrying a position = keyframes minus refused. **Not** `poses_solved`: an anchor has a position and is counted as neither solved nor refused |
+| `pose_count` | poses carrying a position that is **evidence**. Read from the manifest's `poses_positioned`, which the build counts per segment: every solved pose, plus the anchor of each segment that solved something. **Not** `poses_solved` (that drops the origin of every segment) and **not** `keyframes - poses_refused` (that promotes the bare anchor of a segment which resolved nothing). See the changelog for why this changed |
+| `poses_anchor` | how many poses were anchors. Reported beside the count, never folded into it, so an uncalibrated walk reads as "N segment origins, no trajectory" rather than as a trajectory |
 | `poses_solved`, `poses_refused`, `keyframes`, `segments` | the underlying figures |
 | `path_length` | see below |
 | `provenance` | `"inferred"` |
@@ -781,7 +883,8 @@ These are actual payloads, captured from the implementation.
   "trajectory": {"available": false, "current": false,
                  "built_from_keyframes": null, "keyframes_now": null,
                  "stale_reason": null, "pose_count": null, "poses_solved": null,
-                 "poses_refused": null, "keyframes": null, "segments": null,
+                 "poses_refused": null, "poses_anchor": null,
+                 "keyframes": null, "segments": null,
                  "path_length": null, "revision": null, "provenance": null,
                  "confidence": null,
                  "unavailable_reason": "no build has run for this session, so no poses exist"},
@@ -839,7 +942,8 @@ Note what a live session does **not** know: `frames_observed` is null, and
                "built_from_keyframes": 4, "keyframes_now": 4,
                "stale_reason": null,
                "pose_count": 4, "poses_solved": 3,
-               "poses_refused": 0, "keyframes": 4, "segments": 1,
+               "poses_refused": 0, "poses_anchor": 1,
+               "keyframes": 4, "segments": 1,
                "path_length": {"available": true, "value": 2.853251890377782,
                                "unit": "world units",
                                "scale_semantics": "relative",
@@ -851,7 +955,12 @@ Note what a live session does **not** know: `frames_observed` is null, and
 
 `pose_count: 4` with `poses_solved: 3` is not an inconsistency — the fourth
 is the anchor, which has a position and is counted as neither solved nor
-refused.
+refused. That segment resolved, so its origin is a real point on the path.
+
+The opposite case is the one that matters. A build with `poses_solved: 0`
+reports **`pose_count: 0`**, however many anchors it produced, because a
+segment that resolved nothing contributes an origin marker for an empty
+coordinate frame rather than a camera position.
 
 ### 10.3 What becomes available only after Stop, and after build
 
@@ -900,7 +1009,749 @@ and `Start → Walk → Stop → the world appears` is the honest description.
 
 ---
 
-## 11. Known limitations
+## 14. Scene Understanding `live` payload
+
+Contract: `scene_understanding.live/2026-08-27`.
+Subscription pair: `("scene_understanding", "live")`.
+
+### 14.0 What this cartridge is, in one paragraph
+
+It answers **"what is around me, right now"**. It stores nothing, it
+retains nothing, and it needs no purge because there is nothing to purge.
+Every payload describes a moment; none of them describes a record. If you
+want history, that is Object Memory, and it is a separate privacy review.
+
+The result type is `live`, not `status`, and the difference is the payload
+rather than the cadence. World Builder's `status` describes a BUILD — how
+far it has got. This payload **is** the answer.
+
+### 14.1 Availability
+
+`available` is about **configuration**, never about current activity.
+
+| `TOWER_SCENE_UNDERSTANDING` | `available` | `lifecycle.state` |
+|---|---|---|
+| unset / off | `false`, reason names the variable | — (no payload; the subscription is refused) |
+| on, nobody has pressed Start | `true` | `"stopped"` |
+| on, Start pressed, model loading | `true` | `"starting"` |
+| on, observing | `true` | `"running"` |
+
+A Tower that is enabled but stopped is **available**. Folding "not running
+right now" into "unavailable" would tell a person their Tower cannot do
+this, when in fact nobody has started it — and those call for opposite
+responses.
+
+### 14.2 Starting and stopping
+
+The phone sends **nothing** to start a session; §6.2 of `IOS-to-Tower.md`
+is explicit that opening a cartridge on the phone is silent, and a test
+asserts the wire stays silent. Sessions are driven over HTTP:
+
+| Route | Effect |
+|---|---|
+| `GET /scene` | the same payload the socket carries, plus `contract` |
+| `POST /scene/start` | begin observing. Idempotent; resumes a paused session |
+| `POST /scene/pause` | stop observing, KEEP the last scene, mark it not current |
+| `POST /scene/resume` | observe again without reloading the model |
+| `POST /scene/stop` | end the session and **discard** the scene |
+
+**A phone does not call any of them.** `IOS-to-Tower.md` §6.2 is
+explicit that opening a cartridge on the phone sends nothing, so the
+session follows the STREAM: `stream_start` starts it and `stream_stop`
+ends it, as does a disconnect — which is the normal case for a wearable.
+`lifecycle.follows_stream` reports whether that is on, and
+`TOWER_SCENE_AUTOSTART=false` turns it off for an operator who wants
+manual control.
+
+A stop only ever ends what the stream started. A connection that never
+sent `stream_start` cannot end a session an operator began by hand.
+
+All five answer `404` when the cartridge is not enabled. A `POST` that
+returned `200` and did nothing is how an operator comes to believe a
+physical test is running when it is not.
+
+**Stop discards the scene, and this is load-bearing.** A scene held past
+the end of a session is a claim about a room the wearer has left. No
+staleness number makes that safe, because a client that renders counts
+above staleness shows the room first. After Stop:
+`scene_available: false`, `counts: null`, `people: null`, `where: null`,
+and `scene_unavailable_reason` says the last scene was discarded.
+
+**Pause is the deliberately different case.** The scene survives with its
+age, and `lifecycle.scene_is_current` is `false`. That is iOS's
+`lastKnown`, kept apart from `observing` as §4.7 asks.
+
+### 14.3 Field reference
+
+Every key is present in every state. A key that appeared and disappeared
+would force a decoder to treat the field as optional and lose the ability
+to tell "zero of these" from "this Tower did not say".
+
+**Self-description — constant, and safe to assert against**
+
+| Field | Value | Meaning |
+|---|---|---|
+| `claim` | `"visible-now-not-a-record"` | this is the present, not history |
+| `identity` | `"anonymous-and-unpublished"` | nothing here identifies anyone, and no handle is published |
+| `absence_means` | `"not-visible-to-this-cartridge"` | a zero is about this camera's forward cone, never about the room |
+| `persistence` | `"none"` | nothing is written; there is nothing to purge |
+| `frame_of_reference` | `"camera"` | everything positional is camera-relative and changes when the wearer turns their head |
+| `time_basis` | `"tower-receipt"` | see §4 |
+
+**`lifecycle`**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `state` | string | one of `states` |
+| `states` | list of string | the closed vocabulary: `stopped`, `starting`, `running`, `paused`, `failed` |
+| `session_id` | int | session-scoped, increments per Start. Two payloads with different `session_id` came from different tracking sessions and **must not be compared** |
+| `scene_is_current` | bool | `true` only while `running` |
+| `failure_reason` | string or null | non-null only in `failed` |
+| `started_at` | float or null | Tower-receipt |
+| `ready_at` | float or null | when the model finished loading |
+| `loading_seconds` | float or null | non-null only while still loading |
+| `load_overdue` | bool | the load has exceeded `load_overdue_after_seconds`. **Not a failure** — nothing can interrupt a blocking model load, and a first-run weight download is slow and still correct |
+| `load_overdue_after_seconds` | float | `120.0` |
+
+**Freshness and flow**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `observed_at` | float or null | when the Tower **received the frame** this scene came from — not when the detector finished with it |
+| `staleness_seconds` | float or null | now minus `observed_at` |
+| `frames_offered` | int | frames handed to the session this session |
+| `frames_observed` | int | frames that produced a scene |
+| `frames_skipped` | int | frames displaced from the single slot because the worker was busy. **On the wire deliberately: a silently dropped frame is indistinguishable from a quiet room** |
+| `frames_dropped_not_running` | int | frames arriving while stopped or paused |
+| `decode_failures` | int | frames that would not decode |
+
+**The scene**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `scene_available` | bool | false in four different situations, told apart by the next field |
+| `scene_unavailable_reason` | string or null | stopped / still loading / failed / running-but-no-frame-yet |
+| `detector` | string or null | the model that produced the counts |
+| `score_threshold` | float or null | the detector's own floor |
+| `reported_classes` | list of 13 strings | the **universe** of labels that can appear in `counts`. A label outside it has never been looked for, which is a weaker silence than "looked for and not seen" |
+
+The thirteen, in full, so a consumer can look one up rather than infer it:
+`person`, `chair`, `couch`, `bed`, `dining table`, `tv`, `laptop`, `book`,
+`bottle`, `cup`, `keyboard`, `mouse`, `cell phone`. They are COCO class
+names and carry COCO's meanings; `mouse` is the pointing device, `tv` is
+any large display. The list is fixed at build time and is what keeps
+`counts` and `where` bounded without a truncation rule.
+
+| `counts` | `{label: int}` or null | one entry per `reported_classes`, present at `0` rather than omitted |
+| `count_basis` | `"confirmed-tracks"` | counts come from the tracker, never from raw detections |
+| `count_is_lower_bound` | bool, always `true` | see §14.4 |
+| `count_limitations` | list of `{limitation, detail}` | `size-floor`, `recall`, `noise-classes`, `departure-lag`, `field-of-view` |
+
+> **All five ship, unconditionally.** This row listed three until
+> 2026-08-27, omitted the noise-class disclosure entirely, and described
+> the departure-lag one as conditional -- there is no branch in
+> `tower/results/scene_understanding.py`, the tuple is a constant. A
+> client rendering a fixed set of disclosures silently dropped the two
+> it was never told about, and these are the fields that stop an
+> undercount looking like a quiet room.
+
+**`people`** — a count and an aggregate, never a list
+
+| Field | Type | Meaning |
+|---|---|---|
+| `count` | int | confirmed person tracks in the camera's forward cone |
+| `may_include_wearer` | bool, `true` | every `person` box in this platform's only real corpus is the wearer's own torso |
+| `validated` | bool, `false` | no bystander footage exists on this host; nothing here has been checked against ground truth |
+| `facing_wearer` | int or **null** | **never 0 when unmeasured.** Null means orientation never produced an estimate |
+| `facing_answered` | bool | whether `facing_wearer` is a measurement |
+| `facing_unavailable_reason` | string or null | why it is null |
+| `facing_unknown` | int or null | people whose orientation is unknown |
+| `oldest_estimate_seconds` | float or null | age of the stalest orientation estimate |
+| `facing_note` | string | the wording, carried as data |
+
+**`where`** — per-label side counts, **non-person labels only**
+
+`{label: {left, centre, right, unknown}}`, integers, summing to that
+label's count. Three fixed buckets per label, so the block is bounded by
+the class list rather than by what is in the room.
+
+Side counts rather than one side per label, because one side cannot
+describe a chair on the left and a chair on the right, and picking one
+would be a wrong answer where a refusal was available.
+
+`where_excludes: ["person"]` and `where_excludes_reason` say why: a
+per-person position, sampled repeatedly, is a movement trace.
+
+**`tracks`** — always `null`, and unexpressibly so
+
+`tracks_absent_reason` says why; `refused_entity_fields` is a list of
+`{field, reason}` naming `track_id`, `box`, `facing`, `visible_eyes` and
+`confidence`. There is no key anywhere in this payload that could hold an
+entity.
+
+This refuses `IOS-to-Tower.md` §4.1's session-scoped anonymous track
+handle. The refusal is delivered as a value rather than as silence
+because those are different instructions: "refused" means build a
+different screen, and "not implemented yet" means wait for the next
+Tower, and a client finding nothing to decode cannot tell them apart.
+
+**`side_convention`** — the one convention iOS declares rather than
+leaves open, answered
+
+§4.3: *"a bearing has to be signed somehow to be usable and a silent
+presumption is the dangerous version — a Tower signing the other way
+would put every person on the wrong side of the wearer."* This payload
+publishes no bearing, but `where` is a coarse signed bearing under
+another name, so it states its convention: the wearer's own left and
+right as the camera sees them, thresholds at 0.45 and 0.55 of frame
+width, stream assumed unmirrored and nothing verifies that.
+
+**`confidence`** — always `null`, with `confidence_absent_reason`
+
+§4.1 asks for a confidence on every track. There are no tracks, and a
+confidence attached to a COUNT would be an average of scores that did not
+decide anything. `score_threshold` is the floor those scores had to
+clear and is published instead. Stated rather than omitted, because
+§0.2's rule is that an unprovenanced value is worse than an absent one.
+
+**`observed_at_note`** — what `observed_at` actually is
+
+Tower-receipt time. §0.3 holds `observedAt` and `receivedAt` separately
+and never substitutes one for the other; a decoder mapping by field name
+would make exactly that substitution, so the payload says it in words.
+
+**`count_measurement`** — when the limitations above were measured
+
+`measured_at`, `corpus_frames`, `corpus_captures`, `is_current`, `note`.
+`is_current` is `false`: this platform's corpus grows continuously, and a
+rate asserted in the present tense would read as current state.
+
+**`people.facing_states_reported` / `facing_states_withheld`**
+
+Only `facing_wearer` and `unknown` have buckets, so
+`count − facing_wearer − facing_unknown` is an undifferentiated
+remainder rather than a fifth category. `away_from_wearer` and `profile`
+are withheld with a reason (`facing_states_withheld_reason`): a
+per-person facing state narrows to one person's orientation the moment
+only one person is in view.
+
+**`lifecycle.follows_stream`** — whether `stream_start` starts this
+session and `stream_stop` ends it. See §14.2.
+
+**`relations`** — always `null`
+
+`relations_absent_reason` says why; `refused_relations` is a list of
+`{relation, reason, reason_source}` covering `in_front_of`, `behind`,
+`on`, `inside`, `near`, `nearer_than_same_class`. The `reason` is the
+first sentence of each refusal and `reason_source` points at the full
+measurement in the repository — the `in_front_of` entry alone runs to
+1,500 characters of flip rates and sample sizes, and it is constant, so
+publishing it whole put 1.5 KB of unchanging prose into every 2 s
+heartbeat.
+
+`withheld_relations` is the separate and weaker list: `left_of`,
+`right_of` and `higher_in_view` are computable from 2-D boxes and are
+TRUE. They are withheld rather than refused because they are
+camera-relative and stop being true the moment the wearer turns their
+head. A client must be able to tell "we can and will not" from "we
+cannot, and here is the measurement". **There is no schema slot anywhere in
+this payload that could hold one.** A refusal that depends on remembering
+not to fill a field is not a refusal.
+
+### 14.4 Every count is an undercount, and the payload says so
+
+Measured against a `fasterrcnn_resnet50_fpn_v2` oracle over 14,128 real
+frames: recall **0.306** for `person`, 0.497 for `cell phone`, 0.209 for
+`tv`, and effectively **blind below ~2% of frame area** (0.000 under 1%).
+The oracle shares COCO training data with the shipped model, so 0.306 is
+an **upper bound**.
+
+`SCORE_THRESHOLD` is not the lever: the F1 sweep is a plateau and
+lowering it buys +0.05 recall for 1.7× the false boxes. The floor is the
+model's.
+
+**An undercount published without disclosure looks exactly like a quiet
+room.** Render `count_is_lower_bound` somewhere a person will see it.
+
+### 14.5 What is NOT on this wire, and why
+
+`track_id`, bounding boxes, `normalised_x`, `view_offset`, per-person
+facing state, `visible_eyes`, `visible_ears`.
+
+The reasoning is not "minimise disclosure". Tower → phone is inside the
+local-first boundary: **the phone sent the pixels**, so a count discloses
+strictly less than the frame the phone already holds, and withholding it
+while shipping frames would be theatre.
+
+What is genuinely new is **joinability**. A stable `track_id` plus a
+timestamp lets a recipient assemble the per-person dwell timeline this
+cartridge refuses to keep — persists-nothing laundered onto the consumer.
+
+**This refuses something iOS asked for.** `IOS-to-Tower.md` §4.1 requests
+a session-scoped anonymous track handle, and §4.3 a signed bearing. V1
+serves neither. The consequence is concrete and is not hidden: iOS cannot
+render per-entity rows for people, only a count and an aggregate. If that
+proves to be the wrong trade, it is a contract change made deliberately,
+with a new identifier — not a field quietly populated later.
+
+### 14.6 Cadence
+
+Published at the standard 0.5 s poll with the 2 s heartbeat, **not at
+frame rate**. `IOS-to-Tower.md` §4.8 asks the Tower to coalesce, and this
+is that: the result sender shares a lock with the frame path, and
+starving frame delivery is what forced World Builder's geometry onto HTTP.
+
+`observed_at`, `staleness_seconds` and every `frames_*` counter are
+excluded from `revision`, so an unchanged scene coalesces. `frames_observed`
+is among them deliberately: a frame having been processed is not the same
+event as the scene having changed.
+
+### 14.7 Known limitations
+
+1. **Orientation is off by default.** The pose model costs 956 ms per call
+   on CPU — 11.5× the delivered frame interval — against 43 ms on CUDA,
+   and `facing_from_keypoints` is unvalidated against ground truth.
+   `TOWER_SCENE_ORIENTATION` enables it; `facing_wearer` stays `null`
+   until it has succeeded once.
+2. **The tracker's constants assume every delivered frame is seen.**
+   `max_misses` is a frame count derived from a 1.0 s absence at 12 fps.
+   A session that is skipping frames stretches what that means. Watch
+   `frames_skipped`: at the measured cost (33 ms of work per 83.5 ms
+   frame) it should stay near zero, and a sustained non-zero value means
+   this Tower is overloaded and the counts are less stable than they look.
+3. **`person` is the wearer's own torso** in every real capture on this
+   host. `may_include_wearer` is `true` and `validated` is `false` for
+   that reason. Nobody has yet worn these glasses in a room with a
+   bystander and checked.
+4. **No bearing, no distance, no world frame.** §14.5.
+5. **No imagery.** This cartridge serves no image and has no artifact
+   fetch contract. Nothing it produces may be displayed as a picture.
+
+---
+
+## 15. Document Memory `status` payload, and the library on HTTP
+
+Contracts: `document_memory.status/2026-08-27` (this channel) and
+`document_memory.library/2026-08-27` (HTTP).
+Subscription pair: `("document_memory", "status")`.
+
+### 15.0 Read this before building anything against it
+
+**The premise is untested, not proven.** On 9,199 frames of real
+first-person footage from these glasses, the page detector fired **six
+times and every one was a false positive** — a venetian blind and a
+backlit laptop keyboard. After `MIN_ROW_TRANSITIONS` was re-derived
+against those same frames it fires **zero** times. And no capture on this
+platform has ever contained a sheet of paper, so the detector has never
+been shown a positive it was built for.
+
+Separately, at the 360×640 the glasses deliver, EasyOCR returned **zero
+dictionary words** across 919 sampled real frames that were dense with
+screen text, at median confidence 0.056.
+
+So: **an empty library is the expected result today.** Every response
+carries `recording_limitations` saying so. A client that renders an empty
+library as "no documents yet" is inviting a person to wait for something
+that is not coming.
+
+The measured fix is a **high-resolution still**, not a higher stream:
+504×896 buys 0.886–1.000 word recall against 0.343–1.000 at the delivered
+rung, and raising the stream would break World Builder's tracking. That
+needs iOS/DAT work and is not in this contract.
+
+### 15.1 The split: status here, documents on HTTP
+
+The documents do **not** travel on this channel. Two reasons, and they
+agree:
+
+- **Size.** `tower/routes/ws.py` gives the result sender and the frame
+  path one shared lock. Document text is the largest thing this platform
+  could put on it.
+- **Privacy.** `IOS-to-Tower.md` §3.2: "The list carries a character
+  count, not the text, so a list of documents is not also a bulk transfer
+  of every document's contents onto the phone."
+
+| Route | Answers |
+|---|---|
+| `GET /documents?limit=&retention_days=` | recent documents, newest first, **no text** |
+| `GET /documents/search?text=&limit=` | literal term matching (BM25), with snippets |
+| `GET /documents/around?at=&window_seconds=` | documents observed within a window of an instant |
+| `GET /documents/{document_id}` | one document **with** its pages and their text |
+| `GET /documents-session` | the capture session's status |
+| `POST /documents-session/{start,pause,resume,stop}` | control it |
+
+All answer `404` when `TOWER_DOCUMENT_ROOT` is unset. That `404` is about
+**configuration** and is never the answer to a query about a document,
+which is answered with `answer: "no_observation"`.
+
+### 15.2 The three answers
+
+Every library response carries `answer`, one of:
+
+| `answer` | Meaning | Render as |
+|---|---|---|
+| `matched` | documents were found | the list |
+| `not_found` | the memory was searched and nothing matched | "Nothing matched" |
+| `no_observation` | the memory holds nothing that could have matched | "Never observed" — **and say explicitly that this is not the same as the document not existing** |
+
+Collapsing the third into the second lets a gap in what the glasses
+happened to see read as a statement about the world. On this platform
+that gap is the normal case, which is why `no_observation_note` is
+carried beside it.
+
+### 15.3 Library field reference
+
+**Envelope**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `contract` | string | `document_memory.library/2026-08-27` |
+| `claim` | `"a-page-was-in-view-and-was-ocred"` | The wire value, pinned as `DOCUMENT_CLAIM` in `tower/results/document_memory.py`. Until the 2026-08-27 unification this table quoted an older spelling that said a document "was read" — a claim the camera cannot establish, five keys above the note saying so. The code had been corrected and the doc had not. `test_the_contract_quotes_the_values_the_wire_actually_carries` now pins the two together, and asserts the retired spelling appears nowhere in this file |
+| `identity` | `"no-document-identity-across-sightings"` | reading the same page twice yields two unrelated records |
+| `absence_means` | `"not-recorded-by-this-cartridge"` | |
+| `time_basis` | `"tower-receipt"` | |
+| `spatial_ref` | always `null` | this cartridge does not know where anything is |
+| `answers` | list | the closed vocabulary above |
+| `retrieval_kinds` | list | `recent`, `text`, `observed_within` |
+| `semantic_retrieval` | bool, `false` | with `semantic_retrieval_unavailable_reason` |
+| `recording_limitations` | list of `{limitation, detail}` | §15.0 |
+| `imagery_treatment` | `"none-retained"` | no image is served; nothing here may be displayed as a picture. `"raw-ephemeral-not-served"` was the spelling here until 2026-08-27 and the code names it retired; the wire has never carried it |
+| `retention` | object | `requested_days`, `writer_window_days` (**always null**), `writer_window_unavailable_reason`, `policy` |
+| `answer`, `no_observation_note`, `documents_in_memory`, `document_count`, `documents` | | |
+
+`retention.writer_window_days` is honestly `null`: unlike Object Memory's
+store, `DocumentStore` persists no retention manifest, so a reader cannot
+learn the window its writer used. A `retention_days` query parameter
+**narrows this read and can never widen what was kept**.
+
+**Imagery, on every response and every record**
+
+| Field | Meaning |
+|---|---|
+| `imagery_treatment` | `none-retained` or `raw-persisted`. It varies with the fact; a constant here said the same thing whether or not an image existed |
+| `imagery_ios_state` | `rawEphemeral` — the strictest of §5's three states that applies, named in iOS's vocabulary so the mapping is the Tower's decision and not the phone's guess. Never `redacted`: this platform performs no redaction |
+| `imagery_served` | always `false`. No route serves an image |
+| `imagery_note` | says the above in words |
+| `privacy_tag_vocabulary` | the closed set `privacy_tags` draws from, published so a client can pin it |
+| `recording_measurement` | `measured_at`, `corpus_frames`, `corpus_captures`, `is_current`, `note` — when the limitations were measured, and on what |
+| `semantic_retrieval_alternative` | what to do instead. iOS routes typed free text to `.semantic`, so its primary input path has no Tower route; saying only "no semantic retrieval" leaves it to guess |
+| `snippet_max_chars` | on a search result: how much verbatim text a match may carry |
+
+**Per document, in a list**
+
+`document_id`, `claim`, `identity`, `title`, `title_is_derived`,
+`summary_available`, `confidence`, `confidence_basis`, `observed_at`,
+`recorded_at`, `observed_seconds`, `pages_observed`, `text_availability`,
+`end_reason`, `timing`, `provenance`, `retains_raw_imagery`,
+`redaction`, `imagery_treatment`, `privacy_tags`, `schema_version`.
+
+> **The prose fields are NOT here. They are on the envelope, once.**
+> `record_notes` carries five entries — `summary_withheld`,
+> `observed_seconds`, `timing`, `imagery_retention`, `joinable` — and a
+> record no longer repeats any of them. That hoist is described a few
+> paragraphs down; this list, and three other places in this file,
+> continued to name the per-record spellings (`summary_withheld_reason`,
+> `observed_seconds_note`, `imagery_retention_note`, `joinable_note`)
+> until 2026-08-27. **None of those keys has ever shipped since the
+> hoist**, so a non-optional Swift decode of any of them throws
+> `keyNotFound` on every document.
+>
+> The hoist was measured, not tidying: 68% of each record was constant
+> prose, 2,351 bytes repeated per record, and a 200-document listing was
+> 488 KB with ~313 KB of it the same five sentences two hundred times.
+> After: 249 KB, 1,218 bytes per record, **nothing dropped**. Caveats were
+> hoisted, never deleted — deleting one to save bytes is the one saving
+> this contract may not make.
+
+Three of those deserve a sentence:
+
+- **`observed_seconds`** is how long the region was in view. It is **not**
+  a claim that the wearer looked at it, noticed it, or read it — the
+  camera cannot establish any of those. Render it as "In view 45 s".
+  `record_notes.observed_seconds` carries that qualification as data,
+  on the envelope rather than on every record.
+- **`title`** is lifted from the document's own first text region.
+  `title_is_derived: true`, and it is CLIPPED to `title_max_chars` (60)
+  with an ellipsis. iOS asks for a title in the list knowing it comes
+  from the document, and one line is a label — but 90 characters times a
+  200-document listing is 18 KB of verbatim first lines for a caller that
+  asked no question. A null title must render as a description of the
+  RECORD — "Untitled document" — never as an invented name.
+**`record_notes` carries the caveats once, at the envelope.** Five
+sentences used to be repeated on every document — the "in view, not
+read" qualification, the summary's provenance, the clock, the
+capture-side imagery lifetime, and the joinability of the frame
+reference. A 200-document listing was 488 KB with two thirds of it the
+same sentences two hundred times. They are keyed by the field they
+qualify: `observed_seconds`, `summary_withheld`, `timing`,
+`imagery_retention`, `joinable`. Render a document with `record_notes`
+beside it; none of them may be dropped, because each is a caveat and
+deleting a caveat to save bytes is the one saving this contract may not
+make.
+
+- **`summary` is NOT in the list.** The stored summary is the document's
+  first forty words **verbatim** — an excerpt, not a paraphrase — and
+  forty words per document across a list is exactly the bulk transfer
+  §3.2 exists to prevent. `summary_available` says it exists;
+  `GET /documents/{document_id}` serves it beside the pages it came from,
+  with `summary_is_verbatim_excerpt: true`.
+
+**`text_availability`** — the typed form of iOS's
+`unknown` / `notReadable` / `extracted(characterCount:)`:
+
+| `state` | `character_count` | Meaning |
+|---|---|---|
+| `unknown` | null | the record has no pages |
+| `not_readable` | 0 | **a real answer**: we looked and found no readable text |
+| `extracted` | int > 0 | text was captured; fetch the document to read it |
+
+A **search** result additionally carries `score`, `matched_terms` and a
+`snippet` — a bounded window around the matched term, capped at
+`snippet_max_chars` (48). It is evidence, not an excerpt: a match with no
+evidence is a number a client has to trust, and `DocumentQueryEvidence`
+exists on the iOS side for exactly this. The cap is published beside it,
+and it is what keeps a 50-result search from becoming a bulk transfer.
+
+**`provenance`** — a pointer into a recording, not a place
+
+`kind: "frame-reference"`, `spatial_ref: null`, `capture_id`,
+`capture_id_validated` (**always `false`** — nothing checks that the
+capture still exists), `page_source_seqs` (the sequence number of each
+frame actually read, at most two per document), `pages_without_source_seq`,
+`frames_considered`, `frames_ocred`, `world_id`, `world_session_id`,
+`imagery_retention: "capture-side"` and `joinable: true`, both
+defined by `record_notes` on the envelope.
+
+**That last pair is said out loud rather than left to be noticed.** This
+block IS joinable: a capture id, frame sequence numbers and a timestamp
+locate this reading in a recording on disk, and the link is durable
+across sessions — which is precisely what Scene Understanding refuses to
+hand anyone. The two cartridges differ here on purpose. A document is a
+record; a scene is not.
+
+The capture id is stamped when the DWELL STARTED, not when the record was
+written. A `stream_start` arriving mid-reading does not move that reading
+onto the new capture, and a `stream_stop` does not erase it — both used
+to happen, and both produced a `page_source_seqs` pointer that resolved
+into the wrong recording.
+
+`frames_considered` will be much larger than `frames_ocred`. That is the
+architecture: OCR costs ~1.19 s a page against a 0.771 ms per-frame
+detection, and at most two frames per dwell are ever read.
+
+**`timing`** — `time_basis`, `source` (`capture-journal` /
+`assumed-interval` / `mixed`), `assumed_frame_interval_s`, `note`. A
+duration derived from an assumed interval is a reconstruction and must
+not be rendered identically to a measured one.
+
+**A search result carries four more fields**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `match_kind` | `"lexical"` | literal term matching. Never `"semantic"`; see `semantic_retrieval` |
+| `searched_documents` | int | how many records were scored. Compare with `documents_in_memory`: a difference means the retention window narrowed this read |
+| `min_score` | float | the BM25 floor a document had to clear. Default `0.1` |
+| `sufficient_evidence` | bool | whether the memory held enough to answer at all. `false` with `answer: "no_observation"` is an empty memory; `false` with `not_found` is a query whose terms nothing contained |
+
+Each matched document additionally carries `score` (rounded to 4 places),
+`matched_terms`, and `snippet` — `snippet_max_chars` characters around the
+first matched term, **so an answer is always traceable back to text that
+was actually captured** rather than to a number a client has to trust.
+
+`snippet_max_chars` is **48**, and it is on the envelope so a client reads
+the bound rather than assuming one. This paragraph said 160 until the
+2026-08-27 unification, which contradicted both the value in
+`tower/results/document_memory.py` (`SNIPPET_MAX_CHARS = 48`) and §15.3
+four hundred lines above it. Read the field, not the prose.
+
+**One document carries pages, and pages carry these**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `page_index` | int | position within this document |
+| `text` | string | what OCR read. Empty string is `not_readable`, not "no page" |
+| `text_source` | `"ocr"` | an enum of one today, stated so a second source is a visible change |
+| `region_count` | int | text regions the recogniser returned. `0` with an empty `text` is the readable-nothing case |
+| `mean_region_confidence` | float or null | null means no region had a score |
+| `min_region_confidence` | float or null | the worst region on the page |
+| `confidence` | string | derived from the MEAN — one hard word should not condemn a page |
+| `sharpness` | float or null | the frame-quality measure that chose this keyframe |
+| `squareness` | float or null | how square-on the page was |
+| `source_seq` | int or null | the frame this page was read from. Null on a record written before provenance existed |
+| `observed_at` | float or null | Tower-receipt time of that frame |
+| `observation_count` | int | how many separate views of this page were merged into it. Two readings of one page during one dwell is one page with a count of two, not two pages |
+| `image_kept` | bool | whether a page image exists on this Tower's disk. **False unless page images were explicitly enabled**, which is off by default, must stay off, and has no configuration path from a web process: this platform has no redaction, so a stored page image is an unredacted photograph of what the wearer was reading |
+| `image_served` | bool | always `false`. A BOOLEAN and not the path, which told a reader where in the store to find that photograph — disclosure with no consumer, since no route resolves it and none may |
+
+The document object also carries `word_count`, and the two summary
+qualifiers `summary_is_model_output` and `summary_is_verbatim_excerpt`.
+
+**`coverage`** — how much of the document was captured, not how much
+exists:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `pages_observed` | int | pages this record holds |
+| `pages_total` | **always null** | the camera cannot know how many pages a document has |
+| `pages_total_note` | string | says exactly that |
+| `words_captured` | int | words across all pages |
+| `low_confidence_pages` | list of int | page indices whose confidence is `low` or `unknown` |
+
+### 15.4 The session `status` payload, on this channel
+
+| Block | Meaning |
+|---|---|
+| `contract_note` | a string pointing at the HTTP routes, carried IN the payload so a client that reads only this channel still learns the documents are elsewhere |
+| `library` | what is on disk, **regardless of whether anything is running**: `available`, `document_count_unfiltered`, `retention_applied: false`, `unavailable_reason`, `newest_observed_at`, `bytes`, `location_disclosed: false` |
+| `session` | the live capture, or `{state: "unavailable", reason: ...}` when `TOWER_DOCUMENT_CAPTURE` is off |
+
+`library.document_count_unfiltered` and `session.library_count` are
+DIFFERENT QUANTITIES and are named apart for that reason. The first
+counts every parseable record on disk; the second is the same count
+through the session's retention window and is refreshed only by a prune.
+They diverge whenever records exist past the window.
+
+`session.follows_stream` reports whether `stream_start` starts this
+session. It defaults to FALSE for Document Memory — the opposite of Scene
+Understanding's — and the asymmetry is the difference between the two
+cartridges: this one writes, and a session that persists what a wearer
+read gets an explicit start. `TOWER_DOCUMENT_AUTOSTART=true` changes it.
+
+**The session block keeps its shape.** When no session exists every field
+is present and `null`, `state` is `"unavailable"`, and `states` carries
+the full vocabulary including that value. A block that changed shape
+forced a decoder to make thirty fields optional and to handle a `state`
+its own enum denied existed — in the one shape that did not carry the
+enum.
+
+**The five session routes carry the full envelope**, not a bare status:
+`contract`, `claim`, `identity`, `absence_means`, `time_basis`,
+`recording_limitations`, `recording_measurement` and the imagery fields,
+with the status under `session`. A client that polls the session and
+never calls a listing would otherwise never learn that an empty library
+is the expected result here.
+
+`session.engine` and `session.recogniser` both name the text recogniser
+in use; `engine` is the generic lifecycle field every live session
+carries, and `recogniser` is this cartridge's name for the same thing.
+They agree by construction.
+
+A Tower with a library and no session is a **normal** configuration — it
+serves documents recorded elsewhere and records nothing itself.
+
+`session` carries the same lifecycle block Scene Understanding uses
+(`state`, `states`, `session_id`, `failure_reason`, `started_at`,
+`ready_at`, `loading_seconds`, `load_overdue`, `frames_offered`,
+`frames_observed`, `frames_skipped`, `frames_dropped_not_running`) plus:
+`recogniser`, `capture_id`, `capture_id_validated`, `in_dwell`,
+`dwells_started`, `pages_detected`, `documents_recorded`,
+`last_document_id`, `last_document_at`, `flushed_document_id`,
+`keeps_page_images`, `retention_days`, `documents_pruned`,
+`retention_incomplete`, `library_count`, `library_soft_limit`,
+`library_over_soft_limit`, `library_soft_limit_note`.
+
+**`retention_incomplete`** is reported rather than logged: a deletion that
+quietly failed looks exactly like one that was kept.
+
+**`library_soft_limit` is reported, never enforced.** This session evicts
+by AGE only. Deleting a wearer's memories because a count grew is a
+policy decision, not a cleanup, and this lane declined to make it.
+
+**Stop KEEPS what was recorded**, unlike Scene Understanding's Stop. A
+record of what was read is exactly as true after the session ends. A dwell
+in progress is **flushed**, not dropped: a wearer still reading when a
+session stops has read something.
+
+### 15.5 Known limitations
+
+1. **The premise is untested.** §15.0. Someone has to wear the glasses and
+   read a page.
+2. **No cross-session document identity.** Reading the same page on Monday
+   and Tuesday produces two unrelated records with different ids and no
+   link. `identity` says so. Dedup exists only WITHIN one dwell, keyed on
+   a 0.65 token-set overlap.
+3. **No pagination.** `limit` is the only bound, capped at 200.
+4. **No semantic retrieval.** BM25 over literal terms. Calling it semantic
+   would be an overclaim, and a client routing a description here will get
+   a lexical answer.
+5. **A match cannot be attributed to a page.** Scoring is over the
+   concatenated page text.
+6. **No redaction exists.** `redaction` is an enum of one, `"none"`, and
+   that is the honest value for imagery this platform cannot redact. Page
+   images are OFF by default and must stay off.
+7. **`retention.writer_window_days` is null.** §15.3.
+8. **Every query re-parses the journal.** There is no index. The session
+   `status` block is stat-gated and does not.
+9. **No capture timestamp.** Everything is `tower-receipt`. This is a
+   cross-boundary blocker, not a Tower gap.
+
+---
+
+### 15.6 Key index — the nested names, spelled out
+
+A key that this document mentions only in prose is a key a consumer has
+to guess at, and a test that matched prose would not notice. These are
+the nested names on both cartridges' wires that are otherwise only
+implied by the block that contains them.
+
+**Inside every `count_limitations` and `recording_limitations` entry**
+
+| Key | Meaning |
+|---|---|
+| `limitation` | a short slug naming the class of limit — `size-floor`, `recall`, `field-of-view`, `noise-classes`, `departure-lag`, `detection-rate`, `no-validated-positive`, `resolution`, `resolution-remedy-is-not-a-fix` |
+| `detail` | the measurement, in a sentence a person can be shown |
+
+**Inside every `refused_relations` entry:** `relation` — the name of the
+relation that is refused. Inside every `refused_entity_fields` entry:
+`field` — the name of the entity field that is refused.
+
+**Inside `where`:** one entry per non-person reported class, each with
+`left`, `centre`, `right` and `unknown` — integer counts of confirmed
+tracks of that label on each side. `where_excludes` is the list of labels
+that never appear here, and is `["person"]`.
+
+**Inside a document `provenance` block**
+
+| Key | Meaning |
+|---|---|
+| `kind` | always `"frame-reference"`. A pointer into a recording, not a place |
+| `imagery_retention` | always `"capture-side"`, defined by `record_notes.imagery_retention` |
+| `joinable` | always `true`, defined by `record_notes.joinable`. This block locates a reading in a recording; the link is durable across sessions, unlike anything Scene Understanding publishes |
+
+**Inside `query`**, which echoes what was asked so a response is
+self-describing:
+
+| Key | Meaning |
+|---|---|
+| `kind` | one of `retrieval_kinds`, or `"document"` on the single-document route |
+| `limit` | the effective cap, after the route's own bound |
+| `text` | the search terms, on a `text` query |
+| `centre` | the instant an `observed_within` window is centred on |
+| `window_seconds` | the half-width of that window |
+| `document_id` | the id asked for, on the single-document route |
+
+**Inside `pagination`**
+
+| Key | Meaning |
+|---|---|
+| `supported` | always `false`. There is no cursor |
+| `bound` | `"limit"` — the name of the thing that does bound a listing |
+| `reason` | how to detect truncation on each query kind |
+
+**Inside `library.bytes`:** `journal`, `images` and `total`, in bytes.
+`journal` is the JSONL; `images` is the page-image directory, which is
+empty unless page images were explicitly enabled; `total` is their sum.
+`retention_applied` on the `library` block is always `false` — that count
+is unfiltered, which is why it is named `document_count_unfiltered`.
+
+**On the single-document response:** `document` is the record itself, and
+`pages` is the list of `PageObservation` views inside it. It is the only
+place either carries text.
+
+
+---
+
+## 16. World Builder: known limitations
 
 1. **Polling latency.** Up to one poll interval (0.5 s) plus the builder's
    own write. Not a frame-rate signal.
@@ -912,14 +1763,88 @@ and `Start → Walk → Stop → the world appears` is the honest description.
    Builder emitting a per-frame event, which would turn a bounded journal
    into a per-frame one.
 5. **No imagery, and no artifact fetch contract.** §10.1.
-6. **Nothing has been validated on physical footage.** Every figure in this
-   document came from synthetic renders.
+6. **Most figures here came from synthetic renders.** One physical walk
+   has now been recorded and analysed (2026-08-24); where a number in
+   this document came from it, it says so.
 7. **`build_completed` is unreachable** in Tower's event vocabulary and is
    not exposed. Do not wait for it.
 
 ---
 
-## 12. Where the code is
+## 17. Changelog
+
+Identifiers are opaque and compared for equality only (§2). This section
+exists so a mismatch can be *understood*, not so it can be computed.
+
+### `scene_understanding.live/2026-08-27` — new
+
+First contract for this cartridge. Nothing preceded it on any wire.
+
+Dated 2026-08-27 rather than the 2026-08-26 of the design document it
+implements, because the payload that shipped is not the payload that was
+designed: `where` carries per-label SIDE COUNTS rather than one side per
+label — one side cannot describe a chair on the left and a chair on the
+right — and a `lifecycle` block was added, because this cartridge has a
+Start and a Stop that World Builder's file-reading status did not.
+
+The design was explicitly "designed, not implemented", so no consumer was
+broken. Minting the date the agreement actually reached a wire is the
+whole discipline these identifiers exist for.
+
+### `document_memory.status/2026-08-27` and `document_memory.library/2026-08-27` — new
+
+First contracts for this cartridge. Two identifiers rather than one,
+because they govern different surfaces with different failure modes: the
+`status` payload rides this channel and is small and pushed; the
+`library` payload is bulk text on HTTP and is pulled. A change to one is
+not a change to the other.
+
+### `world_builder.status/2026-08-25`
+
+Supersedes `world_builder.status/2026-08-23`. **One field changed
+meaning**, which is why the identifier moved rather than staying put for
+an additive change.
+
+**`trajectory.pose_count` counts something different.** It was
+`keyframes - poses_refused`. The build counts a segment ANCHOR as
+neither solved nor refused, so that subtraction promoted every anchor to
+a camera position — and an anchor is definitional, not measured: an
+identity rotation at the origin.
+
+The first physical walk (2026-08-24) made the consequence concrete. Its
+manifest reads `backend_id: "unposed", keyframes: 155, poses_solved: 0,
+poses_refused: 119, points: 0, segments: 36`. Nothing was reconstructed:
+no intrinsics exist for this camera, so the backend that solves poses
+could not run and withheld every one. The 36 remaining rows were segment
+anchors, all at the same point. The channel reported **"pose_count: 36"**
+and a phone displayed *"Camera poses: 36"*.
+
+`pose_count` is now read from the manifest's `poses_positioned`, which
+the build counts per segment: every solved pose, plus the anchor of each
+segment that solved something. For a build with `poses_solved: 0` it is
+**0**, whatever the anchor count.
+
+**`trajectory.poses_anchor` is new**, reported beside the count and never
+folded into it, so the same walk reads as "36 segment origins, no
+trajectory".
+
+**Worlds built before this change** carry no `poses_positioned`. The
+producer falls back to the old arithmetic for them rather than blanking
+the trajectory of every world already on disk; for the classical builds
+those worlds are, the two agree except across a segment that resolved
+nothing.
+
+**What a consumer must do.** Nothing, if it does not pin the contract
+identifier — the key set is unchanged apart from the added
+`poses_anchor`. A consumer that *does* pin it will be refused with
+`contract_mismatch` and must adopt the new identifier deliberately,
+having read the paragraph above. That refusal is the point: this build
+serves a figure that means something different from what the old
+identifier promised.
+
+---
+
+## 18. Where the code is
 
 | Concern | File |
 |---|---|
@@ -930,7 +1855,21 @@ and `Start → Walk → Stop → the world appears` is the honest description.
 | World Builder producer | `tower/results/world_builder.py` |
 | WebSocket protocol | `tower/routes/results_ws.py` |
 | `GET /cartridges` | `tower/routes/cartridges.py` |
-| Wiring | `tower/main.py`, `tower/config.py` (`TOWER_WORLD_ROOT`) |
+| Scene Understanding producer | `tower/results/scene_understanding.py` |
+| Scene Understanding session | `tower/scene/live.py`, `tower/live_session.py` |
+| Scene Understanding control | `tower/routes/scene.py` |
+| Document Memory producer | `tower/results/document_memory.py` |
+| Document Memory session | `tower/document_memory/live.py`, `tower/live_session.py` |
+| Document Memory library and control | `tower/routes/documents.py` |
+| Experimental CV Lab producer | `tower/results/experimental_cv.py` |
+| Experimental CV Lab control | `tower/routes/cv_lab.py`, `tower/routes/cv_lab_ws.py` |
+| Object Memory session control | `tower/routes/sessions.py`, `tower/cartridge_session.py` |
+| Object Memory store and imagery | `tower/object_memory/`, `tower/routes/observations.py` |
+| Live cartridge construction | `tower/cartridge_runtime.py` |
+| Wiring | `tower/main.py`, `tower/config.py` (`TOWER_WORLD_ROOT`, `TOWER_SCENE_UNDERSTANDING`, `TOWER_SCENE_DEVICE`, `TOWER_SCENE_ORIENTATION`, `TOWER_DOCUMENT_ROOT`, `TOWER_DOCUMENT_CAPTURE`) |
 
 Tests: `tests/test_result_channel_{protocol,bounds,truthfulness,isolation}.py`
-and `tests/result_channel_fixtures.py`.
+and `tests/result_channel_fixtures.py`. The two newer cartridges are
+driven end to end through the real app in `tests/test_scene_wire_e2e.py`
+and `tests/test_documents_wire_e2e.py`; their sessions are tested in
+isolation in `tests/test_scene_live_session.py`.

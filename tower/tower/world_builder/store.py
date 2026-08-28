@@ -43,6 +43,7 @@ from tower.storage import (
 )
 
 from tower.world_builder.records import (
+    SegmentPlacement,
     Keyframe,
     KeyframeEdge,
     Session,
@@ -356,7 +357,14 @@ class WorldStore:
         return data
 
     def write_derived(
-        self, world_id: str, session_id: str, *, poses, points, manifest
+        self,
+        world_id: str,
+        session_id: str,
+        *,
+        poses,
+        points,
+        manifest,
+        support=None,
     ) -> None:
         """Write the rebuildable reconstruction outputs.
 
@@ -367,6 +375,15 @@ class WorldStore:
         large enough that a viewer needs partial or memory-mapped reads --
         the same "small enough that rewriting wholesale is fine" reasoning
         object memory's store already documents for itself.
+
+        `support` is the 2-D/3-D association -- which feature in which
+        keyframe produced which point -- and goes in its OWN file rather
+        than into a points.json row. points.json is the source for a live
+        cross-platform wire contract (docs/contracts/
+        WORLD-BUILDER-GEOMETRY.md) whose row shape is pinned by test; a
+        second file costs a reader one open and costs that contract
+        nothing. `None` writes no file at all, which is what every world
+        built before this existed looks like on disk.
         """
         # Under the same lock as purge_world. Without it an in-flight
         # build can recreate a world directory that purge has just
@@ -376,6 +393,8 @@ class WorldStore:
             derived = self.derived_dir(world_id) / session_id
             write_json_atomic(derived / "poses.json", {"poses": poses})
             write_json_atomic(derived / "points.json", {"points": points})
+            if support is not None:
+                write_json_atomic(derived / "support.json", {"support": support})
             write_json_atomic(self.derived_manifest_path(world_id), manifest)
 
     def read_derived(
@@ -389,6 +408,13 @@ class WorldStore:
         prevent: the numbers look fine, they are just answers to an older
         question. Returning None makes a stale tree indistinguishable from
         an absent one, which is the honest outcome -- both mean "rebuild".
+
+        `support` is OPTIONAL and reads as None when the file is not
+        there. It arrived after ~29 worlds were already on disk, and a
+        reconstruction is complete without it -- it is an index into the
+        reconstruction, not part of it. A missing support.json is
+        therefore absent, never an error, and never a reason to refuse
+        poses and points that are perfectly good.
         """
         if verify:
             digest = compute_input_digest(
@@ -410,9 +436,112 @@ class WorldStore:
             return {
                 "poses": read_json_closed(poses_path)["poses"],
                 "points": read_json_closed(points_path)["points"],
+                "support": self._read_support(derived),
             }
         except (json.JSONDecodeError, KeyError):
             logger.warning("world builder: derived output unreadable for %s", world_id)
+            return None
+
+    def write_placements(self, world_id: str, session_id: str, placements) -> None:
+        """Persist where each segment sits, or why it does not sit anywhere.
+
+        Its own file, for the same reason `support` has one: geometry is
+        immutable once solved and PLACEMENT is not, so a later registration
+        pass must be able to change where a segment sits without rewriting
+        the points that decide its content hash. Folding placement into
+        points.json would couple the two and make every re-placement look
+        like new geometry.
+        """
+        with self._lock:
+            derived = self.derived_dir(world_id) / session_id
+            payload = {"placements": [p.to_json_dict() for p in placements]}
+            # allow_nan=False: Python writes NaN and Infinity as bare
+            # tokens that JSON.parse, Swift's JSONSerialization and Go's
+            # encoding/json all reject. A file only this runtime can read
+            # is not a wire artifact. Raising here leaves no file, because
+            # the write is atomic.
+            json.dumps(payload, allow_nan=False)
+            write_json_atomic(derived / "placements.json", payload)
+
+    def read_placements(self, world_id: str, session_id: str):
+        """The placements, or None. Never raises, never refuses a read.
+
+        Absent and unreadable are the same answer, exactly as for
+        `support`: every world built before placements existed has no such
+        file, and a reconstruction is complete without one. Refusing a
+        world over a truncated index beside it would turn an optional file
+        into a hard dependency by the back door.
+
+        A row that fails its own invariants is dropped rather than
+        poisoning the rest -- a placement that cannot be represented is
+        one that must not be drawn, and the others are still good.
+        """
+        path = self.derived_dir(world_id) / session_id / "placements.json"
+        if not path.exists():
+            return None
+        # Broad on purpose. An earlier version caught only JSONDecodeError
+        # and KeyError, which covers a truncated file and nothing else --
+        # `{"placements": null}`, a top-level list, a string, or a null row
+        # are all VALID JSON and each raised straight through
+        # build_manifest into an HTTP 500, taking poses and points that
+        # were perfectly good down with an optional index beside them.
+        # That is exactly what this method's contract exists to prevent,
+        # so the contract is enforced rather than described.
+        try:
+            document = read_json_closed(path)
+            rows = document["placements"]
+            if not isinstance(rows, list):
+                raise TypeError(f"placements must be a list, got {type(rows)}")
+        except Exception:
+            logger.warning(
+                "world builder: placements unreadable at %s; treating as "
+                "absent",
+                path,
+            )
+            return None
+        kept = []
+        for row in rows:
+            try:
+                kept.append(SegmentPlacement.from_json_dict(row))
+            except Exception:
+                logger.warning(
+                    "world builder: dropping unrepresentable placement in "
+                    "%s: %r",
+                    path,
+                    row,
+                )
+        return kept
+
+    def _read_support(self, derived: Path):
+        """The association, or None. Never raises, never refuses a read.
+
+        Unreadable is treated the same as missing on purpose. Poses and
+        points do not become wrong because an index beside them is
+        truncated, and refusing the whole derived tree over it would turn
+        an optional file into a hard dependency by the back door -- which
+        is precisely what keeping it out of points.json was meant to
+        avoid. Logged, because a corrupt file is still worth knowing about.
+        """
+        path = derived / "support.json"
+        if not path.exists():
+            return None
+        try:
+            support = read_json_closed(path)["support"]
+            # Shape-checked, not just parsed. A top-level list raised
+            # TypeError straight out of a method whose docstring promises
+            # it never raises, and a string was returned AS the support
+            # table -- which cross-segment registration then consumes.
+            if not isinstance(support, list):
+                raise TypeError(
+                    f"support must be a list, got {type(support)}"
+                )
+            return support
+        except Exception:
+            logger.warning(
+                "world builder: support association unreadable at %s; "
+                "treating as absent",
+                path,
+            )
             return None
 
     def derived_is_current(self, world_id: str, input_digest: str) -> bool:

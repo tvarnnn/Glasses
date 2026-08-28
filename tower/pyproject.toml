@@ -25,20 +25,56 @@ dev = [
     "websockets>=12.0",
 ]
 ml = [
-    "torch",
+    # PINNED, AND THE INDEX IS NOT OPTIONAL.
+    #
+    #   pip install --index-url https://download.pytorch.org/whl/cu132 \
+    #       "torch==2.13.0+cu132" "torchvision==0.28.0+cu132"
+    #
+    # Install these two FIRST, from that index, before anything else in
+    # this extra or in `ocr`. A bare `pip install .[ml]` resolves torch
+    # from PyPI, whose Windows wheel is CPU-only (122 MB against 1.92 GB)
+    # -- and CPU torch does not announce itself. It imports, it runs, and
+    # every GPU figure in the docs silently becomes a CPU figure. That is
+    # not hypothetical: it is how this venv arrived at torch 2.13.0+cpu
+    # and stayed there (weekend run report, item 5).
+    #
+    # cu132 rather than cu128: the RTX 5070 is Blackwell, sm_120. Verified
+    # on this host 2026-08-26 -- get_device_capability() == (12, 0),
+    # arch_list includes sm_120, and a real matmul executed on device.
+    # Note that general web search still recommends "nightly cu128 or
+    # WSL2" for Blackwell; that advice is stale, cu128/cu129 were removed
+    # from the build matrix, and following it wastes an afternoon.
+    #
+    # Needs driver >= 580 (this host: 596.21). No CUDA Toolkit install --
+    # the Windows wheel bundles its own runtime.
+    "torch==2.13.0+cu132",
     # torchvision is now a DIRECT dependency, not only a transitive one:
     # tower/experiments/object_detection.py uses its
     # ssdlite320_mobilenet_v3_large with COCO weights (~13.4 MB, downloaded
     # on first use). No new package was added for it -- it was already
     # here, which is most of why that detector was chosen over one that
     # would have cost a dependency.
-    "torchvision",
+    #
+    # Also pinned to the cu132 index, same reason as torch above. And it
+    # carries more than the detector: KeypointRCNN, which Scene
+    # Understanding's coarse orientation needs, is torchvision-only. That
+    # capability costs no additional package.
+    "torchvision==0.28.0+cu132",
     # timm: not a Tower dependency directly, but MiDaS's hubconf.py
     # (intel-isl/MiDaS, loaded via torch.hub in tower/experiments/depth.py)
     # unconditionally imports a DPT/beit backbone chain that requires it,
     # even to load the "MiDaS_small" model. Without it, DepthEstimation.load()
     # fails with ModuleNotFoundError: No module named 'timm'.
-    "timm",
+    #
+    # Installed and verified on this host 2026-08-26 at 1.0.28. Unlike the
+    # two above it carries no index trap -- it is pure Python on PyPI --
+    # so it takes a floor rather than an exact pin. What WAS checked is
+    # that installing it does not disturb them: pip reported torch and
+    # torchvision "already satisfied", and afterwards both still report
+    # +cu132 with a real matmul executing on sm_120. Re-check that after
+    # any change here; a resolver that decides to "help" with torch is
+    # exactly the failure this block exists to prevent.
+    "timm>=1.0.28",
 ]
 ocr = [
     # Document Memory's text recognition. Chosen after a pip dry-run
@@ -50,7 +86,61 @@ ocr = [
     #
     # Adds: scipy, scikit-image, imageio, tifffile, lazy-loader, ninja,
     # pyclipper, python-bidi, shapely. `pip check` clean before and after.
-    "easyocr",
+    #
+    # PINNED, for the same reason the `ml` extra pins torch: the version
+    # is load-bearing on a measurement. Installed and verified on this
+    # host 2026-08-26 -- `pip check` clean, `cv2.__version__` still
+    # 5.0.0 with `opencv-python-headless` the ONLY cv2 distribution
+    # present, `numpy` still 2.5.2, `torch` still 2.13.0+cu132 with CUDA
+    # available. The 2026-08-26 reality check
+    # (docs/superpowers/research/2026-08-26-document-memory-reality-check.md)
+    # reproduced the published 640x480 and 1280x720 word-recall rows
+    # exactly against THIS version; an unpinned upgrade would silently
+    # move the baseline those rows are compared to.
+    #
+    # `easyocr` lists `torch` as a requirement. Install the cu132 wheels
+    # from the `ml` extra FIRST, or a bare resolve fetches the CPU-only
+    # Windows wheel over them -- the same trap that extra documents.
+    "easyocr==1.7.2",
+]
+semantic = [
+    # Object Memory's second opinion on a detector label. Optional, off
+    # by default, and gated at the settings layer: with
+    # TOWER_OBSERVATION_VERIFIER unset nothing here is imported, no
+    # weights are fetched, and the cartridge records exactly what it
+    # recorded before this extra existed.
+    #
+    # WHAT IT BUYS, MEASURED. `google/owlv2-base-patch16-ensemble`
+    # (Apache-2.0, ~600 MB of weights fetched once) accepts 93.2% of
+    # correct detector labels and rejects 94.3% of wrong ones over 94
+    # human-labelled crops from the real corpus, at 128 ms and 842 MB of
+    # peak VRAM per call -- called once per sighting, which measured 53
+    # times across 18,821 frames. Evidence:
+    # docs/superpowers/research/2026-08-27-object-memory-corpus-precision.md
+    #
+    # A FLOOR, NOT AN EXACT PIN, unlike torch and easyocr above. Those
+    # two are pinned because a measurement is calibrated against the
+    # version; here the calibrated thing is the WEIGHTS, which are
+    # addressed by repo id and are not what pip resolves. The library is
+    # a loader.
+    #
+    # THE MAJOR VERSION IS LOAD-BEARING. transformers 5.x exposes
+    # `Owlv2ForObjectDetection` through `AutoModelForZeroShotObjectDetection`
+    # and `post_process_grounded_object_detection` with the signature
+    # `tower/object_memory/verification.py` calls. Verified on this host
+    # 2026-08-27 at 5.16.1.
+    #
+    # WHAT IT DOES NOT DISTURB, checked with `pip install --dry-run`
+    # BEFORE installing: the resolve adds only tokenizers, regex, typer,
+    # rich, markdown-it-py, mdurl and shellingham -- all pure Python --
+    # and reports every existing package "already satisfied". Nothing
+    # touches torch, torchvision, numpy or cv2. Re-check that after any
+    # change here; a resolver that decides to "help" with torch is
+    # exactly the failure the `ml` extra exists to prevent.
+    #
+    # `huggingface_hub` and `safetensors` are already present via timm,
+    # so they are not listed.
+    "transformers>=5.16,<6",
 ]
 
 [build-system]
@@ -59,3 +149,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["tower*"]
+
+[tool.pytest.ini_options]
+markers = [
+    # End-to-end tests that spawn a real subprocess and build a real
+    # world. Slow on purpose: a fast version would fake the spawn, and a
+    # faked spawn is exactly what let the 2026-08-24 lifecycle gap exist.
+    "slow: spawns real processes and builds real worlds",
+]

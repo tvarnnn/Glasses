@@ -9,10 +9,11 @@ The brief's four example questions, and one rule that governs all of them:
     How many appear to be facing my direction? -> orientation, or a refusal
 
 The third question hides a trap the others do not. If orientation is
-disabled -- and it is, by default, because it costs 744 ms a frame --
-then "how many people are facing me" has **no answer**, and returning 0
-would be a lie of exactly the kind Core Principle 3 forbids: an
-observation gap reported as an observation of absence.
+disabled -- and it is by default, because the default device is CPU where
+a call costs 956 ms against an 83.5 ms frame interval -- then "how many
+people are facing me" has **no answer**, and returning 0 would be a lie
+of exactly the kind Core Principle 3 forbids: an observation gap reported
+as an observation of absence.
 
 Nothing here reads or writes a store. There is no store.
 """
@@ -142,8 +143,9 @@ class SceneQuery:
                 detail={
                     "people_in_view": self._state.count("person"),
                     "how_to_enable": (
-                        "supply a pose estimator; it costs ~744 ms per call "
-                        "on this CPU, which is why it is off by default"
+                        "supply a pose estimator; it costs ~956 ms per call "
+                        "on CPU and ~43 ms on CUDA, and the default device "
+                        "is CPU, which is why it is off by default"
                     ),
                 },
             )

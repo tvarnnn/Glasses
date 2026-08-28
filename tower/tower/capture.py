@@ -59,6 +59,38 @@ END_REASON_BOUNDED_LIMIT = "bounded_limit"
 # stopped trying, so anything arriving later is genuinely a new walk.
 RESUME_GRACE_SECONDS = 90.0
 
+# How long a follower tolerates a capture whose manifest is still OPEN but
+# has stopped growing, expressed as polls at the default 0.25 s interval.
+#
+# `CaptureFollower.follow` has always accepted this bound and its docstring
+# has always promised it -- "Bounded by construction (Rule 15): a capture
+# whose manifest never closes -- a crashed recorder -- ends the follow after
+# `max_idle_polls` quiet polls rather than waiting forever". Neither worker
+# spec in `main.py` passed it, so the parameter defaulted to None and the
+# promise was never kept. A producer whose Tower died without closing the
+# manifest polled that directory forever. On Windows that is the ordinary
+# way a Tower dies: `terminate()` is `TerminateProcess`, which runs no
+# lifespan and closes nothing.
+#
+# 900 s, and the number is chosen against what a LEGITIMATE silence can be
+# rather than picked for roundness. Frames arrive at ~12 fps, so a live
+# capture is never quiet for long; every ordinary interruption CLOSES the
+# capture and is handled by the successor path instead. The longest
+# plausible silence with the manifest still open is the window in which the
+# phone has stopped sending and uvicorn has not yet noticed the dead
+# socket, which `stop()` records as 20-40 s. This is an order of magnitude
+# above that, and ten times `RESUME_GRACE_SECONDS`, which is this file's own
+# allowance for a walk that goes quiet and comes back.
+#
+# The failure directions are asymmetric and that is why the bound is
+# generous: firing early costs a wearer the rest of a mapped walk, while
+# firing late only costs an idle process a few more minutes.
+IDLE_FOLLOW_TIMEOUT_SECONDS = 900.0
+DEFAULT_FOLLOW_POLL_SECONDS = 0.25
+DEFAULT_MAX_IDLE_POLLS = int(
+    IDLE_FOLLOW_TIMEOUT_SECONDS / DEFAULT_FOLLOW_POLL_SECONDS
+)
+
 logger = logging.getLogger(__name__)
 
 CAPTURE_FILENAME = "capture.json"
@@ -388,9 +420,18 @@ class _JournalTail:
 
     __slots__ = ("_path", "_offset", "_remainder")
 
-    def __init__(self, path) -> None:
+    def __init__(self, path, *, start_at_end: bool = False) -> None:
         self._path = path
+        # Where reading begins. Zero -- the whole journal -- unless a
+        # caller has said it arrived late and must not read the part of
+        # the recording that happened before it was asked for. A journal
+        # that does not exist yet is empty, so both answers are 0.
         self._offset = 0
+        if start_at_end:
+            try:
+                self._offset = path.stat().st_size
+            except OSError:
+                self._offset = 0
         self._remainder = b""
 
     def read_new(self) -> list:
@@ -481,10 +522,11 @@ class CaptureFollower:
         self,
         directory,
         *,
-        poll_seconds: float = 0.25,
+        poll_seconds: float = DEFAULT_FOLLOW_POLL_SECONDS,
         sleep=time.sleep,
         follow_reconnects: bool = True,
         resume_grace_seconds: float = RESUME_GRACE_SECONDS,
+        start_at_end: bool = False,
     ):
         from pathlib import Path
 
@@ -493,6 +535,21 @@ class CaptureFollower:
         self._sleep = sleep
         self._follow_reconnects = follow_reconnects
         self._resume_grace_seconds = resume_grace_seconds
+        # Skip whatever the journal already holds, and yield only frames
+        # recorded from now on.
+        #
+        # Off by default, because every existing caller follows a capture
+        # from the moment it opens and must see all of it. It is turned
+        # on by a consumer ATTACHED LATE -- a cartridge a wearer started
+        # three minutes into a walk. Reading the earlier frames would be
+        # cheap and wrong: nobody asked for the first three minutes to be
+        # processed, and a follower is not the right place to decide that
+        # they should be.
+        #
+        # It applies to THIS directory only. A successor capture after a
+        # reconnect is read whole, because by then the consumer has been
+        # attached the entire time that capture existed.
+        self._start_at_end = start_at_end
 
     @property
     def directory(self):
@@ -513,7 +570,7 @@ class CaptureFollower:
 
     def follow(self, *, max_idle_polls: int | None = None):
         journal = self._directory / FRAMES_FILENAME
-        tail = _JournalTail(journal)
+        tail = _JournalTail(journal, start_at_end=self._start_at_end)
         idle_polls = 0
 
         while True:

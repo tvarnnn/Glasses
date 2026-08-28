@@ -223,3 +223,61 @@ class TestTokenisation:
     def test_numbers_survive(self):
         """A receipt total is a searchable term."""
         assert "1749" in tokenise("Total 1749")
+
+
+class TestDocumentFrequencyIsCorpusWideAndComputedOnce:
+    """Document frequency is a property of (corpus, term), not of a document.
+
+    It was computed INSIDE the per-document scoring loop, rescanning every
+    document and rebuilding `set(token_list)` for each one on every call --
+    O(D^2) in library size. Measured before the change: 25 documents 7.6 ms,
+    800 documents 9,532 ms.
+
+    These tests pin the two things a hoist must not break: the arithmetic,
+    and the fact that a term absent from a document contributes nothing.
+    """
+
+    def _reference_document_frequency(self, corpus, term):
+        """The original expression, kept as the thing parity is checked against."""
+        return sum(1 for token_list in corpus.tokens if term in set(token_list))
+
+    def test_the_precomputed_frequency_equals_the_original_expression(self):
+        from tower.document_memory.retrieval import _Corpus
+
+        documents = [
+            _document("transformers", TRANSFORMERS, NOW - 1800),
+            _document("depth", DEPTH, NOW - 600),
+            _document("receipt", RECEIPT, NOW - 60),
+        ]
+        corpus = _Corpus(documents)
+
+        every_term = {token for token_list in corpus.tokens for token in token_list}
+        assert every_term, "the fixture corpus tokenised to nothing"
+
+        for term in sorted(every_term):
+            assert corpus.document_frequency[term] == (
+                self._reference_document_frequency(corpus, term)
+            ), term
+
+    def test_a_term_in_no_document_has_frequency_zero(self):
+        from tower.document_memory.retrieval import _Corpus
+
+        corpus = _Corpus([_document("depth", DEPTH, NOW)])
+
+        assert corpus.document_frequency.get("nonexistentterm", 0) == 0
+
+    def test_ranking_is_unchanged_by_the_hoist(self, memory):
+        """The scores themselves, pinned against the pre-hoist implementation.
+
+        Recorded by running the ORIGINAL quadratic code on this exact
+        fixture. If a future change moves a score, this is the test that
+        should have to be argued with.
+        """
+        result = memory.search_text("transformer attention depth receipt")
+
+        ranked = [(match.document_id, match.score) for match in result.matches]
+        assert ranked == [
+            ("transformers", 2.307606327102424),
+            ("depth", 1.4577347001839878),
+            ("receipt", 0.9658420488061142),
+        ]

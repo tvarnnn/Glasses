@@ -21,6 +21,12 @@
 import Combine
 import MWDATCore
 import XCTest
+#if DEBUG
+// For `MWDATCamera.StreamState`, which `isCaptureSessionClaimed` switches over.
+// The app imports MWDATCamera only under DEBUG, and everything here that names
+// it is DEBUG-only for the same reason.
+import MWDATCamera
+#endif
 
 @testable import Glasses
 
@@ -42,24 +48,62 @@ final class CartridgeCatalogTests: XCTestCase {
         XCTAssertEqual(ids.count, Set(ids).count, "Duplicate cartridge id would break ForEach identity")
     }
 
-    /// The whole point of the shell: nothing is runnable yet. If a future
-    /// change adds an "available"/"active" status, this test should fail and
-    /// force a deliberate decision about whether the Tower actually supports
-    /// it (module container is V0.8, first module V0.9).
-    func testNoCartridgeClaimsToBeAvailable() {
-        let honestBadges: Set<String> = ["Up next", "Planned", "Future"]
+    /// **This test was the tripwire that guarded the old badge vocabulary, and
+    /// it has been answered rather than deleted.**
+    ///
+    /// It used to read: *"nothing is runnable yet. If a future change adds an
+    /// 'available'/'active' status, this test should fail and force a
+    /// deliberate decision about whether the Tower actually supports it (module
+    /// container is V0.8, first module V0.9)."*
+    ///
+    /// It fired, and here is the deliberate decision. The Tower **does**
+    /// support it: probed live on 2026-08-26 it reports `module_state:
+    /// "active"` with `module_id: "experimental-cv"`, and `GET /cartridges`
+    /// declares `world_builder.status/2026-08-25` with `available: true` — a
+    /// contract this build implements and has drawn live geometry from on
+    /// hardware. The premise the tripwire defended is gone.
+    ///
+    /// What replaces it is the invariant that is still worth defending: **a
+    /// badge may not claim more than the app can open.** A cartridge with no
+    /// workspace has nothing for a person to try, so it can never be
+    /// `.readyToTest`, and one with a workspace is never `.notBuilt`. That is
+    /// asserted in both directions so neither half can drift.
+    func testABadgeNeverClaimsMoreThanTheAppCanOpen() {
         for cartridge in Cartridge.catalog {
-            XCTAssertTrue(
-                honestBadges.contains(cartridge.status.badge),
-                "\(cartridge.name) advertises status '\(cartridge.status.badge)', which implies a runtime that does not exist"
-            )
+            if cartridge.workspace == nil {
+                XCTAssertEqual(
+                    cartridge.status,
+                    .notBuilt,
+                    "\(cartridge.name) advertises '\(cartridge.status.badge)' with no workspace to open"
+                )
+            } else {
+                XCTAssertNotEqual(
+                    cartridge.status,
+                    .notBuilt,
+                    "\(cartridge.name) ships a workspace but calls itself not built"
+                )
+            }
         }
     }
 
-    func testExactlyOneCartridgeIsMarkedNext() {
-        let next = Cartridge.catalog.filter { $0.status == .next }
-        XCTAssertEqual(next.count, 1, "Roadmap defines a single Module #1")
-        XCTAssertEqual(next.first?.name, "Experimental CV Lab")
+    /// The badge is a fact about this build, not about the Tower on the other
+    /// end of the socket.
+    ///
+    /// `CartridgeStatus` must consult nothing at runtime — a live Tower's
+    /// ability to serve a cartridge is resolved per-connection by
+    /// `CartridgeAvailability.resolve` and rendered inside the workspace. If
+    /// this ever became connection-dependent, "Ready to test" would start
+    /// flickering with the network and the drawer would stop being a stable
+    /// answer to "what is in this build".
+    func testTheBadgeIsStaticAndDoesNotTrackTheTower() {
+        let first = Cartridge.catalog.map(\.status)
+        let second = Cartridge.catalog.map(\.status)
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(
+            Cartridge.catalog.first { $0.id == "object-memory" }?.status,
+            .readyToTest,
+            "Object Memory stays ready to test even though the live Tower answers 404 — that is one Tower's configuration, not this build's capability"
+        )
     }
 
     func testEveryCartridgeCitesASpec() {
@@ -150,14 +194,16 @@ final class CartridgeWorkspaceTests: XCTestCase {
         // added without a deliberate decision about its status fails here
         // rather than passing silently.
         let expected: [String: CartridgeStatus] = [
-            "experimental-cv": .next,        // Module #1, V0.9
-            "object-memory": .planned,
-            "visual-qa": .planned,
-            "world-build": .future,
-            "accessibility": .future,
-            "environmental-memory": .future,
-            "document-memory": .future,      // concept seed, Tower has not adopted it
-            "scene-understanding": .future,  // concept seed, Tower has not adopted it
+            // Each value is justified by evidence, cited here so a future
+            // change has to argue with the evidence rather than with a habit.
+            "experimental-cv": .readyToTest,      // the Tower's only running module; module_state "active"
+            "object-memory": .readyToTest,        // two live HTTP routes, decoder pinned against a real Tower
+            "world-build": .readyToTest,          // the one offered contract; device-validated walk, 7,086 points
+            "document-memory": .readyToTest,      // declares status/2026-08-27 + library under http_contracts
+            "scene-understanding": .readyToTest,  // declares live/2026-08-27; `live` answers the persistence objection
+            "visual-qa": .notBuilt,               // zero Tower code
+            "accessibility": .notBuilt,           // zero Tower code
+            "environmental-memory": .notBuilt,    // zero Tower code; its own design says do not begin
         ]
         XCTAssertEqual(
             Set(Cartridge.catalog.map(\.id)),
@@ -168,13 +214,34 @@ final class CartridgeWorkspaceTests: XCTestCase {
             XCTAssertEqual(
                 cartridge.status,
                 expected[cartridge.id],
-                "\(cartridge.name)'s roadmap status drifted"
+                "\(cartridge.name)'s status drifted from the evidence recorded beside it"
             )
         }
 
-        // Restated positively: Module #1 is still exactly one cartridge, and
-        // shipping screens for four of them did not create a second.
-        XCTAssertEqual(Cartridge.catalog.filter { $0.status == .next }.count, 1)
+        // Restated positively. This count moved from three to five on
+        // 2026-08-27 when the Tower unified four lanes, and the number is
+        // asserted rather than derived so that moving it stays a decision
+        // somebody makes on evidence.
+        //
+        // `.awaitingTower` now has **no members**, and that is the honest
+        // state rather than a gap: the case meant "the Tower implements this
+        // and offers no contract for it", and there is no longer a cartridge
+        // in that position — every one with Tower code behind it now declares
+        // something. The case is kept because it is the correct answer the
+        // next time a Tower lane finishes an engine before its contract, which
+        // is the ordinary order of work.
+        XCTAssertEqual(
+            Cartridge.catalog.filter { $0.status == .readyToTest }.count,
+            5,
+            """
+            five cartridges reach a person today: World Builder, Object Memory, \
+            Experimental CV Lab, Document Memory, Scene Understanding
+            """
+        )
+        XCTAssertTrue(
+            Cartridge.catalog.filter { $0.status == .awaitingTower }.isEmpty,
+            "a cartridge is waiting on a Tower contract again; say which and why beside it"
+        )
     }
 
     /// The availability guard, asserted rather than implied.
@@ -195,21 +262,31 @@ final class CartridgeWorkspaceTests: XCTestCase {
     ///
     /// The two pre-existing tests are left untouched. They were Mac-validated,
     /// they are not wrong, and they still guard the badge strings.
-    func testCartridgeStatusHasNoRunnableCase() {
-        for status in [CartridgeStatus.next, .planned, .future] {
+    func testEveryStatusIsADeliberateDecisionWithItsOwnBadge() {
+        for status in CartridgeStatus.allCases {
             switch status {
-            case .next, .planned, .future:
+            case .readyToTest, .awaitingTower, .notBuilt:
                 continue
-            // Any case added here makes this switch non-exhaustive. If that case
-            // means "the Tower can run this", stop: the Tower has no module
-            // container (V0.8) and no module (V0.9), and the drawer would begin
-            // advertising a runtime that does not exist.
+            // A case added here makes this switch non-exhaustive and stops the
+            // build, which is louder than a red test and is the point. Before
+            // adding one, answer the question this vocabulary exists to answer:
+            // what can a person DO with it in this build? If the answer is a
+            // roadmap position, it does not belong here — roadmap position
+            // lives in docs/03-ROADMAP.md and each cartridge's specPath, and
+            // rendering it in the drawer is what produced a catalog where
+            // Visual Q&A read "Planned" with no backend while World Builder
+            // read "Future" with a device-validated walk behind it.
             }
         }
         XCTAssertEqual(
-            Set([CartridgeStatus.next.badge, CartridgeStatus.planned.badge, CartridgeStatus.future.badge]).count,
-            3,
+            Set(CartridgeStatus.allCases.map(\.badge)).count,
+            CartridgeStatus.allCases.count,
             "two statuses render the same badge, so the drawer cannot distinguish them"
+        )
+        XCTAssertEqual(
+            CartridgeStatus.allCases.filter(\.isProminent),
+            [.readyToTest],
+            "exactly one status may draw the eye, or the drawer stops answering 'which can I try' in a glance"
         )
     }
 
@@ -256,17 +333,17 @@ final class CartridgeWorkspaceTests: XCTestCase {
         }
     }
 
-    /// The existing availability guard must keep holding after workspaces were
-    /// introduced — stated here too, because this is the change most likely to
-    /// have quietly broken it.
-    func testWorkspacesDidNotIntroduceAnAvailabilityClaim() {
-        let honestBadges: Set<String> = ["Up next", "Planned", "Future"]
-        for cartridge in Cartridge.selectable {
-            XCTAssertTrue(
-                honestBadges.contains(cartridge.status.badge),
-                "\(cartridge.name) is openable and advertises '\(cartridge.status.badge)'"
-            )
-        }
+    /// Openability and the badge are now two views of one fact, so they must
+    /// agree exactly.
+    ///
+    /// The drawer decides tappability from `CartridgeDrawerRow`; the badge is
+    /// read off `status`. If those disagreed, a row would either invite a tap
+    /// that goes nowhere or hide a cartridge a person was just told is ready.
+    func testTheOpenableRowsAreExactlyTheCartridgesThatAreNotUnbuilt() {
+        XCTAssertEqual(
+            Cartridge.selectable.map(\.id),
+            Cartridge.catalog.filter { $0.status != .notBuilt }.map(\.id)
+        )
     }
 
     func testExactlyTheCartridgesWithWorkspacesAreSelectable() {
@@ -305,6 +382,98 @@ final class CartridgeWorkspaceTests: XCTestCase {
             "no workspace-less cartridge left to test the fallback with"
         )
         XCTAssertNil(Cartridge.workspaceCartridge(forID: withoutWorkspace.id))
+    }
+
+    // MARK: One answer to "is this cartridge openable?"
+
+    /// `Cartridge.selectable` is documented as "every cartridge the drawer may
+    /// present as openable", but for most of this shell's life the drawer did
+    /// not consult it — or anything derived from it. It iterated
+    /// `Cartridge.catalog` and re-derived openability inline as
+    /// `cartridge.workspace != nil`, twice: once to decide whether to wrap the
+    /// row in a `Button`, and once inside the row to pick the accessibility
+    /// hint. `selectable`'s only callers were in this file.
+    ///
+    /// Two code paths answering one question agreed only by coincidence of
+    /// implementation. Nothing made them agree, so nothing would have caught
+    /// them diverging — a cartridge could have been openable to the drawer and
+    /// absent from `selectable`, and every test here would still have passed
+    /// while asserting the wrong list.
+    ///
+    /// `Cartridge.drawerRows` is now the single answer. The drawer renders it;
+    /// `selectable` is defined as the openable rows of it. These tests pin that
+    /// definition, so the identity below is not a coincidence being observed —
+    /// it is the construction being checked.
+    func testTheDrawerRendersEveryCatalogEntryInCatalogOrder() {
+        XCTAssertEqual(
+            Cartridge.drawerRows.map(\.cartridge.id),
+            Cartridge.catalog.map(\.id),
+            "the drawer shows all catalog entries, openable or not — dropping the informational rows would hide three modules"
+        )
+    }
+
+    func testTheDrawersOpenableRowsAreExactlyTheSelectableCartridges() {
+        let openable = Cartridge.drawerRows.filter(\.isOpenable).map(\.cartridge.id)
+        XCTAssertEqual(
+            openable,
+            Cartridge.selectable.map(\.id),
+            "the drawer and Cartridge.selectable disagree about which cartridges may be opened"
+        )
+        XCTAssertFalse(openable.isEmpty, "this test is vacuous if nothing is openable")
+    }
+
+    /// The other half of the same guarantee: a row is openable **if and only
+    /// if** its cartridge has a workspace. The `.openable` case carries a
+    /// non-optional `CartridgeWorkspace`, so the compiler already forbids an
+    /// openable row with nothing to open; this pins the converse, that a
+    /// cartridge with a workspace cannot be filed as informational.
+    func testARowIsOpenableExactlyWhenItsCartridgeHasAWorkspace() {
+        for row in Cartridge.drawerRows {
+            switch row {
+            case .openable(let cartridge, let workspace):
+                XCTAssertEqual(
+                    cartridge.workspace,
+                    workspace,
+                    "\(cartridge.name) opens a workspace that is not its own"
+                )
+            case .informational(let cartridge):
+                XCTAssertNil(
+                    cartridge.workspace,
+                    "\(cartridge.name) has a workspace but the drawer renders it as informational"
+                )
+            }
+        }
+    }
+
+    /// The three rows with no workspace, named. `testAStoredCartridgeWithout…`
+    /// only needs one of them to exist; this pins which three, so a cartridge
+    /// silently losing its workspace fails here rather than quietly becoming an
+    /// informational row in a shipped build.
+    func testTheThreeCartridgesWithoutAWorkspaceStayInformational() {
+        let informational = Cartridge.drawerRows.filter { !$0.isOpenable }.map(\.cartridge.id)
+        XCTAssertEqual(informational, ["visual-qa", "accessibility", "environmental-memory"])
+    }
+
+    /// Both hint strings, pinned to the same decision that decides tappability.
+    ///
+    /// These are the only two sentences VoiceOver reads that state whether a
+    /// row does anything. If the hint and the `Button` were ever derived
+    /// separately, one of them would eventually say a row opens something it
+    /// cannot open — a lie told only to the users who cannot see that nothing
+    /// happened (Rule 3, Truthful State Only).
+    func testTheAccessibilityHintFollowsTheSameOpenabilityDecision() {
+        for row in Cartridge.drawerRows {
+            XCTAssertEqual(
+                row.accessibilityHint,
+                row.isOpenable ? "Opens this workspace" : "No workspace in this app yet",
+                "\(row.cartridge.name)'s hint does not match its openability"
+            )
+        }
+        XCTAssertEqual(
+            Set(Cartridge.drawerRows.map(\.accessibilityHint)),
+            ["Opens this workspace", "No workspace in this app yet"],
+            "both hints must still be reachable — a drawer with one hint has stopped distinguishing the two kinds of row"
+        )
     }
 }
 
@@ -436,39 +605,341 @@ final class CartridgeIntegrationTests: XCTestCase {
 
     // MARK: What the Tower has declared
 
-    /// The whole current state of Tower integration, asserted rather than
-    /// assumed. When the first real contract lands this test fails, and that
-    /// failure is the intended signal to review every consumer — it is not a
-    /// nuisance to delete.
-    func testTheTowerDeclaresNoCartridgeContracts() {
-        XCTAssertTrue(
-            TowerCapabilities.declared.isEmpty,
-            "a Tower contract appeared; every cartridge's client must be reviewed"
+    /// The state of Tower integration, asserted rather than assumed.
+    ///
+    /// This test used to assert both tables were empty, and its own comment
+    /// said that the first real contract landing should make it fail as a
+    /// signal to review every consumer. That happened: the Tower now declares
+    /// `world_builder.status/2026-08-25` over the socket, and every consumer
+    /// was reviewed. What it pins now is the same property in its new form —
+    /// **exactly one contract is implemented, and it is that one** — so a
+    /// second one appearing is still a review and not a silent widening.
+    func testTheImplementedContractsAreExactlyTheFiveThisBuildDecodes() {
+        XCTAssertEqual(
+            TowerCapabilities.supported,
+            [
+                WorldBuilderResultContract.identifier,
+                ExperimentalCVContract.status,
+                SceneUnderstandingContract.identifier,
+                DocumentMemoryContract.statusIdentifier,
+                DocumentMemoryContract.libraryIdentifier
+            ],
+            "this build's implemented contracts changed; every cartridge's client must be reviewed"
         )
         XCTAssertTrue(
-            TowerCapabilities.supported.isEmpty,
-            "this build claims to implement a contract that does not exist"
+            TowerCapabilities.declared.isEmpty,
+            """
+            a contract was hardcoded into the local table. Every one this app \
+            implements arrives over the wire, and a compile-time copy is a second \
+            answer that can disagree with the Tower's.
+            """
         )
     }
 
-    /// No cartridge becomes usable by connecting. Connectivity is not the thing
-    /// that is missing, and a UI that suggested otherwise would send a user
-    /// round a loop that cannot terminate.
+    /// Object Memory has a complete client and no declaration, deliberately.
+    ///
+    /// This is the one asymmetry in the system that looks like a bug from every
+    /// angle, so it is pinned from the iOS side rather than left to be
+    /// rediscovered. The Tower's own contract §9 says: *"Object Memory is NOT
+    /// in `GET /cartridges`, and that is deliberate… Reach Object Memory over
+    /// HTTP. Learn nothing about it from the declaration."* A
+    /// `result_subscribe` for it is refused `unknown_cartridge`, and the Tower
+    /// pins that refusal on its side too.
+    ///
+    /// So the absence below is the assertion, not an omission in it. If Object
+    /// Memory ever gains a socket declaration, this test fails and **that is
+    /// the review** — the two halves must land together, and the Tower lane
+    /// recorded the decision as a human's to make.
+    func testObjectMemoryIsReachedWithoutADeclaration() {
+        XCTAssertNil(
+            TowerCapabilities.towerCartridgeNames["object-memory"],
+            """
+            Object Memory gained a Tower name. It is undeclared by design and \
+            reached over HTTP; a name here would make it look subscribable.
+            """
+        )
+        XCTAssertFalse(
+            TowerCapabilities.supported.contains(where: { $0.hasPrefix("object_memory.") }),
+            "an object_memory contract entered the subscription set; it has none on the socket"
+        )
+    }
+
+    /// The Tower's name for a cartridge is not this app's, and only cartridges
+    /// with a client that decodes a declared contract have both.
+    ///
+    /// The hyphen/underscore split is not cosmetic: `experimental-cv` against
+    /// `experimental_cv` is the mapping without which a complete client, a
+    /// correct decoder and a live offer still resolve to "nothing here".
+    func testTheCartridgeNameMappingCoversTheDeclaredCartridges() {
+        XCTAssertEqual(
+            TowerCapabilities.towerCartridgeNames,
+            [
+                "world-build": "world_builder",
+                "experimental-cv": "experimental_cv",
+                "scene-understanding": "scene_understanding",
+                "document-memory": "document_memory"
+            ]
+        )
+        let mapped = Set(TowerCapabilities.towerCartridgeNames.keys)
+        for cartridge in Cartridge.catalog where !mapped.contains(cartridge.id) {
+            XCTAssertNil(
+                TowerCapabilities.towerCartridgeNames[cartridge.id],
+                "\(cartridge.name) gained a Tower name without a client to use it"
+            )
+        }
+    }
+
+    // MARK: Availability against a live declaration
+
+    private func declaration(
+        cartridge: String = "world_builder",
+        contract: String = WorldBuilderResultContract.identifier,
+        available: Bool = true,
+        reason: String? = nil
+    ) -> TowerCartridgeDeclaration {
+        TowerCartridgeDeclaration(
+            envelopeContract: "cartridge_results.envelope/2026-08-23",
+            offers: [
+                TowerCartridgeOffer(
+                    json: [
+                        "cartridge": cartridge,
+                        "result_type": "status",
+                        "contract": contract,
+                        "available": available,
+                        "unavailable_reason": reason as Any,
+                        "snapshot_only": true,
+                    ]
+                )!
+            ]
+        )
+    }
+
+    /// A Tower that has declared nothing is indistinguishable from one that
+    /// never will — which is correct, because from here it is.
+    func testWorldBuilderIsUnavailableUntilTheTowerDeclaresIt() {
+        XCTAssertEqual(
+            TowerCapabilities.availability(
+                for: "world-build",
+                declaredBy: nil,
+                isTowerReachable: true
+            ),
+            .noContract
+        )
+    }
+
+    /// The declaration is what makes it available, and connectivity is the
+    /// second gate rather than the first.
+    func testADeclaredWorldBuilderContractBecomesAvailableWhenReachable() {
+        let declared = declaration()
+        XCTAssertEqual(
+            TowerCapabilities.availability(
+                for: "world-build",
+                declaredBy: declared,
+                isTowerReachable: true
+            ),
+            .available(
+                CartridgeContract(
+                    cartridgeID: "world-build",
+                    identifier: WorldBuilderResultContract.identifier
+                )
+            )
+        )
+        XCTAssertEqual(
+            TowerCapabilities.availability(
+                for: "world-build",
+                declaredBy: declared,
+                isTowerReachable: false
+            ),
+            .towerUnreachable,
+            "a declared contract must read as disconnected, not as absent, while the socket is down"
+        )
+    }
+
+    /// A Tower speaking a different dated contract is a disagreement, not a
+    /// version to compare. It must reach `.unsupportedContract`, which tells a
+    /// person to update the app rather than to reconnect.
+    func testAnUndatedOrLaterContractIsNotDecodedOnAGuess() {
+        for identifier in ["world_builder.status/2027-01-01", "world_builder.status/2026-01-01", "v2"] {
+            XCTAssertEqual(
+                TowerCapabilities.availability(
+                    for: "world-build",
+                    declaredBy: declaration(contract: identifier),
+                    isTowerReachable: true
+                ),
+                .unsupportedContract(
+                    declared: CartridgeContract(cartridgeID: "world-build", identifier: identifier)
+                ),
+                "contract \(identifier) was treated as compatible"
+            )
+        }
+    }
+
+    /// `available: false` is an offer, not silence. Collapsing it to
+    /// `.noContract` would render "no world root is configured" as "this Tower
+    /// will never do this" — a different and wrong claim, calling for a
+    /// different response from a person.
+    func testAnUnavailableOfferIsStillAnOffer() {
+        XCTAssertEqual(
+            TowerCapabilities.availability(
+                for: "world-build",
+                declaredBy: declaration(available: false, reason: "no world root is configured"),
+                isTowerReachable: true
+            ),
+            .available(
+                CartridgeContract(
+                    cartridgeID: "world-build",
+                    identifier: WorldBuilderResultContract.identifier
+                )
+            )
+        )
+    }
+
+    /// A declaration naming some other cartridge must not make World Builder
+    /// available, and a cartridge this build has no name for stays absent.
+    ///
+    /// This test used to use `scene_understanding` as its "other cartridge",
+    /// and that stopped being a valid choice on 2026-08-27: Scene Understanding
+    /// now has a name mapping and a client, so a declaration for it resolves to
+    /// something. `visual-qa` is the replacement because it is the case the
+    /// test is actually about — a cartridge with **no Tower code anywhere**,
+    /// which no amount of declaring can change.
+    func testADeclarationForAnotherCartridgeChangesNothing() {
+        let other = declaration(cartridge: "visual_qa", contract: "visual_qa.v1")
+        XCTAssertEqual(
+            TowerCapabilities.availability(
+                for: "world-build",
+                declaredBy: other,
+                isTowerReachable: true
+            ),
+            .noContract
+        )
+        XCTAssertEqual(
+            TowerCapabilities.availability(
+                for: "visual-qa",
+                declaredBy: other,
+                isTowerReachable: true
+            ),
+            .noContract,
+            "a cartridge with no name mapping and no client became available"
+        )
+    }
+
+    /// The contract's **third state**, which this app could not previously
+    /// express and which is the whole reason `GET /cartridges` exists over HTTP
+    /// as well as the socket.
+    ///
+    /// The Tower's §2 puts three outcomes side by side and says they call for
+    /// *opposite* instructions to a person:
+    ///
+    /// | the declaration says | show |
+    /// |---|---|
+    /// | absent from every list | "not built yet" |
+    /// | present, contract this build cannot read | **"update the app"** |
+    /// | present, `available: false` | "connect" / the reason |
+    ///
+    /// The middle row is the one worth a test, because collapsing it into the
+    /// first tells someone a feature does not exist when they are one update
+    /// away from it. Before the name mapping existed, every unmapped cartridge
+    /// fell into the first row regardless of what the Tower said — which is why
+    /// this could not be asserted until now.
+    func testADeclaredContractThisBuildCannotReadAsksForAnUpdateNotForPatience() {
+        let futureTower = declaration(
+            cartridge: "scene_understanding",
+            contract: "scene_understanding.live/2027-01-01"
+        )
+        XCTAssertEqual(
+            TowerCapabilities.availability(
+                for: "scene-understanding",
+                declaredBy: futureTower,
+                isTowerReachable: true
+            ),
+            .unsupportedContract(
+                declared: CartridgeContract(
+                    cartridgeID: "scene-understanding",
+                    identifier: "scene_understanding.live/2027-01-01"
+                )
+            ),
+            """
+            a Tower speaking a newer contract resolved to "not built" rather than \
+            "update the app". Those are opposite instructions to a person.
+            """
+        )
+    }
+
+    /// No cartridge becomes usable by connecting **alone**. Connectivity is the
+    /// second gate, never the first: a declaration has to arrive as well, and
+    /// a UI that suggested reconnecting would fix a missing contract would send
+    /// a user round a loop that cannot terminate.
+    ///
+    /// Asserted through the no-declaration entry point.
+    ///
+    /// ## Why this no longer expects one answer for all eight
+    ///
+    /// It used to assert `.noContract` for every cartridge in both reachability
+    /// states, which was right when the Tower declared nothing. **With no
+    /// declaration and no connection, the honest answer now depends on whether
+    /// this build could ever receive one:**
+    ///
+    /// - A cartridge with a client and a Tower-name mapping — World Builder,
+    ///   the CV Lab, Scene, Document — gets `.towerUnreachable`. Saying "this
+    ///   Tower has not declared it" on a cold launch is a claim about a machine
+    ///   nobody has spoken to, and the shipped `.noContract` string goes
+    ///   further and denies being about the connection.
+    /// - A cartridge with **no Tower code anywhere** — Visual Q&A,
+    ///   Accessibility, Environmental Memory — stays `.noContract` in both
+    ///   states, because "the Tower is unreachable" would be its own false
+    ///   story: reconnecting cannot help.
+    /// - Object Memory stays `.noContract` here too, and that is not an
+    ///   oversight: it is undeclared by design and resolves its real
+    ///   availability by probing over HTTP, not through this path.
+    ///
+    /// What the test still pins is the property in its name — **connectivity
+    /// alone never makes anything available.** `.isAvailable` is false in every
+    /// one of the sixteen combinations.
     func testNoCartridgeIsAvailableWhetherOrNotTheTowerIsReachable() {
         for cartridge in Cartridge.catalog {
+            let thisBuildCanReceiveADeclaration =
+                TowerCapabilities.towerCartridgeNames[cartridge.id] != nil
             for reachable in [true, false] {
                 let availability = TowerCapabilities.availability(
                     for: cartridge.id,
                     isTowerReachable: reachable
                 )
+                let expected: CartridgeAvailability =
+                    (thisBuildCanReceiveADeclaration && !reachable)
+                        ? .towerUnreachable
+                        : .noContract
                 XCTAssertEqual(
                     availability,
-                    .noContract,
+                    expected,
+                    "\(cartridge.name) resolved wrongly with reachable=\(reachable)"
+                )
+                XCTAssertFalse(
+                    availability.isAvailable,
                     "\(cartridge.name) claimed availability with reachable=\(reachable)"
                 )
-                XCTAssertFalse(availability.isAvailable)
-                XCTAssertEqual(availability.forcedPhase, .unsupported)
+                XCTAssertEqual(
+                    availability.forcedPhase,
+                    expected == .towerUnreachable ? .disconnected : .unsupported
+                )
             }
+        }
+    }
+
+    /// The cold-launch case, stated on its own because it is what a person
+    /// actually meets first.
+    ///
+    /// Before the fix this returned `.noContract` for all four, whose shipped
+    /// explanation reads *"That is a statement about what the Tower offers, not
+    /// about this connection"* — false in precisely the situation that produced
+    /// it, and the first thing anyone sees if the Tower is not up yet.
+    func testAColdLaunchWithNoTowerBlamesTheConnectionNotTheTower() {
+        for cartridgeID in TowerCapabilities.towerCartridgeNames.keys {
+            XCTAssertEqual(
+                TowerCapabilities.availability(for: cartridgeID, isTowerReachable: false),
+                .towerUnreachable,
+                "\(cartridgeID) told a cold-launched app the Tower had never heard of it"
+            )
         }
     }
 
@@ -486,7 +957,13 @@ final class CartridgeIntegrationTests: XCTestCase {
         )
         XCTAssertEqual(availability, .unsupportedContract(declared: declared))
         XCTAssertFalse(availability.isAvailable)
-        XCTAssertEqual(availability.forcedPhase, .unsupported)
+        // `.needsUpdate`, not `.unsupported`. The Tower *declared* this
+        // cartridge — it can do it — and this build is the half that cannot
+        // read the agreement. That is the one empty state on this screen a
+        // person can end themselves, and "Nothing yet" told them a feature
+        // did not exist when they were one update away from it.
+        XCTAssertEqual(availability.forcedPhase, .needsUpdate)
+        XCTAssertNotEqual(availability.forcedPhase, .unsupported)
     }
 
     /// The precedence rule. A contract mismatch is not fixed by reconnecting,
@@ -526,9 +1003,12 @@ final class CartridgeIntegrationTests: XCTestCase {
         // unreachable may well be able to do this, and the shared panel now
         // says so in its headline and glyph rather than only in its prose.
         XCTAssertEqual(CartridgeAvailability.towerUnreachable.forcedPhase, .disconnected)
+        // `.needsUpdate`, not `.unsupported`, for the same reason `.disconnected`
+        // is not `.unsupported`: opposite responses. Nothing fixes `.noContract`
+        // but a Tower change; this one is fixed by updating the app.
         XCTAssertEqual(
             CartridgeAvailability.unsupportedContract(declared: declared).forcedPhase,
-            .unsupported
+            .needsUpdate
         )
     }
 
@@ -666,7 +1146,10 @@ final class CartridgeIntegrationTests: XCTestCase {
         XCTAssertFalse(CartridgePhase.live.showsProgress)
         XCTAssertFalse(CartridgePhase.settled.showsProgress)
         XCTAssertFalse(CartridgePhase.failed.showsProgress)
-        XCTAssertEqual(CartridgePhase.allCases.count, 7, "a phase was added without a decision here")
+        // Decided: nothing is in flight while the app is the thing that is
+        // behind, so a spinner would be as untrue here as in `.unsupported`.
+        XCTAssertFalse(CartridgePhase.needsUpdate.showsProgress)
+        XCTAssertEqual(CartridgePhase.allCases.count, 8, "a phase was added without a decision here")
     }
 
     /// An unreachable Tower and an absent capability are different situations
@@ -674,6 +1157,20 @@ final class CartridgeIntegrationTests: XCTestCase {
     func testAnUnreachableTowerIsNotAMissingCapability() {
         XCTAssertNotEqual(CartridgePhase.disconnected, CartridgePhase.unsupported)
         XCTAssertFalse(CartridgePhase.disconnected.mayCarryData)
+    }
+
+    /// The third member of the same family. All four empty phases mean "there
+    /// is nothing to show", and each one implies a different next move: wait
+    /// for the Tower to gain the capability, wait for the network, update the
+    /// app, or press the button. Collapsing any two of them hands a person the
+    /// wrong instruction.
+    func testTheFourEmptyPhasesAreDistinctBecauseTheirRemediesAre() {
+        let empty: [CartridgePhase] = [.unsupported, .disconnected, .needsUpdate, .idle]
+        XCTAssertEqual(Set(empty).count, empty.count, "two empty phases collapsed into one")
+        for phase in empty {
+            XCTAssertFalse(phase.mayCarryData, "\(phase) must not carry data")
+            XCTAssertFalse(phase.showsProgress, "\(phase) must not claim work is underway")
+        }
     }
 
     // MARK: Failures
@@ -693,13 +1190,28 @@ final class CartridgeIntegrationTests: XCTestCase {
     }
 }
 
-// MARK: - The four cartridge clients
+// MARK: - The four unavailable cartridge clients
 
-/// One table, four cartridges, one invariant: **nothing in this app produces
-/// Tower data, because the Tower produces none.**
+/// One table, four cartridges, one invariant: **these four clients produce no
+/// Tower data, because the Tower produces none for them.**
 ///
-/// Written as a table rather than four suites so that a fifth cartridge added
-/// without a truthful client fails here rather than passing by omission.
+/// Written as a table rather than four suites so that a cartridge added without
+/// a truthful client fails here rather than passing by omission.
+///
+/// ## Why Object Memory is not in the table
+///
+/// It is the fifth cartridge and the first whose Tower half genuinely answers:
+/// two read-only HTTP routes, serving a real store. Its client therefore
+/// *should* be able to reach `.settled` with records in it, which is precisely
+/// what `testNoClientProducesTowerData` forbids — the invariant here is "no
+/// data from a Tower that produces none", and for Object Memory the premise is
+/// false.
+///
+/// So it is covered by `ObjectMemoryTests` instead, which asserts the stronger
+/// property that actually applies to it: that what it produces is decoded from
+/// what the Tower sent, and that nothing it says about a record overclaims.
+/// `testEveryOpenableCartridgeHasAClient` below still includes it, because
+/// "every screen has a client" is true of all five.
 @MainActor
 final class CartridgeClientTests: XCTestCase {
 
@@ -741,7 +1253,11 @@ final class CartridgeClientTests: XCTestCase {
                 cartridgeID: scene.cartridgeID,
                 phase: scene.state.phase,
                 reason: UnavailableSceneUnderstandingClient.reason,
-                hasData: scene.state.snapshot != nil
+                // `observation`, not the old `snapshot`. `SceneSnapshot` was
+                // removed with the entity/relationship types it held: the wire
+                // has no key that could carry an entity, so a type shaped like
+                // a list of them could never be filled from a real payload.
+                hasData: scene.state.observation != nil
             ),
         ]
     }
@@ -831,7 +1347,14 @@ final class CartridgeClientTests: XCTestCase {
     /// would have to invent its own state, which is where fabricated data
     /// enters an app.
     func testEveryOpenableCartridgeHasAClient() {
-        let clientIDs = Set(allClients().map(\.cartridgeID))
+        // The four unavailable clients, plus Object Memory's — which is not in
+        // `allClients()` because the invariant that table asserts does not
+        // apply to it. Read off `CartridgeClients` rather than hardcoded, so a
+        // sixth cartridge cannot be satisfied by a string in this file.
+        let clients = CartridgeClients()
+        var clientIDs = Set(allClients().map(\.cartridgeID))
+        clientIDs.insert(clients.objectMemory.cartridgeID)
+
         for cartridge in Cartridge.selectable {
             XCTAssertTrue(
                 clientIDs.contains(cartridge.id),
@@ -906,14 +1429,34 @@ final class CartridgeClientTests: XCTestCase {
 @MainActor
 final class CartridgeViewModelTests: XCTestCase {
 
-    func testEveryViewModelReportsUnsupportedWhetherOrNotTheTowerIsReachable() {
-        for reachable in [true, false] {
-            XCTAssertEqual(WorldBuilderViewModel(client: UnavailableWorldBuilderClient()).phase(isTowerReachable: reachable), .unsupported)
-            XCTAssertEqual(ExperimentalCVViewModel(client: UnavailableExperimentalCVClient()).phase(isTowerReachable: reachable), .unsupported)
-            XCTAssertEqual(DocumentMemoryViewModel(client: UnavailableDocumentMemoryClient()).phase(isTowerReachable: reachable), .unsupported)
-            XCTAssertEqual(SceneUnderstandingViewModel(client: UnavailableSceneUnderstandingClient()).phase(isTowerReachable: reachable), .unsupported)
+    /// With no declaration, the phase now depends on whether the Tower is
+    /// reachable — and that difference is the point, not an inconsistency.
+    ///
+    /// `.unsupported` says "this Tower will never do this"; `.disconnected`
+    /// says "ask again when connected". All four of these cartridges have a
+    /// client and a Tower-name mapping, so on a cold launch the second is the
+    /// true one. Asserting `.unsupported` in both states — which this test did
+    /// — is what let a disconnected app tell a person the Tower had never heard
+    /// of four cartridges it serves.
+    func testEveryViewModelSeparatesAnAbsentContractFromAnAbsentConnection() {
+        for (name, phaseFor) in Self.viewModelPhases {
+            XCTAssertEqual(
+                phaseFor(true), .unsupported,
+                "\(name) with a reachable Tower and no declaration is not 'unsupported'"
+            )
+            XCTAssertEqual(
+                phaseFor(false), .disconnected,
+                "\(name) blamed the Tower for what is a missing connection"
+            )
         }
     }
+
+    private static let viewModelPhases: [(String, (Bool) -> CartridgePhase)] = [
+        ("World Builder", { WorldBuilderViewModel(client: UnavailableWorldBuilderClient()).phase(isTowerReachable: $0) }),
+        ("Experimental CV Lab", { ExperimentalCVViewModel(client: UnavailableExperimentalCVClient()).phase(isTowerReachable: $0) }),
+        ("Document Memory", { DocumentMemoryViewModel(client: UnavailableDocumentMemoryClient()).phase(isTowerReachable: $0) }),
+        ("Scene Understanding", { SceneUnderstandingViewModel(client: UnavailableSceneUnderstandingClient()).phase(isTowerReachable: $0) })
+    ]
 
     /// Availability must outrank the client's own state, or a cartridge whose
     /// Tower cannot serve it would render `.idle` and invite a user to start
@@ -1482,60 +2025,18 @@ final class WorldModelIntegrationTests: XCTestCase {
 
 // MARK: - Experimental CV Lab
 
-/// Guards the two rules `docs/modules/EXPERIMENTAL-CV.md` puts on results:
-/// inference must be distinguishable from measurement, and nothing may be called
-/// "better" without a baseline to be better than.
+/// Guards the rule `docs/modules/EXPERIMENTAL-CV.md` puts on results:
+/// inference must be distinguishable from measurement.
+///
+/// The other rule it used to guard — nothing may be called "better" without a
+/// baseline to be better than — is no longer testable here, because there is
+/// no longer any code that could break it. `CVMetric` carries no `baseline`,
+/// no `higherIsBetter` and no `comparison`: the Tower sends those fields as
+/// `null` on every metric, always, and the machinery was deleted rather than
+/// left dormant behind them. The four tests that lived here asserted the
+/// behaviour of a verdict renderer that no longer exists.
 @MainActor
 final class ExperimentalCVModelTests: XCTestCase {
-
-    private func metric(
-        _ value: Double,
-        baseline: Double? = nil,
-        higherIsBetter: Bool? = nil
-    ) -> CVMetric {
-        CVMetric(
-            label: "accuracy",
-            value: value,
-            provenance: .inferred(confidence: nil),
-            baseline: baseline,
-            higherIsBetter: higherIsBetter
-        )
-    }
-
-    /// "Avoid declaring an approach 'better' without a measurement", enforced.
-    func testNoVerdictWithoutABaseline() {
-        XCTAssertNil(metric(0.9, higherIsBetter: true).comparison)
-    }
-
-    /// A metric with no stated direction cannot be judged either: latency and
-    /// error improve downward, and guessing gets it backwards half the time.
-    func testNoVerdictWithoutAStatedDirection() {
-        XCTAssertNil(metric(0.9, baseline: 0.5).comparison)
-    }
-
-    /// Integral values on purpose: this asserts the *direction* logic, and a
-    /// binary-float delta would make the test about `Double` equality instead.
-    func testAVerdictRespectsTheStatedDirection() {
-        XCTAssertEqual(
-            metric(90, baseline: 50, higherIsBetter: true).comparison,
-            .better(delta: 40)
-        )
-        // The same movement, on a metric where lower is better.
-        XCTAssertEqual(
-            metric(90, baseline: 50, higherIsBetter: false).comparison,
-            .worse(delta: 40)
-        )
-        XCTAssertEqual(
-            metric(20, baseline: 50, higherIsBetter: false).comparison,
-            .better(delta: -30)
-        )
-    }
-
-    /// A tie is a real result and must not round into a win.
-    func testMatchingTheBaselineIsUnchanged() {
-        XCTAssertEqual(metric(0.5, baseline: 0.5, higherIsBetter: true).comparison, .unchanged)
-        XCTAssertEqual(CVMetric.Comparison.unchanged.label, "Unchanged")
-    }
 
     /// A unit the Tower did not send is omitted, not substituted.
     func testAMissingUnitIsOmittedRatherThanInvented() {
@@ -1590,6 +2091,242 @@ final class ExperimentalCVModelTests: XCTestCase {
         }
         XCTAssertTrue(ExperimentalCVState.running(run).isRunning)
         XCTAssertFalse(ExperimentalCVState.completed(run).isRunning)
+    }
+
+    // MARK: The frame channel
+    //
+    // The Tower's per-frame reply carries the running experiment's own answer —
+    // `result_value`, `result_label`, `mean_intensity`, `processing_ms`,
+    // `metrics` — and it arrives on the frame path, not on the cartridge
+    // contract channel. `CVFrameReading` is that reply projected for display.
+    // The tests below guard the two things that are easy to get wrong about it:
+    // that a bare number never escapes without the Tower's own name for it, and
+    // that showing it does not turn the cartridge layer's `.unsupported` state
+    // into a state that carries data.
+
+    private func frameResult(
+        sequence: Int? = 41,
+        meanIntensity: Double? = nil,
+        processingMs: Double? = nil,
+        resultValue: Double? = nil,
+        resultLabel: String? = nil,
+        metrics: [String: Double] = [:]
+    ) -> TowerFrameResult {
+        TowerFrameResult(
+            sequence: sequence,
+            meanIntensity: meanIntensity,
+            processingMs: processingMs,
+            resultValue: resultValue,
+            resultLabel: resultLabel,
+            stageMs: [:],
+            metrics: metrics,
+            // A Tower running no CV Lab attaches no `cv_lab` block, which is
+            // the case these fixtures describe: they exercise the pair rule on
+            // the message's own fields.
+            cvLab: nil
+        )
+    }
+
+    /// The pair rule, in both directions. `result_value` is a bare number whose
+    /// meaning belongs to the experiment; rendering it under a caption this app
+    /// chose would invent a unit nobody promised. A label with no number under
+    /// it is the mirror-image fabrication — a row that asserts the experiment
+    /// measured something it did not report.
+    func testAHeadlineNumberAndItsLabelAreOnlyReadableTogether() {
+        XCTAssertNil(
+            CVFrameReading(frameResult(resultValue: 0.42)).headline,
+            "a bare number escaped without the Tower's own name for it"
+        )
+        XCTAssertNil(
+            CVFrameReading(frameResult(resultLabel: "edge density")).headline,
+            "a label was offered with no number under it"
+        )
+        // Absent and empty are indistinguishable on the wire, and a row
+        // captioned with whitespace is a bare number with extra steps.
+        XCTAssertNil(
+            CVFrameReading(frameResult(resultValue: 0.42, resultLabel: "  ")).headline,
+            "whitespace was accepted as a label"
+        )
+
+        let both = CVFrameReading(frameResult(resultValue: 0.42, resultLabel: "edge density"))
+        XCTAssertEqual(both.headline?.label, "edge density")
+        XCTAssertEqual(both.headline?.value ?? -1, 0.42, accuracy: 0.0001)
+    }
+
+    /// Rule 3: absence renders as absence. A field the Tower omitted is unknown,
+    /// and a zero it actually sent is a result — the two must not merge in
+    /// either direction.
+    func testAnOmittedFigureStaysAbsentAndAReportedZeroStaysAResult() {
+        let silent = CVFrameReading(frameResult())
+        XCTAssertNil(silent.headline)
+        XCTAssertNil(silent.meanIntensity, "silence about intensity became a dark frame")
+        XCTAssertNil(silent.processingMs, "silence about timing became instant work")
+        XCTAssertTrue(silent.measurements.isEmpty)
+        XCTAssertFalse(
+            silent.hasAnything,
+            "a reply carrying only a sequence number claimed to have a result in it"
+        )
+
+        let dark = CVFrameReading(frameResult(meanIntensity: 0, resultValue: 0, resultLabel: "edges"))
+        XCTAssertEqual(dark.meanIntensity, 0)
+        XCTAssertEqual(dark.headline?.value, 0)
+        XCTAssertTrue(dark.hasAnything, "a reported zero was discarded as if it were silence")
+    }
+
+    /// The Tower's additive measurements arrive as a dictionary, which has no
+    /// stable order. A list of numbers that reshuffles itself twelve times a
+    /// second is unreadable, and an unnamed one is a bare number again.
+    func testMeasurementsKeepTheirTowerGivenNamesInAStableOrder() {
+        let reading = CVFrameReading(
+            frameResult(metrics: ["edges": 4210, "": 7, "contrast": 0.5])
+        )
+        XCTAssertEqual(reading.measurements.map(\.label), ["contrast", "edges"])
+        XCTAssertEqual(reading.measurements.first?.displayValue, "0.500")
+        XCTAssertTrue(reading.hasAnything)
+    }
+
+    /// Two wire keys that differ only in whitespace are two entries the Tower
+    /// sent, and they have to stay two distinguishable rows.
+    ///
+    /// The display label is trimmed — a row captioned with whitespace is a bare
+    /// number with extra steps — so `{"edges": 1, " edges": 2}` collapses to one
+    /// caption. When the row identity was that trimmed caption, `ForEach` saw
+    /// duplicate ids and the sort key was equal for both; `sorted(by:)` is not
+    /// stable, so the two rows could swap places on every reply. That is the
+    /// exact twelve-times-a-second reshuffle the sort was added to prevent.
+    func testKeysDifferingOnlyInWhitespaceStayDistinctAndTotallyOrdered() {
+        let reading = CVFrameReading(frameResult(metrics: ["edges": 1, " edges": 2]))
+
+        XCTAssertEqual(reading.measurements.count, 2, "the Tower sent two entries and one was dropped")
+        XCTAssertEqual(
+            Set(reading.measurements.map(\.id)).count, 2,
+            "two rows share one identity, which is a duplicate ForEach id"
+        )
+        XCTAssertEqual(reading.measurements.map(\.label), ["edges", "edges"])
+        // Ordered on the untrimmed key once the captions tie, so the order is
+        // total and does not depend on the dictionary's iteration order.
+        XCTAssertEqual(reading.measurements.map(\.id), [" edges", "edges"])
+        XCTAssertEqual(reading.measurements.map(\.value), [2, 1])
+    }
+
+    /// Rule 16. `frame_result` has no provenance field, and silence must not be
+    /// read as "measured" — so the reading states `.unknown` and owes the caveat
+    /// that goes with it wherever its figures are drawn.
+    func testTheFrameChannelClaimsNoProvenance() {
+        XCTAssertEqual(CVFrameReading.provenance, .unknown)
+        XCTAssertFalse(CVFrameReading.provenance.isInference)
+        XCTAssertNotNil(
+            CVFrameReading.provenance.caveat,
+            "figures of unstated provenance would be drawn with nothing said about it"
+        )
+    }
+
+    /// The invariant this whole design exists to protect, in the two halves it
+    /// actually has — one checkable at runtime and one only at compile time.
+    ///
+    /// The frame reading is frame-path output. It must not become a case of
+    /// `ExperimentalCVState`, because the Tower offers no typed contract for
+    /// `experimental_cv` and that state is therefore `.unsupported` — a phase
+    /// `CartridgePhase.mayCarryData` forbids from carrying anything. Showing the
+    /// Tower's real answer must not cost that guarantee.
+    ///
+    /// **What no assertion can reach.** Swift cannot be asked at runtime what
+    /// payload types an enum's cases carry, and assertions can only speak about
+    /// values that exist — so an earlier version of this test, which built a
+    /// `lab` and a `reading` that never interacted and then checked facts about
+    /// the `lab` alone, would have stayed green if `case
+    /// frameReading(CVFrameReading)` had been added to `ExperimentalCVState`
+    /// and rendered. It asserted that the *current* state is `.unsupported`,
+    /// which is true because `UnavailableExperimentalCVClient.state` is a
+    /// hardcoded literal.
+    ///
+    /// **What does reach it**: `assertCarriesOnlyContractData` below switches
+    /// over every case without a `default`. Adding a case stops this test
+    /// target compiling, at the one line whose comment says why the case must
+    /// not exist — which is the only mechanism available that a new case cannot
+    /// pass silently.
+    func testNoCartridgeStateCarriesAFrameReading() {
+        let experiment = CVExperiment(id: "e", name: "E")
+        let run = CVExperimentRun(experiment: experiment)
+        for state: ExperimentalCVState in [
+            .unsupported(reason: "no runner"),
+            .idle(available: []),
+            .idle(available: [experiment]),
+            .starting(experiment),
+            .running(run),
+            .completed(run),
+            .failed(CartridgeFailure(kind: .notSupported, message: "no")),
+        ] {
+            assertCarriesOnlyContractData(state)
+        }
+    }
+
+    /// Every case of `ExperimentalCVState`, and what each may carry.
+    ///
+    /// No `default`, deliberately. A case added here to carry `CVFrameReading`
+    /// — the frame channel's output, which has no contract behind it and no
+    /// provenance attached — breaks the build rather than passing, and whoever
+    /// adds it has to argue with this comment first. The frame channel belongs
+    /// beside this enum (`CVFrameReading`, read straight off `TowerClient`),
+    /// never inside it.
+    private func assertCarriesOnlyContractData(_ state: ExperimentalCVState) {
+        switch state {
+        case .unsupported, .idle, .starting, .failed:
+            XCTAssertNil(
+                state.run,
+                "a state with no run produced one: \(state)"
+            )
+            XCTAssertFalse(
+                state.phase.mayCarryData,
+                "\(state) claims a phase that permits data it does not have"
+            )
+        case .running(let run), .paused(let run), .completed(let run):
+            // The only three cases that carry results, and what they carry is
+            // a `CVExperimentRun` — metrics with `provenance` required by the
+            // type, which is exactly what the frame channel
+            // cannot supply.
+            XCTAssertEqual(state.run, run)
+            XCTAssertTrue(state.phase.mayCarryData)
+        }
+    }
+
+    /// The runtime half: with the only client that exists, nothing the frame
+    /// channel produces reaches the cartridge state — before or after a reading
+    /// with a real result in it has been built and read.
+    func testReadingTheFrameChannelLeavesTheCartridgeStateUntouched() {
+        let lab = ExperimentalCVViewModel(client: UnavailableExperimentalCVClient())
+        let before = lab.state
+
+        let reading = CVFrameReading(frameResult(resultValue: 0.42, resultLabel: "edge density"))
+        XCTAssertTrue(reading.hasAnything, "the fixture must actually carry a result")
+        XCTAssertNotNil(reading.headline)
+
+        XCTAssertEqual(lab.state, before, "the frame channel moved the cartridge state")
+        XCTAssertEqual(lab.state.phase, .unsupported)
+        XCTAssertFalse(lab.state.phase.mayCarryData)
+        XCTAssertNil(lab.state.run, "the frame channel produced a cartridge run")
+        XCTAssertEqual(
+            lab.availability(isTowerReachable: true),
+            .noContract,
+            "experimental-cv gained a contract it was never offered"
+        )
+        XCTAssertEqual(lab.phase(isTowerReachable: true), .unsupported)
+    }
+
+    /// Reading the experiment's answer is not the same as being able to choose
+    /// it. There is no wire message to list, start or stop an experiment, so the
+    /// list stays empty and the request stays refused.
+    func testShowingTheAnswerDoesNotMakeAnythingRunnable() {
+        let client = UnavailableExperimentalCVClient()
+        XCTAssertThrowsError(try client.run(CVExperiment(id: "any", name: "Any"))) { error in
+            XCTAssertEqual((error as? CartridgeFailure)?.kind, .notSupported)
+        }
+
+        let lab = ExperimentalCVViewModel(client: client)
+        XCTAssertTrue(
+            lab.availableExperiments.isEmpty,
+            "the app is offering experiments the Tower has not declared"
+        )
     }
 }
 
@@ -1743,255 +2480,6 @@ final class DocumentMemoryModelTests: XCTestCase {
         ]
         for (state, phase) in expected {
             XCTAssertEqual(state.phase, phase, "\(state) mapped to the wrong phase")
-        }
-    }
-}
-
-// MARK: - Scene Understanding
-
-/// The anonymity and no-gaze rules, as tests. These are the assertions most
-/// likely to be tripped by a future well-meaning copy edit, which is exactly why
-/// they are here rather than in a comment.
-@MainActor
-final class SceneUnderstandingModelTests: XCTestCase {
-
-    private func person(_ id: String, facing: SceneFacing = .unknown) -> SceneEntity {
-        SceneEntity(
-            trackID: SceneTrackID(id),
-            kind: .person,
-            facing: facing,
-            provenance: .inferred(confidence: 0.7)
-        )
-    }
-
-    // MARK: Anonymity
-
-    /// A person on screen is a positional label and nothing else. The Tower's
-    /// track handle never reaches the display, because a stable-looking string
-    /// beside a person's outline invites a reader to treat it as an identity.
-    func testAPersonIsNamedPositionallyAndNeverByTheirTrackHandle() {
-        let handle = SceneTrackID("track-7f3a-9b21")
-        let name = handle.displayName(index: 0, kind: .person)
-        XCTAssertEqual(name, "Person 1")
-        XCTAssertFalse(name.contains(handle.rawValue), "a track handle reached the display")
-    }
-
-    /// An object may carry a class label — "chair" — which is a category, not an
-    /// identity. Limitation 6's distinction, preserved.
-    func testAnObjectMayCarryAClassLabelButNeverAnIdentity() {
-        let handle = SceneTrackID("track-2")
-        XCTAssertEqual(handle.displayName(index: 1, kind: .object(label: "chair")), "chair")
-        XCTAssertEqual(handle.displayName(index: 1, kind: .object(label: nil)), "Object 2")
-    }
-
-    /// Two tracked people differ only by their handle — never by anything the
-    /// system claims to know *about* them.
-    ///
-    /// The anonymity guarantee itself is structural: `SceneEntityKind.person`
-    /// has no associated value, so there is nowhere to put a name, and no
-    /// runtime test can assert the absence of a field. What is testable is the
-    /// consequence, which is what this checks. An earlier version asserted
-    /// `SceneEntityKind.person == SceneEntityKind.person`, a tautology that
-    /// would keep passing if someone added `case identifiedPerson(name:)`
-    /// beside it.
-    func testTwoTrackedPeopleDifferOnlyByTheirHandle() {
-        let a = person("track-a")
-        let b = person("track-b")
-        XCTAssertNotEqual(a.trackID, b.trackID)
-        XCTAssertEqual(a.kind, b.kind, "the system distinguished two people by something about them")
-        XCTAssertFalse(SceneEntityKind.object(label: "person").isPerson)
-
-        // And the display of each is positional, so even the handle that does
-        // distinguish them never reaches the screen.
-        XCTAssertEqual(a.trackID.displayName(index: 0, kind: a.kind), "Person 1")
-        XCTAssertEqual(b.trackID.displayName(index: 1, kind: b.kind), "Person 2")
-    }
-
-    // MARK: Gaze
-
-    /// The wording rule from Limitation 8. `.towardCamera` is body orientation
-    /// and reads as such; every phrasing that would claim attention is absent.
-    func testOrientationLabelsNeverClaimGaze() {
-        XCTAssertEqual(SceneFacing.towardCamera.displayName, "Facing your direction")
-        let forbidden = ["look", "watch", "eye", "gaze", "stare", "notice", "see you"]
-        for facing in SceneFacing.allCases {
-            let lowered = facing.displayName.lowercased()
-            for word in forbidden {
-                XCTAssertFalse(
-                    lowered.contains(word),
-                    "\(facing.displayName) claims attention the glasses cannot observe"
-                )
-            }
-            XCTAssertFalse(facing.displayName.isEmpty)
-        }
-    }
-
-    /// The caveat must name the missing hardware, not merely hedge. A softened
-    /// version invites the reading it exists to prevent.
-    func testTheGazeCaveatNamesTheMissingCapability() {
-        let caveat = SceneFacing.gazeCaveat.lowercased()
-        XCTAssertTrue(caveat.contains("no eye tracking"), "got: \(SceneFacing.gazeCaveat)")
-        XCTAssertTrue(caveat.contains("cannot"))
-    }
-
-    /// "Not reported" is its own answer and must not collapse into a direction.
-    func testUnknownOrientationIsItsOwnAnswer() {
-        XCTAssertEqual(SceneFacing.unknown.displayName, "Orientation unknown")
-        XCTAssertNotEqual(SceneFacing.unknown.displayName, SceneFacing.acrossView.displayName)
-    }
-
-    // MARK: Counts
-
-    /// Derived from the list, so a header can never disagree with the rows
-    /// beneath it.
-    func testCountsAreDerivedFromTheEntityListItself() {
-        let snapshot = SceneSnapshot(entities: [
-            person("a"),
-            person("b"),
-            SceneEntity(trackID: SceneTrackID("c"), kind: .object(label: "chair"), provenance: .measured),
-        ])
-        XCTAssertEqual(snapshot.personCount, 2)
-        XCTAssertEqual(snapshot.objectCount, 1)
-        XCTAssertEqual(snapshot.personCount + snapshot.objectCount, snapshot.entities.count)
-    }
-
-    func testAnEmptySceneCountsZeroOfEach() {
-        let snapshot = SceneSnapshot()
-        XCTAssertEqual(snapshot.personCount, 0)
-        XCTAssertEqual(snapshot.objectCount, 0)
-        XCTAssertTrue(snapshot.isEmpty)
-    }
-
-    /// Core Principle 3. A bare "0 people" invites the reading that nobody is
-    /// there; the caveat is what prevents it, so it must actually disclaim
-    /// absence rather than merely describe the camera.
-    func testTheCountCaveatDisclaimsAbsenceRatherThanJustDescribingTheCamera() {
-        let caveat = SceneSnapshot.countCaveat.lowercased()
-        XCTAssertTrue(caveat.contains("not ruled out"), "got: \(SceneSnapshot.countCaveat)")
-        XCTAssertTrue(caveat.contains("camera"))
-    }
-
-    // MARK: Positions
-
-    /// The same monocular-depth rule World Builder obeys, applied to a distance
-    /// to a person.
-    func testADistanceToAnEntityIsWithheldWithoutMetricScale() {
-        let relative = ScenePosition(frame: .cameraRelative, distance: 2.5, scale: .relative)
-        XCTAssertFalse(relative.distanceDisplayable)
-
-        let inferred = ScenePosition(frame: .cameraRelative, distance: 2.5, scale: .inferredMetric)
-        XCTAssertTrue(inferred.distanceDisplayable)
-        XCTAssertTrue(inferred.scale.isEstimate, "an inferred distance must be labelled an estimate")
-
-        let unknown = ScenePosition(frame: .cameraRelative, distance: 2.5, scale: .unknown)
-        XCTAssertFalse(unknown.distanceDisplayable)
-    }
-
-    /// A bearing is an angle and needs no depth, so it is not subject to the
-    /// scale rule — treating it as if it were would discard information the
-    /// system genuinely has.
-    func testABearingIsAvailableWithoutAnyScale() {
-        let position = ScenePosition(frame: .cameraRelative, bearingDegrees: -30, scale: .unknown)
-        XCTAssertEqual(position.bearingDescription, "To your left")
-        XCTAssertFalse(position.distanceDisplayable)
-    }
-
-    /// Coarse on purpose: a bounding-box centre does not support "37.4° right".
-    func testBearingsAreDescribedCoarsely() {
-        XCTAssertEqual(ScenePosition(frame: .cameraRelative, bearingDegrees: 5).bearingDescription, "Ahead")
-        XCTAssertEqual(ScenePosition(frame: .cameraRelative, bearingDegrees: 30).bearingDescription, "To your right")
-        XCTAssertEqual(ScenePosition(frame: .cameraRelative, bearingDegrees: -30).bearingDescription, "To your left")
-        XCTAssertNil(ScenePosition(frame: .cameraRelative).bearingDescription)
-    }
-
-    /// **The camera sees a forward cone.**
-    ///
-    /// An earlier version said "Beside you, left" past 60° and "Behind you,
-    /// right" past 120° — telling the wearer the system had detected someone
-    /// behind them, which no forward-facing camera can do.
-    /// `docs/modules/SCENE-UNDERSTANDING.md` says so itself: a wearer looking
-    /// at a desk has most of the room behind the camera.
-    ///
-    /// The previous test enshrined the 150° case rather than catching it, which
-    /// is what a test asserting the implementation back to itself does.
-    func testNoBearingClaimsAnObservationBehindTheWearer() {
-        for degrees in stride(from: -180.0, through: 180.0, by: 5.0) {
-            let description = ScenePosition(
-                frame: .cameraRelative,
-                bearingDegrees: degrees
-            ).bearingDescription ?? ""
-            let lowered = description.lowercased()
-            XCTAssertFalse(
-                lowered.contains("behind"),
-                "a bearing of \(degrees)° claimed an observation behind the wearer"
-            )
-            XCTAssertFalse(
-                lowered.contains("beside"),
-                "a bearing of \(degrees)° claimed an observation outside the camera cone"
-            )
-            XCTAssertFalse(description.isEmpty, "a bearing of \(degrees)° could not be described")
-        }
-        // Past the plausible field of view it says so, rather than picking a
-        // direction the sensor cannot justify.
-        XCTAssertEqual(
-            ScenePosition(frame: .cameraRelative, bearingDegrees: 150).bearingDescription,
-            "At the edge of view, right"
-        )
-    }
-
-    /// Camera-relative and world-relative are different claims: one changes when
-    /// the wearer turns their head and the other does not.
-    func testFramesOfReferenceAreDistinguishable() {
-        XCTAssertNotEqual(
-            SceneFrameOfReference.cameraRelative,
-            SceneFrameOfReference.worldRelative(worldID: nil)
-        )
-        XCTAssertNotEqual(
-            SceneFrameOfReference.worldRelative(worldID: "a"),
-            SceneFrameOfReference.worldRelative(worldID: "b")
-        )
-    }
-
-    // MARK: Relationships and staleness
-
-    /// A relation is an inference about two inferences and carries its own
-    /// confidence; the predicate is the Tower's word, kept verbatim.
-    func testARelationshipKeepsItsPredicateAndItsConfidence() {
-        let relationship = SceneRelationship(
-            subject: SceneTrackID("a"),
-            predicate: "seated at",
-            object: SceneTrackID("b"),
-            provenance: .inferred(confidence: 0.3)
-        )
-        XCTAssertEqual(relationship.predicate, "seated at")
-        XCTAssertEqual(relationship.provenance.confidence, 0.3)
-        XCTAssertTrue(relationship.id.contains("seated at"))
-    }
-
-    /// Limitation 7: a last-known scene is not a current one, and the states
-    /// must be distinguishable so the view can say which it is drawing.
-    func testALastKnownSceneIsNotCurrent() {
-        let snapshot = SceneSnapshot(entities: [person("a")])
-        XCTAssertTrue(SceneUnderstandingState.observing(snapshot).isCurrent)
-        XCTAssertFalse(SceneUnderstandingState.lastKnown(snapshot).isCurrent)
-        XCTAssertEqual(SceneUnderstandingState.lastKnown(snapshot).phase, .settled)
-    }
-
-    func testEverySceneStateMapsToTheRightPhase() {
-        let snapshot = SceneSnapshot()
-        let expected: [(SceneUnderstandingState, CartridgePhase)] = [
-            (.unsupported(reason: "x"), .unsupported),
-            (.idle, .idle),
-            (.awaitingFirstScene, .waiting),
-            (.observing(snapshot), .live),
-            (.lastKnown(snapshot), .settled),
-            (.failed(CartridgeFailure(kind: .transport, message: "x")), .failed),
-        ]
-        for (state, phase) in expected {
-            XCTAssertEqual(state.phase, phase, "\(state) mapped to the wrong phase")
-        }
-        for state in expected where !state.1.mayCarryData {
-            XCTAssertNil(state.0.snapshot, "\(state.0) carried a scene it may not have")
         }
     }
 }
@@ -2239,3 +2727,236 @@ final class CameraReadinessTests: XCTestCase {
         XCTAssertNil(connection.errorMessage, "an automatic read must never raise an alert")
     }
 }
+
+// MARK: - Connection lifetime
+
+@MainActor
+final class ConnectionLifetimeTests: XCTestCase {
+
+    /// The retain cycle, made a failing test rather than an argument.
+    ///
+    /// `GlassesConnection` stores the three `Task`s it creates in `init`. If a
+    /// task body holds `self` strongly for the life of an unbounded
+    /// `for await` — which `guard let self else { return }` placed *outside*
+    /// the loop does — then the object owns the task and the task owns the
+    /// object, and the `isolated deinit` that stops the camera and the device
+    /// session can never run.
+    ///
+    /// Written after the fix, and verified against the code before it: this
+    /// test fails on the old shape and passes on the new one. Without it
+    /// nothing in the suite would notice the cycle being reintroduced, and the
+    /// pattern is idiomatic enough to come back by accident.
+    func testGlassesConnectionDeallocatesWhenReleased() async {
+        weak var weakConnection: GlassesConnection?
+        do {
+            let wearables = ScriptedWearables(permissionResults: [.success(.granted)])
+            let connection = GlassesConnection(wearables: wearables)
+            weakConnection = connection
+            // The `init` tasks subscribe asynchronously, and the probe only
+            // means anything once they are actually suspended on their
+            // streams — that suspension is where the strong reference would
+            // be held. Asserted rather than merely waited for, so this fails
+            // loudly instead of passing over streams that were never live.
+            for _ in 0..<20 where !wearables.isSubscribed {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            XCTAssertTrue(wearables.isSubscribed, "the probe needs live streams to be meaningful")
+            withExtendedLifetime(connection) {}
+        }
+        // Deallocation follows task cancellation in `deinit`, which is not
+        // synchronous with the scope exit.
+        for _ in 0..<50 {
+            if weakConnection == nil { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertNil(
+            weakConnection,
+            "GlassesConnection outlived its last strong reference — isolated deinit never ran"
+        )
+    }
+}
+
+// MARK: - Capture resolution
+
+/// Pins the DEBUG-only capture-resolution control.
+///
+/// The control exists because the rung was a hardcoded `.low` and Document
+/// Memory's premise cannot be tested at 360x640 — its measured word recall is
+/// 0.429-0.810 there against 0.957-1.000 at 1280x720. What these tests actually
+/// guard is the *other* side of that: World Builder's path is physically proven
+/// at `.low`, so the default must not move, and the label must not invent a
+/// size DAT did not declare.
+///
+/// DEBUG-only because `CaptureResolutionPreference` is, and because
+/// `MWDATCamera` is imported under `#if DEBUG` in `GlassesConnection.swift`.
+#if DEBUG
+final class CaptureResolutionPreferenceTests: XCTestCase {
+
+    /// The rung every existing measurement was taken at, including the P3 clean
+    /// walk. If this moves, every prior figure silently stops being comparable
+    /// and World Builder's proven path changes underneath it.
+    func testTheDefaultIsLow() {
+        XCTAssertEqual(CaptureResolutionPreference.default, .low)
+    }
+
+    /// A fresh connection starts at the default rather than at whatever the
+    /// picker last showed — there is no persistence here and there should not
+    /// be one, because a rung silently surviving a relaunch is how a walk gets
+    /// recorded at the wrong resolution without anyone choosing that.
+    @MainActor
+    func testAFreshConnectionStartsAtTheDefault() {
+        let connection = GlassesConnection(wearables: ScriptedWearables(permissionResults: []))
+        XCTAssertEqual(connection.captureResolution, .default)
+    }
+
+    /// Three rungs, each mapping to a distinct `StreamingResolution`. A
+    /// collapsed mapping would make the picker move while the stream did not.
+    func testEachRungMapsToADistinctStreamingResolution() {
+        let all = CaptureResolutionPreference.allCases
+        XCTAssertEqual(all.count, 3)
+        XCTAssertEqual(Set(all.map(\.id)).count, 3, "rung ids must be unique")
+
+        let resolutions = all.map(\.streamingResolution)
+        XCTAssertEqual(resolutions.count, 3)
+        for (index, lhs) in resolutions.enumerated() {
+            for rhs in resolutions[(index + 1)...] {
+                XCTAssertNotEqual(lhs, rhs, "two rungs collapsed onto one StreamingResolution")
+            }
+        }
+    }
+
+    /// The displayed size must come from DAT, not from a literal in this app.
+    ///
+    /// Asserted against `StreamingResolution.videoFrameSize` rather than
+    /// against the string "360x640", so that if the SDK ever changes a rung the
+    /// label follows it instead of quietly going stale — which is the whole
+    /// reason `declaredSizeDescription` reads the SDK at all.
+    func testTheDeclaredSizeIsReadFromDATRatherThanHardcoded() {
+        for rung in CaptureResolutionPreference.allCases {
+            let size = rung.streamingResolution.videoFrameSize
+            XCTAssertEqual(
+                rung.declaredSizeDescription,
+                "\(size.width)x\(size.height)",
+                "\(rung.rawValue) must render the size DAT declares"
+            )
+        }
+    }
+
+    /// Ties the default rung to the physical evidence. The P3 clean walk
+    /// recorded 108 frames, every one 360x640
+    /// (`docs/evidence/2026-08-26-p3-clean-walk-console.txt`). If DAT's `.low`
+    /// ever stops meaning that, the corpus and every figure derived from it
+    /// stop being comparable, and this test is the tripwire.
+    func testLowIsStillTheRungTheWalkWasMeasuredAt() {
+        XCTAssertEqual(CaptureResolutionPreference.low.declaredSizeDescription, "360x640")
+    }
+
+    /// Every rung needs a picker segment. An empty label renders as a blank
+    /// segment the user cannot identify.
+    func testEveryRungHasANonEmptyShortLabel() {
+        for rung in CaptureResolutionPreference.allCases {
+            XCTAssertFalse(rung.shortLabel.isEmpty, "\(rung.rawValue) has no label")
+        }
+    }
+}
+#endif
+
+
+// MARK: - Capture session claim
+
+/// Pins the predicate that decides whether the capture rung may be changed.
+///
+/// This exists because of a defect an adversarial review found and this suite
+/// could not have caught: the picker was originally gated on
+/// `isCaptureEngaged`, which answers *"should the button read Stop?"* and is
+/// deliberately **false** during `.paused` and `.stopping`. Both DAT enums have
+/// those cases and the original allow-lists covered neither, so a cap-touch
+/// pause — documented as device-initiated in `07-PLATFORM-CONSTRAINTS.md` §146
+/// — unlocked the picker while the session and camera were both still held. A
+/// change made there is accepted, displayed, and then silently discarded by
+/// `beginCameraStream`'s `guard camera == nil` on resume, leaving the panel
+/// asserting a rung that was never requested.
+///
+/// Every combination is exercised rather than a chosen few, because the defect
+/// was precisely a case nobody thought to enumerate.
+#if DEBUG
+final class CaptureSessionClaimTests: XCTestCase {
+
+    private let allSessionStates: [DeviceSessionState] =
+        [.idle, .starting, .started, .paused, .stopping, .stopped]
+    private let allStreamStates: [MWDATCamera.StreamState] =
+        [.stopped, .stopping, .waitingForDevice, .starting, .streaming, .paused]
+
+    /// The regression. Neither of these may report "no session".
+    func testAPausedSessionStillCountsAsClaimed() {
+        XCTAssertTrue(
+            GlassesConnection.isCaptureSessionClaimed(session: .paused, stream: .paused),
+            "a cap-touch pause holds the session and camera; the rung cannot change under it"
+        )
+        XCTAssertTrue(
+            GlassesConnection.isCaptureSessionClaimed(session: .started, stream: .paused),
+            "the stream pausing alone still leaves a camera that beginCameraStream will refuse to replace"
+        )
+    }
+
+    /// `stopCameraSession()` sets both to `.stopping` synchronously, but
+    /// `deviceSession` stays non-nil until the `.stopped` callback runs
+    /// cleanup. In that window `startCameraSession()` refuses, so "applies at
+    /// the next start" describes a start the app is declining to perform.
+    func testAStoppingSessionStillCountsAsClaimed() {
+        XCTAssertTrue(
+            GlassesConnection.isCaptureSessionClaimed(session: .stopping, stream: .stopping)
+        )
+    }
+
+    /// The only combination that may report "no session" is the fully torn-down
+    /// one. Asserted over every pairing so a future case cannot be quietly
+    /// admitted to the not-claimed side.
+    func testOnlyAFullyTornDownSessionIsUnclaimed() {
+        for session in allSessionStates {
+            for stream in allStreamStates {
+                let claimed = GlassesConnection.isCaptureSessionClaimed(session: session, stream: stream)
+                let shouldBeIdle = (session == .idle || session == .stopped) && stream == .stopped
+                XCTAssertEqual(
+                    claimed,
+                    !shouldBeIdle,
+                    "session=\(session) stream=\(stream) decided wrongly"
+                )
+            }
+        }
+    }
+
+    /// The two predicates must genuinely differ, and differ in the direction
+    /// that matters — `isCaptureSessionClaimed` is the strictly more
+    /// conservative one. If a refactor ever collapsed them, the defect returns
+    /// silently.
+    func testTheClaimPredicateIsStrictlyBroaderThanTheEngagedPredicate() {
+        var foundADisagreement = false
+        for session in allSessionStates {
+            for stream in allStreamStates {
+                let claimed = GlassesConnection.isCaptureSessionClaimed(session: session, stream: stream)
+                // `isCaptureEngaged`'s rule, restated here rather than called,
+                // so this test still fails if that property is widened to match
+                // instead of the two staying deliberately different.
+                let engagedBySession: Bool
+                switch session {
+                case .starting, .started: engagedBySession = true
+                default: engagedBySession = false
+                }
+                let engagedByStream: Bool
+                switch stream {
+                case .streaming, .starting, .waitingForDevice: engagedByStream = true
+                default: engagedByStream = false
+                }
+                let engaged = engagedBySession || engagedByStream
+                if engaged { XCTAssertTrue(claimed, "engaged must imply claimed") }
+                if claimed != engaged { foundADisagreement = true }
+            }
+        }
+        XCTAssertTrue(
+            foundADisagreement,
+            "the two predicates agree everywhere, which means the paused/stopping gap is back"
+        )
+    }
+}
+#endif

@@ -157,9 +157,45 @@ struct WorldGeometryReport: Equatable, Sendable {
 /// `docs/modules/WORLD-BUILD.md` admits no unlabelled ones — on monocular RGB
 /// it will normally be `.relative`, in which case it is a shape statistic and
 /// not a number of metres, and `distanceDisplayable` refuses to show it as one.
+///
+/// ## A camera position and a segment origin are not the same figure
+///
+/// `world_builder.status/2026-08-25` exists because they were being added
+/// together. Under the superseded contract `pose_count` was
+/// `keyframes - poses_refused`, and the Tower's build counts a segment ANCHOR
+/// as neither solved nor refused — so every anchor was promoted to a camera
+/// position. On the 2026-08-24 walk that produced *"Camera poses: 36"* from a
+/// build whose manifest read `poses_solved: 0, points: 0`: nothing had been
+/// reconstructed, and 36 was the segment count.
+///
+/// An anchor is definitional, not measured — identity rotation, zero
+/// translation — so the two are now separate figures and this type keeps them
+/// separate. `posesAnchor` is reported *beside* `poseCount`, never folded into
+/// it, which is what lets an uncalibrated walk read as "36 segment origins, no
+/// trajectory" instead of as a path.
 struct WorldTrajectoryReport: Equatable, Sendable {
-    /// Camera poses the Tower retained.
+    /// Poses carrying a position that is **evidence**: every solved pose, plus
+    /// the anchor of each segment that solved something.
+    ///
+    /// `0` is a real answer and is not `nil`. A build that solved nothing
+    /// reports zero here however many anchors it produced, because a segment
+    /// that resolved nothing contributes the origin of an empty coordinate
+    /// frame rather than a camera position.
     var poseCount: Int?
+    /// How many of the build's poses were segment anchors.
+    ///
+    /// Never added to `poseCount`. Present so the panel can say what the walk
+    /// actually produced when no camera was positioned at all.
+    var posesAnchor: Int?
+    /// The underlying figures the Tower counted, carried for the same reason
+    /// the count above is: an anchor-only build is a different thing from a
+    /// build that refused everything, and only these tell them apart.
+    var posesSolved: Int?
+    var posesRefused: Int?
+    /// Tracking segments. A break means tracking was lost, and poses either
+    /// side of one share no coordinate frame — which is why the Tower refuses
+    /// a path length across more than one.
+    var segments: Int?
     /// Path length, in the unit the Tower names below.
     var pathLength: Double?
     /// The Tower's unit string for `pathLength`, if it gave one.
@@ -176,11 +212,19 @@ struct WorldTrajectoryReport: Equatable, Sendable {
 
     init(
         poseCount: Int? = nil,
+        posesAnchor: Int? = nil,
+        posesSolved: Int? = nil,
+        posesRefused: Int? = nil,
+        segments: Int? = nil,
         pathLength: Double? = nil,
         pathLengthUnit: String? = nil,
         scale: WorldScaleSemantics = .unknown
     ) {
         self.poseCount = poseCount
+        self.posesAnchor = posesAnchor
+        self.posesSolved = posesSolved
+        self.posesRefused = posesRefused
+        self.segments = segments
         self.pathLength = pathLength
         self.pathLengthUnit = pathLengthUnit
         self.scale = scale
@@ -199,7 +243,49 @@ struct WorldTrajectoryReport: Equatable, Sendable {
         }
     }
 
-    var hasReport: Bool { poseCount != nil || pathLength != nil }
+    /// Whether the path length may be shown **as the labelled figure it is**,
+    /// which is a weaker question than `distanceDisplayable` and has a
+    /// different answer.
+    ///
+    /// The Tower reconstructs monocular RGB, so `.relative` is the best scale
+    /// it can reach and `distanceDisplayable` is correctly false for every
+    /// figure it will ever send. Refusing on that basis alone would mean this
+    /// panel never shows a path length at all — and "2.9 world units", with the
+    /// Tower's own unit attached and its own scale named beside it, is not a
+    /// distance claim. It is the honest rendering of a shape statistic.
+    ///
+    /// The gate is the **unit**, not the scale. A bare number is what
+    /// `ReportedFigure` exists to prevent: without a unit a reader supplies
+    /// their own, and the one they supply is metres. `.unknown` scale is
+    /// excluded separately — the Tower sends no distance figure at all in that
+    /// state, because it could not be labelled.
+    var labelledFigureDisplayable: Bool {
+        guard pathLength != nil, let pathLengthUnit, !pathLengthUnit.isEmpty else { return false }
+        return scale != .unknown
+    }
+
+    /// Whether the Tower positioned a camera anywhere at all.
+    ///
+    /// `false` for `poseCount == 0`, which is the uncalibrated case, and also
+    /// `false` when the count is absent — "no trajectory to draw" is the same
+    /// answer either way, and the two are still distinguished everywhere the
+    /// difference is a claim rather than a drawing decision.
+    var hasPositionedPoses: Bool { (poseCount ?? 0) > 0 }
+
+    /// The uncalibrated outcome, named: the build produced segment origins and
+    /// positioned no camera.
+    ///
+    /// This is the figure the panel shows instead of a pose count, because
+    /// "36 segment origins" is a precise description of what happened and
+    /// "0 camera poses" alone is not.
+    var isAnchorsOnly: Bool { poseCount == 0 && (posesAnchor ?? 0) > 0 }
+
+    var hasReport: Bool {
+        poseCount != nil
+            || pathLength != nil
+            || posesAnchor != nil
+            || segments != nil
+    }
 }
 
 // MARK: - Persistence

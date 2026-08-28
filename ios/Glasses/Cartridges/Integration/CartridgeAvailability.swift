@@ -43,17 +43,41 @@ struct CartridgeContract: Equatable, Hashable, Sendable {
 
 /// Why a cartridge's Tower backing is, or is not, usable right now.
 ///
-/// Four cartridges need this and they need exactly the same four answers, which
-/// is what justifies it being shared rather than restated per cartridge. It is
-/// resolved by `resolve(declared:supported:towerStatus:)` below, so the ordering
-/// of the checks — which failure wins when several apply — is decided once
-/// instead of four times.
+/// Five cartridges need this and they need exactly the same four answers, which
+/// is what justifies it being shared rather than restated per cartridge. Four of
+/// them reach it through `resolve(declared:supported:isTowerReachable:)` below,
+/// so the ordering of the checks — which failure wins when several apply — is
+/// decided once instead of five times. Object Memory is the fifth and projects
+/// its own learned state onto these cases directly, because its contract is not
+/// declared in advance and `.unprobed` is a state none of the four can express;
+/// it follows the same precedence deliberately, and says so where it does.
 enum CartridgeAvailability: Equatable, Sendable {
-    /// The Tower has not declared a contract for this cartridge at all. Today
-    /// this is the answer for every cartridge, and it is a statement about the
-    /// Tower's roadmap rather than about this connection: the module container
-    /// is V0.8 and the first module V0.9 (docs/03-ROADMAP.md), so there is
-    /// nothing to declare.
+    /// The Tower has not declared a contract for this cartridge at all.
+    ///
+    /// This was once the answer for every cartridge. It no longer is: a live
+    /// Tower declares `world_builder.status/2026-08-25` over `GET /cartridges`,
+    /// which reaches `declared` as a `TowerCartridgeDeclaration` offer, so World
+    /// Builder resolves past this case.
+    ///
+    /// **The roadmap framing this comment used to carry is now wrong and has
+    /// been removed rather than softened.** It said this was "a statement about
+    /// the Tower's roadmap rather than about this connection", because the
+    /// module container was V0.8 and the first module V0.9, and because the
+    /// Tower listed Experimental CV Lab, Document Memory and Scene
+    /// Understanding under `not_offered`. As of 2026-08-27 the Tower declares
+    /// four contracts and `not_offered` is `[]`.
+    ///
+    /// So this is now a statement about **this connection and this build**, and
+    /// nothing else: either the Tower declared no contract for the cartridge,
+    /// or this app has no name for it. Both are answerable facts about two
+    /// machines, not a position on a roadmap — which is the better meaning,
+    /// because a person reading "not built yet" can at least be told truthfully
+    /// which of the two it is.
+    ///
+    /// Kept distinct from `unsupportedContract` for the reason the Tower's
+    /// contract §2 gives: a cartridge absent from every list means *"this Tower
+    /// has never heard of it"*, while one present with an unreadable contract
+    /// means *"update the app"*. Those are opposite instructions to a person.
     case noContract
     /// The Tower declared a contract this build does not implement. Kept
     /// separate from `noContract` because they call for opposite responses:
@@ -64,8 +88,18 @@ enum CartridgeAvailability: Equatable, Sendable {
     /// can be asked of it. Not an error — a connection state.
     case towerUnreachable
     /// The Tower speaks a contract this build implements and is reachable.
-    /// **Unreachable today**, by construction: `TowerCapabilities` declares no
-    /// contracts and this build supports none.
+    ///
+    /// This case used to be documented as unreachable by construction, on the
+    /// grounds that `TowerCapabilities` declared no contracts and this build
+    /// supported none. Both halves of that are now false:
+    /// `TowerCapabilities.supported` contains
+    /// `WorldBuilderResultContract.identifier`, and a live Tower offers exactly
+    /// that identifier for `world_builder`. **World Builder genuinely resolves
+    /// here against a connected Tower.**
+    ///
+    /// It is still unreachable for every other cartridge, for the reason
+    /// `noContract` gives — which is a fact about what those cartridges' Towers
+    /// offer, not a property of this type.
     case available(CartridgeContract)
 
     /// Whether a request may be made at all.
@@ -84,11 +118,16 @@ enum CartridgeAvailability: Equatable, Sendable {
     func explanation(cartridgeName: String) -> String? {
         switch self {
         case .noContract:
+            // Deliberately says only what is observable from here. It used to
+            // assert that the Tower "has no module runtime at all", which was
+            // true of every cartridge until one of them gained a contract and
+            // is now a claim this app cannot make on the Tower's behalf — the
+            // Tower declares each cartridge separately, and silence about one
+            // says nothing about the others.
             return """
-                The Tower does not run \(cartridgeName) yet. It has no module \
-                runtime at all — frames sent from this app reach its current \
-                fixed handler, which returns a simple per-frame result and \
-                nothing else.
+                This Tower has not declared a \(cartridgeName) contract, so \
+                there is nothing to ask it for. That is a statement about what \
+                the Tower offers, not about this connection.
                 """
         case .unsupportedContract(let contract):
             return """
@@ -113,7 +152,11 @@ enum CartridgeAvailability: Equatable, Sendable {
     /// as `idle`, which would invite a user to press a button that cannot work.
     var forcedPhase: CartridgePhase? {
         switch self {
-        case .noContract, .unsupportedContract: return .unsupported
+        case .noContract: return .unsupported
+        // Not `.unsupported`. The Tower is already serving this cartridge; the
+        // app is the half that is behind, and that is the one case on this
+        // screen a person can actually fix.
+        case .unsupportedContract: return .needsUpdate
         // Not `.unsupported`. A Tower that is merely unreachable may well be
         // able to do this, and drawing it with the same headline and glyph as
         // "will never do this" is the half of the distinction a person actually
@@ -126,7 +169,7 @@ enum CartridgeAvailability: Equatable, Sendable {
     /// The unavailable explanation, joined with whatever the cartridge's own
     /// client had to add.
     ///
-    /// Extracted because all four workspaces were restating the same join —
+    /// Extracted because every workspace was restating the same join —
     /// which of the two sentences comes first, and what happens when either is
     /// absent. The per-cartridge part (which of its own states yields a reason)
     /// stays in the cartridge, where it belongs; the ordering is a shared
@@ -159,16 +202,74 @@ enum CartridgeAvailability: Equatable, Sendable {
     ///
     /// - Parameters:
     ///   - declared: what the Tower says it offers for this cartridge, or `nil`
-    ///     if it has said nothing. Today always `nil`.
-    ///   - supported: the contract identifiers this build implements. Today
-    ///     always empty.
+    ///     if it has said nothing. Non-`nil` today for exactly one cartridge:
+    ///     World Builder, whose offer arrives over the wire in the Tower's
+    ///     `GET /cartridges` declaration and reaches here via
+    ///     `TowerCapabilities.declaredContract(for:in:)`. `nil` for every other
+    ///     cartridge, because the local `TowerCapabilities.declared` table is
+    ///     empty and the Tower declares nothing for them.
+    ///   - supported: the contract identifiers this build implements. One
+    ///     element today — `WorldBuilderResultContract.identifier`,
+    ///     `"world_builder.status/2026-08-25"`. Not empty, and it matches the
+    ///     identifier a live Tower offers, which is why `.available` is a
+    ///     reachable outcome rather than a theoretical one.
     ///   - isTowerReachable: whether the connection is currently up.
+    /// - Parameter knownToThisBuild: whether this build has a client and a
+    ///   Tower-name mapping for the cartridge — i.e. whether a declaration for
+    ///   it could ever arrive.
+    ///
+    ///   This is the discriminator between the two honest answers when nothing
+    ///   has been declared. For Visual Q&A there is **no Tower code anywhere**
+    ///   and no mapping, so "the Tower is unreachable" would be its own false
+    ///   story — `.noContract` is right whether or not a socket is up. For
+    ///   Scene Understanding, which has both, a silent socket means only that
+    ///   nobody has asked yet.
+    ///
+    ///   Defaults to `false` so that a caller which has not thought about it
+    ///   gets the old, more conservative answer rather than a claim about a
+    ///   connection.
     static func resolve(
         declared: CartridgeContract?,
         supported: Set<String>,
-        isTowerReachable: Bool
+        isTowerReachable: Bool,
+        knownToThisBuild: Bool = false
     ) -> CartridgeAvailability {
-        guard let declared else { return .noContract }
+        guard let declared else {
+            // Only a cartridge this build could actually receive a declaration
+            // for may report `.towerUnreachable` here. See `knownToThisBuild`.
+            guard knownToThisBuild else { return .noContract }
+            // ## Reachability is checked FIRST when nothing was declared
+            //
+            // This used to `return .noContract` unconditionally, and on a cold
+            // launch with no Tower that was a **false statement rendered to a
+            // person** — the explanation for `.noContract` reads *"That is a
+            // statement about what the Tower offers, not about this
+            // connection"*, which is exactly wrong in the case that produced
+            // it.
+            //
+            // Four of the five cartridges learn `declared` **only** from the
+            // socket declaration. Before any successful connection there is no
+            // declaration to have, so `.towerUnreachable` was unreachable on a
+            // first run and every one of them said the Tower had never heard of
+            // it. Object Memory was the only one that got this right, because
+            // it probes over HTTP instead of waiting on the declaration.
+            //
+            // The contract names this failure and prescribes the cure: `GET
+            // /cartridges` exists over HTTP as well as the socket precisely
+            // because *"a client that can only learn the contract set by
+            // opening the socket cannot tell 'unreachable' from 'not built'"*.
+            // This app does not issue that request yet, so it cannot always
+            // tell them apart — but when the socket is **down** it knows which
+            // one it is looking at, and saying so is free.
+            //
+            // The reasoning already existed one layer up: `TowerClient` keeps a
+            // declaration across a teardown, arguing that clearing it *"would
+            // turn every dropped connection into `.noContract` — 'this will
+            // never work' — when the truthful reading is `.towerUnreachable`,
+            // and those two call for opposite responses."* That fixed the
+            // drop-after-success case. This fixes never-connected.
+            return isTowerReachable ? .noContract : .towerUnreachable
+        }
         guard supported.contains(declared.identifier) else {
             return .unsupportedContract(declared: declared)
         }
@@ -181,7 +282,7 @@ enum CartridgeAvailability: Equatable, Sendable {
 /// A cartridge-level failure, stated so a view can show it without inventing
 /// wording and a test can assert what it is without matching prose.
 ///
-/// Shared because all four cartridges fail the same ways, and because Rule 3
+/// Shared because every cartridge fails the same ways, and because Rule 3
 /// (Truthful State Only, docs/02-DEVELOPMENT-RULES.md) makes "the backend
 /// failed" a state the UI must be able to reach — a cartridge that can only
 /// render success and emptiness will render a failure as emptiness.

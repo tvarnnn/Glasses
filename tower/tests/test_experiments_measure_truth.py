@@ -44,6 +44,65 @@ def _textured(seed: int = 7, size=(240, 320)) -> np.ndarray:
     return cv2.resize(small, (size[1], size[0]), interpolation=cv2.INTER_NEAREST)
 
 
+class TestTheSharpnessIntermediateIsExact:
+    """`sharpness` uses a CV_16S Laplacian instead of a CV_64F one.
+
+    4.69x on real frames (1.4885 -> 0.3173 ms), on a stage that runs
+    synchronously on the event loop whenever this experiment is selected.
+    It is only defensible because the cheaper intermediate is EXACT for
+    this input, and these tests pin the two facts the argument rests on so
+    a successor cannot quietly widen the input and keep the optimisation.
+
+    The same reasoning, with the full derivation, is in
+    `world_builder/frontend.py: measure_sharpness`.
+    """
+
+    def _gray(self, array):
+        return cv2.cvtColor(array, cv2.COLOR_BGR2GRAY)
+
+    def test_the_int16_laplacian_is_elementwise_identical_to_the_float_one(self):
+        """8-bit input with ksize=1 bounds it at +/-1020 against +/-32767.
+
+        Saturation is unreachable, so the cheaper dtype loses nothing.
+        """
+        for source in (_textured(), _flat(), _flat(0), _flat(255)):
+            gray = self._gray(source)
+            wide = cv2.Laplacian(gray, cv2.CV_64F)
+            narrow = cv2.Laplacian(gray, cv2.CV_16S)
+
+            assert np.array_equal(wide, narrow)
+            assert abs(int(narrow.min())) <= 1020
+            assert abs(int(narrow.max())) <= 1020
+
+    def test_the_variance_agrees_with_the_float64_form(self):
+        for source in (_textured(), _textured(11), _flat(), _flat(3)):
+            gray = self._gray(source)
+            reference = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            _, deviation = cv2.meanStdDev(cv2.Laplacian(gray, cv2.CV_16S))
+            measured = float(deviation[0, 0] ** 2)
+
+            if reference == 0:
+                assert measured == 0
+                continue
+            assert abs(measured - reference) / reference < 1e-12, (
+                f"{measured=} {reference=}"
+            )
+
+    def test_the_input_this_experiment_feeds_it_is_uint8_single_channel(self):
+        """The exactness argument holds only for that, and there is no
+        dtype guard here -- `run()` produces `gray` two lines earlier with
+        `cvtColor(..., BGR2GRAY)`, so the guarantee is structural. If that
+        ever stops being true, the guard the shared function carries has
+        to come with it: on colour input `meanStdDev` returns a
+        PER-CHANNEL deviation and `[0, 0]` would silently report channel
+        zero where `.var()` pooled all three.
+        """
+        gray = self._gray(_textured())
+
+        assert gray.dtype == np.uint8
+        assert gray.ndim == 2
+
+
 class TestFrameQualityMeasuresQuality:
     def test_a_blurred_frame_scores_lower_sharpness_than_its_original(self):
         original = _textured()
@@ -353,7 +412,7 @@ class TestUndecodableInputIsAFrameLevelFailure:
         from tower.modules.base import FrameProcessingError
 
         # Built from hex so this source file stays plain ASCII: a
-        # literal ÿ byte in a test file is a trap for every tool
+        # literal ï¿½ byte in a test file is a trap for every tool
         # that reads it as text.
         truncated = bytes.fromhex("ffd8ffe00010") + b"JFIF" + bytes(40)
         experiment = EXPERIMENTS[name]()

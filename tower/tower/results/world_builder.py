@@ -37,6 +37,7 @@ import logging
 import math
 from pathlib import Path
 
+from tower.logging_config import client_safe_reason
 from tower.results.contracts import TIME_BASIS
 from tower.storage import read_raw_jsonl
 from tower.results.envelope import Snapshot, compute_revision
@@ -357,7 +358,9 @@ class WorldBuilderStatusProducer:
             # documented behaviour and it must survive to the wire rather
             # than becoming a dropped subscription.
             logger.warning("result channel: world %s unreadable: %s", world_id, exc)
-            return self._unavailable(f"world could not be read: {exc}")
+            return self._unavailable(
+                f"world could not be read: {client_safe_reason(exc)}"
+            )
 
     def _unavailable(self, reason: str, *, supported: bool = True) -> Snapshot:
         """Nothing to report, and whether that is a Tower limitation.
@@ -569,16 +572,19 @@ class WorldBuilderStatusProducer:
                     "path covers built_from_keyframes of them"
                 )
             ),
-            # Poses that actually carry a position, which is NOT
-            # poses_solved. engine.build counts an ANCHOR as neither
-            # solved nor refused, yet an anchor has a translation and is a
-            # real point on the path. Reporting poses_solved as "the
-            # number of poses" would drop the first keyframe of every
-            # segment; reporting the keyframe count would claim a position
-            # for keyframes the backend refused. Neither is the trajectory.
+            # Poses that actually carry a position, which is neither
+            # poses_solved nor the keyframe count. See _pose_count: the
+            # first keyframe of a segment that resolved is a real point
+            # on the path, and the only keyframe of a segment that
+            # resolved nothing is not.
             "pose_count": _pose_count(manifest),
             "poses_solved": manifest.get("poses_solved"),
             "poses_refused": manifest.get("poses_refused"),
+            # Reported beside the count rather than folded into it. An
+            # uncalibrated walk should read as "36 segment origins, no
+            # trajectory" -- a precise description -- instead of either
+            # a fabricated pose count or a silent absence.
+            "poses_anchor": manifest.get("poses_anchor"),
             "keyframes": manifest.get("keyframes"),
             "segments": manifest.get("segments"),
             "path_length": self._path_length(
@@ -1162,6 +1168,7 @@ def _trajectory_unavailable(reason: str) -> dict:
         "pose_count": None,
         "poses_solved": None,
         "poses_refused": None,
+        "poses_anchor": None,
         "keyframes": None,
         "segments": None,
         "path_length": None,
@@ -1426,12 +1433,36 @@ def _read_manifest(store, world_id):
 
 
 def _pose_count(manifest):
-    """Poses carrying a position: every keyframe the backend did not refuse."""
-    keyframes = manifest.get("keyframes")
-    refused = manifest.get("poses_refused")
-    if not isinstance(keyframes, int) or not isinstance(refused, int):
+    """Poses carrying a position that is EVIDENCE.
+
+    This used to be `keyframes - poses_refused`, and that arithmetic is
+    what put "Camera poses: 36" on the phone during the 2026-08-24
+    physical walk, from a manifest reading `poses_solved: 0, points: 0,
+    backend_id: "unposed", segments: 36`.
+
+    `engine.build` counts an ANCHOR as neither solved nor refused, so
+    subtraction quietly promotes every anchor to a camera position. An
+    anchor is definitional, not measured -- identity rotation, zero
+    translation -- and `backends/unposed.py` says the status exists
+    precisely so "a downstream consumer [cannot] count it as evidence".
+    All 36 of those anchors were the same point.
+
+    But an anchor IS a real position when the chain it anchors resolved:
+    it is that segment's origin, and dropping it would under-report
+    every segment by one. The rule is therefore per segment, which only
+    the build can evaluate, so the build now records the answer as
+    `poses_positioned` instead of leaving it to be inferred here.
+    """
+    positioned = manifest.get("poses_positioned")
+    if isinstance(positioned, bool) or not isinstance(positioned, int):
+        # No fallback. The old arithmetic -- keyframes - poses_refused --
+        # counted a segment ANCHOR as a camera position, and an anchor is
+        # definitional: identity rotation, zero translation, one per segment.
+        # That is where "Camera poses: 36" came from on a world whose manifest
+        # read poses_solved: 0. A manifest without poses_positioned predates
+        # the fix, and absent is the only honest answer for it.
         return None
-    return max(0, keyframes - refused)
+    return max(0, positioned)
 
 
 def _keyframes_digest(store, world_id, session_id):

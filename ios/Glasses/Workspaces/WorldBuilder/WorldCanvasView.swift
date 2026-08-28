@@ -10,16 +10,23 @@ import SwiftUI
 /// be drawn, and today the place the app explains that there is not one.
 ///
 /// It renders `WorldModelState` and nothing else, so it cannot show geometry
-/// the Tower did not send. Today the only reachable state is `.unsupported`,
-/// because `UnavailableWorldBuilderClient` is the only client that exists.
+/// the Tower did not send. Every state is now reachable:
+/// `TowerWorldBuilderClient` maps the Tower's `model_state` onto them.
 ///
 /// Deliberately absent, and each for a reason:
 ///
-/// - **No 3D framework.** SceneKit, RealityKit and Metal would all be weight
-///   in exchange for nothing to render. When a representation exists — point
-///   cloud, sparse landmarks, trajectory, or whatever the Tower chooses — it
-///   is added behind `.receiving`/`.finalized` without disturbing anything
-///   here. Nothing in this view assumes which one it will be.
+/// - **No 3D framework.** SceneKit, RealityKit and Metal are still absent, and
+///   now for a sharper reason than "nothing to render". There *is* something to
+///   render — points and poses arrive over HTTP, per segment — but the
+///   manifest's `up_axis` is `"unknown"`, so a 3D view would have to guess
+///   which way is up, and segments are unregistered, so a single scene would
+///   superimpose reconstructions that share no coordinate frame. A top-down
+///   `(x, z)` `Canvas` per fragment is both cheaper and the only honest
+///   projection available. See `WorldFragmentsView`.
+/// - **No single world map.** Each fragment gets its own frame, its own scale
+///   and its own box until the Tower registers them. Per-segment scale
+///   disagrees by up to ~87x on a real walk; one shared scale would draw
+///   something that looks like a room and means nothing.
 /// - **No animated placeholder.** A drifting point cloud would look like
 ///   progress and be a fabrication.
 /// - **No spinner in the unsupported state.** A spinner claims work is
@@ -54,6 +61,23 @@ struct WorldCanvasView: View {
     /// dead dependency, so removing it cost nothing.
     let explanation: String
     var inspection: WorldInspectionMode = .live
+    /// What the client established about whose world this is.
+    ///
+    /// It changes no figure and hides nothing — the gate in
+    /// `TowerWorldBuilderClient` has already decided what `state` may be. All
+    /// this does is let the waiting state say *why* it is waiting, which is
+    /// the sentence nobody could see on 2026-08-24.
+    var sessionBinding: WorldSessionBinding = .none
+
+    /// The segments the Tower's manifest names, and their points and poses.
+    ///
+    /// Defaulted to empty so that the states with nothing to draw — and the
+    /// previews, and any caller that only wants the summary rows — construct
+    /// this view exactly as they did before. An empty model draws the
+    /// "nothing mapped yet" sentence, which is what the panel said in that
+    /// situation anyway.
+    var fragments = WorldFragmentsModel(segments: [])
+    var geometryChunks: [String: WorldSegmentChunk] = [:]
 
     var body: some View {
         if let forcedPhase = availability.forcedPhase {
@@ -68,10 +92,13 @@ struct WorldCanvasView: View {
         }
     }
 
+    /// Shown only where the panel has nothing else to say. It describes the
+    /// fields this panel draws **when the Tower reports them** — which is a
+    /// claim about this build, not a promise about the Tower's roadmap.
     private static let futureDescription = """
-        When the Tower can build worlds, this panel will show the model it is \
-        assembling, how well it is tracking, whether its scale is relative or \
-        estimated, and how far the camera travelled. None of those exist yet.
+        When the Tower reports a world, this panel shows the keyframes it kept, \
+        how well it is tracking, whether its scale is relative or unknown, and \
+        what it built. Fields it does not report are not drawn.
         """
 
     // MARK: The panel for a Tower that can actually answer
@@ -96,43 +123,124 @@ struct WorldCanvasView: View {
             unsupported(reason)
 
         case .idle:
-            headline("Not started", systemImage: "cube.transparent")
-            detailText("Start a capture session to begin building a world.")
+            headline("No world yet", systemImage: "cube.transparent")
+            // Not "start a capture session to begin building a world". The
+            // Tower reaches this state by having no world to report, and
+            // capture alone does not create one — reconstruction runs in a
+            // separate Tower process reading the capture from disk, which
+            // this app can neither start nor see. Promising a world in
+            // exchange for a tap would be a claim about the other machine.
+            detailText("The Tower has not reported a world. Frames from a capture session reach it; what it builds from them is its own to start.")
 
         case .awaitingFirstUpdate:
             // The one honest use of a progress indicator: frames really are
             // going out and the Tower really has not answered yet.
             HStack(spacing: 10) {
                 ProgressView()
-                Text("Waiting for the Tower's first world update…")
+                Text(waitingHeadline)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+            }
+            if let detail = waitingDetail {
+                detailText(detail)
             }
 
         case .receiving(let snapshot):
             headline(snapshot.name ?? "Building", systemImage: "cube")
             WorldSummaryView(snapshot: snapshot, isLive: true)
+            fragmentGallery
 
         case .finalizing(let snapshot):
-            // Progress is honest here — the Tower is genuinely working — but
-            // the badge must not say "live", because no new observations are
-            // arriving and the camera may already be off.
-            HStack(spacing: 10) {
-                ProgressView()
-                Text(snapshot.name.map { "Finishing \($0)…" } ?? "Finishing the world…")
-                    .font(.headline)
-            }
+            // ## No spinner here, and the reason is not style
+            //
+            // This drew a `ProgressView` beside "Finishing the world…" under a
+            // comment reading *"Progress is honest here — the Tower is
+            // genuinely working"*. **The Tower says it cannot know that.**
+            //
+            // `tower/tower/results/world_builder.py` is explicit: the writer
+            // lock is released before `build()` is called, and `build()` emits
+            // no event and writes nothing until it finishes, so *"a build in
+            // progress is indistinguishable on disk from one that never started
+            // and from one that crashed"*. Its `build_in_progress` field is
+            // `null` for exactly that reason, and the Tower spells out that
+            // `null` is not `False` because `False` would itself be a claim.
+            //
+            // This app's own client already knew. `TowerWorldBuilderClient`
+            // says this state means *"the stored figures are not the final
+            // figures", **not** "a process is working right now"*. Two comments
+            // in this repo contradicted each other and the pixels followed the
+            // wrong one — an animating spinner is the strongest possible
+            // assertion that work is underway, made from a fact that cannot
+            // support it. If the builder crashed, this span forever.
+            //
+            // What is true and worth saying is the staleness, which is what the
+            // state actually means.
+            headline(snapshot.name ?? "World", systemImage: "cube")
             WorldSummaryView(snapshot: snapshot, isLive: false)
-            detailText("Capture has ended. The Tower is still working, so these figures may still change.")
+            detailText("Capture has ended and these figures are not final. The Tower does not report whether a build is running, so this app cannot say whether one is.")
+            fragmentGallery
 
         case .finalized(let snapshot):
             headline(snapshot.name ?? "World", systemImage: "cube.fill")
             WorldSummaryView(snapshot: snapshot, isLive: false)
+            fragmentGallery
 
         case .failed(let failure):
             headline("World building failed", systemImage: "exclamationmark.triangle.fill")
             detailText(failure.message)
         }
+    }
+
+    /// What the wait is, in the two cases the phone can tell apart.
+    private var waitingHeadline: String {
+        switch sessionBinding {
+        case .none, .bound:
+            return "Waiting for the Tower's first world update…"
+        case .awaiting, .foreign:
+            return "Frames are reaching the Tower."
+        }
+    }
+
+    /// The sentence that was missing on 2026-08-24, when the phone showed a
+    /// frozen world beside a live camera and nothing said which capture the
+    /// figures belonged to.
+    ///
+    /// Both strings are claims the phone can actually support. `.foreign` means
+    /// a snapshot arrived and described a capture that is not this one, so the
+    /// stronger sentence is earned. `.awaiting` means a capture is open and the
+    /// Tower has resolved no session for it at all — which is true in the
+    /// seconds after Start, and stays true if nothing ever attaches a builder.
+    private var waitingDetail: String? {
+        switch sessionBinding {
+        case .none, .bound:
+            return nil
+        case .awaiting:
+            return "Nothing is building a world from them yet."
+        case .foreign:
+            // "Could not be matched", not "is a different capture". Both the
+            // 2026-08-24 case (a world finished an hour ago) and the narrow one
+            // where this phone's own capture ended before DAT reported the stop
+            // arrive here, and only the weaker sentence is true of both.
+            return """
+                The world it is reporting could not be matched to this \
+                session's capture, so nothing here describes it yet.
+                """
+        }
+    }
+
+    /// What the Tower actually built, drawn one fragment at a time.
+    ///
+    /// Below the summary rows and never instead of them. The rows are the
+    /// Tower's own figures; this is the geometry those figures are about, and a
+    /// reader who scrolls past a picture should still find the counts that
+    /// picture came from.
+    ///
+    /// Shown in the three states that carry a snapshot and in no others.
+    /// `.idle` and `.failed` have no world to have geometry for, and drawing an
+    /// empty gallery under them would offer a container where there is not even
+    /// a world.
+    private var fragmentGallery: some View {
+        WorldFragmentsView(model: fragments, chunks: geometryChunks)
     }
 
     /// The state that is actually reachable today.
@@ -171,8 +279,8 @@ struct WorldCanvasView: View {
 /// drawn as "—". That is the difference between a panel that is early and a
 /// panel that looks broken.
 ///
-/// Unreachable today — no client produces a snapshot — but written now so the
-/// display rule below lands with the data rather than after it.
+/// Reached from `.receiving`, `.finalizing` and `.finalized`, all three of
+/// which `TowerWorldBuilderClient` now produces from real Tower snapshots.
 struct WorldSummaryView: View {
     let snapshot: WorldSnapshot
     let isLive: Bool
@@ -224,7 +332,6 @@ struct WorldSummaryView: View {
     private var geometryRows: some View {
         if snapshot.geometry.hasReport {
             row("Geometry", geometryValue)
-            caption("This build cannot draw the Tower's world representation yet.")
         }
     }
 
@@ -243,10 +350,46 @@ struct WorldSummaryView: View {
         if let poses = snapshot.trajectory.poseCount {
             row("Camera poses", "\(poses)")
         }
-        if snapshot.trajectory.distanceDisplayable, let length = snapshot.trajectory.pathLength {
-            // The Tower's unit, or none. See `ReportedFigure`.
+        // Beside the count, never folded into it. `world_builder.status/2026-08-25`
+        // exists because the two were being added: an anchor is a segment's
+        // origin — identity rotation, zero translation — and 36 of them are not
+        // 36 camera positions. Shown whenever the Tower reported any, so a walk
+        // that positioned 41 cameras across 3 segments reads as both figures.
+        if let anchors = snapshot.trajectory.posesAnchor {
+            row("Segment origins", "\(anchors)")
+        }
+        if let segments = snapshot.trajectory.segments {
+            row("Segments", "\(segments)")
+        }
+        if snapshot.trajectory.isAnchorsOnly {
+            // The uncalibrated outcome, said plainly. No intrinsics exist for
+            // this camera yet, so the backend that solves poses withholds every
+            // one — and "0 camera poses, 36 segment origins" is a true and
+            // uninterpretable pair without this line.
+            caption("""
+                No camera position was reconstructed. Each origin marks where \
+                tracking restarted, not where the camera was.
+                """)
+        } else if let segments = snapshot.trajectory.segments, segments > 1 {
+            // Why there is no path length beside these figures. The Tower
+            // refuses one across a segment break, because poses either side of
+            // it share no coordinate frame.
+            caption("""
+                Tracking restarted \(segments - 1) time\(segments == 2 ? "" : "s"). \
+                Distances either side of a restart are not comparable, so the \
+                Tower reports no path length.
+                """)
+        }
+        if snapshot.trajectory.labelledFigureDisplayable, let length = snapshot.trajectory.pathLength {
+            // The Tower's unit, always. `labelledFigureDisplayable` refuses
+            // when there is none, so `ReportedFigure` cannot be reached here
+            // with a bare number.
             row("Path length", ReportedFigure.format(length, unit: snapshot.trajectory.pathLengthUnit))
-            if snapshot.trajectory.scale.isEstimate {
+            // Said for every scale that is not a plain measurement, not only
+            // for estimates: `.relative` needs the sentence most of all,
+            // because "2.9 world units" is the one figure on this panel a
+            // reader might otherwise take for a distance.
+            if snapshot.trajectory.scale != .measuredMetric {
                 caption(snapshot.trajectory.scale.explanation)
             }
         }

@@ -10,7 +10,7 @@ part deliberately off by default.
 | Object detection, anonymous tracking, counts from tracks | **CURRENTLY IMPLEMENTED** |
 | Camera-relative positions and relationships | **CURRENTLY IMPLEMENTED** |
 | Query layer, including refusals | **CURRENTLY IMPLEMENTED** |
-| Coarse head orientation ("appears to be facing your direction") | **IMPLEMENTED, OFF BY DEFAULT** — 798 ms per call on this CPU. See Orientation |
+| Coarse head orientation ("appears to be facing your direction") | **IMPLEMENTED, OFF BY DEFAULT** — 43.4 ms per call on CUDA, 956.4 ms on CPU, and CPU is the default device. See Orientation |
 | World-anchored positions | **BLOCKED** — no live world pose exists. Camera-relative is the honest alternative and is what ships |
 | Depth-dependent relationships (`in_front_of`, `on`, `inside`) | **REFUSED**, each with the evidence it would need |
 | Registration as a production module | **BLOCKED** at the same V1.0/V1.1 boundary as every other cartridge |
@@ -64,18 +64,42 @@ throughout:
 | 0% | 2 | [2] | 1.000 |
 | 10% | 2 | [2] | 1.000 |
 | 20% | 2 | [2] | 1.000 |
-| 40% | 2 | [1, 2] | 0.939 |
+| 40% | 2 | [1, 2] | **0.965** |
+| 60% | 2 | [0, 1, 2] | **0.783** |
 
 A count taken from raw detections would follow the dropout column
 exactly.
 
-The 40% row was **0.974 before the confirmation fix in §8.1** and is
-0.939 after. That is the correct direction for the trade: requiring a
-consecutive streak means a track dropped at extreme dropout takes longer
-to re-confirm, and it is what stops a detection present one frame in six
-from becoming a permanent phantom person. A count that is occasionally
-conservative under a detector losing 40% of frames is a better failure
-than one that is permanently wrong under a reflection.
+The 40% row was **0.974 before the confirmation fix in §8.1**, 0.939
+after it, and 0.965 since the miss budget was retuned; the 60% row is
+new and is where that retune shows, at 0.783 against **0.252** on the
+old constant. Requiring a consecutive streak means a track dropped at
+extreme dropout takes longer to re-confirm, and it is what stops a
+detection present one frame in six from becoming a permanent phantom
+person. A count that is occasionally conservative under a detector
+losing 40% of frames is a better failure than one that is permanently
+wrong under a reflection.
+
+**The miss budget is a duration, and it was written as a frame count.**
+`max_misses = 5` was justified as "roughly 1.5 seconds of absence"
+against an assumed ~3.3 fps. At the measured 12.0 fps it bought 0.42 s,
+so a person occluded for half a second was dropped, returned with a new
+`track_id`, and was **counted as somebody new** — the exact failure
+counting-from-tracks exists to prevent. It is now derived:
+`MAX_ABSENCE_S = 1.0` divided by the measured frame interval, which is
+12 frames. The sweep behind that number, on 9,145 real corpus frames,
+is in `docs/superpowers/research/2026-08-26-tracker-retune.md`. The other
+two thresholds were swept in the same pass and both survived, with
+`min_iou = 0.25` now derived from the measured 1st percentile of
+same-object consecutive-frame IoU and `min_hits = 3` from a two-sided
+sweep that rejects 4 and 2.
+
+The cost is named rather than hidden: a track whose object has genuinely
+gone stays confirmed for up to one second, so the count can be one too
+high for that long. That is a real claim about the room, and 1.0 s is
+where it was put because count stability at 18 and 24 frames is
+identical to 12 — a longer window buys nothing measurable and asserts
+more.
 
 
 **Association is by IoU only, never appearance.** Matching by how
@@ -95,21 +119,58 @@ Real evidence exists: COCO keypoints include eyes and ears, and their
 and an ear means the front of the head is toward the camera; both ears
 and no eyes means the back of it.
 
-Measured cost:
+Measured cost — warm medians over **754 real corpus frames** at 360×640,
+decode excluded, `torch.cuda.synchronize()` bracketing every CUDA call
+(`docs/superpowers/research/2026-08-26-scene-understanding-measurements.md`):
 
-| Model | Per frame, CPU |
-|---|---|
-| `ssdlite320_mobilenet_v3_large` (detection) | **33 ms** |
-| `keypointrcnn_resnet50_fpn` (keypoints) | **798 ms** |
+| Model | CUDA | CPU |
+|---|---|---|
+| `ssdlite320_mobilenet_v3_large` (detection) | **30.4 ms** | **32.9 ms** |
+| `keypointrcnn_resnet50_fpn` (keypoints) | **43.4 ms** | **956.4 ms** |
+| keypoints, p95 | 50.6 ms | 1112.8 ms |
 
-798 ms is **24× the detector** and **2.5× the ~300 ms interval the
-glasses deliver**. It cannot run per frame, so it runs at a bounded
-cadence on person tracks and **every estimate carries its age**, expiring
-to `unknown` rather than being deleted — a missing field would read as
-"not facing".
+**The device is the variable that matters, and none of this document's
+earlier figures named one.** This section used to say 798 ms, "24× the
+detector" and "2.5× the ~300 ms interval the glasses deliver". All four
+numbers are wrong:
 
-**The unblocker is named:** torch is CPU-only on this host. A restored
-CUDA build is what changes this decision, not a different algorithm.
+- Orientation is **43.4 ms on CUDA** and **956.4 ms on CPU** — a 22.0×
+  spread, and the CPU figure is *worse* than either number previously
+  documented, because those were measured on synthetic input.
+- The detector is launch-bound at an internal 320 px and gains almost
+  nothing from the GPU, so orientation is **1.43× the detector on CUDA**
+  and 29.1× on CPU. The ratio inverts with the device.
+- The delivered frame interval, measured from the corpus's own
+  `frames.jsonl` receipt timestamps, is **83.5 ms (12.0 fps)**, not
+  ~300 ms — the docs were off by 3.6×. Against the real interval
+  orientation is **0.52× on CUDA** and 11.5× on CPU.
+- Cost is flat in the number of people: ~1 ms each, 40.0 ms at zero to
+  44.3 ms at four. VRAM peaks at 988 MB reserved of 12 GB.
+
+**The cadence survives; its constant did not.** Detector plus orientation
+is 73.8 ms against an 83.5 ms budget on CUDA — per-frame fits at the
+median and overruns at p95 (86.4 ms), at an 88% duty cycle with no
+headroom and no accuracy to show for it, since a person's facing does not
+change in 83 ms. So `ORIENTATION_INTERVAL_S` is now **3 delivered frames,
+~250 ms**, not 2.0 s. The stride is `TrackerPolicy.min_hits`: estimating
+facing more often than a track can be confirmed buys nothing.
+
+**Every estimate still carries its age**, expiring to `unknown` rather
+than being deleted — a missing field would read as "not facing". CUDA did
+*not* make that bookkeeping redundant, for two reasons unrelated to 43 ms:
+`TorchvisionPoseEstimator` defaults to `device="cpu"`, where the original
+argument holds in full at 956 ms; and `age_estimate`'s clamp guards a
+backward NTP step that pushed an expiry deadline into the future, which is
+a clock bug, not a latency one.
+
+**The old unblocker is spent.** This document used to say torch was
+CPU-only on this host and a restored CUDA build was what would change the
+decision. That build exists — `torch 2.13.0+cu132`, verified executing on
+an RTX 5070 (Blackwell, sm_120) — and the numbers above came from it. The
+cost question is closed. **Accuracy is not measured and cannot be here**:
+there is no bystander footage on this host, and the corpus's person boxes
+are almost certainly the wearer's own torso, so `facing_from_keypoints`
+remains unvalidated against ground truth.
 
 ### It is never gaze
 
@@ -145,7 +206,7 @@ to anchor to. No world ids are invented.
 
 | Refused | Why, and what would settle it |
 |---|---|
-| `in_front_of` / `behind` | Needs depth. The only depth available is MiDaS relative inverse depth, measured by this project at 6–8% temporal flicker; ordering two boxes by a flickering field gives a relation that inverts frame to frame. To settle it: run the depth experiment over two objects at a known separation and measure how often the ordering flips |
+| `in_front_of` / `behind` | **Measured and still refused** (2026-08-26, 9,199 real frames — `docs/superpowers/research/2026-08-26-depth-ordering-on-real-frames.md`). Ordering two boxes by MiDaS relative inverse depth reverses on **3.8%** of consecutive-frame transitions over 2,700 object pairs, and separation predicts it strongly (15.7% below 0.02 separation, 0.0% above 0.40) — but only while the scene is still. At matched separation the flip rate goes from **0.0% (n=124) to 11.5% (n=52)** between the most static frames and the top motion decile, and the corpus's 99th-percentile inter-frame box motion is 56 px, so it contains no walking. Cost is not the obstacle: **5.73 ms CUDA / 18.29 ms CPU** against an 83.4 ms interval. The earlier 6–8% flicker figure was about right in magnitude (4.8% here) but the ordering conclusion drawn from it did not follow. To settle it: corpus footage with sustained wearer locomotion |
 | `on` | Needs support-surface reasoning and depth. Box containment is not it — a laptop *in front of* a desk overlaps its box identically to one *on* it |
 | `inside` | Same: 2-D containment cannot distinguish it |
 | `near` | Image proximity is not world proximity. Two things at opposite ends of a room can be adjacent in a frame |
@@ -164,9 +225,22 @@ because the purpose is a live answer:
 - **Nothing persisted.** No store, no imagery, no history.
 - **No identity.** Anonymous, session-scoped track ids, meaningless
   across processes. No appearance matching, so no re-identification.
-- **No face processing.** No face detector exists on this platform
-  anyway. Keypoints locate eyes and ears as anonymous landmarks; they
-  produce no descriptor and support no matching.
+- **No face processing.** Keypoints locate eyes and ears as anonymous
+  landmarks; they produce no descriptor and support no matching.
+
+  This bullet used to add "no face detector exists on this platform
+  anyway", and that justification was **wrong**. `cv2.FaceDetectorYN` is
+  compiled into our OpenCV and needed only a 227 KB weights file, which
+  is now vendored at `models/face_detection_yunet_2023mar.onnx` and used
+  by World Builder to redact faces before a keyframe is written. The
+  original search was scoped to `cv2/` and missed it; the same error was
+  corrected in `reports/2026-08-22-cartridge-run-report.md` on 2026-08-23
+  and missed here.
+
+  **The posture is unchanged and does not depend on that claim.** This
+  cartridge does no face processing because it has no need to, not
+  because it could not. A capability being available is exactly when
+  "we don't do this" has to be a decision rather than a limitation.
 - **Raw pixels are ephemeral**, held only for the frame being processed.
 
 ## Relationship to other cartridges

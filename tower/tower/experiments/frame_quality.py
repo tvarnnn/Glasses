@@ -16,8 +16,24 @@ the others offer.
 import cv2
 import numpy as np
 
-from tower.experiments import ExperimentResult, decode_color
+from tower.experiments import ExperimentResult, MetricKind, decode_color
 from tower.instrumentation import StageTimer
+
+# What each number means when many frames are combined. Seven of these
+# are per-frame measurements whose corpus answer is a mean; `width` and
+# `height` are neither summable nor averageable -- a corpus of 9,199
+# frames does not have a mean width, it has the sizes it was shot at.
+METRIC_KINDS: dict[str, MetricKind] = {
+    "sharpness_laplacian_var": MetricKind.RATE,
+    "gradient_energy": MetricKind.RATE,
+    "entropy_bits": MetricKind.RATE,
+    "contrast_std": MetricKind.RATE,
+    "edge_density": MetricKind.RATE,
+    "overexposed_fraction": MetricKind.RATE,
+    "underexposed_fraction": MetricKind.RATE,
+    "width": MetricKind.CONSTANT,
+    "height": MetricKind.CONSTANT,
+}
 
 # 8-bit imagery, so these are absolute levels rather than fractions.
 # Chosen at the ends of the range: a pixel at 250+ has almost certainly
@@ -33,12 +49,54 @@ def run(raw_bytes: bytes) -> ExperimentResult:
         gray = cv2.cvtColor(decode_color(raw_bytes), cv2.COLOR_BGR2GRAY)
 
     with timer.stage("sharpness"):
-        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        # CV_16S and meanStdDev rather than CV_64F and .var(). A 640x360
+        # float64 Laplacian is a 1.8 MB allocation per frame, and reducing
+        # it in numpy costs more than computing it.
+        #
+        # MEASURED on 1,500 real corpus frames, same-session A/B with
+        # alternating arm order: 1.4885 ms -> 0.3173 ms per frame, 4.69x.
+        # This experiment runs SYNCHRONOUSLY ON THE EVENT LOOP whenever it
+        # is the selected one, so the saving is loop time every connection
+        # shares.
+        #
+        # The intermediate is EXACT here, not merely close, for the same
+        # reason it is in `world_builder/frontend.py: measure_sharpness`,
+        # whose docstring carries the full argument: 8-bit input with
+        # ksize=1 bounds the Laplacian at +/-1020 against int16's +/-32767,
+        # so saturation is unreachable. Verified on this corpus rather
+        # than assumed -- `np.array_equal(Laplacian(g, CV_64F),
+        # Laplacian(g, CV_16S))` held on 400 frames, observed range
+        # -538..392 -- and the variance then agreed to a max relative
+        # difference of 5.053e-16 across all 1,500.
+        #
+        # DUPLICATED FROM THAT FUNCTION RATHER THAN IMPORTED. The Lab is a
+        # sandbox that may be thrown away and must not import another
+        # cartridge; `test_scene_understanding_does_not_import_another_
+        # cartridge` states the rule for its neighbour and the reasoning
+        # is the same one `cartridge_runtime._resolve_device` gives for
+        # duplicating in spirit. No dtype guard is needed here because
+        # `gray` is produced two lines above by `cvtColor(..., BGR2GRAY)`
+        # and is uint8 single-channel by construction; the shared function
+        # needs one only because it is public.
+        _, deviation = cv2.meanStdDev(cv2.Laplacian(gray, cv2.CV_16S))
+        sharpness = float(deviation[0, 0] ** 2)
 
     with timer.stage("gradient"):
         # Scharr rather than a 3x3 Sobel: same cost, better rotational
         # symmetry, so the number does not depend on which way an edge
         # happens to run.
+        #
+        # `cv2.magnitude(dx, dy)` was MEASURED as a replacement for the
+        # numpy chain below and REFUSED. It is 1.72x on this stage
+        # (1.4551 -> 0.8441 ms/frame over 1,500 real frames), not the 5.36x
+        # an earlier estimate suggested, and unlike the sharpness change it
+        # is NOT exact: max relative difference 2.203e-07, which is float32
+        # epsilon rather than float64 agreement. `gradient_energy` is a
+        # REPORTED measurement whose whole purpose is that thresholds get
+        # chosen from its distribution, so 0.6 ms per frame on a sandbox
+        # experiment does not buy a perturbation in its seventh
+        # significant digit. Recorded because it is the intuitive next
+        # step and the numbers argue against it.
         dx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
         dy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
         gradient_energy = float(np.mean(np.sqrt(dx * dx + dy * dy)))

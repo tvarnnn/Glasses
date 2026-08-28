@@ -50,6 +50,44 @@ ERR_TOO_MANY = "too_many_subscriptions"
 ERR_UNKNOWN_SUBSCRIPTION = "unknown_subscription"
 ERR_SNAPSHOT_FAILED = "snapshot_failed"
 
+# How much of a client-supplied identifier comes back in a refusal.
+#
+# `cartridge`, `result_type` and `subscription_id` are echoed into both a
+# message string and a field, and were bounded by nothing. MEASURED at
+# exactly 2.00x and unbounded: a 1,000,000-character `cartridge` produced
+# a 2,000,311-character reply.
+#
+# It costs more than its size. These replies are sent while holding the
+# send lock the FRAME PATH shares, so an oversized echo is paid by every
+# `frame_result` queued behind it -- which is the starvation
+# `CARTRIDGE-RESULTS.md` forbids in Tower responsibility #3.
+#
+# 120 to match the two guards that already exist for exactly this, in the
+# same words: `routes/ws.py: _echo_safe` ("the alternative is letting a
+# remote party choose the size of our messages") and `cv_lab/lab.py:
+# _clip` ("A remote party must not be able to choose the size of a message
+# this Tower sends"). Not imported from either: `ws.py`'s helper passes
+# numbers through untouched because it bounds a numeric `seq`, and
+# `cv_lab`'s lives inside a cartridge that this module is forbidden to
+# import -- `test_the_result_channel_core_is_cartridge_blind` is what
+# keeps the result-channel core cartridge-blind, and reaching through it
+# for a string helper would honour the letter of that rule while breaking
+# it.
+ECHO_LIMIT = 120
+
+
+def _echo_safe(value) -> str:
+    """A client-supplied identifier on its way back out, bounded.
+
+    Always a string: these three fields are typed as strings by the
+    contract, an ill-formed client can send anything, and the refusal has
+    to name what arrived so a person can see their own typo.
+    """
+    text = str(value)
+    if len(text) <= ECHO_LIMIT:
+        return text
+    return text[: ECHO_LIMIT - 1] + "…"
+
 
 async def handle(message: dict, *, websocket, sender, channel_holder) -> None:
     """Dispatch one result-channel message. Never raises."""
@@ -78,7 +116,7 @@ async def _cartridges(websocket, sender) -> None:
     Served from the same `registry.declare()` so the two surfaces cannot
     drift. A test asserts they are byte-identical.
     """
-    await sender.send(registry.declare(_world_root(websocket)))
+    await sender.send(registry.declare(**_declaration_inputs(websocket)))
 
 
 async def _subscribe(message, websocket, sender, channel_holder) -> None:
@@ -92,6 +130,21 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
         )
         return
 
+    # Bounded HERE, once, rather than at each of the eight sites that echo
+    # them. A guard applied per call site is a guard someone adds a ninth
+    # call site next to, and the ninth one is the hole -- this function
+    # already echoes `cartridge` and `result_type` into six different
+    # refusals, and an audit that listed the sites missed
+    # `requested_contract` below.
+    #
+    # Safe to rebind before the lookup rather than only on the way out:
+    # every cartridge and result type this Tower serves is a short
+    # identifier from a closed set in `contracts.py`, so truncation can
+    # only ever affect a value that was already going to be refused. A
+    # name long enough to be clipped is not a name `find_offer` knows.
+    cartridge = _echo_safe(cartridge)
+    result_type = _echo_safe(result_type)
+
     world_id = message.get("world_id")
     session_id = message.get("session_id")
     if world_id is not None and not isinstance(world_id, str):
@@ -101,10 +154,47 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
         await _error(sender, ERR_MALFORMED, "'session_id' must be a string or absent")
         return
 
-    world_root = _world_root(websocket)
-    offer = registry.find_offer(world_root, cartridge, result_type)
+    # These two are bounded HERE rather than with the pair above only
+    # because they are read here -- and that gap is exactly the failure
+    # the comment above predicts. The first version of this guard bound
+    # four fields at the top of the handler and these two were declared
+    # eleven lines further down, checked for TYPE and echoed verbatim.
+    #
+    # They are the WORSE half, because a subscribe carrying them
+    # SUCCEEDS. Measured: 2,000,000 characters in, 4,001,438 bytes back --
+    # the same 2.00x -- and then the string persists on the
+    # `Subscription` and inside `Subscription.target`, so `poll_once`
+    # re-serialises it every 0.5 s for the life of the subscription,
+    # across the send lock the frame path shares. Eight per connection.
+    #
+    # `None` survives as `None`: absent is a meaningful value on both, and
+    # `_echo_safe` would turn it into the string "None".
+    #
+    # Truncating before use is safe for the same reason it is above: a
+    # world id is a 32-character hex string, so a value long enough to be
+    # clipped is one no world was ever going to match.
+    world_id = None if world_id is None else _echo_safe(world_id)
+    session_id = None if session_id is None else _echo_safe(session_id)
+
+    inputs = _declaration_inputs(websocket)
+    offer = registry.find_offer(
+        inputs["world_root"],
+        cartridge,
+        result_type,
+        document_root=inputs["document_root"],
+        scene_enabled=inputs["scene_enabled"],
+        # The offer's `unavailable_reason` goes on the wire below, so this
+        # surface must be told the same thing `/cartridges` was.
+        scene_unavailable_reason=inputs["scene_unavailable_reason"],
+        cv_lab=inputs["cv_lab"],
+    )
     if offer is None:
-        known = registry.known_cartridges(world_root)
+        known = registry.known_cartridges(
+            inputs["world_root"],
+            document_root=inputs["document_root"],
+            scene_enabled=inputs["scene_enabled"],
+            cv_lab=inputs["cv_lab"],
+        )
         if cartridge not in known:
             await _error(
                 sender,
@@ -138,7 +228,8 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
             cartridge=cartridge,
             result_type=result_type,
             offered_contract=offer["contract"],
-            requested_contract=requested,
+            # Client-supplied and echoed, exactly like the two above.
+            requested_contract=_echo_safe(requested),
         )
         return
 
@@ -243,6 +334,10 @@ async def _unsubscribe(message, sender, channel_holder) -> None:
             sender, ERR_MALFORMED, "result_unsubscribe requires 'subscription_id'"
         )
         return
+    # Same rebinding as `_subscribe`, same reason. Ids are minted by
+    # `next_subscription_id()` and are short, so a value long enough to be
+    # clipped is one `remove()` was never going to match.
+    subscription_id = _echo_safe(subscription_id)
     channel = channel_holder.existing()
     removed = False
     if channel is not None:
@@ -271,8 +366,15 @@ async def _error(sender, reason: str, message: str, **extra) -> None:
     await sender.send(payload)
 
 
-def _world_root(websocket):
-    return getattr(websocket.app.state, "world_root", None)
+def _declaration_inputs(websocket) -> dict:
+    """What this Tower's declaration depends on, off one app state.
+
+    Delegated to `registry.declaration_inputs` rather than reading the
+    attributes here, so this surface and `/cartridges` over HTTP cannot
+    come to disagree about what "configured" means. That byte-identity is
+    asserted by a test and is the reason the helper exists at all.
+    """
+    return registry.declaration_inputs(websocket.app.state)
 
 
 class ChannelHolder:
