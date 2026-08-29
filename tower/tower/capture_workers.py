@@ -35,6 +35,7 @@ protect.
 
 import logging
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -74,6 +75,87 @@ ATTACH_MODE_FROM_START = "from-start"
 ATTACH_MODE_FROM_NOW = "from-now"
 
 
+def _ask_to_stop(process) -> bool:
+    """Ask a worker to stop, without killing it. Returns whether it was asked.
+
+    THE GRACE WINDOW WAS WAITING ON A REQUEST NOBODY HAD MADE.
+
+    `_stop_worker` used to `wait(grace)` first and terminate second. That
+    is the right shape, but nothing in between ever told the worker
+    anything, so the wait measured the full grace every single time and
+    the process was shot at the end of it regardless. The Object Memory
+    producer's `finally: engine.release()` -- the only code that closes
+    open sightings and writes the ones that matured -- therefore never
+    ran when a wearer pressed Stop. The fix is not a longer wait. It is
+    to ask.
+
+    TWO CHANNELS, BECAUSE ONE OF THEM DOES NOT WORK WHERE THIS RUNS.
+
+    The obvious channel is a signal, and on POSIX `terminate()` is
+    `SIGTERM` and that is the whole story. On Windows `terminate()` is
+    `TerminateProcess`, which is not a signal and cannot be caught, so
+    the only route to a catchable stop is a console control event --
+    which is why `_start` passes `CREATE_NEW_PROCESS_GROUP`, and
+    `CTRL_BREAK_EVENT` rather than `CTRL_C_EVENT` because a new process
+    group starts with Ctrl-C disabled.
+
+    MEASURED, and it is why there is a second channel: a console control
+    event is delivered through a CONSOLE, and this Tower does not
+    reliably have one. Under a pseudoconsole -- a terminal that reports
+    `GetConsoleWindow() == 0`, which is what an editor's integrated
+    terminal, a CI runner and a Windows service all look like --
+    `GenerateConsoleCtrlEvent` returns success and the child never hears
+    anything. A trivial child that registers all three handlers and
+    sleeps was still alive thirty seconds later. Shipping a flush that
+    works on the operator's own PowerShell and silently does not work
+    anywhere else is the same defect as not having one.
+
+    So the FIRST channel is closing the child's stdin. The supervisor
+    holds the write end for any spec that asked for it
+    (`WorkerSpec.stop_via_stdin`), closing it is an EOF the child's
+    reader thread cannot miss, and a pipe needs no console, no signal
+    disposition and no permission. It also fixes something adjacent for
+    free: a producer orphaned by a Tower that died gets its EOF from the
+    operating system rather than polling for its full fifteen-minute idle
+    bound.
+
+    Both are attempted. Neither is required to succeed, and each is
+    contained separately -- a signal that raises must not stop the pipe
+    from being closed. Contained overall as "not asked" so the caller
+    falls through to `terminate()` rather than leaving a worker alive
+    because an optional courtesy failed.
+    """
+    asked = False
+
+    stdin = getattr(process, "stdin", None)
+    if stdin is not None:
+        try:
+            stdin.close()
+            asked = True
+        except Exception:
+            logger.debug(
+                "[Tower][Worker] could not close stdin for pid %s",
+                getattr(process, "pid", "?"),
+                exc_info=True,
+            )
+
+    try:
+        if os.name == "nt":
+            os.kill(process.pid, signal.CTRL_BREAK_EVENT)
+        else:
+            process.terminate()
+        asked = True
+    except Exception:
+        logger.debug(
+            "[Tower][Worker] could not signal pid %s; it will be terminated "
+            "instead",
+            getattr(process, "pid", "?"),
+            exc_info=True,
+        )
+
+    return asked
+
+
 @dataclass(frozen=True)
 class WorkerSpec:
     """What to run, once per capture lineage.
@@ -96,6 +178,16 @@ class WorkerSpec:
     # the lesser problem, and small in practice -- the world builder logs
     # once at session start, once per rebuild, and once at the end.
     inherit_output: bool = True
+    # Whether this worker is handed a stdin pipe the supervisor keeps,
+    # so that closing it is a stop request the child can act on.
+    #
+    # False by default, and that default is not timidity: a child that
+    # does not WATCH its stdin gains nothing from being given a pipe, and
+    # a child that inherits a stdin already at EOF -- a Tower started with
+    # `< nul`, or as a service -- would read that as an immediate stop.
+    # A spec sets this only alongside the argv flag that makes its child
+    # watch, so the two halves of the agreement are written in one place.
+    stop_via_stdin: bool = False
     # Asked at every capture open: may this spec run right now?
     #
     # None means "always", which is what every spec meant before gates
@@ -551,14 +643,54 @@ class CaptureWorkerSupervisor:
             for worker in registry.workers.values()
         ]
 
-    def following(self, name: str) -> list[str]:
-        """The capture ids one named spec currently has a live worker on."""
+    def mark(self) -> float:
+        """A reading of THIS supervisor's clock, for use with `following`.
+
+        Exists so that nothing outside compares a `started_at` against a
+        timestamp from somewhere else. That is not a hypothetical
+        tidiness: this supervisor's clock defaults to `time.monotonic`
+        and `CartridgeSession`'s to `time.time`, so the first version of
+        `following(since=...)` compared an uptime against a Unix epoch,
+        every worker looked older than every session, and a correct
+        implementation reported nothing at all. A caller that takes its
+        mark from here cannot make that mistake.
+
+        Monotonic is also the right clock for the question. "Did this
+        start after that" must survive a clock adjustment, and a wall
+        clock stepping backwards mid-walk would make a live producer look
+        like a leftover.
+        """
+        return self._clock()
+
+    def following(self, name: str, *, since: float | None = None) -> list[str]:
+        """The capture ids one named spec currently has a live worker on.
+
+        `since` narrows the answer to workers STARTED at or after a
+        moment, and it exists because this supervisor is deliberately
+        cartridge-blind and therefore knows nothing about sessions. A
+        `CartridgeSession` asking "what is MY producer on" and a
+        `/health` reader asking "what is running on this Tower" are
+        different questions, and answering the first with the second is
+        how a brand-new session that attached nothing came to render as
+        recording: a previous session's un-killable worker is still in
+        this registry, and it was being reported under the new session's
+        id.
+
+        Unfiltered is still the default, and still the honest answer to
+        the second question. A worker nobody can kill must stay visible
+        somewhere, or the one control a wearer has over being remembered
+        fails open silently.
+        """
         with self._lock:
             registry = self._registries.get(name)
             if registry is None:
                 return []
             self._reap_locked()
-            return [worker.capture_id for worker in registry.workers.values()]
+            return [
+                worker.capture_id
+                for worker in registry.workers.values()
+                if since is None or worker.started_at >= since
+            ]
 
     # -- internals ----------------------------------------------------
 
@@ -652,6 +784,9 @@ class CaptureWorkerSupervisor:
                 cwd=spec.cwd,
                 stdout=None if spec.inherit_output else subprocess.DEVNULL,
                 stderr=None if spec.inherit_output else subprocess.DEVNULL,
+                # See `_ask_to_stop`. The write end lives on the Popen and
+                # closing it is the one stop request that needs no console.
+                stdin=subprocess.PIPE if spec.stop_via_stdin else None,
                 # A worker must not die because the operator pressed
                 # Ctrl-C in the Tower's console: on Windows a console
                 # Ctrl-C goes to the whole process group, and a follower
@@ -699,6 +834,15 @@ class CaptureWorkerSupervisor:
         supervisor aware of one.
         """
         process = worker.process
+        # ASK FIRST. A grace window that waits without asking measures
+        # the whole window every time and then shoots the process
+        # anyway -- see `_ask_to_stop`. Only when there IS a window:
+        # `detach(grace_seconds=0)` means "gone now", and asking a
+        # process to stop and then immediately terminating it is worse
+        # than not asking, because a producer that had started its flush
+        # gets killed halfway through it.
+        if grace_seconds:
+            _ask_to_stop(process)
         try:
             process.wait(timeout=grace_seconds)
             logger.info(
@@ -712,7 +856,8 @@ class CaptureWorkerSupervisor:
             if grace_seconds:
                 logger.warning(
                     "[Tower][Worker] worker pid %s for capture %s did not "
-                    "exit within %.1fs; terminating.",
+                    "exit within %.1fs of being asked; terminating. Anything "
+                    "it had not finished writing is lost.",
                     process.pid,
                     worker.capture_id,
                     grace_seconds,

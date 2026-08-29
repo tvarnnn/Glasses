@@ -131,6 +131,11 @@ Two tests hold this:
 **What deletion would not reach anyway.** A record's `session_id` + `frame_seq`
 resolves into `data/captures/`, where the JPEG it was derived from is still
 sitting. Object Memory's retention governs *this store and nothing else*.
+Since 2026-08-29 a record may also own one small filtered crop under
+`<root>/keyframes/`, and `--purge-all` and `prune_expired` both delete it
+with the record — so *that* picture is reached, and the purge reports any
+file the filesystem refused to remove rather than printing a count over
+it. What is still out of reach is the full frame in `data/captures/`.
 Every `where` object therefore carries `imagery_retention: "capture-side"`:
 purging every observation here leaves the imagery exactly where it is, and
 capture-side retention is not this cartridge's to promise or to give away.
@@ -417,26 +422,75 @@ that walk. **Render liveness from `following`.**
 | `supported` | boolean | Whether this Tower has a producer to start at all. `false` on a Tower with the cartridge switched off — a Start button that silently does nothing is worse than one that says why it cannot. |
 | `session_id` | string \| **null** | Minted at Start, kept across Pause, cleared at Stop. **Not** a capture id. |
 | `started_at` / `changed_at` | float \| **null** | Tower-receipt epoch seconds. |
-| `following` | array of string | Capture ids a producer is **alive** on, right now. See the caveat below — these are the SUPERVISOR's producers, not necessarily this session's. |
-| `captures` | array of string | Every capture a producer has been seen following since this session started, in order first seen. |
+| `following` | array of string | **Every** capture a producer for this cartridge is alive on right now, including one left over from a session that could not kill it. Supervisor-scoped, deliberately — see below. |
+| `following_this_session` | array of string \| **null** | The subset of `following` that **this session** started. **This is the field a liveness claim is drawn from.** Added 2026-08-29. Three values, see below. |
+| `captures` | array of string | Every capture **this session's** producer has been seen following, in order first seen. |
 
-> ⚠️ **`following` and `captures` are supervisor-scoped, not
-> session-scoped.** This table said "this session's producer" until
-> 2026-08-27; that was wrong and a reviewer reproduced it.
+> ✅ **The supervisor-scoping defect is fixed, and the fix is additive.**
+> This table said "this session's producer" until 2026-08-27; that was
+> wrong, a reviewer reproduced it, and the warning that stood here from
+> 2026-08-27 to 2026-08-29 described a live false positive.
 >
-> A producer that ignored `terminate()` on a previous Pause or Stop stays
-> registered with the supervisor — which is the same condition that makes
-> a Pause able to report `changed: true` without stopping anything. Start
-> a **new** session and it will report the OLD session's capture under the
-> new `session_id`, having attached nothing.
+> The defect: a producer that ignored `terminate()` on a previous Pause or
+> Stop stays registered with the supervisor — the same condition that
+> makes a Pause able to report `changed: true` without stopping anything.
+> Start a **new** session and `following` reported the OLD session's
+> capture under the new `session_id`, having attached nothing. Against the
+> rule stated everywhere else here — render liveness from `following`,
+> never from `state` — that produced a **false positive**: a brand-new
+> session that attached nothing rendered as recording.
 >
-> That matters more than it looks, because the rule everywhere else in
-> this contract is "render liveness from `following`, never from
-> `state`". Under this defect that rule produces a **false positive**: a
-> brand-new session that attached nothing renders as recording. Cross-check
-> `attached_capture_id` on the POST reply, which is honest, and treat a
-> `following` entry that does not match a capture this session opened as
-> unproven.
+> **`following` was NOT narrowed to fix it.** Narrowing it would hide the
+> un-killable producer, and an un-killable producer is exactly what "the
+> Stop button failed open" looks like. That is the worst thing this
+> cartridge can do to a person and the one thing that must never become
+> silent. `following` therefore keeps its full breadth, and the
+> intent-contradicts-liveness alarm is still drawn from it.
+>
+> **`following_this_session` is the new field**, scoped by the
+> supervisor's own clock reading at the moment this session last went
+> active. A client should:
+>
+> - draw **"remembering"** from `following_this_session`;
+> - draw the **alarm** (`state` is `paused` or `stopped` and something is
+>   still recording) from `following`;
+> - say something separate and specific about `following` minus
+>   `following_this_session` — a producer that is recording and that this
+>   session's Stop will not reach.
+>
+> **Three values, and the third is why this is nullable.**
+>
+> - a **list** — these captures, and no others, have a producer this
+>   session started still alive on them;
+> - the **empty list** — this session has started nothing that is still
+>   running. A positive claim, and safe to draw a warning from;
+> - **`null`** — this session cannot scope the question at all. Fall back
+>   to `following`, and draw no warning.
+>
+> A Tower that omits the field entirely means the same as `null`.
+>
+> The distinction is not pedantry. The first implementation answered `[]`
+> for the unanswerable case, reasoning that a claim which cannot be
+> scoped must not be made. The reasoning was right and the encoding was
+> wrong: a client reads `[]` as a positive claim and draws "a producer
+> you did NOT start is recording, and Stop will not reach it" from the
+> difference with `following` — so a Tower that merely could not answer
+> would have raised that alarm about a producer the person had started
+> themselves.
+>
+> Scoped by **start time**, not by a list of ids the session kept, and the
+> difference is not cosmetic: a capture that opens while the gate is open
+> is spawned by the supervisor without consulting the session at all, and
+> that is the *normal* path — Start before the camera is the documented
+> order. A session that counted only its own attach returns would report
+> nothing for almost every real walk.
+>
+> Both clocks are the supervisor's. `CaptureWorkerSupervisor._clock`
+> defaults to `time.monotonic` and `CartridgeSession._clock` to
+> `time.time`; the first implementation of this compared one against the
+> other, every worker looked older than every session, and the correct
+> looking code reported nothing at all. `CaptureWorkerSupervisor.mark()`
+> exists so that a caller cannot get that wrong.
 | `accepted` | boolean | On `POST` only. |
 | `changed` | boolean | On `POST` only. `false` means the action was honoured and nothing moved — a double tap. |
 | `attached_capture_id` | string \| **null** | On `POST` only. The capture a producer was just started against, if any. |
@@ -509,21 +563,78 @@ does not.
 LAN-local origin, and a proxy or a browser holding a copy is a second
 store nobody chose and nobody's retention governs.
 
+### 10.0 Two sources, and only `/crop` has two — added 2026-08-29
+
+`/crop` prefers a small crop **this cartridge owns**, written under
+`<observation_root>/keyframes/<observation_id>.jpg` when the sighting
+closed, and falls back to cropping the capture frame when there is no
+owned one. `/frame` has only ever one source, because a keyframe *is* a
+crop and there is nothing to synthesise a context view out of.
+
+`imagery_source` on the payload says which served the bytes, and
+`imagery_retention` says whose retention therefore governs them. **Both
+are additive and `object_memory.imagery/2026-08-27` does not move**: a
+shipped iOS build compares that identifier for equality and refuses a
+payload that does not carry it, and a decoder that has never heard of a
+keyframe reads `imagery_retention` exactly as it always did.
+
+**Why this exists.** A record is kept for 30 days; the frame it points at
+lives in `data/captures/`, which this cartridge does not own. Until
+2026-08-29 that was survivable only by accident — this repository has no
+capture pruner at all, `CaptureRecorder.purge()` has zero production
+callers — so the imagery had never actually expired. Any pruner, or any
+human reclaiming the ~2.1 GB an hour of walking costs, would have taken
+the picture off every memory at once. A durable record pointing into an
+ephemeral store is the defect; owning one small crop fixes it without
+extending raw capture retention by a day.
+
+**What it costs.** One JPEG per observation, long side capped at 384 px
+at quality 80. The context view still comes from the recording and is
+still governed by capture-side retention.
+
+**What it does not change.** It is written through the same YuNet filter
+`/frame` uses, and it is fail-closed: no weights, a filter that raises,
+or a filter that returns nothing all write **no file at all** rather than
+an unfiltered crop. There is no path in `KeyframeStore.write` by which
+the input crop reaches the disk; everything written derives from the
+filter's output. An image whose sidecar is missing is **ignored rather
+than served**, so the sidecar's presence is what makes the claim
+checkable.
+
 ### 10.1 The `imagery` payload
 
 | Field | Type | Notes |
 |---|---|---|
 | `contract` | string | `object_memory.imagery/2026-08-27`. |
 | `claim` | string | `frame-from-the-recording-this-record-was-derived-from`. It is a frame from a recording, filtered on the way out. It is **not** evidence of where anything is. |
-| `available` | boolean | Whether bytes can be served. |
+| `available` | boolean | **Whether a picture can be served at all**, not whether `/frame` holds one. Built from a crop render since 2026-08-29, so it is `true` for a record whose recording has been deleted and whose owned keyframe survives — see the warning below. |
 | `reason` | string \| **null** | `null` when available. Otherwise a value to switch on, never a sentence to display. |
 | `memory_retained` | boolean | **The field this shape exists for.** `true` with `available: false` means the record is still here and its picture is not. |
 | `filter` | string | `display-filter/yunet-2023mar@0.30`. See §10.3. |
-| `filter_means` | string | `applied-on-read-the-stored-frame-is-unchanged`. |
+| `filter_means` | string | `applied-on-read-the-stored-frame-is-unchanged` for a capture frame; `applied-before-this-file-was-written` for an owned keyframe. |
+| `imagery_source` | string | `capture-frame` or `object-memory-keyframe`. Which store served these bytes. Added 2026-08-29. |
+| `frame_available` | boolean \| **null** | Whether `/frame` could serve the wider context view. `null` where it was not computed — on a refusal detail from a binary route, where the client already knows which it asked for. Added 2026-08-29. |
 | `regions_filled` | integer | How many regions the filter filled. Zero means **nothing was detected**, not that there was nothing there. |
 | `subject_obscured` | float 0.0–1.0 | How much of the record's own box the filter covered. See §10.4. |
 | `bounding_box_normalized` | array of 4 floats \| **null** | Where in the picture. Same caveat as §4.5. |
-| `imagery_retention` | string | `capture-side`. |
+| `imagery_retention` | string | `capture-side` **or** `object-memory`, depending on `imagery_source`. Not a constant since 2026-08-29: a crop served from this cartridge's own keyframe expires with the record and is deleted by `--purge-all`, while a frame served out of `data/captures/` may vanish on a schedule this cartridge does not set. |
+| `imagery_retention_means` | string | The same fact as a value to switch on rather than a sentence to display. |
+
+> ⚠️ **`available` is not `/frame`'s availability, and it was until
+> 2026-08-29.**
+>
+> The view route rendered a frame and reported that. Once a record could
+> own a crop that outlives its recording, that answer was wrong in the
+> one case the crop exists for: `available: false` for a record whose
+> picture was sitting on disk. A client that gates on it — and the
+> shipped iOS loader does, with `guard description.available else {
+> .noPicture }` — would never have asked for the crop, and would have
+> told a wearer the picture was gone while it was being held for them.
+>
+> So the view is built from a **crop** render, and `frame_available`
+> answers the separate question about the context view. A client
+> choosing between the object and its context must read both: they no
+> longer stand or fall together.
 
 ### 10.2 Status codes, and the one that carries meaning
 
@@ -561,8 +672,26 @@ and rear views are a known weakness of this detector class. **Bodies,
 clothing, room contents, screens and any undetected face are all still in
 the picture.**
 
-A Tower whose weights are missing **serves nothing**. There is no lenient
-default, because the lenient default here is a raw first-person frame.
+A Tower whose weights are missing **serves no capture frame**. There is
+no lenient default, because the lenient default there is a raw
+first-person frame.
+
+**An owned keyframe is the one exception, and it is not a weakening.**
+Those bytes were filtered *before* they were written — which is the
+`world_builder/redaction.py` posture this section contrasts itself with,
+not the read-time one — so `filter_means` for a keyframe reads
+`applied-before-this-file-was-written`. Refusing to serve one because the
+ONNX weights went missing *afterwards* would withhold a picture on the
+strength of a check that has already been passed, more thoroughly, at
+write time. The corollary is the safe one: if the weights were missing at
+write time, **no keyframe exists**, and the request falls through to the
+capture path and is refused there.
+
+The wording rule is unchanged and applies to both. A keyframe's label is
+still `display-filter/yunet-2023mar@0.30` and still names the detector
+and its threshold; it is never "redacted", "anonymised" or
+"privacy-safe", and YuNet's blind spots are exactly what they were.
+`regions_filled: 0` on a keyframe still means nothing was detected.
 
 ### 10.4 `subject_obscured`, and the defect it exists for
 
@@ -671,12 +800,31 @@ offers it.
 |---|---|---|
 | `TOWER_OBSERVATION_ENABLED` | `true` | `false` switches the cartridge off entirely: nothing is produced, and both `GET`s answer **404**. |
 | `TOWER_OBSERVATION_ROOT` | `<tower>/data/object_memory` | Where the producer writes **and** where the routes read. One value, handed to both. |
-| `TOWER_OBSERVATION_DEVICE` | `cpu` | Where the detector runs. CPU measured 69.3 ms/frame against CUDA's 100.4 on this host. |
-| `TOWER_OBSERVATION_VERIFIER` | `none` | `owlv2` loads `google/owlv2-base-patch16-ensemble` (Apache-2.0, ~600 MB, downloaded once) and unlocks the `verify` tier. An unrecognised name falls back to `none` — the **narrowing** direction — and is logged loudly. |
-| `TOWER_OBSERVATION_VERIFIER_DEVICE` | `cuda` | Where the verifier runs. CUDA even though the detector defaults to CPU: the detector costs about the same either way, the verifier measured 126 ms a crop on the GPU against 2,473 on the CPU. Costs 620 MB of VRAM. A host with no CUDA needs no setting — the verifier reports the downgrade and runs on CPU. |
+| `TOWER_OBSERVATION_DEVICE` | `auto` | Where the detector runs. `auto` resolves in the **producer**, which is the process that imports torch. CPU measured 69.3 ms/frame against CUDA's 100.4 on this host, so auto picking the GPU costs nothing measurable either way. |
+| `TOWER_OBSERVATION_VERIFIER` | **`owlv2`** | Changed from `none` on 2026-08-29 — see below. `owlv2` loads `google/owlv2-base-patch16-ensemble` (Apache-2.0, ~600 MB, downloaded once) and unlocks the `verify` tier, taking `recorded_classes` from two to fourteen. An unrecognised name falls back to `none` — the **narrowing** direction — and is logged loudly. An **empty** value means `none`: a person switching it off is obeyed rather than defaulted over. |
+| `TOWER_OBSERVATION_VERIFIER_DEVICE` | `auto` | Where the verifier runs. The measurement that made this CUDA still holds — 126 ms a crop on the GPU against 2,473 on the CPU, a factor of nineteen, for 620 MB of VRAM — but `cuda` as a literal default is a value a second machine has to un-set by hand, which is the edit-the-environment-before-every-run problem this whole surface exists to remove. `auto` picks the GPU where there is one and says which it got. |
 | `TOWER_OBSERVATION_RETENTION_DAYS` | `30` | The window the producer writes under, recorded in the store manifest. |
 | `TOWER_CAPTURE_ROOT` | *(unset)* | Required for §10. Without it the imagery routes answer 503. |
 | `TOWER_FACE_REDACTION_MODEL` | *(vendored)* | The YuNet weights. Without them **no picture is served**. |
+
+**The verifier default was reversed on 2026-08-29, and this closes a
+decision that was explicitly reserved.**
+`docs/agent-handoffs/OBJECT-MEMORY-HANDOFF.md` section 7.4 recorded
+turning the verifier on by default as an open question **for a human, not
+for an agent**: *"the default stays `none` because 94 crops from one home
+justify building it and not switching it on for everybody."* A human
+closed it. The 2026-08-29 product pass was instructed that OWLv2 is this
+project's intended standard configuration and that setting the variable
+by hand before every launch is not acceptable for ordinary use.
+
+What makes it safe to default rather than merely asked for: a host that
+cannot load the weights is **not broken by it**. `_build_verifier`
+catches the failure, says so on stderr, and the run continues with no
+verifier — which narrows `recorded_classes` back to the two the detector
+is trusted on. The producer's report then carries both `verifier` (what
+ran) and `verifier_requested` (what was asked for), so a run can never
+claim a verification tier it did not have. Set the variable to `none` to
+get the old behaviour deliberately.
 
 **The unset-means-404 default was reversed, and the reason is the point.**
 It used to default to `None` on the grounds that "a memory of what a
