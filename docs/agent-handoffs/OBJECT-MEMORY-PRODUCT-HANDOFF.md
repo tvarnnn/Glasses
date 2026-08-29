@@ -556,6 +556,92 @@ and the frame path does not come through here.
 
 ---
 
+## 5A. What review changed
+
+Two independent reviewers, neither of which wrote the code it read.
+
+### 5A.1 The iOS review — thirteen findings, one blocking
+
+**The blocker.** Every control on the Object Memory screen, *including
+Stop*, was disabled for up to twelve seconds after Start. `isActing`
+covered the whole Start sequence, and that sequence ends with the bounded
+convergence poll — so during the window in which the Tower session is
+open and the camera this screen just started is streaming, the one
+control a wearer has over being recorded was greyed out and the only way
+out was to leave for Home. Which is the exact thing this change exists to
+delete.
+
+`isActing` now covers only the mutating step. A second flag covers the
+whole sequence and is what the pushed-reading guard uses — necessary,
+because the workspace's watch loop polls at the same cadence and would
+otherwise turn the legal "accepted, nothing attached yet" into
+`notObserved` seconds before the deadline that word belongs to.
+
+**Reachability.** A camera-permission refusal is set by a DAT callback
+*after* `startCameraSession()` returns, so the coordinator read `nil`,
+claimed ownership, and reported "asked to remember, and not observed"
+twelve seconds later — while the true answer was known and had a written
+sentence that would never be shown.
+
+**Claims that outran the facts.** "The camera is sending frames" was
+printed from the instant of the tap, over a session that had not
+connected; `CaptureClaim.running` includes `DeviceSessionState.starting`.
+Three doc comments proved what this app *calls* and claimed it as what
+the SDK *exposes*. A new copy line said "Restarting the Tower will" about
+a producer that had already ignored `terminate()`.
+
+**A test that passed for the wrong reason.** New copy contained a
+forbidden phrase, and the forbidden-phrase test missed it only because
+its fixture never populated the field that produced the line. Both were
+fixed — the wording and the fixture.
+
+**Two prominent Starts and two differently-labelled Stops** on one
+screen, both routing to the same call.
+
+**Dead code with a comment claiming otherwise.** `deinit { work?.cancel() }`
+could never fire while work was outstanding, because the task held `self`
+strongly — which also made the cancellation branches in `converge()`
+unreachable. The blocker's fix made cancellation real, so they are live
+now and the comment says which thing reaches them.
+
+**And a rule nothing enforced.** "This view writes no prose" was stated
+three times in doc comments and checked by nothing. It is now
+`swift-structure-check.py --no-prose`.
+
+### 5A.2 The break the two lanes nearly shipped past each other
+
+Not a review finding — found while applying one, and the most valuable
+thing in this section.
+
+The Tower gained a second `filter_means` value, because a picture
+filtered *before it was written* is not a picture filtered on read and
+must not claim to be. The shipped iOS decoder compared that field against
+a **single** constant. Every keyframe payload would have failed the parse
+outright, and the whole owned-picture feature would have been invisible
+on the phone — with both suites green, because neither can see the other.
+
+`ios/scripts/cross-stack-constants-check.py` is the check that would have
+caught it, and it needs no Mac and no running Tower: it imports the
+Tower's own constants and greps the Swift for them. It is a tripwire for
+a value that moved on one side only, which is the failure that actually
+happens when two lanes ship the same day. Verified against a deliberately
+injected skew.
+
+### 5A.3 Two things I found by running rather than reading
+
+**The lineage bound.** `MAX_LINEAGE_STEPS = 8` was written from "chains
+of five are in this corpus". Checking the corpus instead of the memory of
+it found an eighteen-capture chain and four records still losing their
+pictures inside the fix that was supposed to save them. See §2.3.
+
+**The world builder's grace, nearly destroyed.** The stop request went to
+every worker, and a `CTRL_BREAK_EVENT` kills a child that installed no
+handler. See §3.3. It looked fine here for the worst possible reason — a
+pseudoconsole swallows the event — so the damage was invisible on the
+only machine it was tested on.
+
+---
+
 ## 6. What is proven, and what is not
 
 **Proven by test, offline:** everything in §1–§5 above, plus the numbers
@@ -600,6 +686,50 @@ Home's views hold prose legitimately, and a checker that shouted at them
 would be turned off within a week.
 
 ---
+
+### 6.1 Re-running every check on this host
+
+From the worktree's own `tower/` directory — see §7 for why that matters:
+
+```powershell
+$py = "C:\Users\tvllo\Projects\Glasses\tower\.venv\Scripts\python.exe"
+
+# The whole suite. The short basetemp is deliberate: a deep one trips
+# MAX_PATH once World Builder nests two UUIDs under tmp_path, and
+# manufactures about 139 phantom failures.
+& $py -m pytest -q -p no:cacheprovider --basetemp=C:\Users\tvllo\AppData\Local\Temp\gf
+
+# Just this change's own suites.
+& $py -m pytest tests\test_object_memory_imagery.py `
+                tests\test_object_memory_keyframes.py `
+                tests\test_object_memory_graceful_stop.py `
+                tests\test_cartridge_session_liveness.py `
+                -q -p no:cacheprovider --basetemp=C:\Users\tvllo\AppData\Local\Temp\gf
+
+& $py -m pip check
+```
+
+From the repository root:
+
+```powershell
+# Brackets and strings balance in every Swift file. NOT a build.
+& $py ios\scripts\swift-structure-check.py `
+    (Get-ChildItem -Recurse ios\Glasses,ios\GlassesTests -Filter *.swift).FullName
+
+# The workspace view writes no sentences of its own.
+& $py ios\scripts\swift-structure-check.py --no-prose `
+    ios\Glasses\Workspaces\ObjectMemory\ObjectMemoryWorkspaceView.swift
+
+# The Swift names every constant and wire key the Tower sends. This is
+# the one that would have caught the filter_means split; see §5A.2.
+& $py ios\scripts\cross-stack-constants-check.py
+```
+
+And the resolved configuration, without starting anything:
+
+```powershell
+cd tower; .\scripts\start_tower.ps1 -CheckOnly
+```
 
 ## 6A. The next physical test
 
@@ -771,6 +901,22 @@ path trip Windows' 260-character limit once World Builder nests
 about 139 phantom failures and one very confusing afternoon. They are
 inside the OS temp directory, which rule 12 allows.
 
+**How the tests were run, because the trap here is real.** The worktree
+has no venv; the only working interpreter is the MAIN checkout's
+`tower\.venv`, and the package is installed editable pointing at the main
+checkout. Run that interpreter from a neutral directory and `import
+tower` resolves to the **main checkout's source**, not this branch's.
+Every run here was made from the worktree's own `tower/` directory, where
+the cwd wins:
+
+```
+tower package resolved from: ...\Glasses-worktrees\object-memory-product	ower	ower\__init__.py
+```
+
+which was checked rather than assumed. Anyone reproducing these numbers
+must `cd` into the worktree's `tower/` first, or they will measure a
+different branch and get the old answers.
+
 **Nothing was written to `C:\` or to the home directory.** The live
 `tower/data/` tree in the main checkout was read for measurement and
 never written: every figure in §2.2, §2A.3 and §6 comes from running the
@@ -783,8 +929,11 @@ shipped code over it read-only.
 - **No iOS code has been compiled or run.** See §6.
 - **The verifier's reject path is unproven physically.** §6.
 - The suite grew because tests were added, not because behaviour is
-  asserted twice. The baseline before this branch was **2217 passed, 68
-  skipped**; §9 records the exact figure after.
+  asserted twice. **Before this branch: 2217 passed, 68 skipped, ~430 s.
+  After: 2340 passed, 68 skipped, 374 s.** Zero failures either side, and
+  `pip check` clean. The 68 skips are the same opt-in gates as before
+  (`TOWER_RUN_MODEL_TESTS`, a machine-local corpus, a vendored face
+  model); none of them was added or widened here.
 - Every "measured" figure here names what it was measured on. Where a
   number came from a synthetic fixture rather than the corpus, it says
   so.
