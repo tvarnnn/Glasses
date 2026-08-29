@@ -577,7 +577,7 @@ enum ObjectMemoryCopy {
         return """
             Faces this Tower's display filter detected have been filled in on \
             the way out.\(named)\(when) Bodies, clothing, room contents, \
-            screens, and any face it did not detect are all in the picture.
+            screens, and any face it did not detect are all still in the picture.
             """
     }
 
