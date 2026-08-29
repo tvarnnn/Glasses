@@ -537,7 +537,7 @@ final class CVLabContractTests: XCTestCase {
         XCTAssertEqual(preview.pollIntervalSeconds, 0.1)
         XCTAssertTrue(preview.isDrawable)
         XCTAssertNil(preview.withheldReason)
-        XCTAssertNotNil(liveStatus().run?.annotation.drawablePreview)
+        XCTAssertNotNil(try liveStatus().run?.annotation.drawablePreview)
     }
 
     /// **The privacy gate, from the strict side.** An unstated treatment is
@@ -612,7 +612,7 @@ final class CVLabContractTests: XCTestCase {
 
     /// The catalog says which experiments have one, before anything is armed.
     func testTheCatalogSaysWhichExperimentsHaveALiveView() throws {
-        let available = liveStatus().available
+        let available = try liveStatus().available
         XCTAssertFalse(available.isEmpty)
         // Not asserted per id: the Tower owns the registry and this app holds
         // no list. What is asserted is that the field is READ rather than
