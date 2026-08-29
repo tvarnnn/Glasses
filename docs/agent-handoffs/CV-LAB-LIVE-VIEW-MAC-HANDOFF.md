@@ -26,14 +26,18 @@ from the frame, never over the frame.
 
 | Claim | Evidence |
 |---|---|
-| Full Tower suite passes | `2312 passed, 36 skipped, 1 failed` — the one failure is `test_object_memory_lifecycle.py::test_an_unconfigured_tower_still_serves_its_own_memory`, which asserts an empty default observation root and finds the 116 real observations in `tower/data/object_memory/` from your physical testing. **Pre-existing and environmental.** It fails the same way on a clean checkout of this machine; nothing in this change touches Object Memory. Do not delete that data to make it pass. |
-| The preview suite | `tests/test_cv_lab_preview.py` — 49 tests, all passing: bounded storage, latest-only semantics, three staleness guards, failure isolation, the depth normaliser, the HTTP surface. |
+| Full Tower suite | `2320 passed, 36 skipped, 1 failed` in 6m17s — the one failure is `test_object_memory_lifecycle.py::test_an_unconfigured_tower_still_serves_its_own_memory`, which asserts an empty default observation root and finds the 116 real observations in `tower/data/object_memory/` from your physical testing. **Pre-existing and environmental.** It fails the same way on a clean checkout of this machine; nothing in this change touches Object Memory. Do not delete that data to make it pass. |
+| The preview suite | `tests/test_cv_lab_preview.py` — 50 tests, all passing: bounded storage, latest-only semantics, three staleness guards, failure isolation, the depth normaliser, the HTTP surface. |
 | Every visual experiment renders a decodable, non-blank image | `test_every_visual_experiment_renders_something_a_person_could_look_at`, parameterised over the registry. |
 | Preview cost on the frame path | Measured, 120 frames per cell at 640x360, **throttle forced off so every frame captures** — i.e. worse than production. `preview` stage: edge 0.000 ms (the array already exists), frame_quality 0.174 ms, optical_flow 0.265 ms, feature_detection 0.736 ms, redaction_impact 1.066 ms. Whole-`run()` delta was within noise in both directions. |
 | Preview cost off the frame path | Encode: edge 0.44 ms / 2.1 KB, frame_quality 1.29 ms / 5.0 KB, feature_detection 2.32 ms / 8.7 KB, optical_flow 2.37 ms / 9.1 KB, redaction_impact 2.94 ms / 9.1 KB. Depth measured separately at ~2.8 ms / ~16-28 KB JPEG. All of it on a worker thread. |
 | Nothing is written to disk | `test_previews_are_written_to_no_file_anywhere` chdirs into a tmp dir, runs 40 render cycles, and asserts the directory tree is unchanged. |
 | Storage is bounded | `test_one_capture_and_one_encoding_exist_however_many_frames_arrive` — 200 frames, then 50 more with renders, asserting one slot and one cached encoding throughout. |
 | A consumer that never fetches costs nothing | `test_a_consumer_that_never_fetches_costs_no_encodes_at_all` — 100 frames, `encoded == 0`. |
+| Object detection, end to end, on the real model | `device` resolved to **cuda**; load with warm-up 2 750 ms; run 44.0 ms first / 35.7 ms median / 37.5 ms last — **no 500 ms first-inference spike**; `preview` stage 0.356 ms against 36.0 ms of inference; two boxes drawn, 4.1 KB. On a synthetic desk scene, on a machine that was also running the test suite. |
+| Every preview looked at, not just measured | One of each kind rendered to PNG/JPEG and inspected. Edge: continuous white lines, a doorway reads as a doorway. Depth: bright near, dark far. Flow: arrows agreeing on direction. Redaction: the magenta rectangle with red survivors inside it. Detections: a bold accepted box and a thin faded near-miss. Frame quality: a histogram with the clipping levels marked. |
+| `pip check` | `No broken requirements found.` |
+| `compileall` over `tower/` | Clean. There is no linter and no type checker configured in this repository — `pytest` is the gate. |
 
 ## REQUIRES MAC / XCODE VALIDATION
 
