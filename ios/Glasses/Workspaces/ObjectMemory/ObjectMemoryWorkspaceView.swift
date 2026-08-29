@@ -29,21 +29,46 @@ import SwiftUI
 /// is no map, no floor plan, and no marker: this cartridge has `spatial_ref:
 /// null` in every payload and knows where nothing is.
 ///
-/// ## No camera controls, and what the Start button is instead
+/// ## One Start button, and what it starts
 ///
-/// Like the other read-only workspaces, this one is handed no
-/// `GlassesConnection`, so the number of places in the app that can start a
-/// **capture** stays at two. The controls this screen grew on 2026-08-27 start
-/// and stop the Tower's **producer** — the process that reads a recording and
-/// writes observations — and they reach a different router that cannot touch
-/// the store at all. It still cannot delete: the query transport is two `GET`s,
-/// and real deletion lives on the Tower where a human types it against a store
-/// they can name.
+/// **This workspace can now begin a capture, and it is the third place in the
+/// app that can.** That is a deliberate change to an invariant that used to
+/// read "exactly two", and the reason is that the previous arrangement did not
+/// work as a product.
 ///
-/// Those controls exist because the alternative was measured. The 2026-08-26
-/// physical run remembered 64 real observations and **every one of them
-/// required a person to find a capture directory and start a producer in a
-/// second terminal.** That is not a product.
+/// It does not receive the `GlassesConnection` itself. It receives
+/// `ObjectMemoryRecordingCoordinator`, built once on `ProjectManager` from the
+/// one connection this app has — so the set of types that can reach DAT is
+/// unchanged, and the coordinator outlives every cartridge switch.
+///
+/// The controls this screen grew on 2026-08-27 started and stopped the Tower's
+/// **producer** — the process that reads a recording and writes observations —
+/// and nothing else. So a person who opened this cartridge and pressed Start
+/// got a session that was genuinely `active`, with `attached_capture_id: null`,
+/// no frames, no records, and no sentence on screen telling them that the
+/// camera lives behind a differently-named button on a different screen. The
+/// button worked and the cartridge did not.
+///
+/// Now one tap runs `ObjectMemoryRecordingCoordinator`, which asks the Tower
+/// first — the documented order, and the one that avoids both the closed-gate
+/// race and `--attach-mode from-now` losing the opening seconds — and then
+/// starts the camera **only if nothing already holds it**. There is still
+/// exactly one camera pipeline and one owner of it: `GlassesConnection`. This
+/// screen calls `startCameraSession()` and `stopCameraSession()` and knows
+/// nothing else about DAT.
+///
+/// Stop honours ownership. A capture Home or World Builder started is left
+/// running, because ending it from here would reach across two other screens,
+/// and the copy says which of the two happened.
+///
+/// None of this makes the query half writable. It is still two `GET`s, real
+/// deletion still lives on the Tower where a human types it against a store
+/// they can name, and the session router still cannot touch the store.
+///
+/// The composed control exists because the alternative was measured. The
+/// 2026-08-26 physical run remembered 64 real observations and **every one of
+/// them required a person to find a capture directory and start a producer in a
+/// second terminal.** That is not a product either.
 ///
 /// ## The one rule this screen cannot get wrong
 ///
@@ -60,11 +85,50 @@ struct ObjectMemoryWorkspaceView: View {
 
     @StateObject private var memory: ObjectMemoryViewModel
 
-    /// The client is injected and owned by `ProjectManager`; see
-    /// `CartridgeClients`. It outlives this view, so an answer survives a
+    /// The composed lifecycle: the Tower's producer and the glasses camera,
+    /// started and stopped together and in the right order.
+    ///
+    /// **Observed, not owned**, and the asymmetry with `memory` above it is
+    /// the point.
+    ///
+    /// `ObjectMemoryViewModel` is a `@StateObject` and stays one: it holds a
+    /// query and a list of answers, and losing those on a cartridge switch
+    /// costs a person one tap. This holds whether this app started the capture
+    /// that is running — and losing THAT costs a person a Stop button that
+    /// leaves the glasses recording, because a rebuilt coordinator believes it
+    /// started nothing and therefore stops nothing.
+    ///
+    /// So it is built once on `ProjectManager` and handed in. That is the rule
+    /// `CartridgeClients` was created for, and this is the first object in the
+    /// app for which it is not a precaution.
+    @ObservedObject private var recording: ObjectMemoryRecordingCoordinator
+
+    /// The clients are injected and owned by `ProjectManager`; see
+    /// `CartridgeClients`. They outlive this view, so an answer survives a
     /// workspace switch.
-    init(isTowerReachable: Bool, client: any ObjectMemoryClient) {
+    ///
+    /// The coordinator likewise. Its own `camera` is what is optional: a
+    /// preview, a Release build, and any future host with no camera all build
+    /// one with `nil` there, and the Tower half of this screen works exactly
+    /// as it did. The camera half then reports that it cannot be reached
+    /// rather than pretending it can.
+    ///
+    /// `memory` is constructed through `StateObject`'s autoclosure and
+    /// therefore lazily, once per installation, which is why the coordinator
+    /// takes the *client* rather than the view model: sharing one view-model
+    /// instance between them would mean building it eagerly on every `init`,
+    /// and `init` runs on every re-evaluation of the view above this one.
+    ///
+    /// No default for `recording`, deliberately. A default would let a caller
+    /// build this screen with a coordinator nobody else can see, which is the
+    /// mistake this parameter exists to prevent.
+    init(
+        isTowerReachable: Bool,
+        client: any ObjectMemoryClient,
+        recording: ObjectMemoryRecordingCoordinator
+    ) {
         self.isTowerReachable = isTowerReachable
+        self.recording = recording
         _memory = StateObject(wrappedValue: ObjectMemoryViewModel(client: client))
     }
 
@@ -80,7 +144,13 @@ struct ObjectMemoryWorkspaceView: View {
             // somebody who opens this screen to check they are not being
             // recorded should not have to scroll past a list of records to
             // find out.
-            ObjectMemorySessionPanel(memory: memory)
+            //
+            // The control comes first and the Tower's own reading second. That
+            // ordering is the same argument one level up: a person looking at
+            // this screen wants the one sentence that says whether anything is
+            // being written into this memory, and then the evidence for it.
+            ObjectMemoryRecordingPanel(recording: recording)
+            ObjectMemorySessionPanel(memory: memory, recording: recording)
             controls
 
             if let forcedPhase {
@@ -98,7 +168,15 @@ struct ObjectMemoryWorkspaceView: View {
         // on now, and a value read once when the screen opened is a claim about
         // a process that may have died since. Bounded by cancellation on
         // disappear rather than running for the life of the app.
-        .onAppear { memory.startWatchingSession() }
+        .onAppear {
+            memory.startWatchingSession()
+            // Set here rather than in `init` so the coordinator never holds a
+            // reference to a view model built for a render that was discarded.
+            // Re-asking the reader's *own* question rather than asking for
+            // everything: a Stop must not silently widen a category they
+            // narrowed to.
+            recording.refreshRecords = { memory.askForEverything() }
+        }
         .onDisappear { memory.stopWatchingSession() }
     }
 
@@ -472,6 +550,12 @@ struct ObjectObservationRow: View {
 /// type's whole output.
 struct ObjectMemorySessionPanel: View {
     @ObservedObject var memory: ObjectMemoryViewModel
+    /// The verbs below are sent through the composed lifecycle rather than
+    /// straight at the Tower, so that a Stop pressed here stops the capture
+    /// this cartridge started and a Start pressed here starts one. There are no
+    /// raw Tower verbs left on this screen; what is read off the Tower is still
+    /// the *vocabulary*, which is what `actions` is for.
+    @ObservedObject var recording: ObjectMemoryRecordingCoordinator
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -523,9 +607,21 @@ struct ObjectMemorySessionPanel: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            // Liveness, from `following`. The glyph is filled only when a
-            // producer is actually alive on a recording — never when `state`
-            // merely says `active`.
+            // A producer this session did not start and cannot stop. Beside
+            // the contradiction and in the same warning role, because it is
+            // the same class of sentence: something is recording that the
+            // controls on this screen will not reach.
+            if let leftover = ObjectMemoryCopy.leftoverProducerLine(snapshot) {
+                Label(leftover, systemImage: "exclamationmark.triangle")
+                    .font(.subheadline)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // Liveness, from what THIS session started. The glyph is filled
+            // only when a producer this session started is actually alive on a
+            // recording — never when `state` merely says `active`, and never
+            // for a producer some earlier session left behind.
             Label(
                 ObjectMemoryCopy.livenessLine(snapshot),
                 systemImage: snapshot.isFollowingACapture
@@ -582,18 +678,118 @@ struct ObjectMemorySessionPanel: View {
                 // it replaces.
                 if action == .start {
                     Button(ObjectMemoryCopy.actionButton(action)) {
-                        memory.apply(action)
+                        recording.apply(action)
                     }
                     .buttonStyle(.borderedProminent)
                 } else {
                     Button(ObjectMemoryCopy.actionButton(action)) {
-                        memory.apply(action)
+                        recording.apply(action)
                     }
                     .buttonStyle(.bordered)
                 }
             }
         }
-        .disabled(!snapshot.supported)
+        // `isActing` is a **local** fact — a sequence this screen started has
+        // not finished — and not a guess about what the Tower would accept, so
+        // gating on it does not make this app's model authoritative over the
+        // Tower's. It is what stops a double tap starting two overlapping
+        // sequences that would race over who owns the camera.
+        .disabled(!snapshot.supported || recording.isActing)
+    }
+
+    private func caption(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+// MARK: - The composed lifecycle
+
+/// One Start, one Stop, and the sentence that says what they actually did.
+///
+/// ## Why this is a second panel and not a fifth button
+///
+/// The panel below it reports what the *Tower* says: intent, liveness,
+/// provenance, and the contradiction between the first two. This one reports
+/// what a *person* asked for and what came of it across both halves — the
+/// producer and the camera — which is a different question with a different
+/// answer, and frequently a longer one. Folding them together would put a
+/// sentence about a DAT stream under a heading that says "what the Tower
+/// reports", which would be false.
+///
+/// ## Nothing here is set optimistically
+///
+/// Every string is drawn from `ObjectMemoryRecordingCoordinator.reading`, which
+/// is only ever written from an answer — a `POST` result, a read-back, a camera
+/// claim published by `GlassesConnection`, or a deadline expiring. A tap sets
+/// `starting`, `pausing`, `resuming` or `stopping`, and each of those says
+/// *asking*, not *done*.
+///
+/// The primary control is deliberately still enabled in states this app
+/// believes the Tower would refuse, for the reason the session panel gives:
+/// `start` from `active` is a legal idempotent no-op, `stop` is never refused,
+/// and disabling on a guess would make this app's model of the state machine
+/// authoritative over the Tower's. The two things it *is* disabled on are a
+/// Tower that has no producer at all, and a sequence this screen has already
+/// started — both local facts.
+///
+/// ## This view writes no prose either
+///
+/// Same absolute rule as the workspace: every sentence comes from
+/// `ObjectMemoryCopy`, and `ObjectMemoryCopyTests` runs the whole product of
+/// phase and camera claim through the claims this cartridge may not make.
+struct ObjectMemoryRecordingPanel: View {
+    @ObservedObject var recording: ObjectMemoryRecordingCoordinator
+
+    var body: some View {
+        // Read once into a local so every line below is drawn from the same
+        // instant — the same discipline `HomeWorkspaceView.liveNumbers` applies
+        // to a metrics snapshot. A phase and a camera claim sampled a render
+        // apart could contradict each other on screen.
+        let reading = recording.reading
+        return VStack(alignment: .leading, spacing: 8) {
+            SectionLabel(ObjectMemoryCopy.recordingHeading)
+
+            VStack(alignment: .leading, spacing: 10) {
+                headline(reading)
+                primaryControl(reading)
+                caption(ObjectMemoryCopy.recordingCameraLine(reading))
+                caption(ObjectMemoryCopy.recordingWhatStartDoes)
+                caption(ObjectMemoryCopy.recordingPauseMeaning)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 18))
+        }
+    }
+
+    /// The one sentence, with a glyph that is filled **only** when a producer
+    /// is confirmed alive on a recording.
+    ///
+    /// `isFollowingACapture` is a property of the phase and is `false` for
+    /// `starting`, `waitingToBeFollowed` and `notObserved` — all three of which
+    /// follow a *successful* Start. A filled record dot on any of them would be
+    /// this screen claiming a recording it has never observed.
+    private func headline(_ reading: ObjectMemoryRecordingReading) -> some View {
+        Label(
+            ObjectMemoryCopy.recordingHeadline(reading),
+            systemImage: reading.phase.isFollowingACapture
+                ? "record.circle.fill" : "record.circle"
+        )
+        .font(.subheadline)
+        .foregroundStyle(reading.phase.isFollowingACapture ? .primary : .secondary)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func primaryControl(_ reading: ObjectMemoryRecordingReading) -> some View {
+        let action = recording.primaryAction
+        return Button(ObjectMemoryCopy.recordingPrimaryButton(action)) {
+            recording.apply(action)
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(reading.phase == .unsupported || recording.isActing)
     }
 
     private func caption(_ text: String) -> some View {

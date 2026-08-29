@@ -869,6 +869,17 @@ final class ObjectMemoryViewModel: ObservableObject {
         Task { await client.readSession() }
     }
 
+    /// Sends one verb straight at the Tower.
+    ///
+    /// **The workspace does not call this any more, and new callers should
+    /// think before they do.** It moves the Tower's producer and nothing else,
+    /// so a `stop` sent through here ends the session and leaves the glasses
+    /// camera streaming, and a `start` opens the gate with no capture behind
+    /// it — which is precisely the half-finished product
+    /// `ObjectMemoryRecordingCoordinator` was written to replace. It is kept
+    /// because the Tower half is genuinely separable and a future caller with
+    /// no camera at all is a real possibility; it is documented because the
+    /// obvious call site is the wrong one.
     func apply(_ action: CartridgeSessionAction) {
         Task { await client.apply(action) }
     }
