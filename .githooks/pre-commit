@@ -1,8 +1,15 @@
 #!/bin/sh
 # Glasses lane guard.
 #
-# Installed at: <repo>/.githooks/pre-commit   (tracked)
-# Activated by: git config core.hooksPath .githooks   (once per clone)
+# Tracked copy:  <repo>/.githooks/pre-commit
+# Live copy:     <repo>/.git/hooks/pre-commit   (copy this file there)
+#
+# Do NOT activate this with `core.hooksPath`. That setting REPLACES
+# .git/hooks rather than adding to it, and it resolves per worktree against
+# each worktree's own top level -- so on any branch that predates this file
+# (main, and every branch cut before 2026-08-29) git would find no hook and
+# silently run none. Copying it into .git/hooks puts one hook in the shared
+# common dir, where it covers every worktree on every branch.
 #
 # Why this exists: on 2026-08-29 two autonomous agents shared the canonical
 # checkout. The second one ran `git switch -c` and inherited the first one's
@@ -21,6 +28,20 @@ common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) 
 [ "$git_dir" != "$common_dir" ] && exit 0
 
 branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+# Integration merges are the canonical checkout's actual job, so let them
+# finish. A conflict-free merge auto-commits without consulting this hook at
+# all -- git looks for pre-merge-commit there, and none is installed -- so
+# refusing only the hand-resolved case would block the careful path while
+# waving the automatic one through. Completing a cherry-pick or a revert is
+# the same situation.
+for _state in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
+	if [ -e "$git_dir/$_state" ]; then
+		printf '%s\n' \
+			"lane guard: allowing an in-progress ${_state%_HEAD} to be completed here." >&2
+		exit 0
+	fi
+done
 
 if [ -z "$CLAUDECODE" ] && [ -z "$GLASSES_LANE_GUARD_STRICT" ]; then
 	printf '%s\n' \

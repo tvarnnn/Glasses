@@ -105,6 +105,16 @@ test "$(git rev-parse --path-format=absolute --git-dir)" \
 ## What the guard does not stop
 
 The branch switch itself; `--no-verify`; two agents inside one *linked*
-worktree; uncommitted mixing (only publishing it is blocked); and merge
-auto-commits in the canonical checkout, which is deliberate so integration
-merges keep working. Those remain rules rather than mechanisms.
+worktree; uncommitted mixing (only publishing it is blocked); and merges in
+the canonical checkout, which is deliberate so integration keeps working.
+Those remain rules rather than mechanisms.
+
+The merge exemption took two tries. Git has no `pre-merge-commit` hook
+installed here, so a conflict-free merge auto-commits and never consults the
+guard — but a *conflicted* merge is finished with `git commit`, which does.
+The first version of the hook therefore refused the careful, hand-resolved
+merge while letting the automatic one through, which is exactly backwards. An
+independent reviewer of the finished state found it. The hook now steps aside
+whenever `MERGE_HEAD`, `CHERRY_PICK_HEAD`, or `REVERT_HEAD` is present, and
+the refusal was re-tested afterwards to confirm it still fires for an ordinary
+commit.

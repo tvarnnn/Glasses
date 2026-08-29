@@ -195,5 +195,11 @@ ls .git/hooks/pre-commit                 # the always-on copy
 The hook detects the canonical checkout by comparing `--git-dir` with
 `--git-common-dir`; they are equal only in the main worktree. It refuses when
 `CLAUDECODE` is set, and warns without blocking otherwise, so a human is never
-locked out of their own repository. `git merge` does not run `pre-commit`, so
-integration merges in the canonical checkout still work.
+locked out of their own repository.
+
+Integration merges in the canonical checkout still work, deliberately and in
+both forms. A conflict-free `git merge` auto-commits without consulting
+`pre-commit` at all, and the hook explicitly steps aside while `MERGE_HEAD`,
+`CHERRY_PICK_HEAD`, or `REVERT_HEAD` is present, so a hand-resolved merge can
+be finished too. Without that second exemption the guard would have refused
+the careful path and waved the automatic one through.
