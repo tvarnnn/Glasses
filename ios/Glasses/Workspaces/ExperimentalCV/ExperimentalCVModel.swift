@@ -507,7 +507,7 @@ struct CVAnnotationReport: Equatable, Sendable {
 /// Nothing here is switched on. It is a diagnostics panel, and every field is
 /// `nil` on a Tower that does not report it rather than defaulted to a zero
 /// that would read as a measurement.
-struct CVPreviewDiagnostics: Equatable, Sendable {
+nonisolated struct CVPreviewDiagnostics: Equatable, Sendable {
     /// Frames the Lab told the preview about.
     var framesOffered: Int?
     /// …of which this many became the newest picture.

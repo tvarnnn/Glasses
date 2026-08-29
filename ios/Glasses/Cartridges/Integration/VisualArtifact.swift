@@ -41,7 +41,7 @@ import Foundation
 /// It is therefore **not a user-facing privacy control**. There is no toggle
 /// backed by this. A switch the Tower cannot honour is worse than no switch,
 /// because it converts a limitation into a false assurance.
-enum RedactionState: String, Equatable, Sendable, CaseIterable {
+nonisolated enum RedactionState: String, Equatable, Sendable, CaseIterable {
     /// A redaction step was applied by the producer before this artifact was
     /// persisted or offered for display.
     case redacted
@@ -74,7 +74,18 @@ enum RedactionState: String, Equatable, Sendable, CaseIterable {
     /// re-serve what it draws. `ExperimentalCVPreview.swift` is the one that
     /// does, and its file comment lists the four things it does to keep the
     /// promise structural rather than intentional.
-    var isDisplayableLive: Bool { self != .unknown }
+    var isDisplayableLive: Bool {
+        // Switched rather than `!= .unknown` so that adding a case is a build
+        // error here. An inequality supplies the default this type's own doc
+        // comment says it does not have, and supplies it in the unsafe
+        // direction: a new treatment would be silently live-displayable in
+        // the one path that draws untreated imagery. `isDisplayableWhenPersisted`
+        // is `== .redacted` and already fails closed by construction.
+        switch self {
+        case .redacted, .rawEphemeral: return true
+        case .unknown: return false
+        }
+    }
 
     /// What a person needs to know about how this image was treated.
     ///
