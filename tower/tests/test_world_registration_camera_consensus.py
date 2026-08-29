@@ -266,6 +266,68 @@ class TestTheConsensusDropsTheFabricatedCameras:
         assert {o.frame for o in kept} == {0, 1, 2}
 
 
+class TestFitDirectionActuallyUsesIt:
+    """The call site, not just the function.
+
+    Found by mutation: deleting the `_consensus_observations(...)` line
+    from `fit_direction` -- leaving the function itself intact, so every
+    other test in this file still passed -- reverted the entire
+    behavioural change (corpus-wide, 17 segments and 20,453 points back
+    to 12 and 15,571) with a green suite. Every other test here calls
+    the filter directly, so none of them could see it.
+    """
+
+    def _fit(self, monkeypatch, ratios):
+        from scripts import world_registration as wr
+
+        source, target, matches, observations = _world_of_cameras(ratios)
+        monkeypatch.setattr(
+            wr, "_pnp_observations",
+            lambda *_args, **_kwargs: list(observations),
+        )
+        return wr.fit_direction(source, target, matches), observations
+
+    def test_a_fabricated_camera_does_not_reach_the_fit(self, monkeypatch):
+        fit, observations = self._fit(monkeypatch, [1.0, 1.0, 1.0, 0.3])
+
+        assert fit is not None
+        assert fit.cameras_considered == len(observations) == 4
+        assert fit.cameras == 3, (
+            "fit_direction was handed four cameras, one measuring a third "
+            "of the others' scale, and used all four -- the consensus "
+            "filter is not on the path"
+        )
+        assert {frame for _, frame in fit.provenance} == {0, 1, 2}, (
+            "provenance names a camera the filter dropped, so "
+            "MutualEvidence would be reasoning about a fit that never ran"
+        )
+
+    def test_nothing_is_dropped_when_the_cameras_agree(self, monkeypatch):
+        """The positive control: the filter is not simply truncating."""
+        fit, observations = self._fit(monkeypatch, [1.0, 1.0, 1.0, 1.0])
+
+        assert fit.cameras == fit.cameras_considered == len(observations)
+
+
+class TestTheToleranceIsNotArbitrary:
+    """A bound, so `MAX_CAMERA_SCALE_DEVIATION = 5.0` cannot pass quietly.
+
+    Both ends are measured. Below ~0.30 the canonical world loses pair
+    (5,32) to ordinary intra-segment drift -- its three forward cameras
+    read 4.23, 4.12 and 5.36. At 0.90 the drawer walk loses (14,29),
+    because segment 29's ten fabricated cameras stop being separated
+    from its genuine ones.
+    """
+
+    def test_the_tolerance_stays_between_its_measured_ends(self):
+        assert 0.30 <= MAX_CAMERA_SCALE_DEVIATION < 0.90, (
+            f"MAX_CAMERA_SCALE_DEVIATION = {MAX_CAMERA_SCALE_DEVIATION} is "
+            "outside the range the corpus supports: below 0.30 honest "
+            "drift is mistaken for fabrication, and at 0.90 the filter "
+            "stops separating the drawer walk's fabricated cameras"
+        )
+
+
 class TestTheGateReadsTheBaselineTheFitActuallyHad:
     """`target_span_over_depth` must describe the placed cameras.
 

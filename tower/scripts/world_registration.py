@@ -245,11 +245,18 @@ class DirectedFit:
     # scale. 1.0x means one scale explains the data; 20x means the fit is
     # indifferent across a 20-fold range and its scale means nothing.
     scale_ambiguity: float
-    # The TARGET segment's own camera-centre span over its median scene
-    # depth. Scale enters this Sim3 only through the baseline between
-    # those cameras, so below MIN_SPAN_OVER_DEPTH the scale is not a
+    # The camera-centre span over median scene depth of the TARGET
+    # cameras THIS FIT PLACED -- not the target segment's own. Scale
+    # enters this Sim3 only through the baseline between the cameras
+    # actually used, so below MIN_SPAN_OVER_DEPTH the scale is not a
     # measurement at all -- see `span_over_depth`.
     target_span_over_depth: float
+    # How many cameras `_pnp_observations` placed before
+    # `_consensus_observations` dropped the ones measuring a different
+    # scale. `cameras` is what survived. Reported because a fit built
+    # from 4 of 23 cameras and one built from 4 of 4 are different
+    # claims, and without this the report showed both as "4".
+    cameras_considered: int = 0
 
     @property
     def sim3(self) -> Sim3:
@@ -824,39 +831,64 @@ def _initial_params(observations: list, scale: float) -> np.ndarray:
 # agree with EACH OTHER, because they collapse toward the origin together
 # -- outvote the genuine ones and the confidently wrong scale comes back.
 #
-# Swept over three real worlds and over eight ground-truth segment splits
-# whose answer is 1.0 by construction:
+# Swept over the saved corpus and over eight ground-truth segment splits
+# whose answer is 1.0 by construction. Per world, at the values that
+# change anything:
 #
-#   tol   drawer walk        canonical world     ground truth
-#   0.15  3 segs / 2,490     2 segs / 2,328      nothing wrong admitted
-#   0.20  6 segs / 7,821     2 segs / 2,328      nothing wrong admitted
-#   0.25  6 segs / 7,821     2 segs / 2,328      nothing wrong admitted
-#   0.30  6 segs / 7,821     3 segs / 3,739      nothing wrong admitted
-#   0.40  6 segs / 7,821     3 segs / 3,739      nothing wrong admitted
-#   0.50  6 segs / 7,821     3 segs / 3,739      nothing wrong admitted
-#   0.75  6 segs / 7,821     3 segs / 3,739      nothing wrong admitted
-#   1.00  5 segs / 4,704     3 segs / 3,739      nothing wrong admitted
+#   tol   drawer walk     canonical      2f076449      ground truth
+#   0.15  3 / 2,490       2 / 2,328      -             nothing wrong admitted
+#   0.25  6 / 7,821       2 / 2,328      -             nothing wrong admitted
+#   0.30  6 / 7,821       3 / 3,739      3 / 7,783     nothing wrong admitted
+#   0.50  6 / 7,821       3 / 3,739      2 / 5,005     nothing wrong admitted
+#   0.90  5 / 4,704       3 / 3,739      2 / 5,005     nothing wrong admitted
+#
+# The ground-truth splits do NOT discriminate: every value in
+# [0.15, 1.00] refuses the wrong answers and admits the right ones. They
+# bound the safety of the mechanism; the real worlds choose the number.
 #
 # Below 0.30 the canonical world loses the pair (5,32) it registers
 # today -- its three forward cameras read 4.23, 4.12 and 5.36, a 28%
-# spread that is drift, not fabrication. At 1.00 the drawer walk loses
+# spread that is drift, not fabrication. At 0.90 the drawer walk loses
 # (14,29), the return leg meeting the outbound leg, because segment 29's
-# ten fabricated cameras are no longer separated from its genuine ones.
+# ten fabricated cameras stop being separated from its genuine ones.
 #
-# [0.30, 0.75] is flat on every world, so 0.50 is the centre of a
-# measured plateau and not the edge of a cliff. It also sits above the
-# largest honest intra-segment drift measured anywhere in this study
-# (0.5% between one segment's halves, ~7% between adjacent thirds, and a
-# weakly-supported ~40% end to end across a 23-keyframe segment).
+# THE INTERVAL BETWEEN IS NOT FLAT, and the world that breaks the tie is
+# `2f076449`. Its pair (0,15) is admitted at 0.30 and refused at 0.50,
+# which looks like recall lost until the two fits are put side by side:
 #
-# The ground-truth splits do NOT discriminate between these values --
-# every one of them refuses the wrong answers and admits the right ones.
-# They bound the change's safety; the two real worlds choose within it.
+#   tol   cameras  placed span/depth  reciprocity  verdict
+#   0.30     3          0.0915           0.9567    admitted, "agree to 4.3%"
+#   0.50     4          0.2036           0.8282    refused, "disagree 1.21x"
+#
+# The tighter tolerance drops a camera, and dropping it collapses the
+# fit's baseline to 0.0915 -- a hair over `MIN_SPAN_OVER_DEPTH`. The
+# directions then agree because at that baseline there is almost no
+# scale left to disagree about. Tightening this constant does not buy
+# recall there; it manufactures agreement by starving the very quantity
+# scale is measured from. At 0.50 the same pair keeps its fourth camera,
+# has a real 0.2036 baseline, and the two directions disagree by 21% --
+# which is a finding, not a failure.
+#
+# So 0.50 is chosen because it is loose enough not to strangle the
+# baseline, and tight enough to separate segment 29's fabricated cameras
+# from its genuine ones. It also sits above the largest honest
+# intra-segment drift measured here (0.5% between one segment's halves,
+# ~7% between adjacent thirds, and a weakly-supported ~40% end to end
+# across a 23-keyframe segment).
 MAX_CAMERA_SCALE_DEVIATION = 0.50
 
 # Doubly-landmarked correspondences a camera needs before its own scale
 # is worth believing. Below this the median is a coin toss and would
 # scatter honest cameras out of the consensus.
+#
+# Note what this costs, because it is more than "does not vote": a
+# camera with no believable scale is dropped from the FIT as well, since
+# it cannot be shown to belong to the consensus group. On `3d49a771`
+# reverse, frame 6 had enough PnP inliers to be placed and only six
+# doubly-landmarked correspondences, so it left the solve entirely and
+# `cameras` fell by one against `min_cameras`. That is the conservative
+# direction -- a camera we cannot vouch for is not counted as evidence
+# -- but it is a real cost and it is not free.
 MIN_CORRESPONDENCES_FOR_CAMERA_SCALE = 8
 
 # Cameras that must carry a scale before the consensus is used at all.
@@ -953,13 +985,32 @@ def _consensus_observations(source, target, matches, observations) -> list:
     (`_camera_scale`) and keeps the largest agreeing group, weighted by
     how much evidence each camera brought.
 
-    IT IS A NARROWING, NOT A LOOSENING. It can only remove cameras, so
-    it can only make `min_cameras` harder to satisfy, and it turns fits
-    that were confidently wrong into honest refusals: on the segment-29
-    ground-truth split the forward direction stops returning 0.30 and
-    returns nothing at all. No threshold moves and `admit()` is
-    untouched. The recall it buys comes from measuring the right
-    cameras, not from a lower bar.
+    WHAT IT DOES AND DOES NOT GUARANTEE. It only ever removes cameras,
+    so `min_cameras` gets harder to satisfy and no pair is admitted on
+    MORE cameras than before. That is the whole of the structural
+    guarantee, and it is narrower than it first looks: dropping outliers
+    also TIGHTENS the surviving fit, so `scale_ambiguity`,
+    `reprojection_px` and `rotation_disagreement_deg` can all improve.
+    They do, dramatically -- on world `6502da15` pair (6,7) the filter
+    takes ambiguity from 207.38 to 1.00 and reprojection from 29.88 px
+    to 1.90 px, and that pair goes from refused by four clauses to
+    admitted at exactly `cameras = 3`. So this is NOT "it can only
+    refuse more". It is "it removes cameras that were measuring the
+    wrong thing, and the remaining clauses then describe the fit that is
+    actually left".
+
+    What holds the safety is therefore not the narrowing but
+    RECIPROCITY, which the filter cannot forge. The two directions PnP
+    different segments' landmarks into different images, so a fabricated
+    group in one has no counterpart in the other. Tested directly: force
+    the filter onto the FABRICATED group of (14,29) and try every
+    reverse-camera subset of size >= 3 -- none of the 16 reaches
+    reciprocity within 10% (best 0.4172). Across 325 cross-world pairs
+    from six different rooms, 74 of which reached the gate, zero are
+    admitted with the filter on or off.
+
+    No threshold moves and `admit()` is untouched. The recall comes from
+    measuring the right cameras.
     """
     landmarks_by_frame: dict = {}
     for frame_a, frame_b, pairs in matches:
@@ -968,6 +1019,19 @@ def _consensus_observations(source, target, matches, observations) -> list:
             landmark = source.observed.get((frame_a, feature_a))
             # The same first-claim rule `_pnp_observations` uses, so the
             # two read one association rather than two similar ones.
+            #
+            # They are not the SAME set, and the difference is worth
+            # naming: `_pnp_observations` keeps only what survived PnP
+            # RANSAC, while the vote below scores every claimed
+            # correspondence. On (14,29) frame 0 the fit uses 151
+            # inliers and the vote reads 52 of the claims; on frame 13
+            # the fit uses 58 and the vote reads 70 of 124. The vote is
+            # a MEDIAN, so a minority of rejected correspondences moves
+            # it very little, and voting on the pre-RANSAC set is what
+            # lets a camera whose inliers are all aliased still report
+            # the aliased scale -- which is exactly the camera this
+            # filter is looking for. Restricting the vote to inliers
+            # would hide the evidence it exists to read.
             if landmark is None or feature_b in claimed:
                 continue
             claimed[feature_b] = landmark
@@ -1018,6 +1082,7 @@ def fit_direction(source, target, matches) -> DirectedFit | None:
     observations = _pnp_observations(source, target, matches, intrinsics)
     if len(observations) < 2:
         return None
+    considered = len(observations)
     observations = _consensus_observations(
         source, target, matches, observations
     )
@@ -1081,6 +1146,7 @@ def fit_direction(source, target, matches) -> DirectedFit | None:
         # closes the gap while it is free rather than after a walk falls
         # into it. It can only ever refuse more, never less.
         target_span_over_depth=_placed_span_over_depth(target, observations),
+        cameras_considered=considered,
     )
 
 
@@ -1134,6 +1200,12 @@ def admit(evidence: MutualEvidence, thresholds: Thresholds) -> Verdict:
         "reprojection_px": reprojection,
         "span_over_depth": span_over_depth,
         "correspondences": min(forward.correspondences, reverse.correspondences),
+        # How many cameras were placed before the consensus filter kept
+        # `cameras` of them. A fit built from 4 of 23 and one built from
+        # 4 of 4 are different claims and the report showed both as "4".
+        "cameras_considered": min(
+            forward.cameras_considered, reverse.cameras_considered
+        ),
     }
 
     def refuse(reason):

@@ -66,6 +66,42 @@ def registered_world(tmp_path_factory):
     )
 
 
+REAL_ROOT = Path("data/world_builder")
+
+
+@pytest.fixture(scope="module")
+def linked_world():
+    """A saved world with at least two segments carrying geometry.
+
+    Registration's pair accounting is only observable where pairs exist,
+    and `--synthetic` yields one segment however many frames it renders.
+    Resolved by world id order so the choice is stable, and skipped
+    rather than faked where the corpus is absent -- the same shape
+    `TestTheRealWalk` uses, and for the same reason.
+    """
+    from scripts.world_registration import SupportMissingError, register
+    from tower.world_builder.store import WorldStore
+
+    if not (REAL_ROOT / "worlds").is_dir():
+        pytest.skip(f"no world corpus at {REAL_ROOT} on this host")
+    store = WorldStore(REAL_ROOT)
+    for path in sorted((REAL_ROOT / "worlds").iterdir()):
+        try:
+            world = store.read_world(path.name)
+        except Exception:
+            continue
+        for session in world.session_ids:
+            try:
+                report = register(store, path.name, session)
+            except SupportMissingError:
+                continue
+            except Exception:
+                continue
+            if report["segments_with_geometry"] >= 2:
+                return report, (path.name, session)
+    pytest.skip("no saved world has two segments carrying geometry")
+
+
 class _Boom:
     """A store whose every read fails, standing in for any solver fault."""
 
@@ -172,6 +208,48 @@ class TestAFailedRegistrationCostsNothingButTheRegistration:
         assert "error" not in outcome
 
 
+class TestTheTransformIsBoundToTheBuildItWasSolvedAgainst:
+    """A rebuild must invalidate every placement, and nothing tested it.
+
+    `write_derived` rewrites poses and points wholesale and never touches
+    `placements.json`, so a Sim3 outlives the reconstruction it was
+    fitted to. `usable_placements` refuses on `input_digest` for exactly
+    that reason -- and forcing `placements_from_report(..., digest=None)`
+    left this file green at 6 passed while `usable_placements` silently
+    dropped to zero registered rows. The guard the whole design rests on
+    was asserted nowhere.
+    """
+
+    def test_a_placement_solved_against_another_build_is_not_served(
+        self, registered_world, tmp_path
+    ):
+        from tower.results.world_builder_geometry import usable_placements
+
+        store, world_id, session_id, _ = registered_world
+        before = usable_placements(store, world_id, session_id)
+        assert before, "the fixture served no placements at all"
+
+        # `world_path` names world.json itself, not the directory.
+        manifest_path = (
+            store.world_path(world_id).parent / "derived" / "manifest.json"
+        )
+        assert manifest_path.exists()
+        original = manifest_path.read_text()
+        manifest = json.loads(original)
+        manifest["input_digest"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest))
+        try:
+            after = usable_placements(store, world_id, session_id)
+        finally:
+            manifest_path.write_text(original)
+
+        assert after == {}, (
+            "a placement solved against a different build was still "
+            "served; a rebuild replaces poses and points wholesale, so "
+            "the transform now describes geometry that does not exist"
+        )
+
+
 class TestEveryCandidatePairIsAccountedFor:
     """A pair the matcher could not link must still produce a row.
 
@@ -182,53 +260,64 @@ class TestEveryCandidatePairIsAccountedFor:
     because it is the one that says whether a walk's problem is
     RETRIEVAL -- we never found the shared view -- or ESTIMATION -- we
     found it and could not agree about it. Those want opposite work.
+
+    These need a world with at least two segments carrying geometry.
+    `--synthetic` produces exactly one, so a fixture built from it makes
+    every assertion here vacuously true -- `candidate_pairs == 0` really
+    does equal `0 * -1 // 2`. They run against the saved corpus and skip
+    where it is absent, in the same shape as `TestTheRealWalk`.
     """
 
-    def test_the_report_covers_the_whole_upper_triangle(self, registered_world):
-        from scripts.world_registration import register
-
-        store, world_id, session_id, _ = registered_world
-        report = register(store, world_id, session_id)
+    def test_the_report_covers_the_whole_upper_triangle(self, linked_world):
+        report, _ = linked_world
 
         n = report["segments_with_geometry"]
+        assert n >= 2
         assert report["candidate_pairs"] == n * (n - 1) // 2, (
             "a pair vanished from the report; a pair nobody could link is "
             "a measurement, not an absence"
         )
 
     def test_an_unlinkable_pair_names_the_matcher_as_the_reason(
-        self, registered_world
+        self, linked_world
     ):
-        from scripts.world_registration import register
+        report, _ = linked_world
 
-        store, world_id, session_id, _ = registered_world
-        report = register(store, world_id, session_id)
+        unlinked = [p for p in report["pairs"] if p["reason"] == NO_VISUAL_LINK]
+        if not unlinked:
+            pytest.skip("every pair on this world shares a verified view")
+        for pair in unlinked:
+            assert pair["registered"] is False
+            assert pair["clauses"]["verified_frame_pairs"] == 0
+            assert pair["clauses"]["inliers"] == 0
 
-        for pair in report["pairs"]:
-            if pair["reason"] == NO_VISUAL_LINK:
-                assert pair["registered"] is False
-                assert pair["clauses"]["verified_frame_pairs"] == 0
-                assert pair["clauses"]["inliers"] == 0
-
-    def test_a_linked_pair_reports_how_much_evidence_it_had(
-        self, registered_world
-    ):
+    def test_a_linked_pair_reports_how_much_evidence_it_had(self, linked_world):
         """Refusals were legible; the evidence behind them was not.
 
         A pair refused with 4,449 verified inliers and one refused with
         16 are different situations, and before this the report said the
         same thing about both.
         """
-        from scripts.world_registration import register
-
-        store, world_id, session_id, _ = registered_world
-        report = register(store, world_id, session_id)
+        report, _ = linked_world
 
         linked = [
             p for p in report["pairs"]
             if p["clauses"].get("verified_frame_pairs", 0) > 0
         ]
-        if not linked:
-            pytest.skip("no pair on this fixture shares a verified view")
+        assert linked, "no pair on this world shares a verified view"
         for pair in linked:
             assert pair["clauses"]["inliers"] > 0
+
+    def test_a_fit_says_how_many_cameras_it_started_with(self, linked_world):
+        """`cameras` alone cannot distinguish 4-of-4 from 4-of-23."""
+        report, _ = linked_world
+
+        solved = [
+            p for p in report["pairs"] if "cameras_considered" in p["clauses"]
+        ]
+        assert solved, "no pair on this world solved in both directions"
+        for pair in solved:
+            assert (
+                pair["clauses"]["cameras_considered"]
+                >= pair["clauses"]["cameras"]
+            ), "the filter reported keeping more cameras than it was given"

@@ -326,6 +326,19 @@ def register_session(store: WorldStore, world_id: str, session_id: str) -> dict:
     started = time.perf_counter()
     try:
         report = register(store, world_id, session_id)
+        # Inside the guard, not after it. Persisting is not the safe part
+        # of this: `placements_from_report` runs every placement through
+        # `SegmentPlacement.__post_init__`, which raises ValueError on a
+        # NaN scale or a non-unit quaternion -- precisely what a
+        # degenerate Sim3 produces, and precisely the failure this guard
+        # exists for. Measured with these three lines outside the try: a
+        # raising `write_placements` gave exit code 1 and zero bytes of
+        # report, losing a walk that had reconstructed perfectly well.
+        manifest = store.read_derived_manifest(world_id) or {}
+        placements = placements_from_report(
+            report, input_digest=manifest.get("input_digest")
+        )
+        store.write_placements(world_id, session_id, placements)
     except SupportMissingError as error:
         return {"attempted": True, "wrote_placements": False, "refusal": str(error)}
     except Exception as error:  # noqa: BLE001 -- see the docstring
@@ -340,11 +353,6 @@ def register_session(store: WorldStore, world_id: str, session_id: str) -> dict:
             "error": f"{type(error).__name__}: {error}",
         }
 
-    manifest = store.read_derived_manifest(world_id) or {}
-    placements = placements_from_report(
-        report, input_digest=manifest.get("input_digest")
-    )
-    store.write_placements(world_id, session_id, placements)
     elapsed = time.perf_counter() - started
 
     logger.info(

@@ -360,13 +360,69 @@ estimator, built on different information, says the same thing the fix says.
 
 ## 8. What was checked on the safety side
 
-The change removes cameras, so it cannot admit a pair on more evidence than
-before. But removing outliers also tightens a fit, which could in principle let
-a genuinely wrong pair clear a clause it previously failed. That was the
-central question put to an independent adversarial review and to a
-false-merge harness built over cross-world negative pairs — segments from
-different rooms and different sessions, which cannot be the same place. Their
-findings are recorded in the handoff alongside this note.
+The filter only ever removes cameras, so no pair is admitted on MORE cameras
+than before. That is the whole of the structural guarantee and it is narrower
+than it sounds: **removing outliers also tightens the surviving fit**, so
+`scale_ambiguity`, `reprojection_px` and `rotation_disagreement_deg` can all
+improve. They do — on world `6502da15` pair (6,7) the filter takes ambiguity
+from 207.38 to 1.00 and reprojection from 29.88 px to 1.90 px, turning a pair
+refused by four clauses into an admission at exactly `cameras = 3`. So "it can
+only refuse more" is **false**, and the first version of this note said it.
+
+What actually holds the line is **reciprocity, which the filter cannot forge**.
+The two directions PnP different segments' landmarks into different images, so
+a fabricated group in one has no counterpart in the other. Tested directly:
+force the filter onto the *fabricated* group of (14,29) and try every
+reverse-camera subset of size ≥ 3 — **none of the 16 reaches reciprocity within
+10%** (best 0.4172).
+
+Three independent checks:
+
+- **Cross-world negatives.** 1,657 pairs of segments from different worlds;
+  464 produce verified matches, 47 reach `admit()`. **4 admitted, with the
+  filter on and with it off — the filter changed none of them.** But the
+  premise is weaker than it looks: six of the twelve usable worlds were
+  captured within 36 minutes of each other in the same home, and two of the
+  four "false merges" are between worlds **67 seconds apart**, so they may be
+  genuine place matches. The two cross-day ones are unresolved. **This
+  measures nothing about the change; it measures the gate, and the gate did
+  not move.**
+- **Synthetic impossible partners.** 18 pairs built from real imagery with
+  perfect descriptor matches, where the points were moved by one Sim3 and the
+  cameras by a different one — geometrically impossible by construction. **The
+  gate refuses all 18.** Four of them are caught by
+  `max_rotation_disagreement_deg` **and nothing else**, at reciprocity
+  0.96–1.02 and 0.57–1.12 px reprojection. That clause's own comment calls it
+  inert ("changes no verdict on the corpus available today"). It is inert on
+  real pairs and it is the only thing standing between this gate and a
+  geometrically impossible merge that reprojects sub-pixel. **Do not delete
+  it.**
+- **Corpus-wide before/after.** 3 pairs gained, **0 lost**, across every saved
+  session (§4.2). Every verdict that moved, moved toward admission of a pair
+  that survives every unchanged clause.
+
+Two things the safety work surfaced that are **not** about this change and
+should not be read as reassurance:
+
+- **`max_reciprocity_error = 0.10` is about 2× the measured self-pair noise
+  floor, not comfortably clear of it.** The worst honest self-pair sits at
+  0.0576. And the four cross-world admissions sit at 0.0063–0.0859 — *inside*
+  the honest band. There is no reciprocity threshold that separates cleanly on
+  this corpus.
+- **`max_reprojection_px = 2.0` would remove all four cross-world admissions**,
+  at a cost of 4 true ones — because the false merges reproject at 2.24–2.38 px
+  while honest self-pairs sit at 0.35–0.84 px. Not changed here: three of the
+  four "false" merges are unresolved and may be real, and tightening a
+  threshold on that basis is the mistake this repository has already recorded
+  twice.
+
+**Determinism.** Registration on the drawer walk is byte-identical over three
+fresh processes and over six run concurrently. A separate harness reported 11
+of 1,657 verdicts moving between builds run under concurrent load, including
+four admit/refuse flips on marginal cross-world pairs; that could not be
+reproduced on the walks that matter, and remains an open question about
+`solvePnPRansac` under OpenCV's parallel scheduling rather than a property of
+this change.
 
 ---
 
