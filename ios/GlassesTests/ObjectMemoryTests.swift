@@ -3802,6 +3802,47 @@ final class ObjectMemoryRecordingTests: XCTestCase {
         XCTAssertEqual(camera.starts, 1)
     }
 
+    /// **A second Start does not disown a capture this screen started.**
+    ///
+    /// `.running` says a capture exists. It does not say who opened it — and
+    /// the wearer can reach a second Start with this screen's own capture
+    /// still streaming, because every phase that maps to
+    /// `primaryAction == .start` offers the button back and a Tower that
+    /// blips off Wi-Fi for one poll is enough to produce one.
+    ///
+    /// Clearing ownership there made the Stop that followed skip
+    /// `stopCameraSession()` entirely: the Tower session ended, the wearer
+    /// was told remembering had stopped, and the glasses kept recording.
+    /// Ownership is dropped when the capture actually ends, which is
+    /// `cameraClaimChanged`'s job and not a second Start's.
+    func testASecondStartKeepsOwnershipOfACaptureThisScreenStarted() async throws {
+        let client = StubObjectMemoryClient()
+        client.sessionAfterRead = .known(try snapshot(state: "active", following: []))
+        let camera = FakeCaptureOwner()
+
+        let recording = makeCoordinator(camera: camera, client: client)
+        recording.start()
+        await settle(recording)
+
+        XCTAssertEqual(camera.starts, 1)
+        XCTAssertTrue(recording.reading.cameraStartedHere, "this screen opened it")
+
+        // The claim is `.running` now, and it is running because of that Start.
+        recording.start()
+        await settle(recording)
+        XCTAssertTrue(
+            recording.reading.cameraStartedHere,
+            "a second Start must not hand this screen's own capture to nobody"
+        )
+
+        recording.stop()
+        await settle(recording)
+        XCTAssertEqual(
+            camera.stops, 1,
+            "Stop must end the capture this screen started, or the glasses keep recording"
+        )
+    }
+
     /// **A repeated verb is not an error.** The Tower answers a second `start`,
     /// a second `pause` and a `stop` from stopped with 200 and
     /// `changed: false` — "you already have what you asked for" — and every one

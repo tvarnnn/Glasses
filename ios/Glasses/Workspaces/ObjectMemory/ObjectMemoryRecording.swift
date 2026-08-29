@@ -569,9 +569,22 @@ final class ObjectMemoryRecordingCoordinator: ObservableObject {
                 phase = .cameraRefused(.deviceHasPausedCapture)
                 return
             case .running:
-                // Home or World Builder owns it. Ownership is *not* claimed,
-                // so Stop below will leave their stream alone.
-                startedTheCamera = false
+                // Somebody else's capture — Home's or World Builder's — and
+                // ownership is *not* claimed here, so Stop below leaves their
+                // stream alone.
+                //
+                // Ownership is not *surrendered* here either. `.running` says
+                // a capture exists; it does not say who opened it, and this
+                // may well be the capture this screen started, because every
+                // phase that maps to `primaryAction == .start` offers the
+                // button back and a Tower that blips off Wi-Fi for one poll
+                // is enough to produce one. Clearing the flag on that second
+                // Start made the Stop that followed skip
+                // `stopCameraSession()`: the Tower session ended, the wearer
+                // was told remembering had stopped, and the glasses kept
+                // recording. A capture that ends drops ownership through
+                // `cameraClaimChanged`, which is where that belongs.
+                break
             case .ending:
                 // **Nobody owns a capture that is dying.** This used to share
                 // the branch above and record "somebody else started it",
