@@ -526,7 +526,10 @@ def _encode_keypoints(payload, *, policy: PreviewPolicy):
             x1 = int((column + 1) * width / grid)
             y1 = int((row + 1) * height / grid)
             cv2.rectangle(tint, (x0, y0), (x1, y1), (0, 90, 0), -1)
-        cv2.addWeighted(tint, 0.18, canvas, 0.82, 0.0, canvas)
+        # 0.12, not more. Rendered at 0.18 the wash reached the structure's
+        # own white lines and turned the whole room green, which made the
+        # coverage signal louder than the scene it is a statement about.
+        cv2.addWeighted(tint, 0.12, canvas, 0.88, 0.0, canvas)
 
     for x, y in np.asarray(payload.xy, dtype=np.int32):
         cv2.circle(canvas, (int(x), int(y)), 2, _GOOD_BGR, -1)

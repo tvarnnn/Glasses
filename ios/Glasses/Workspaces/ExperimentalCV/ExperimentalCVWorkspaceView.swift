@@ -1275,12 +1275,6 @@ struct CVRunSummaryView: View {
             // measured rate is normally bounded by what arrives.
             row("The Lab could manage", "\(CVMetric.format(capacity)) fps")
         }
-        if !run.hasMeasuredAnything {
-            Text(Self.notMeasuredNote)
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
     }
 
     private static let notMeasuredNote = """
