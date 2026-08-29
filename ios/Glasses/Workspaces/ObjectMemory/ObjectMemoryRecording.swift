@@ -394,8 +394,16 @@ final class ObjectMemoryRecordingCoordinator: ObservableObject {
             .sink { [weak self] claim in self?.cameraClaimChanged(claim) }
             .store(in: &cancellables)
 
+        // Delivered where it is sent, and deliberately without a
+        // `.receive(on:)` hop. `sessionChanged`'s gate asks "is a sequence
+        // running *now*", and a hop makes that question unanswerable: the
+        // read-back a sequence's own `apply` publishes would arrive a turn
+        // after the sequence had ended, with the gate already down, and
+        // `resting` would replace the verdict that sequence just wrote — a
+        // camera refusal, or a failure — with the reading that produced it.
+        // `ObjectMemoryClient` is `@MainActor`, so there is no thread to hop
+        // from and the hop was only ever costing this ordering.
         client.sessionUpdates
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] session in self?.sessionChanged(session) }
             .store(in: &cancellables)
     }
