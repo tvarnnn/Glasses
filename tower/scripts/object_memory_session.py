@@ -66,7 +66,7 @@ expires and deleted by `object_query.py --purge-all`.
 It needs a face-detection model and FAILS CLOSED without one: no model
 means no keyframes at all, never an unfiltered crop on disk, and this
 script says so once at start rather than refusing quietly all walk.
-Measured at ~13.9 KB a record, about 5.3 MB an hour of walking.
+Measured at ~11.7 KB a record, about 4.3 MB an hour of walking.
 
     .venv\Scripts\python.exe scripts/object_memory_session.py --frames data/captures/<id>
     .venv\Scripts\python.exe scripts/object_memory_session.py --follow-capture data/captures/<id>
@@ -531,7 +531,7 @@ def main(argv=None) -> int:
             "data/captures/, which this cartridge does not own and whose "
             "lifetime it does not set -- so the first thing that prunes "
             "captures takes the picture out of every memory at once. "
-            "Measured at ~13.9 KB a record, about 5.3 MB an hour of "
+            "Measured at ~11.7 KB a record, about 4.3 MB an hour of "
             "walking. Needs a face-detection model; without one nothing "
             "is written and this says so at start."
         ),

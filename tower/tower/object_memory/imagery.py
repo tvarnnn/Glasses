@@ -399,13 +399,18 @@ class FaceFilter:
 # sighting that opened before the hiccup and had its STRONGEST look after
 # it carries the OLD capture's id beside the NEW capture's frame.
 #
-# Measured against this host's own store on 2026-08-29: of 74 records, 70
-# resolved inside their own capture directory and 4 did not. All four of
-# those frames were on disk, one directory along, in the successor. Every
-# capture directory still existed and nothing had expired -- this repo has
-# no capture pruner at all, so nothing CAN expire. The route was answering
-# 410 "the memory is kept, the picture is gone" about pictures that were
-# sitting right there.
+# Measured against this host's own store on 2026-08-29, over 116 records
+# and 71 capture directories: 90 resolve inside their own capture and
+# **26 do not** -- 22.4% of every memory in the store. Every one of those
+# 26 frames is on disk, further along the same walk. Nothing had expired;
+# this repository has no capture pruner at all, so nothing CAN expire.
+# The route was answering 410 "the memory is kept, the picture is gone"
+# about pictures that were sitting right there.
+#
+# (An earlier note here said 74 records, 70 and 4. That was the store as
+# it stood a few hours before, and it was left stale for long enough for
+# a reviewer to catch it -- so the numbers above are the ones the shipped
+# code was re-run against, not the ones first written down.)
 #
 # So resolution follows the lineage, not the single directory.
 #
@@ -450,9 +455,9 @@ def _successors(root: Path) -> dict[str, str]:
     except OSError:
         return index
     for entry in entries:
-        if not entry.is_dir():
-            continue
         try:
+            if not entry.is_dir():
+                continue
             manifest = json.loads(
                 (entry / "capture.json").read_text(encoding="utf-8")
             )
@@ -587,12 +592,20 @@ def capture_lineage_present(capture_root, observation) -> bool:
     if session_id is None:
         return False
     root = Path(capture_root) / "captures"
+    # Contained, like every other path this module builds out of a
+    # record. `session_id` comes off a JSONL file and is used to BUILD A
+    # PATH; `_frame_in` runs it through `_contained` and this did not,
+    # which is an inconsistency a reviewer was right to call out even
+    # though the value here only steers a log line.
+    own = _contained(root, root / session_id)
+    if own is None:
+        return False
     # The record's own directory first, and it answers on its own in the
     # overwhelmingly common case. This runs immediately after a
     # `frame_path` that already paid for one directory scan, and asking
     # `_lineage` again would pay for a second one to answer a question
     # the first `is_dir` has usually already settled.
-    if (root / session_id).is_dir():
+    if own.is_dir():
         return True
     return any(
         (root / capture_id).is_dir() for capture_id in _lineage(root, session_id)

@@ -247,6 +247,8 @@ $obsRoot     = Resolve-Setting 'TOWER_OBSERVATION_ROOT'
 $obsDevice   = Resolve-Setting 'TOWER_OBSERVATION_DEVICE'
 $obsVerifier = Resolve-Setting 'TOWER_OBSERVATION_VERIFIER'
 $obsVerDev   = Resolve-Setting 'TOWER_OBSERVATION_VERIFIER_DEVICE'
+$obsKeepImg  = Resolve-Setting 'TOWER_OBSERVATION_KEEP_IMAGERY'
+$obsRetain   = Resolve-Setting 'TOWER_OBSERVATION_RETENTION_DAYS'
 
 Write-Host ''
 Write-Host 'Effective configuration' -ForegroundColor Cyan
@@ -331,6 +333,33 @@ if ($obsEnabled.Value -and $obsEnabled.Value.ToLower() -eq 'false') {
         Write-Line "TOWER_OBSERVATION_DEVICE   $($obsDevice.Value)   [$($obsDevice.Source)]"
     } else {
         Write-Line 'TOWER_OBSERVATION_DEVICE   <unset, defaults to auto>'
+    }
+    if ($obsRetain.Value) {
+        Write-Line "TOWER_OBSERVATION_RETENTION_DAYS $($obsRetain.Value)   [$($obsRetain.Source)]"
+    } else {
+        Write-Line 'TOWER_OBSERVATION_RETENTION_DAYS <unset, defaults to 30>'
+    }
+    # Only `1`, `true`, `yes` and `on` mean true to tower/config.py's shared
+    # `_flag`, and a blank means "unset". Anything else -- including a typo --
+    # reads as FALSE and silently stops this cartridge keeping pictures, so
+    # this block reports the value it will actually be read as rather than
+    # echoing what was typed.
+    $keepsImagery = $true
+    if ($obsKeepImg.Value) {
+        $keepsImagery = @('1', 'true', 'yes', 'on') -contains $obsKeepImg.Value.Trim().ToLower()
+    }
+    if ($obsKeepImg.Value) {
+        Write-Line "  ...KEEP_IMAGERY          $($obsKeepImg.Value) -> $keepsImagery   [$($obsKeepImg.Source)]"
+    } else {
+        Write-Line '  ...KEEP_IMAGERY          <unset, defaults to true>'
+    }
+    if ($keepsImagery) {
+        Write-Line '                    Each record keeps one small filtered crop of its'
+        Write-Line '                    own, deleted when the record expires or is purged.'
+    } else {
+        Write-Problem '                    No NEW crop is written. A memory then keeps its'
+        Write-Problem '                    picture only while capture-side retention keeps the'
+        Write-Problem '                    frame. Crops already on disk are still served.'
     }
     Write-Line 'auto is resolved by the PRODUCER, not here. It prints the device it'
     Write-Line 'actually got on its first line when a session starts, into this window.'

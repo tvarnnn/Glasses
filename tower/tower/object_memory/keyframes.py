@@ -68,15 +68,19 @@ frame is still on disk -- 26 of them -- cropped at its own
 vendored YuNet weights, downscaled to a 384 px long side and encoded at
 JPEG quality 80:
 
-    mean 13.9 KB, median 12.3 KB, min 8.2 KB, max 22.1 KB
+    mean 11.7 KB, median 10.9 KB, min 2.5 KB, max 22.1 KB
     (361.7 KB for all 26)
 
 The corpus's own rate is one record every 9.2 seconds of walking, about
-380 an hour, so a keyframe per record costs about **5.3 MB an hour of
-walking** -- against the ~2.1 GB an hour the recording itself costs,
-which is a factor of about 400. Thirty days at an hour of walking a day
-is ~160 MB. Those are the numbers to revisit if the record rate, the
-padding or the size bound moves.
+380 an hour, so a keyframe per record costs about **4.3 MB an hour of
+walking**, against roughly 2.1 GB an hour for the recording it is taken
+from -- a factor of about 500. The whole owned store for every record on
+this host is **1.31 MiB against 568 MiB of frames: 0.23%**.
+
+MEASURED OVER ALL 116 RECORDS, not a sample. An earlier version of this
+note quoted a 26-record subset and a 13.9 KB mean; a reviewer caught it,
+and the figures above come from re-running the shipped `KeyframeStore`
+over every record in the store whose frame still resolves -- 116 of 116.
 
 The 384 px bound is the reason those figures are small, and it is a CAP
 rather than a target: a crop already smaller is written at its own size
@@ -318,22 +322,34 @@ class KeyframeStore:
 
         # From here down, `crop_bgr` is never read again. Everything that
         # can reach the file is derived from `filtered`.
+        #
+        # EVERYTHING that touches the filter's output is inside this
+        # `try`, and it did not used to be. `len(filled)`,
+        # `encoded.tobytes()` and `_obscured_fraction` sat outside it, so
+        # a filter returning an unexpected SHAPE -- a generator instead of
+        # a sequence, an int, a box of the wrong arity -- raised a
+        # `TypeError` straight out of `write()`. A reviewer reproduced all
+        # three. The caller is a producer mid-walk whose `_write_keyframe`
+        # promises never to raise, so the escape killed the process and
+        # took the whole `engine.release()` flush with it: a bad keyframe
+        # would have cost every sighting still open.
         try:
             bounded = self._bounded(filtered)
             ok, encoded = cv2.imencode(
                 IMAGE_SUFFIX, bounded, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
             )
+            if not ok:
+                return KeyframeWrite(False, ENCODE_FAILED)
+            image_bytes = encoded.tobytes()
+            regions_filled = len(filled)
+            obscured = _obscured_fraction(filtered.shape, filled)
         except Exception:  # noqa: BLE001
             logger.exception(
                 "[Tower][ObjectMemory] could not encode the keyframe for %s",
                 observation_id,
             )
             return KeyframeWrite(False, ENCODE_FAILED)
-        if not ok:
-            return KeyframeWrite(False, ENCODE_FAILED)
 
-        image_bytes = encoded.tobytes()
-        obscured = _obscured_fraction(filtered.shape, filled)
         sidecar = {
             "schema_version": SCHEMA_VERSION,
             # WHAT RAN, named as what ran. `FaceFilter.label` is
@@ -342,7 +358,7 @@ class KeyframeStore:
             "filter_label": getattr(face_filter, "label", None),
             # How many regions were filled. Zero means the detector found
             # none, NOT that there were none.
-            "regions_filled": len(filled),
+            "regions_filled": regions_filled,
             # How much of this keyframe a fill covered, 0.0 to 1.0.
             #
             # Measured against the WHOLE CROP rather than against the
@@ -365,6 +381,32 @@ class KeyframeStore:
             "source_relpath": source_relpath,
         }
 
+        # SERIALISED BEFORE THE IMAGE IS WRITTEN, and that ordering is the
+        # whole of the "no partial pair" promise this module makes in
+        # bold.
+        #
+        # It used to be serialised inside the sidecar's own `try`, which
+        # caught `OSError` only -- so a `filter_label` that would not
+        # serialise raised `TypeError` AFTER the `.jpg` had already
+        # landed, escaped `write()`, and left an unattributable
+        # first-person crop on disk for the retention window. `read()`
+        # refuses it, so nothing was ever served; the file was there
+        # anyway, and the docstring said it could not be. A reviewer
+        # reproduced it.
+        #
+        # Doing the encoding first means the only thing left after the
+        # image is written is one `write_text` of bytes that already
+        # exist.
+        try:
+            encoded_sidecar = json.dumps(sidecar)
+        except (TypeError, ValueError):
+            logger.exception(
+                "[Tower][ObjectMemory] the keyframe sidecar for %s could not "
+                "be serialised; writing nothing",
+                observation_id,
+            )
+            return KeyframeWrite(False, WRITE_FAILED)
+
         try:
             self._directory.mkdir(parents=True, exist_ok=True)
             path.write_bytes(image_bytes)
@@ -377,9 +419,7 @@ class KeyframeStore:
             return KeyframeWrite(False, WRITE_FAILED)
 
         try:
-            self._sidecar_path(path).write_text(
-                json.dumps(sidecar), encoding="utf-8"
-            )
+            self._sidecar_path(path).write_text(encoded_sidecar, encoding="utf-8")
         except OSError:
             # An image with no sidecar is not something this store may
             # leave behind: `read()` would ignore it forever and `prune`

@@ -173,8 +173,16 @@ Measured on the development host's live store:
 | | before | after |
 |---|---|---|
 | records | 116 | 116 |
-| picture resolves | 94 | **116** |
-| answering 410 with the frame on disk | **22 (19%)** | 0 |
+| resolve in their own capture | 90 | 90 |
+| resolve only along the reconnect lineage | **0 — these were the 410s** | **26** |
+| answering 410 with the frame on disk | **26 (22.4%)** | **0** |
+
+An earlier version of this table said 94 and 22. Those were real numbers
+from a store that was still being written into a few hours earlier, left
+stale rather than re-measured, and an independent reviewer caught them.
+The figures above come from re-running the shipped resolution code over
+the store as it stands: 116 records, 71 capture directories, 32 lineage
+roots.
 
 ### 2.3 The fix, and the bound that was wrong
 
@@ -286,8 +294,8 @@ records in this host's store, cropping the real frames they point at:
 | `data/captures/` frames on the same host | **568 MiB** |
 
 Long side capped at 384 px, quality 80. The owned pictures for every
-memory this host holds cost **0.24%** of what the recordings they came
-from cost — and unlike the recordings, they are bounded by a retention
+memory this host holds cost **0.23%** of what the recordings they came
+from cost (1.31 MiB against 568.1 MiB) — and unlike the recordings, they are bounded by a retention
 window that is actually enforced.
 
 ### 2A.3b The whole chain, run once, offline
@@ -373,15 +381,20 @@ and that is the whole story. On Windows the only catchable route is a
 console control event, which is why `_start` already passed
 `CREATE_NEW_PROCESS_GROUP`.
 
-**Measured, and it is why there is a second channel:** a console control
-event needs a console, and this Tower does not reliably have one. Under a
-pseudoconsole — `GetConsoleWindow() == 0`, which is what an editor's
-integrated terminal, a CI runner and a Windows service all look like —
-`GenerateConsoleCtrlEvent` returns success and the child hears nothing. A
-trivial child registering all three handlers was still alive thirty
-seconds after `CTRL_BREAK_EVENT`. Shipping a flush that works on one
-operator's PowerShell and silently nowhere else is the same defect as not
-having one.
+**A first version of this section said the event is never delivered under
+a pseudoconsole. That was wrong, and a reviewer proved it.** Under
+`GetConsoleWindow() == 0` the event *is* delivered, and a child that
+installed no handler dies of it with `STATUS_CONTROL_C_EXIT` and no
+unwinding — which is the more dangerous half of the truth, because it
+means a signal sent to the wrong worker destroys exactly the grace it was
+meant to protect. That is §3.3.
+
+The stdin channel is still first, for reasons that survive the
+correction: a pipe needs no console at all, so it works where an event
+genuinely cannot be delivered; it is unambiguous, where a control event's
+effect depends on what the child did with its handlers; and closing it
+costs nothing when the child is already gone. Two independent channels
+for a request that must not be missed, neither required to succeed.
 
 So the first channel is **closing the child's stdin**. The supervisor
 holds the write end for any spec that sets `WorkerSpec.stop_via_stdin`;
@@ -403,9 +416,16 @@ can finish the build that releases its writer lock, would have become an
 instant kill. The result channel would then have reported a world
 `failed` for a build seconds from finishing.
 
-It looked fine here for the worst possible reason: a pseudoconsole
-swallows the event, so the damage was invisible on the one machine it was
-tested on.
+**And the reason it looked fine was itself wrong.** The commit that fixed
+this said the damage was invisible here because a pseudoconsole swallows
+the event. It does not: a reviewer measured the event being delivered
+under `GetConsoleWindow() == 0`, with a handler-less child dying of
+`STATUS_CONTROL_C_EXIT` and no unwinding. So the World Builder would have
+been killed on this host too, at t=0 of a ten-second grace, and the
+regression was not latent — it was live and simply had not been run into
+yet. `scripts/world_build_session.py` has no signal handler and no
+`try/finally`: its `stop_session()` and final `build()` are on the
+normal-exit path only.
 
 `_Worker.handles_stop_request` is copied off `WorkerSpec.stop_via_stdin`
 at spawn and gates both channels. Object Memory's producer opted in;
@@ -419,8 +439,27 @@ the glasses on a desk and presses Stop is in the quietest stretch there
 is. It did not stop at all. `CaptureFollower.follow()` now takes
 `should_stop`, asked once per poll, before the journal read.
 
-**Measured after the fix: the producer exits 0 within 0.27 s of the
-request, having printed its full report.**
+**Measured after the fix, two ways.** Closing the pipe on an idle
+producer: exit 0 within **0.27 s**, full report printed. And the whole
+production path — a real `CaptureWorkerSupervisor.detach(grace=3.0)`
+against a real producer following a real 120-frame capture, which is
+`_ask_to_stop`'s *both* channels rather than the pipe alone:
+
+```
+alive after 12 s: True
+detach() stopped 1 worker(s) in 0.85 s
+exit code: 0
+  stopped_because        SIGBREAK
+  frames_observed        120
+  observations_recorded  2
+  keyframes_written      2
+  keyframes_refused      {}
+```
+
+`stopped_because: SIGBREAK` is the correction in §3.1 showing up in
+practice: the signal *is* delivered here, the producer's handler catches
+it, and the flush runs. A producer without that handler would simply have
+died — which is why §3.3 exists.
 
 ---
 
@@ -460,9 +499,19 @@ epoch. Every worker looked older than every session and the
 correct-looking code reported nothing at all. `mark()` exists so a caller
 cannot make that mistake.
 
-Degrading: a supervisor with no `mark()` leaves `following_this_session`
-**empty** rather than falling back to the unscoped list. A false success
-is worse than no answer, and `following` still carries everything.
+Degrading: a supervisor that cannot answer a scoped question — no
+`mark()`, or a `following()` that refuses the `since` keyword — makes
+`following_this_session` **null**, not empty. A false success is worse
+than no answer, and `following` still carries everything.
+
+`[]` and `null` are different claims and the difference is the whole
+point: `[]` says "I started nothing that is running", which a client may
+draw a warning from, and `null` says "I cannot tell you", which it may
+not. An earlier draft answered `[]` for both, and a reviewer showed that
+one of the two fallback paths still returned the *unscoped* list under
+the scoped field — which would have raised the loud
+something-else-is-recording alarm about a recording the person started
+themselves.
 
 ---
 
@@ -608,6 +657,72 @@ now and the comment says which thing reaches them.
 three times in doc comments and checked by nothing. It is now
 `swift-structure-check.py --no-prose`.
 
+### 5A.1b The Tower review — two blockers and a false claim of my own
+
+**Two invariants this branch stated in bold and did not hold.**
+
+`KeyframeStore.write` promised "no image, no sidecar, no partial pair".
+`json.dumps` sat inside a `try` that caught `OSError` only, *after* the
+image had been written — so a `filter_label` that would not serialise
+raised `TypeError` out of `write()` and left an **unattributable
+first-person crop on disk** for the retention window. `read()` refuses to
+serve such a file, which is why nothing ever leaked; the file was there
+anyway and the docstring said it could not be. The sidecar is now
+serialised before the image is written, so the only step left after the
+image lands is one `write_text` of bytes that already exist.
+
+`_write_keyframe` promised "never raises". `len(filled)`,
+`encoded.tobytes()` and `_obscured_fraction` all sat outside the encode
+guard, so a filter returning an unexpected *shape* — a generator, an int,
+a box of the wrong arity; the reviewer reproduced all three — raised
+straight through. The caller is a producer inside its frame loop, so that
+escape ended the walk and took `engine.release()` with it: **one bad
+keyframe would have cost every sighting still open**, which is precisely
+the failure §3 exists to prevent, arriving by a different door. Both the
+function and its call site are now contained, and five parametrised cases
+pin it.
+
+**A claim of mine that was simply false.** §3.1 said a console control
+event is never delivered under a pseudoconsole. The reviewer measured the
+opposite and was right: it *is* delivered, and a child with no handler
+dies of it with `STATUS_CONTROL_C_EXIT`. That correction makes §3.3 more
+important rather than less — and it is why the whole production path was
+then re-run end to end rather than argued about (see §3.2's second
+measurement).
+
+**The scoped-liveness fallback still widened.** `_following` retries
+unscoped on a `TypeError`, which is right for the public `following`
+field; `_following_this_session` returned that widened list *as* the
+scoped one. A client would have been told "these are the producers you
+started" about every producer on the Tower — the exact false positive the
+field was added to remove. `_scoped_following` now refuses instead of
+guessing, which is what `_supervisor_mark` had always done beside it.
+
+**Two documents were left describing a Tower that no longer exists.** The
+contract still said the verifier default was `none` in three places,
+including a note warning clients that hard-coding two class names was
+safe. And `TOWER_OBSERVATION_KEEP_IMAGERY` — the single switch governing
+whether this cartridge persists first-person pixels at all — was
+documented **nowhere**: not the contract, not `.env.example` whose stated
+purpose is to make the list discoverable, not the launcher that prints
+every other `TOWER_OBSERVATION_*`. All three now carry it, and the
+launcher prints it and the retention window too.
+
+**Numbers presented as measured that were stale.** The resolution table
+said 94/22; re-running the shipped code says **90/26**. The keyframe cost
+was quoted from a 26-record subset; over all 116 it is a mean of 11.7 KB
+rather than 13.9. Both were real measurements left behind by a store that
+kept growing, which is the least excusable kind of wrong number, and the
+corrected ones are in §2.2 and §2A.3.
+
+**And the mutation testing.** The reviewer backed up each file, broke one
+behaviour, ran the targeted tests, restored and verified by hash. Seven
+mutations, seven caught: dropping the lineage fallback, not unlinking an
+image whose sidecar failed, serving an image with no sidecar, waiting
+without asking, not pruning keyframes, moving the keyframe lookup after
+the filter guard, and never building a crop. The tests prove behaviour
+rather than mocking it.
+
 ### 5A.2 The break the two lanes nearly shipped past each other
 
 Not a review finding — found while applying one, and the most valuable
@@ -644,9 +759,14 @@ only machine it was tested on.
 
 ## 6. What is proven, and what is not
 
-**Proven by test, offline:** everything in §1–§5 above, plus the numbers
-in §2.2 which were measured by running the shipped resolution code
-against the host's real store.
+**Proven by test, offline: the Tower half — §2, §2A, §3, §4, §5.** 2340
+tests, plus the numbers in §2.2 and §2A.3, which were measured by running
+the shipped code against this host's real store rather than asserted.
+
+**§1 is the iOS half and is NOT proven.** It is reviewed, structure
+checked, and cross-checked against the Tower's constants; it has not been
+compiled. Every claim in §1 about what a screen does is a claim about
+source that no compiler has read.
 
 **Proven by the physical runs that already happened**, read out of
 `data/object_memory/observations.jsonl` rather than from a report:

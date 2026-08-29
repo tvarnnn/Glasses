@@ -138,6 +138,12 @@ class ObservationStore:
         # prints this beside the count. Never None: a purge that could
         # not run at all still reports zero of each rather than silence.
         self.last_keyframe_purge: tuple[int, tuple[str, ...]] = (0, ())
+        # The store's OWN artifacts that a purge could not delete. Same
+        # reason as `last_keyframe_purge`: a purge that prints a count
+        # while `observations.jsonl` is still on disk is the false claim
+        # of deletion `CARTRIDGE-GROUNDWORK.md` calls worse than an
+        # honest failure. Never None; reset at the top of every purge.
+        self.last_purge_retained: tuple[str, ...] = ()
         self._path = self._directory / OBSERVATIONS_FILENAME
         self._temp_path = self._path.with_suffix(TEMP_SUFFIX)
         self._manifest_path = self._directory / MANIFEST_FILENAME
@@ -604,32 +610,58 @@ class ObservationStore:
         unparseable lines. Both the main file and a stale rewrite temp
         file (left behind by a crash mid-_rewrite) are removed regardless.
 
-        THE PICTURES GO TOO, and what could not go is reported rather
-        than swallowed. `last_keyframe_purge` holds `(removed, retained)`
-        after this returns; `retained` is non-empty only when the
-        filesystem refused, which on Windows means a reader had the file
-        open. A caller that prints only the observation count while a
-        directory of crops survives is making the false claim of deletion
-        `CARTRIDGE-GROUNDWORK.md` names as worse than an honest failure,
-        so `scripts/object_query.py` prints both.
+        THE PICTURES GO TOO, and so does everything else, and what could
+        not go is reported rather than swallowed. `last_purge_retained`
+        holds the store's own artifacts that survived and
+        `last_keyframe_purge` holds `(removed, retained)` for the crops.
+        Either is non-empty only when the filesystem refused, which on
+        Windows means a reader had the file open. A caller that prints
+        only the observation count while a directory of crops survives is
+        making the false claim of deletion `CARTRIDGE-GROUNDWORK.md`
+        names as worse than an honest failure, so
+        `scripts/object_query.py` prints both and exits non-zero when
+        anything is left.
         """
         with self._lock:
             # Counted WITHOUT the retention cutoff: purge deletes the
             # files outright, so it must report what it actually removed
             # rather than only the part a read was still willing to serve.
             count = len(self._all_observations_locked(None))
+            self.last_purge_retained = ()
             self.last_keyframe_purge = self._keyframes.purge()
             # The manifest goes too: it describes observations that no
             # longer exist, and a store that is asked to keep forever
             # after a purge must not still be bound by a window the
             # deleted records were written under.
+            # THE RECORDS' HALF REPORTS ITS FAILURES TOO, and it did not.
+            #
+            # The keyframe half returned `(removed, retained)` while this
+            # one was a bare `unlink(missing_ok=True)`. On Windows a
+            # reader holding `observations.jsonl` open makes that raise
+            # `PermissionError` straight out of `purge()` -- so the one
+            # command a wearer's erasure request actually runs answered a
+            # traceback rather than the structured "here is what I could
+            # not delete" this docstring promises. A reviewer found it.
+            #
+            # Each artifact is attempted independently: one locked file
+            # must not stop the others being removed, because a partial
+            # deletion that continues is strictly better than a partial
+            # deletion that stops.
             for artifact in (
                 self._path,
                 self._temp_path,
                 self._manifest_path,
                 self._manifest_path.with_suffix(".json.tmp"),
             ):
-                artifact.unlink(missing_ok=True)
+                try:
+                    artifact.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "[Tower][ObjectMemory] could not delete %s during a "
+                        "purge; it is still on disk",
+                        artifact.name,
+                    )
+                    self.last_purge_retained += (artifact.name,)
             return count
 
     def prune_expired(self, now: float | None = None) -> int:

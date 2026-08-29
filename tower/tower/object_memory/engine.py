@@ -571,14 +571,36 @@ class ObjectMemoryEngine:
         observation_id = observation_id_for(
             self._session_id, sighting.object_class, sighting.first.at
         )
-        result = self._keyframes.write(
-            observation_id,
-            sighting.best_crop,
-            self._face_filter,
-            source_capture=self._session_id,
-            source_relpath=sighting.best.relpath,
-            written_at=self._clock(),
-        )
+        # CONTAINED, because the docstring above promises it and because
+        # the cost of being wrong is not a missing thumbnail. This runs
+        # inside `_settle`, which runs inside the frame loop: an escape
+        # here ends the producer and takes `engine.release()` with it, so
+        # one unwritable keyframe would cost every sighting still open --
+        # which is the failure the whole graceful-stop change exists to
+        # prevent, arriving by a different door.
+        #
+        # `KeyframeStore.write` is itself exception-tight now. This is
+        # the second wall, and a reviewer found the first one had gaps:
+        # a filter returning an unexpected shape raised straight through.
+        try:
+            result = self._keyframes.write(
+                observation_id,
+                sighting.best_crop,
+                self._face_filter,
+                source_capture=self._session_id,
+                source_relpath=sighting.best.relpath,
+                written_at=self._clock(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[Tower][ObjectMemory] the keyframe store raised for a %s "
+                "record; the record itself is written and this walk goes on",
+                sighting.object_class,
+            )
+            self.keyframes_refused["store-raised"] = (
+                self.keyframes_refused.get("store-raised", 0) + 1
+            )
+            return
         if result.written:
             self.keyframes_written += 1
             return

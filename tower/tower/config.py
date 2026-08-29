@@ -167,8 +167,21 @@ class Settings:
     # this setting is allowed to fail in.
     #
     # It changes what this Tower RECORDS, from two classes to fourteen.
-    # `recorded_classes` on the read routes is derived from this value,
-    # so the wire says which it is and no client has to assume.
+    #
+    # `recorded_classes` on the read routes is derived from this value --
+    # and that means it reports what was ASKED FOR, not what loaded. The
+    # web process cannot know the difference: the weights are loaded in
+    # the producer, in another process, minutes later, and there is no
+    # channel back. So on a host where the download fails, the routes
+    # advertise fourteen classes while the producer records two, and the
+    # only place that says so is the producer's own report
+    # (`verifier` beside `verifier_requested`) and the loud line it
+    # prints on stderr into the Tower console.
+    #
+    # Documented rather than papered over. Inventing a channel for it
+    # would put cartridge state on the web process for a case that is
+    # loud and one-off, and a client that needs certainty should read the
+    # report.
     #
     # A NAME rather than a boolean, because the answer will eventually be
     # a model identifier and a boolean cannot become one. It is handed to
@@ -209,9 +222,9 @@ class Settings:
     # a label and a timestamp. With this on, the record keeps a crop this
     # cartridge owns and this cartridge's retention deletes.
     #
-    # WHAT IT COSTS. MEASURED over this host's own records: mean 13.9 KB
+    # WHAT IT COSTS. MEASURED over all 116 of this host's records: mean 11.7 KB
     # a keyframe (median 12.3, max 22.1) at a 384 px long side and JPEG
-    # quality 80, so about 5.3 MB an hour of walking at the corpus's
+    # quality 80, so about 4.3 MB an hour of walking at the corpus's
     # measured rate of ~380 records an hour -- roughly 1/400th of what
     # the recording itself costs. On the frame path it costs one padded
     # numpy copy per admitted detection; the write itself happens once

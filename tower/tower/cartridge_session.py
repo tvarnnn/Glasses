@@ -541,6 +541,52 @@ class CartridgeSession:
             )
             return None
 
+    def _scoped_following(self, since: float) -> list[str] | None:
+        """The scoped list, or None when this supervisor cannot scope.
+
+        SEPARATE FROM `_following` ON PURPOSE, and a reviewer found the
+        defect that made it necessary.
+
+        `_following` WIDENS on a `TypeError`: it retries without `since`,
+        because a supervisor from before that keyword existed should
+        still be able to answer the public `following` field, and
+        over-reporting what is running is the safe direction there.
+
+        It is the unsafe direction here. Handing that widened list back
+        as `following_this_session` tells a client "these are the
+        producers YOU started" when the answer is "every producer on this
+        Tower" -- which is exactly the false positive this field was
+        added to remove, and it would raise the loud "something you did
+        not start is recording, and Stop will not reach it" warning about
+        a recording the person started themselves. `_supervisor_mark`
+        already refuses to guess for that reason; this refuses for it
+        too.
+
+        The `TypeError` catch is narrow and deliberate. One raised INSIDE
+        a modern `following()` is a bug in the supervisor rather than an
+        old signature, and swallowing it as "cannot scope" would hide it
+        -- so it is logged at exception level in the general branch below
+        rather than folded into the quiet one.
+        """
+        try:
+            return list(self._supervisor.following(self._worker, since=since))
+        except TypeError:
+            logger.debug(
+                "[Tower][Session] this supervisor cannot answer a scoped "
+                "`following`; %s reports null rather than a list it cannot "
+                "stand behind",
+                self._cartridge,
+                exc_info=True,
+            )
+            return None
+        except Exception:
+            logger.exception(
+                "[Tower][Session] could not ask the supervisor what worker %r "
+                "is following for this session",
+                self._worker,
+            )
+            return None
+
     def _following_this_session(self) -> list[str] | None:
         """Live producers THIS session started, or None if it cannot say.
 
@@ -550,7 +596,9 @@ class CartridgeSession:
           this session started still alive on them;
         - the **empty list** -- this session has started nothing that is
           still running. A positive claim;
-        - **None** -- this session cannot scope the question at all.
+        - **None** -- this session cannot scope the question at all,
+          because the supervisor has no clock mark to offer or cannot
+          answer a scoped question. See `_scoped_following`.
 
         The third is not pedantry. A client draws "you are being
         recorded" from this field and draws a loud "a producer you did
@@ -579,7 +627,7 @@ class CartridgeSession:
             # from before `mark()` existed, or one that raised. The claim
             # is unavailable, which is not the same as false.
             return None
-        return self._following(since=self._attached_since)
+        return self._scoped_following(self._attached_since)
 
     def _following(self, *, since: float | None = None) -> list[str]:
         try:

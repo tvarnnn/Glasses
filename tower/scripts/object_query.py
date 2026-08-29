@@ -141,16 +141,27 @@ def main(argv=None) -> int:
         # violation is enough to cause one -- look identical to a run
         # that removed everything.
         keyframes_removed, retained = store.last_keyframe_purge
+        # The store's own artifacts as well as the crops. Both halves
+        # report, because "everything was deleted except the file with
+        # every observation in it" is the answer a person asking for
+        # erasure most needs and least expects.
+        store_retained = store.last_purge_retained
         report = {
             "observations_removed": removed,
             "keyframes_removed": keyframes_removed,
             "keyframes_not_removed": list(retained),
+            "store_files_not_removed": list(store_retained),
         }
         if args.format == "json":
             print(json.dumps(report, indent=2))
         else:
             print(f"observations removed  {removed}")
             print(f"keyframes removed     {keyframes_removed}")
+            if store_retained:
+                print(
+                    f"store files NOT removed {len(store_retained)}: "
+                    + ", ".join(store_retained)
+                )
             if retained:
                 print(
                     f"keyframes NOT removed {len(retained)}: "
@@ -162,7 +173,7 @@ def main(argv=None) -> int:
                 )
         # Non-zero when something survived, so a caller acting on a
         # wearer's behalf cannot read a complete deletion out of exit 0.
-        return 1 if retained else 0
+        return 1 if (retained or store_retained) else 0
 
     observation = store.last_seen(args.last_seen)
 

@@ -204,7 +204,7 @@ class — see §1.
 | `identity` | string | `category-not-instance` |
 | `absence_means` | string | `not-observed-by-this-cartridge` |
 | `spatial_ref` | **always `null`** | Reserved, never populated. Carried so a consumer sees the field exists and is empty. |
-| `recorded_classes` | array of string | The universe of what could ever appear. `["laptop", "cell phone"]` on a Tower with no verifier, which is the default; a Tower with `TOWER_OBSERVATION_VERIFIER=owlv2` adds twelve more (§11). A class outside this list has never been looked for — a weaker silence than "looked for and not seen". **A client must read this list rather than hard-coding it.** |
+| `recorded_classes` | array of string | The universe of what could ever appear. **Fourteen entries on a default Tower since 2026-08-29**, when the verifier default became `owlv2` (§13); `["laptop", "cell phone"]` on a Tower with `TOWER_OBSERVATION_VERIFIER=none`. Derived from the **configured** verifier, which is what was asked for rather than what loaded — see §13. A class outside this list has never been looked for, a weaker silence than "looked for and not seen". **A client must read this list rather than hard-coding it.** |
 | `imagery` | object | Where the pictures are: `contract`, `claim`, `filter_means`, and URL **templates** for `view`, `frame` and `crop` (§10). A descriptor, not an availability claim. |
 | `retention` | object | See §5. |
 | `object_class` | string \| **null** | The class the request narrowed to. `null` on an unfiltered listing. |
@@ -374,11 +374,15 @@ decodes the new one unchanged and simply does not see them. That is why
 the identifier does not move: adding a field an older decoder ignores is
 not a contract break; changing what an existing field *means* is.
 
-**One thing to watch.** `recorded_classes` is now configuration-dependent
-(§11). Its value on a default Tower is byte-identical to before —
-`["laptop", "cell phone"]`, in that order — but a client that hard-coded
-those two names rather than reading the list will silently mis-render a
-Tower with a verifier enabled.
+**One thing to watch, and it changed on 2026-08-29.** `recorded_classes`
+is configuration-dependent (§11), and a default Tower now returns
+**fourteen** entries rather than two, because the verifier default became
+`owlv2`. A client that hard-coded `["laptop", "cell phone"]` rather than
+reading the list was correct against every Tower before that date and is
+wrong against every one after it. This is exactly the "changing what an
+existing field *means*" case the paragraph above calls a break — the
+field's *type* did not move, its *contents* did, and the mitigation is
+the one already stated: read the list.
 
 ---
 
@@ -424,7 +428,7 @@ that walk. **Render liveness from `following`.**
 | `started_at` / `changed_at` | float \| **null** | Tower-receipt epoch seconds. |
 | `following` | array of string | **Every** capture a producer for this cartridge is alive on right now, including one left over from a session that could not kill it. Supervisor-scoped, deliberately — see below. |
 | `following_this_session` | array of string \| **null** | The subset of `following` that **this session** started. **This is the field a liveness claim is drawn from.** Added 2026-08-29. Three values, see below. |
-| `captures` | array of string | Every capture **this session's** producer has been seen following, in order first seen. |
+| `captures` | array of string | Every capture **this session's** producer has been seen following, in order first seen — accumulated from `following_this_session`. When that is `null` this falls back to `following`, because a history that goes permanently empty on a Tower that cannot scope is a second thing broken by one thing being unanswerable. |
 
 > ✅ **The supervisor-scoping defect is fixed, and the fix is additive.**
 > This table said "this session's producer" until 2026-08-27; that was
@@ -612,10 +616,10 @@ checkable.
 | `memory_retained` | boolean | **The field this shape exists for.** `true` with `available: false` means the record is still here and its picture is not. |
 | `filter` | string | `display-filter/yunet-2023mar@0.30`. See §10.3. |
 | `filter_means` | string | `applied-on-read-the-stored-frame-is-unchanged` for a capture frame; `applied-before-this-file-was-written` for an owned keyframe. |
-| `imagery_source` | string | `capture-frame` or `object-memory-keyframe`. Which store served these bytes. Added 2026-08-29. |
+| `imagery_source` | string \| **null** | `capture-frame` or `object-memory-keyframe`. Which store served these bytes; `null` on a refusal, because nothing served them. Added 2026-08-29. |
 | `frame_available` | boolean \| **null** | Whether `/frame` could serve the wider context view. `null` where it was not computed — on a refusal detail from a binary route, where the client already knows which it asked for. Added 2026-08-29. |
 | `regions_filled` | integer | How many regions the filter filled. Zero means **nothing was detected**, not that there was nothing there. |
-| `subject_obscured` | float 0.0–1.0 | How much of the record's own box the filter covered. See §10.4. |
+| `subject_obscured` | float 0.0–1.0 | How much of the picture the filter covered. **The denominator follows `imagery_source`**: for a capture frame it is the record's own box, measured on the full frame; for an owned keyframe the full frame is gone by serving time, so it is the whole padded crop — which is the box plus 35% on every side, and therefore a systematically *smaller* number for the same fill. Read it with `imagery_source`. See §10.4. |
 | `bounding_box_normalized` | array of 4 floats \| **null** | Where in the picture. Same caveat as §4.5. |
 | `imagery_retention` | string | `capture-side` **or** `object-memory`, depending on `imagery_source`. Not a constant since 2026-08-29: a crop served from this cartridge's own keyframe expires with the record and is deleted by `--purge-all`, while a frame served out of `data/captures/` may vanish on a schedule this cartridge does not set. |
 | `imagery_retention_means` | string | The same fact as a value to switch on rather than a sentence to display. |
@@ -641,10 +645,10 @@ checkable.
 | Code | `reason` | Meaning |
 |---|---|---|
 | 200 | `null` | A picture. |
-| **410** | `imagery-no-longer-available` | **The pointer is intact and the picture is gone.** Capture-side retention removed it. `memory_retained: true`. |
+| **410** | `imagery-no-longer-available` | **The pointer is intact and the picture is gone**, and there is no owned keyframe either. `memory_retained: true`. Usually capture-side retention; the Tower distinguishes that (INFO) from a pointer that does not resolve into a recording still on disk (WARNING, a defect) in its **log**, and deliberately not on the wire — there is nothing a wearer can do differently about the two. |
 | 404 | `no-such-observation` | The handle matched nothing **within retention**. |
 | 404 | `record-has-no-frame-reference` | The record never had a pointer. |
-| 503 | `display-filter-unavailable` | No face-detection weights, or the filter failed. **Nothing is served.** |
+| 503 | `display-filter-unavailable` | No face-detection weights, or the filter failed. **No capture frame is served.** An owned keyframe still is: it was filtered before it was written, so the check has already been passed — §10.3. |
 | 503 | `no-capture-root-configured` | This Tower has nowhere to look. |
 | 503 | `frame-unreadable` | The file is there and could not be decoded. |
 
@@ -739,9 +743,11 @@ detected bystander remains an **open ruling for a human**; leaving
 the deterministic tables have already admitted, and a verdict naming
 anything else is recorded as evidence and changes nothing.
 
-With no verifier — the default — the `verify` tier is never written, and
+With no verifier — `TOWER_OBSERVATION_VERIFIER=none`, which was the
+default until 2026-08-29 — the `verify` tier is never written, and
 `recorded_classes` is `["laptop", "cell phone"]`: the same answer the old
-whitelist gave, reached from evidence rather than asserted.
+whitelist gave, reached from evidence rather than asserted. On a default
+Tower today the verifier is `owlv2` and all fourteen are recordable.
 
 ---
 
@@ -804,8 +810,9 @@ offers it.
 | `TOWER_OBSERVATION_VERIFIER` | **`owlv2`** | Changed from `none` on 2026-08-29 — see below. `owlv2` loads `google/owlv2-base-patch16-ensemble` (Apache-2.0, ~600 MB, downloaded once) and unlocks the `verify` tier, taking `recorded_classes` from two to fourteen. An unrecognised name falls back to `none` — the **narrowing** direction — and is logged loudly. An **empty** value means `none`: a person switching it off is obeyed rather than defaulted over. |
 | `TOWER_OBSERVATION_VERIFIER_DEVICE` | `auto` | Where the verifier runs. The measurement that made this CUDA still holds — 126 ms a crop on the GPU against 2,473 on the CPU, a factor of nineteen, for 620 MB of VRAM — but `cuda` as a literal default is a value a second machine has to un-set by hand, which is the edit-the-environment-before-every-run problem this whole surface exists to remove. `auto` picks the GPU where there is one and says which it got. |
 | `TOWER_OBSERVATION_RETENTION_DAYS` | `30` | The window the producer writes under, recorded in the store manifest. |
+| `TOWER_OBSERVATION_KEEP_IMAGERY` | `true` | **Whether this cartridge persists pixels at all.** `true` writes one small filtered crop per observation under `<observation_root>/keyframes/` (§10.0), deleted with the record. `false` writes no new crop; a record's picture is then a capture frame for as long as capture-side retention keeps one. Turning it off does **not** delete crops already on disk — they are still served and still pruned with their records, because a config change is not a deletion request; `scripts/object_query.py --purge-all` is. |
 | `TOWER_CAPTURE_ROOT` | *(unset)* | Required for §10. Without it the imagery routes answer 503. |
-| `TOWER_FACE_REDACTION_MODEL` | *(vendored)* | The YuNet weights. Without them **no picture is served**. |
+| `TOWER_FACE_REDACTION_MODEL` | *(vendored)* | The YuNet weights. Without them **no capture frame is served, and no keyframe is written**. A keyframe already on disk is still served, because it was filtered before it was written — see §10.3. |
 
 **The verifier default was reversed on 2026-08-29, and this closes a
 decision that was explicitly reserved.**

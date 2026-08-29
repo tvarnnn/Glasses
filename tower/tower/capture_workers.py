@@ -99,16 +99,28 @@ def _ask_to_stop(process) -> bool:
     `CTRL_BREAK_EVENT` rather than `CTRL_C_EVENT` because a new process
     group starts with Ctrl-C disabled.
 
-    MEASURED, and it is why there is a second channel: a console control
-    event is delivered through a CONSOLE, and this Tower does not
-    reliably have one. Under a pseudoconsole -- a terminal that reports
-    `GetConsoleWindow() == 0`, which is what an editor's integrated
-    terminal, a CI runner and a Windows service all look like --
-    `GenerateConsoleCtrlEvent` returns success and the child never hears
-    anything. A trivial child that registers all three handlers and
-    sleeps was still alive thirty seconds later. Shipping a flush that
-    works on the operator's own PowerShell and silently does not work
-    anywhere else is the same defect as not having one.
+    A SIGNAL IS NOT ENOUGH, AND THE REASON IS NOT THE ONE FIRST WRITTEN
+    HERE.
+
+    This docstring used to claim that a console control event is never
+    delivered under a pseudoconsole and that the child hears nothing. **A
+    reviewer measured the opposite and was right.** Under
+    `GetConsoleWindow() == 0` the event IS delivered, and a child that
+    installed no handler dies of it with `STATUS_CONTROL_C_EXIT` and no
+    unwinding at all -- which is the more dangerous half of the truth,
+    because it means a signal sent to the wrong worker destroys exactly
+    the grace it was meant to protect. That is what
+    `_Worker.handles_stop_request` gates, and it is why the gate is not
+    optional.
+
+    The stdin channel stays, and is still the first one tried, for
+    reasons that survive the correction: a pipe needs no console at all,
+    so it works where an event genuinely cannot be delivered (a detached
+    service, a job object, a host that revoked the group); it is
+    unambiguous, where a control event's disposition depends on what the
+    child did with its handlers; and closing it costs nothing when the
+    child is already gone. Two independent channels for a request that
+    must not be missed is the shape, and neither is required to succeed.
 
     So the FIRST channel is closing the child's stdin. The supervisor
     holds the write end for any spec that asked for it
@@ -125,6 +137,21 @@ def _ask_to_stop(process) -> bool:
     falls through to `terminate()` rather than leaving a worker alive
     because an optional courtesy failed.
     """
+    # A process that has already exited is not asked, and this is not
+    # tidiness. `os.kill(pid, CTRL_BREAK_EVENT)` treats the pid as a
+    # process GROUP id, Windows recycles pids aggressively, and a reaped
+    # worker's pid can belong to something else by the time a shutdown
+    # gets here. Signalling a stranger's process group is the one failure
+    # in this file that would not look like a failure.
+    try:
+        if process.poll() is not None:
+            return False
+    except Exception:  # noqa: BLE001
+        # A process object that cannot say. Fall through and try: the
+        # caller terminates either way, and refusing to ask on a
+        # can't-tell would silently drop the flush.
+        pass
+
     asked = False
 
     stdin = getattr(process, "stdin", None)

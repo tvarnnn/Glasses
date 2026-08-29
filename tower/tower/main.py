@@ -363,11 +363,13 @@ def _log_effective_configuration(
         # picture for thirty days and one whose picture belongs to a
         # capture directory nobody promised to keep.
         logger.info(
-            "[Tower][Config] owned keyframes %s. On, each record keeps a "
-            "small filtered crop under the observation root, deleted when "
-            "the record expires; off, every picture is a capture frame "
-            "governed by capture-side retention. TOWER_OBSERVATION_KEEP_"
-            "IMAGERY.",
+            "[Tower][Config] owned keyframes %s (TOWER_OBSERVATION_KEEP_"
+            "IMAGERY). On, each record keeps a small filtered crop under "
+            "the observation root, deleted when the record expires. Off, "
+            "no NEW crop is written -- crops already on disk are still "
+            "served and still pruned with their records, because deleting "
+            "them on a config change would be a deletion nobody asked "
+            "for; scripts/object_query.py --purge-all removes them.",
             "on" if settings.observation_keep_imagery else "off",
         )
         # `auto` is a request, not an answer, and this process cannot

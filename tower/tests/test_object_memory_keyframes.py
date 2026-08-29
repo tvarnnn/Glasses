@@ -30,6 +30,8 @@ is the first place in this cartridge where a pixel reaches disk:
 """
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import cv2
@@ -492,8 +494,8 @@ class TestTheSidecar:
 class TestTheSizeBound:
     """A picture kept for thirty days has to have a ceiling.
 
-    384 px on the long side at JPEG quality 80 measured 13.9 KB mean over
-    this host's own records -- about 5.3 MB an hour of walking against
+    384 px on the long side at JPEG quality 80 measured 11.7 KB mean over
+    all 116 of this host's records -- about 4.3 MB an hour of walking against
     the ~2.1 GB an hour the recording costs.
     """
 
@@ -1126,3 +1128,253 @@ class TestTheViewRouteDescribesWhatCanBeServed:
             "an owned keyframe is served from bytes filtered at write time; "
             "the view route must not run the filter at all"
         )
+
+
+
+def _settings():
+    """`Settings` as this process's environment currently describes it.
+
+    `get_settings` reads the environment on every call and caches
+    nothing, which is what lets a parametrised case here set one variable
+    and read the answer back. Wrapped anyway so the import stays local to
+    the cases that need it, exactly as `test_capture_arming.py` does.
+    """
+    from tower.config import get_settings
+
+    return get_settings()
+
+
+class TestTheWriteIsExceptionTight:
+    """`write()` must not raise, whatever the filter hands back.
+
+    `_write_keyframe` promises in its docstring that it never raises, and
+    the caller is a producer inside its frame loop -- so an escape here
+    ends the walk and takes `engine.release()` with it. One unwritable
+    keyframe would cost every sighting still open, which is the exact
+    failure the graceful-stop work exists to prevent, arriving by a
+    different door.
+
+    A reviewer reproduced three escapes: a filter returning a generator
+    instead of a sequence of boxes, an int, and a box of the wrong arity.
+    `len(filled)`, `encoded.tobytes()` and `_obscured_fraction` all sat
+    outside the guard.
+    """
+
+    def _write(self, tmp_path, filled):
+        store = KeyframeStore(tmp_path)
+        image = _image()
+
+        class Filter:
+            available = True
+            label = "display-filter/yunet-2023mar@0.30"
+
+            def apply(self, frame):
+                return frame, filled
+
+        return store, store.write(
+            "0" * 16, image, Filter(), source_capture="cap", source_relpath="f.jpg"
+        )
+
+    @pytest.mark.parametrize(
+        "filled",
+        [
+            (row for row in []),
+            5,
+            [(0, 0, "a", 1)],
+            [(0, 0)],
+            object(),
+        ],
+        ids=["generator", "int", "string-in-a-box", "short-box", "object"],
+    )
+    def test_a_filter_of_the_wrong_shape_refuses_rather_than_raising(
+        self, tmp_path, filled
+    ):
+        store, result = self._write(tmp_path, filled)
+
+        assert result.written is False
+        assert list((tmp_path / "keyframes").glob("*")) == [] or not (
+            tmp_path / "keyframes"
+        ).exists()
+        assert store.read("0" * 16) is None
+
+    def test_a_sidecar_that_cannot_be_serialised_leaves_no_image(self, tmp_path):
+        """The partial pair a reviewer found, and the invariant it broke.
+
+        `json.dumps` used to run inside a `try` that caught `OSError`
+        only, AFTER the image had already been written -- so an
+        unserialisable `filter_label` raised `TypeError` out of `write()`
+        and left an unattributable first-person crop on disk for the
+        retention window. `read()` refused to serve it, which is why
+        nothing leaked; the file was there anyway, and this module's
+        docstring said in bold that it could not be.
+        """
+        store = KeyframeStore(tmp_path)
+
+        class Filter:
+            available = True
+            label = object()  # not JSON-serialisable
+
+            def apply(self, frame):
+                return frame, []
+
+        result = store.write(
+            "0" * 16, _image(), Filter(), source_capture="cap", source_relpath="f.jpg"
+        )
+
+        assert result.written is False
+        assert not list((tmp_path / "keyframes").glob("*")), (
+            "the image must not survive a sidecar that could not be written"
+        )
+        assert store.read("0" * 16) is None
+
+    def test_the_engine_survives_a_keyframe_store_that_raises(self, tmp_path):
+        """The second wall. `write()` is tight now; this proves the caller
+        does not depend on that being true forever."""
+
+        class Exploding:
+            def write(self, *args, **kwargs):
+                raise RuntimeError("no")
+
+        _, engine = _engine(tmp_path, keyframes=Exploding(), face_filter=_StubFilter())
+        _walk(engine, count=6)
+        engine.release()
+
+        assert engine.observations_recorded >= 1, (
+            "the record must still be written when its picture cannot be"
+        )
+        assert engine.keyframes_refused.get("store-raised", 0) >= 1
+
+
+class TestTheSwitch:
+    """`TOWER_OBSERVATION_KEEP_IMAGERY` had no test of any kind.
+
+    It is the single setting governing whether this cartridge persists
+    first-person pixels, and neither its default, its parsing, nor its
+    journey into the producer's argv was covered anywhere. The repo has
+    the precedent for pinning exactly this shape --
+    `test_the_settings_and_the_producer_agree_about_verifier_names`.
+    """
+
+    def test_it_defaults_to_on(self, monkeypatch):
+        monkeypatch.delenv("TOWER_OBSERVATION_KEEP_IMAGERY", raising=False)
+
+        assert _settings().observation_keep_imagery is True
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("true", True),
+            ("TRUE", True),
+            ("1", True),
+            ("yes", True),
+            ("on", True),
+            ("false", False),
+            ("0", False),
+            ("no", False),
+            ("", True),
+            ("treu", False),
+        ],
+        ids=[
+            "true", "TRUE", "1", "yes", "on",
+            "false", "0", "no", "blank", "a-typo",
+        ],
+    )
+    def test_only_the_shared_spellings_of_true_mean_true(
+        self, monkeypatch, value, expected
+    ):
+        """Pinned because the last case is a trap worth knowing about.
+
+        `config._flag` is one helper for every on/off variable, and its
+        docstring says why: so a fourth flag cannot arrive with a fifth
+        spelling of "true". Two consequences are worth pinning. A BLANK
+        value means "unset, use the default" -- this file's convention
+        everywhere, and the opposite of `TOWER_DEV_MODE`'s, which that
+        docstring calls out. And anything else outside the accepted list,
+        including a typo, reads as **false** -- which for this variable
+        means the cartridge stops keeping pictures.
+
+        That is not softened here. Growing a private spelling for one
+        flag is exactly what the shared helper exists to prevent, and the
+        failure is at least loud in behaviour: no keyframe is written,
+        the startup line says `off`, and the producer's report carries
+        `keep_imagery: false`. What was missing was anybody having
+        checked, which is what this case is.
+        """
+        monkeypatch.setenv("TOWER_OBSERVATION_KEEP_IMAGERY", value)
+
+        assert _settings().observation_keep_imagery is expected
+
+    def test_the_producer_is_told_which_way_it_is_set(self, monkeypatch, tmp_path):
+        """Both halves of the agreement, in the argv the Tower builds."""
+        from tower.main import OBJECT_MEMORY_WORKER, create_app
+
+        for setting, flag in (("true", "--keep-imagery"), ("false", "--no-keep-imagery")):
+            monkeypatch.setenv("TOWER_OBSERVATION_KEEP_IMAGERY", setting)
+            monkeypatch.setenv("TOWER_OBSERVATION_ROOT", str(tmp_path / "memory"))
+            monkeypatch.setenv("TOWER_CAPTURE_ROOT", str(tmp_path / "capture"))
+            app = create_app()
+            argv = list(app.state.capture_workers.spec_for(OBJECT_MEMORY_WORKER).argv)
+            assert flag in argv, f"{setting!r} should pass {flag}"
+            other = "--no-keep-imagery" if flag == "--keep-imagery" else "--keep-imagery"
+            assert other not in argv
+
+    def test_the_producer_accepts_both_flags(self):
+        """Run as a user runs it, so a flag the Tower passes cannot be one
+        the producer refuses -- which would kill it at spawn with only a
+        warning in a log nobody is reading."""
+        for flag in ("--keep-imagery", "--no-keep-imagery"):
+            result = subprocess.run(
+                [sys.executable, "scripts/object_memory_session.py", "--help"],
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0
+            assert flag in result.stdout
+
+    def test_switching_it_off_writes_no_keyframe(self, tmp_path):
+        _, engine = _engine(tmp_path, keyframes=None, face_filter=_StubFilter())
+        _walk(engine, count=6)
+        engine.release()
+
+        assert engine.observations_recorded >= 1
+        assert engine.keyframes_written == 0
+        assert not (tmp_path / "keyframes").exists()
+
+
+class TestTheUnboundedStore:
+    def test_a_keyframe_is_written_when_nothing_ever_expires(self, tmp_path):
+        """`retention is None` short-circuits `prune_expired`, keyframes
+        included. That must mean "never deleted", not "never written"."""
+        store = KeyframeStore(tmp_path)
+        result = store.write(
+            "a" * 16, _image(), _StubFilter(), source_capture="cap",
+            source_relpath="f.jpg",
+        )
+
+        assert result.written is True
+
+        observations = ObservationStore(tmp_path, retention_seconds=None)
+        observations.prune_expired()
+
+        assert store.read("a" * 16) is not None
+
+
+class TestTheLineagePresenceIsContained:
+    @pytest.mark.parametrize(
+        "session_id",
+        ["../..", "..\\..", "/etc", "C:\\Windows", "a/../../b"],
+    )
+    def test_a_traversal_shaped_session_id_reports_nothing(
+        self, tmp_path, session_id
+    ):
+        """It only steers a log line, and it is still built into a path.
+
+        `_frame_in` runs `session_id` through `_contained` and this did
+        not, which is the kind of inconsistency that is free to fix and
+        expensive to discover.
+        """
+        from tower.object_memory.imagery import capture_lineage_present
+
+        record = _observation(session_id=session_id)
+
+        assert capture_lineage_present(tmp_path, record) is False

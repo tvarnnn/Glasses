@@ -361,3 +361,69 @@ class TestTheWireStillCarriesBoth:
             "a supervisor that CAN scope must never answer null; null is "
             "reserved for a Tower that cannot answer the question at all"
         )
+
+
+class TestASupervisorThatCannotAnswerAScopedQuestion:
+    """A `TypeError` from `following(since=...)` must not widen the claim.
+
+    `_following` widens on purpose -- it retries unscoped so an older
+    supervisor can still answer the PUBLIC `following` field, and
+    over-reporting what is running is safe there. Handing that same
+    widened list back as `following_this_session` is the opposite: it
+    tells a client "these are the producers YOU started" when the answer
+    is "every producer on this Tower", and raises the loud
+    something-else-is-recording warning about a recording the person
+    started themselves.
+
+    A reviewer found that the fallback did exactly that.
+    """
+
+    class Narrow:
+        """Accepts `since` and then raises, which is the shape of an old
+        supervisor seen through a modern call."""
+
+        def __init__(self):
+            self.calls = []
+
+        def worker_names(self):
+            return ("worker",)
+
+        def mark(self):
+            return 100.0
+
+        def attach(self, name, capture_id, capture_dir):
+            return False
+
+        def detach(self, name, grace_seconds=10.0):
+            return 0
+
+        def following(self, name, *args, **kwargs):
+            self.calls.append(kwargs)
+            if "since" in kwargs:
+                raise TypeError("following() got an unexpected keyword 'since'")
+            return ["someone-elses-producer"]
+
+    def test_it_answers_null_rather_than_the_unscoped_list(self):
+        supervisor = self.Narrow()
+        session = _session(supervisor)
+
+        session.apply("start")
+        snapshot = session.snapshot()
+
+        assert snapshot["following"] == ["someone-elses-producer"], (
+            "the wide field still reports everything, so nothing goes invisible"
+        )
+        assert snapshot["following_this_session"] is None, (
+            "a claim that could not be scoped must not be answered with a "
+            "list that was not scoped"
+        )
+
+    def test_the_scoped_question_was_actually_asked(self):
+        supervisor = self.Narrow()
+        session = _session(supervisor)
+        session.apply("start")
+        session.snapshot()
+
+        assert any("since" in call for call in supervisor.calls), (
+            "the session must try the scoped call before giving up on it"
+        )
