@@ -963,3 +963,24 @@ def test_many_concurrent_fetches_all_answer_and_none_corrupt_each_other():
     payloads = {r.image_bytes for r in results if isinstance(r, RenderedPreview)}
     assert len(payloads) == 1, "eight fetches of one frame produced two pictures"
     assert all(isinstance(r, RenderedPreview) for r in results)
+
+
+def test_the_detection_picture_draws_near_misses_and_not_the_tail():
+    """A refusal at 0.03 is not a near-miss; it is the detector saying no.
+
+    Measured on a synthetic desk scene before the floor existed: one
+    accepted box and twenty-three refusals scoring 0.02 to 0.03, whose
+    label chips covered the room and buried the detection that mattered.
+    Showing somebody the tail is not showing them the near-misses.
+    """
+    from tower.experiments.object_detection import (
+        PREVIEW_LOW_SCORE_FLOOR,
+        SCORE_THRESHOLD,
+    )
+
+    assert PREVIEW_LOW_SCORE_FLOOR == SCORE_THRESHOLD / 2.0
+    scores = np.array([0.91, 0.42, 0.28, 0.21, 0.19, 0.03, 0.02], np.float32)
+    drawable = np.flatnonzero(scores >= PREVIEW_LOW_SCORE_FLOOR)
+    # Both accepted, both genuine near-misses, neither of the two the
+    # detector had already dismissed.
+    assert list(scores[drawable]) == pytest.approx([0.91, 0.42, 0.28, 0.21])

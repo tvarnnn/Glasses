@@ -693,7 +693,7 @@ final class CVLabContractTests: XCTestCase {
         // The experiment's own timings are untouched by any of it.
         XCTAssertEqual(run.timings.processingMs, 18.4667)
         XCTAssertNotNil(stats.deliveryNote)
-        XCTAssertEqual(CVPreviewDiagnostics(json: [:]).deliveryNote, nil)
+        XCTAssertNil(CVPreviewDiagnostics(json: [:]).deliveryNote)
     }
 
     // MARK: - 5. Projection onto this app's state machine

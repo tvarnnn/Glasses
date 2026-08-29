@@ -196,13 +196,34 @@ struct CVPreviewFrame: Equatable, @unchecked Sendable {
     /// The Tower's dense per-run ordinal. Not the phone's capture index, which
     /// skips by design and cannot order results.
     let resultSeq: Int?
-    /// Seconds between the Tower producing this and answering for it. Shown,
-    /// so a still picture reads as "this is a second old" rather than as now.
+    /// Seconds between the Tower producing this and answering for it.
     let ageSeconds: Double?
+    /// When this device received it.
+    ///
+    /// Needed because `ageSeconds` is a fact about the moment the Tower
+    /// answered and does not tick. A phone polling a Tower whose stream has
+    /// stopped gets `304 Not Modified` for as long as the frame stays inside
+    /// `max_age_s` — the picture is genuinely unchanged, and reporting its
+    /// original age for those two seconds would say "Live" over a frozen
+    /// image. `displayedAge` adds the time since.
+    let arrivedAt: Date
     let treatment: RedactionState
     /// The `ETag` to send back, so the next poll costs a round trip instead of
     /// an encode on the Tower when nothing has changed.
     let etag: String?
+
+    /// How old this picture is NOW, as far as this device can tell.
+    ///
+    /// Two clocks, and they are not being compared: `ageSeconds` is the
+    /// Tower's own measurement of its own work, and the second term is this
+    /// device measuring its own wait. Adding them is legitimate where
+    /// subtracting two absolute timestamps would not be — which is the
+    /// distinction `07-PLATFORM-CONSTRAINTS.md` Limitation 9 draws, and the
+    /// reason there is still no end-to-end latency field anywhere here.
+    var displayedAge: Double? {
+        guard let ageSeconds else { return nil }
+        return ageSeconds + max(0, Date().timeIntervalSince(arrivedAt))
+    }
 
     static func == (lhs: CVPreviewFrame, rhs: CVPreviewFrame) -> Bool {
         lhs.runID == rhs.runID && lhs.resultSeq == rhs.resultSeq
@@ -353,6 +374,7 @@ nonisolated struct CVLivePreviewHTTPClient {
                         .flatMap(Int.init),
                     ageSeconds: http.value(forHTTPHeaderField: "X-CV-Preview-Age")
                         .flatMap(Double.init),
+                    arrivedAt: Date(),
                     treatment: treatment,
                     etag: http.value(forHTTPHeaderField: "ETag")
                 )
@@ -649,7 +671,7 @@ struct CVLivePreviewPanel: View {
     private static let freshSeconds = 0.35
 
     private func isFresh(_ shown: CVPreviewFrame) -> Bool {
-        guard let age = shown.ageSeconds else { return true }
+        guard let age = shown.displayedAge else { return true }
         return age < Self.freshSeconds
     }
 
@@ -710,9 +732,13 @@ struct CVLivePreviewPanel: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         HStack(spacing: 10) {
-            if case .showing(let shown) = loader.phase, let age = shown.ageSeconds {
+            if case .showing(let shown) = loader.phase, let age = shown.displayedAge {
                 // How old, rather than implying now. A picture is a statement
-                // about a moment and the moment has a timestamp.
+                // about a moment and the moment has a timestamp -- and this
+                // one keeps ticking, because a `304` means the picture did not
+                // change and not that it got younger. Redrawn on every poll:
+                // `unchangedResponses` is `@Published` and moves whether or
+                // not a new frame arrived.
                 Text(
                     age < Self.freshSeconds
                         ? "Live" : String(format: "%.1fs behind", age)

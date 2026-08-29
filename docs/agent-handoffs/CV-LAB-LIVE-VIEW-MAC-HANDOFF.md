@@ -1,7 +1,8 @@
 # CV Lab live view — Mac and iPhone validation
 
 **Branch:** `feature/cv-lab-live-visualization-v1`
-**Commit:** `36e75ff`
+**Commits:** `36e75ff` … `81d69ac`
+**Check out:** `feature/cv-lab-live-visualization-v1`
 **Written:** 2026-08-29, from Windows. **No Xcode ran. No iPhone ran.**
 
 Everything below the line marked WINDOWS was verified by running it. Everything
@@ -26,7 +27,7 @@ from the frame, never over the frame.
 | Claim | Evidence |
 |---|---|
 | Full Tower suite passes | `2312 passed, 36 skipped, 1 failed` — the one failure is `test_object_memory_lifecycle.py::test_an_unconfigured_tower_still_serves_its_own_memory`, which asserts an empty default observation root and finds the 116 real observations in `tower/data/object_memory/` from your physical testing. **Pre-existing and environmental.** It fails the same way on a clean checkout of this machine; nothing in this change touches Object Memory. Do not delete that data to make it pass. |
-| The preview suite | `tests/test_cv_lab_preview.py` — 42 tests, all passing: bounded storage, latest-only semantics, three staleness guards, failure isolation, the depth normaliser, the HTTP surface. |
+| The preview suite | `tests/test_cv_lab_preview.py` — 49 tests, all passing: bounded storage, latest-only semantics, three staleness guards, failure isolation, the depth normaliser, the HTTP surface. |
 | Every visual experiment renders a decodable, non-blank image | `test_every_visual_experiment_renders_something_a_person_could_look_at`, parameterised over the registry. |
 | Preview cost on the frame path | Measured, 120 frames per cell at 640x360, **throttle forced off so every frame captures** — i.e. worse than production. `preview` stage: edge 0.000 ms (the array already exists), frame_quality 0.174 ms, optical_flow 0.265 ms, feature_detection 0.736 ms, redaction_impact 1.066 ms. Whole-`run()` delta was within noise in both directions. |
 | Preview cost off the frame path | Encode: edge 0.44 ms / 2.1 KB, frame_quality 1.29 ms / 5.0 KB, feature_detection 2.32 ms / 8.7 KB, optical_flow 2.37 ms / 9.1 KB, redaction_impact 2.94 ms / 9.1 KB. Depth measured separately at ~2.8 ms / ~16-28 KB JPEG. All of it on a worker thread. |
@@ -64,7 +65,7 @@ Everything about whether it feels live, and both object-detection findings.
 cd ~/…/Glasses
 git fetch origin
 git checkout feature/cv-lab-live-visualization-v1
-git log --oneline -1        # expect 36e75ff
+git log --oneline -4        # newest should be 81d69ac
 ```
 
 Open `ios/Glasses.xcodeproj`, build for your device. **If it does not compile,
@@ -271,6 +272,54 @@ The frame path returns to exactly what it was — no capture, no derivation, no
 `TOWER_CV_PREVIEW_MAX_EDGE_PX` (default 320) and
 `TOWER_CV_PREVIEW_MIN_INTERVAL_S` (default 0.05, a 20 Hz ceiling) are the two
 other knobs.
+
+---
+
+## What three independent reviews found
+
+Run after the first commit, on the code rather than on the description:
+performance and architecture, CV correctness, and iOS/state/privacy. **No
+blockers.** Seven findings, all seven fixed in `81d69ac`. Two were real bugs
+and both came from the reviewers who ran the code:
+
+1. **A lost write in the depth scale.** Two concurrent renders of one fresh
+   capture both folded the same bounds and one update vanished. Cosmetic — one
+   frame at a slightly wrong brightness — but real, and the "everything is an
+   immutable handover so no lock is needed" argument genuinely did not cover
+   it. The normaliser has its own lock now.
+2. **A caption that contradicted the metric beside it.** The detection preview
+   drew the top 24 boxes and captioned itself "24 over 0.40" next to
+   `detections: 160`. Now "24 of 160 over 0.40 drawn".
+3. Sub-pixel optical-flow jitter was drawn as five-pixel arrows, making a still
+   room look full of independently moving things. Below half a pixel it is a
+   dot.
+4. A flat depth frame rendered solid black, which in INFERNO means "very far".
+   Mid-grey now.
+5. An empty depth array raised `IndexError` where the NaN path had a sentence.
+6. The histogram's bars and clipping markers truncated independently and landed
+   up to a pixel apart.
+7. The iOS panel did not drop its picture on backgrounding, so iOS's
+   app-switcher snapshot could capture it. It watches `scenePhase` now.
+
+What the reviews **confirmed**, with measurement rather than agreement:
+
+- Storage is bounded: 5,000 frames with the consumer never fetching added
+  ~4.8 MB in the first 1,000 and then flatlined for the next 9,000
+  (192.85 → 192.77 MB). 200 start/stop cycles: RSS −0.07 MB.
+- The throttle is real: 216–235 of every 240 offered frames were skipped when
+  driven as fast as the CPU allows.
+- Coordinates are correct in all four overlay kinds, verified by putting a
+  known marker at a known position and finding the drawn pixel.
+- `prediction["boxes"]` really is in the original frame's coordinates —
+  confirmed against torchvision's `GeneralizedRCNNTransform.postprocess`.
+- The depth EMA reduces frame-to-frame brightness variance **190×** against
+  MiDaS's own per-frame min/max (23.0 vs 2096.6).
+- INFERNO polarity is right: near reads bright (luminance 243.7), far reads
+  dark (0.46).
+- The edge downscale preserves **95.4%** of connected components against
+  INTER_NEAREST's 74.6%; a single diagonal line stays one component instead of
+  shattering into 81.
+- Nothing is written to disk on this path, and no `.pbxproj` edit is needed.
 
 ---
 

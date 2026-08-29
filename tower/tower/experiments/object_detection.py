@@ -54,6 +54,17 @@ TRACKED_CLASSES = ("person", "chair", "couch", "dining table", "tv", "laptop")
 # pattern.
 PREVIEW_MAX_BOXES = 24
 
+# How far below the threshold a detection may be and still be drawn.
+#
+# Half of it, which is a principled line rather than a taste: a
+# NEAR-MISS is something that got at least halfway to being believed,
+# and everything under that is the detector saying no. Measured on a
+# synthetic desk scene: without this floor the picture drew one accepted
+# box and twenty-three refusals scoring 0.02 to 0.03, whose label chips
+# covered the room and buried the one detection that mattered. That is
+# not showing somebody the near-misses; it is showing them the tail.
+PREVIEW_LOW_SCORE_FLOOR = SCORE_THRESHOLD / 2.0
+
 # `score_threshold` is SCORE_THRESHOLD echoed back on every frame: a
 # constant, and the old harness AVERAGED it, which happened to give the
 # right number for the wrong reason. The per-class entries are derived
@@ -327,11 +338,13 @@ class ObjectDetectionExperiment:
         structure = scene_structure(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
         scale = structure.shape[1] / float(image.shape[1] or 1)
 
-        # Accepted first, then the best of the rest. `argsort` on the
-        # whole array rather than a partition: SSD returns at most 300
-        # boxes, so this is a sort of 300 floats and the clarity is worth
-        # more than the microsecond.
-        order = np.argsort(-scores)[:PREVIEW_MAX_BOXES]
+        # Everything worth looking at, best first: accepted, plus the
+        # refusals that came close. `argsort` on the whole array rather
+        # than a partition -- SSD returns at most 300 boxes, so this is a
+        # sort of 300 floats and the clarity is worth more than the
+        # microsecond.
+        drawable = np.flatnonzero(scores >= PREVIEW_LOW_SCORE_FLOOR)
+        order = drawable[np.argsort(-scores[drawable])][:PREVIEW_MAX_BOXES]
         chosen_boxes = (boxes[order] * scale).astype(np.float32)
         chosen_scores = scores[order].astype(np.float32)
         names = tuple(
