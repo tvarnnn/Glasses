@@ -54,7 +54,7 @@ import argparse
 import json
 import math
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import cv2
@@ -101,6 +101,19 @@ SCALE_GRID_STEPS = 45
 # own scale to within 1.2% in a self-test, and the two below 0.07 came
 # back 33% and 57% wrong while fitting at under 1.8 px.
 MIN_SPAN_OVER_DEPTH = 0.09
+
+# Why a pair produced no verdict beyond "we could not link them".
+#
+# A named constant because the segment-level explanation has to be able
+# to recognise it: a segment ALL of whose pairs read this way has a
+# retrieval problem, and one whose pairs read anything else has an
+# estimation problem. Those want opposite work, so the report must not
+# blur them together.
+NO_VISUAL_LINK = (
+    "no keyframe of either segment matched a keyframe of the other well "
+    "enough to survive an essential-matrix check, so there is no shared "
+    "view to register on"
+)
 
 
 class SupportMissingError(Exception):
@@ -488,11 +501,33 @@ def _solve_pnp_ransac_or_refuse(object_points, image_points, camera_matrix):
 def _pnp_observations(source, target, matches, intrinsics) -> list:
     """PnP the source segment's landmarks into each of the target's keyframes.
 
-    This is the route that works. A 3-D/3-D correspondence needs a landmark
-    on BOTH sides of a match, and the association density on the real walk
-    ranges 0.54% to 52%, so the product leaves the strongest links in the
-    whole graph with fewer than six usable pairs. PnP needs the association
-    on ONE side and yields 10-100x more constraints.
+    This is the route that works, and the reason recorded here used to be
+    the wrong one.
+
+    It said a 3-D/3-D correspondence needs a landmark on BOTH sides, that
+    the association density ranges 0.54% to 52%, and that the product
+    therefore "leaves the strongest links in the whole graph with fewer
+    than six usable pairs". **That is measurably false on the 2026-08-29
+    drawer walk**: pooling over all keyframe pairs rather than the
+    eight-frame matching sample, segments 14 and 29 share 1,552 distinct
+    mutually-triangulated landmark pairs, and 43 of that walk's 253
+    segment pairs clear ten. Density is not the obstacle.
+
+    The real reason is depth, and it is worse than a density problem
+    because more data does not fix it. A 3-D/3-D similarity is DRIVEN by
+    landmark depth; PnP is driven by bearings, which are accurate, plus
+    the target's own camera baseline. `landmark_gate` admits a landmark
+    at `min_parallax_deg`, which by construction is around 100% depth
+    uncertainty, so a segment's points are only ever as good as that
+    bound. Measured on halves of segment 29 that re-triangulate
+    independently from a known-identical truth, the landmarks the two
+    halves share land **1.05x scene depth apart at the median**, and a
+    RANSAC similarity over them prefers a 3.3x-wrong scale to the true
+    identity by 28 inliers to 2. Four of eight such known-answer cases
+    came back wrong, three catastrophically.
+
+    PnP also needs the association on ONE side only, which is where the
+    10-100x constraint count comes from. That part always held.
     """
     grouped: dict = {}
     for frame_a, frame_b, pairs in matches:
@@ -780,6 +815,196 @@ def _initial_params(observations: list, scale: float) -> np.ndarray:
     )
 
 
+# How far one target camera's own scale may sit from the consensus.
+#
+# Bounded from BOTH sides, which is why it is a measured plateau rather
+# than a taste. Too tight and honest cameras at the far end of a segment
+# are dropped for ordinary intra-segment scale drift, until a thin pair
+# falls under `min_cameras`. Too loose and the fabricated cameras -- which
+# agree with EACH OTHER, because they collapse toward the origin together
+# -- outvote the genuine ones and the confidently wrong scale comes back.
+#
+# Swept over three real worlds and over eight ground-truth segment splits
+# whose answer is 1.0 by construction:
+#
+#   tol   drawer walk        canonical world     ground truth
+#   0.15  3 segs / 2,490     2 segs / 2,328      nothing wrong admitted
+#   0.20  6 segs / 7,821     2 segs / 2,328      nothing wrong admitted
+#   0.25  6 segs / 7,821     2 segs / 2,328      nothing wrong admitted
+#   0.30  6 segs / 7,821     3 segs / 3,739      nothing wrong admitted
+#   0.40  6 segs / 7,821     3 segs / 3,739      nothing wrong admitted
+#   0.50  6 segs / 7,821     3 segs / 3,739      nothing wrong admitted
+#   0.75  6 segs / 7,821     3 segs / 3,739      nothing wrong admitted
+#   1.00  5 segs / 4,704     3 segs / 3,739      nothing wrong admitted
+#
+# Below 0.30 the canonical world loses the pair (5,32) it registers
+# today -- its three forward cameras read 4.23, 4.12 and 5.36, a 28%
+# spread that is drift, not fabrication. At 1.00 the drawer walk loses
+# (14,29), the return leg meeting the outbound leg, because segment 29's
+# ten fabricated cameras are no longer separated from its genuine ones.
+#
+# [0.30, 0.75] is flat on every world, so 0.50 is the centre of a
+# measured plateau and not the edge of a cliff. It also sits above the
+# largest honest intra-segment drift measured anywhere in this study
+# (0.5% between one segment's halves, ~7% between adjacent thirds, and a
+# weakly-supported ~40% end to end across a 23-keyframe segment).
+#
+# The ground-truth splits do NOT discriminate between these values --
+# every one of them refuses the wrong answers and admits the right ones.
+# They bound the change's safety; the two real worlds choose within it.
+MAX_CAMERA_SCALE_DEVIATION = 0.50
+
+# Doubly-landmarked correspondences a camera needs before its own scale
+# is worth believing. Below this the median is a coin toss and would
+# scatter honest cameras out of the consensus.
+MIN_CORRESPONDENCES_FOR_CAMERA_SCALE = 8
+
+# Cameras that must carry a scale before the consensus is used at all.
+# With one or two there is no majority to be in, and filtering on a
+# two-camera "consensus" is just filtering on the first camera.
+MIN_CAMERAS_FOR_CONSENSUS = 3
+
+
+def _placed_span_over_depth(target, observations) -> float:
+    """`span_over_depth` over the cameras a fit actually placed.
+
+    The whole-segment figure answers "could this segment's scale be
+    recovered from its own cameras". The gate needs the narrower
+    question: "could it be recovered from the cameras THIS estimate
+    used". Those differ whenever only part of a segment overlaps its
+    partner, which is the normal case for a revisit.
+    """
+    centres = np.array([
+        -target.poses[observation.frame][0].T @ target.poses[observation.frame][1]
+        for observation in observations
+        if observation.frame in target.poses
+    ])
+    return span_over_depth(centres, target.points)
+
+
+def _camera_scale(source, target, observation, landmarks) -> tuple:
+    """This one camera's own view of how the two segments' units compare.
+
+    For a correspondence that is genuinely the same physical point, the
+    depth of the source's landmark in the PnP-placed camera and the
+    depth of the target's landmark in the target's own camera differ by
+    exactly the Sim3 scale. So every camera can state the scale
+    independently, from the two reconstructions that already exist and
+    no ground truth at all.
+
+    Returns (median ratio, how many correspondences voted).
+    """
+    ratios = []
+    for feature, landmark in landmarks.items():
+        partner = target.observed.get((observation.frame, feature))
+        if partner is None:
+            continue
+        source_depth = float(
+            (observation.r_pnp @ source.points[landmark] + observation.t_pnp)[2]
+        )
+        target_depth = float(
+            (observation.r_target @ target.points[partner]
+             + observation.t_target)[2]
+        )
+        if source_depth > 1e-6 and target_depth > 1e-6:
+            ratios.append(source_depth / target_depth)
+    if not ratios:
+        return None, 0
+    return float(np.median(ratios)), len(ratios)
+
+
+def _consensus_observations(source, target, matches, observations) -> list:
+    """Drop target cameras that are not looking at the shared geometry.
+
+    THIS IS THE FIX FOR THE FAILURE THAT KEPT THE DRAWER WALK IN PIECES,
+    and it is worth stating precisely, because the symptom pointed
+    somewhere else entirely.
+
+    `_pnp_observations` will place ANY target keyframe for which twelve
+    of the source's landmarks survive RANSAC. On repetitive indoor
+    texture a keyframe sharing no physical view with the source still
+    clears that bar on aliased matches, and -- this is the part that
+    hurts -- the fabricated cameras are MUTUALLY consistent, so nothing
+    downstream notices. Because a Sim3's scale is exactly the ratio of
+    the placed constellation's span to the target's own span, collapsing
+    part of the constellation reports a smaller scale.
+
+    Measured against a known answer, by splitting ONE segment into two
+    halves that share a frame and a unit by construction so the truth is
+    scale 1.0 exactly: segment 29 of the 2026-08-29 drawer walk came
+    back at 0.30 -- 3.04x wrong -- while agreeing on rotation to 0.62
+    deg, reprojecting at 2.48 px, and reporting a scale ambiguity of
+    2.04. Every clause in `admit()` except reciprocity passed a fit that
+    was provably three times wrong. Seven of that split's eight target
+    cameras were fabricated: they cleared PnP on 15-34 mutually
+    consistent false correspondences and were placed with centre errors
+    of 4.8 to 12.3 against a scene depth of 27.6.
+
+    The same signature produced the real refusal. Pair (14,29) is the
+    walk's return leg meeting its outbound leg -- 20,267 verified
+    inliers between the two best-conditioned segments in the capture --
+    and it was refused because the directions disagreed on scale by
+    2.4x. Restricting the forward solve to segment 29's frames 0-11,
+    which are the ones that actually overlap segment 14, gives 1.0031
+    against the reverse's 0.9408. The disagreement was never a statement
+    about the room. It was ten cameras that had no business in the fit.
+
+    So the filter asks each placed camera to state the scale itself
+    (`_camera_scale`) and keeps the largest agreeing group, weighted by
+    how much evidence each camera brought.
+
+    IT IS A NARROWING, NOT A LOOSENING. It can only remove cameras, so
+    it can only make `min_cameras` harder to satisfy, and it turns fits
+    that were confidently wrong into honest refusals: on the segment-29
+    ground-truth split the forward direction stops returning 0.30 and
+    returns nothing at all. No threshold moves and `admit()` is
+    untouched. The recall it buys comes from measuring the right
+    cameras, not from a lower bar.
+    """
+    landmarks_by_frame: dict = {}
+    for frame_a, frame_b, pairs in matches:
+        claimed = landmarks_by_frame.setdefault(frame_b, {})
+        for feature_a, feature_b in pairs:
+            landmark = source.observed.get((frame_a, feature_a))
+            # The same first-claim rule `_pnp_observations` uses, so the
+            # two read one association rather than two similar ones.
+            if landmark is None or feature_b in claimed:
+                continue
+            claimed[feature_b] = landmark
+
+    scales, weights, kept = [], [], []
+    for index, observation in enumerate(observations):
+        scale, votes = _camera_scale(
+            source, target, observation,
+            landmarks_by_frame.get(observation.frame, {}),
+        )
+        if scale is None or scale <= 0.0:
+            continue
+        if votes < MIN_CORRESPONDENCES_FOR_CAMERA_SCALE:
+            continue
+        scales.append(math.log(scale))
+        weights.append(float(votes))
+        kept.append(index)
+
+    if len(kept) < MIN_CAMERAS_FOR_CONSENSUS:
+        # Not enough cameras carry an opinion to form one. Left exactly
+        # as it was rather than refused: this is the sparse-overlap case
+        # the gate already judges on its other clauses, and inventing a
+        # consensus from one camera would be filtering on noise.
+        return observations
+
+    scales = np.asarray(scales)
+    weights = np.asarray(weights)
+    tolerance = math.log(1.0 + MAX_CAMERA_SCALE_DEVIATION)
+    best_support, best_group = -1.0, None
+    for centre in scales:
+        group = np.abs(scales - centre) <= tolerance
+        support = float(weights[group].sum())
+        if support > best_support:
+            best_support, best_group = support, group
+    return [observations[kept[i]] for i in np.flatnonzero(best_group)]
+
+
 def fit_direction(source, target, matches) -> DirectedFit | None:
     """Estimate the Sim3 mapping `target`'s frame into `source`'s frame.
 
@@ -791,6 +1016,11 @@ def fit_direction(source, target, matches) -> DirectedFit | None:
     """
     intrinsics = source.intrinsics
     observations = _pnp_observations(source, target, matches, intrinsics)
+    if len(observations) < 2:
+        return None
+    observations = _consensus_observations(
+        source, target, matches, observations
+    )
     if len(observations) < 2:
         return None
 
@@ -835,7 +1065,22 @@ def fit_direction(source, target, matches) -> DirectedFit | None:
         provenance=frozenset(
             (target.index, observation.frame) for observation in observations
         ),
-        target_span_over_depth=target.span_over_depth,
+        # The baseline THIS FIT had, not the one its segment has.
+        #
+        # Scale enters a Sim3 only through the baseline between the
+        # target cameras the fit actually placed, and that is routinely a
+        # subset -- more so since `_consensus_observations`. Reading the
+        # whole segment's span credits an estimate with parallax it never
+        # saw: on the drawer walk the forward fit of (14,29) is scored
+        # against segment 29's 0.7335 while the cameras it used span
+        # 0.1699, a 4.3x overstatement.
+        #
+        # HONEST STATUS: this changes no verdict on any world available
+        # today -- the thinnest admitted fit spans 0.0947 against the
+        # 0.09 bar, so every pair admitted before is admitted after. It
+        # closes the gap while it is free rather than after a walk falls
+        # into it. It can only ever refuse more, never less.
+        target_span_over_depth=_placed_span_over_depth(target, observations),
     )
 
 
@@ -1268,8 +1513,14 @@ def pair_is_hopeless(source, target, thresholds) -> str | None:
     registration cannot run anywhere near the live path.
 
     Returns the refusal reason, or None if the pair is worth matching.
-    Deliberately the SAME bar as the gate: a prune stricter than admit()
-    would silently refuse pairs the gate would have taken.
+
+    The bar is the same NUMBER as the gate's, deliberately, but it is no
+    longer the same quantity: the gate now reads the span of the cameras
+    a fit actually placed, which is a subset of the segment's, so the
+    gate is the stricter of the two. That is the safe direction and the
+    only safe direction. A prune stricter than the gate would silently
+    refuse pairs the gate would have taken, and nothing downstream would
+    ever say so.
     """
     span = min(source.span_over_depth, target.span_over_depth)
     if span < thresholds.min_span_over_depth:
@@ -1397,12 +1648,31 @@ def register(store: WorldStore, world_id: str, session_id: str,
                 # the matching. Same verdict, same reason string as the
                 # gate would have produced -- only sooner.
                 verdicts.append(
-                    Verdict((left, right), False, hopeless, float("nan"), {})
+                    Verdict((left, right), False, hopeless, float("nan"),
+                            {"span_over_depth": round(min(
+                                segments[left].span_over_depth,
+                                segments[right].span_over_depth), 4)})
                 )
                 continue
             matches = cross_matches(segments[left], segments[right])
             if not matches:
+                # Recorded, not skipped. This branch used to `continue`,
+                # which meant a pair the matcher could not link produced
+                # no row at all: `candidate_pairs` counted 228 of the 253
+                # pairs on the 2026-08-29 drawer walk and the missing 25
+                # were indistinguishable from pairs that were never
+                # enumerated. "We looked and found no shared view" is a
+                # measurement, and the one that says whether a walk's
+                # problem is retrieval or estimation.
+                verdicts.append(Verdict(
+                    (left, right), False, NO_VISUAL_LINK,
+                    float("nan"), {"verified_frame_pairs": 0, "inliers": 0},
+                ))
                 continue
+            evidence = {
+                "verified_frame_pairs": len(matches),
+                "inliers": sum(len(pairs) for _, _, pairs in matches),
+            }
             forward = fit_direction(segments[left], segments[right], matches)
             reverse = fit_direction(
                 segments[right], segments[left],
@@ -1428,12 +1698,14 @@ def register(store: WorldStore, world_id: str, session_id: str,
                     )
                 verdicts.append(Verdict(
                     (left, right), False, reason, float("nan"),
-                    {"forward": forward is not None,
+                    {**evidence,
+                     "forward": forward is not None,
                      "reverse": reverse is not None},
                 ))
                 continue
             verdict = admit(MutualEvidence(forward=forward, reverse=reverse),
                             thresholds)
+            verdict = replace(verdict, clauses={**evidence, **verdict.clauses})
             verdicts.append(verdict)
             if verdict.registered:
                 admitted.append(
@@ -1479,6 +1751,13 @@ def register(store: WorldStore, world_id: str, session_id: str,
         ),
         "candidate_pairs": len(verdicts),
         "admitted_pairs": [[a, b] for a, b, *_ in admitted],
+        # Only the largest of these is ever placed -- `_pick_reference`
+        # chooses inside it and `compose_tree` walks outward from there.
+        # A second group is two segments that agreed with each other and
+        # with nothing in the main cluster; it is drawn as more islands,
+        # and until this field existed the report could not say whether
+        # that had happened.
+        "admitted_components": admitted_components(admitted),
         # Reported whether or not they refuse anything. A cluster whose
         # loops close tightly is better evidence than one with no loops at
         # all, and until now there was no way to tell those apart.
@@ -1498,6 +1777,38 @@ def register(store: WorldStore, world_id: str, session_id: str,
     }
 
 
+def admitted_components(admitted) -> list:
+    """The connected groups of the admitted graph, largest first.
+
+    Reported because only ONE of them is ever served. `_pick_reference`
+    picks the largest and `compose_tree` walks outward from it, so a
+    second group -- two segments that agreed with each other but with
+    nothing in the main cluster -- is placed nowhere and is drawn as two
+    more islands. Until now nothing said whether that had happened, so a
+    walk that produced two coherent halves and a walk that produced one
+    coherent half read identically in the report.
+    """
+    adjacency: dict = {}
+    for left, right, *_ in admitted:
+        adjacency.setdefault(left, set()).add(right)
+        adjacency.setdefault(right, set()).add(left)
+    seen, components = set(), []
+    for node in sorted(adjacency):
+        if node in seen:
+            continue
+        stack, component = [node], []
+        seen.add(node)
+        while stack:
+            current = stack.pop()
+            component.append(current)
+            for neighbour in sorted(adjacency[current]):
+                if neighbour not in seen:
+                    seen.add(neighbour)
+                    stack.append(neighbour)
+        components.append(sorted(component))
+    return sorted(components, key=len, reverse=True)
+
+
 def _pick_reference(admitted, points_by_segment):
     """The segment carrying the most points in the largest admitted group.
 
@@ -1507,25 +1818,7 @@ def _pick_reference(admitted, points_by_segment):
     """
     if not admitted:
         return None
-    adjacency: dict = {}
-    for left, right, *_ in admitted:
-        adjacency.setdefault(left, set()).add(right)
-        adjacency.setdefault(right, set()).add(left)
-    seen, components = set(), []
-    for node in adjacency:
-        if node in seen:
-            continue
-        stack, component = [node], []
-        seen.add(node)
-        while stack:
-            current = stack.pop()
-            component.append(current)
-            for neighbour in adjacency[current]:
-                if neighbour not in seen:
-                    seen.add(neighbour)
-                    stack.append(neighbour)
-        components.append(component)
-    largest = max(components, key=len)
+    largest = admitted_components(admitted)[0]
     return max(largest, key=lambda s: points_by_segment.get(s, 0))
 
 
@@ -1567,11 +1860,18 @@ def _segment_row(index, segments, placements, verdicts, points_by_segment,
         return row
 
     involved = [v for v in verdicts if index in v.pair]
-    if not involved:
+    linked = [v for v in involved if v.reason != NO_VISUAL_LINK]
+    if not linked:
+        # Every pair this segment took part in failed at the matcher, so
+        # nothing downstream of matching ever ran on it. Said separately
+        # from "linked but refused" because the two ask for different
+        # work: this one wants better retrieval or a longer look, not a
+        # better estimator.
         row["reason"] = (
             "no verified visual link to any other segment with geometry"
         )
         return row
+    involved = linked
     best = min(involved, key=lambda v: _ratio(v.reciprocity)
                if math.isfinite(v.reciprocity) else float("inf"))
     row["reason"] = (

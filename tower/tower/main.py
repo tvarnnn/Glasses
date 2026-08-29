@@ -120,6 +120,8 @@ def _world_build_spec(settings: Settings) -> WorkerSpec | None:
     if settings.world_root is None or not settings.world_autobuild:
         return None
 
+    register = ("--register",) if settings.world_register else ()
+
     return WorkerSpec(
         argv=(
             sys.executable,
@@ -130,6 +132,12 @@ def _world_build_spec(settings: Settings) -> WorkerSpec | None:
             settings.world_root,
             "--rebuild-every",
             str(settings.world_rebuild_every),
+            # Place the segments once the walk ends. It is a flag on the
+            # child's argv rather than anything this process does,
+            # because the web process must keep knowing the builder only
+            # as a command line -- and because registration is seconds of
+            # solving that the frame path must never see.
+            *register,
             # So a producer whose Tower died without closing the manifest
             # stops following instead of polling that directory forever.
             # See DEFAULT_MAX_IDLE_POLLS: the bound has always existed and
