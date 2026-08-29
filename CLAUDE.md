@@ -155,20 +155,41 @@ the guard sits.
 ## Installing the guard
 
 `.githooks/pre-commit` refuses any agent commit made in the canonical
-checkout. It is tracked, so it reaches every worktree; it is activated once
-per clone:
+checkout. There are two ways to activate it and they are mutually exclusive,
+because `core.hooksPath` *overrides* `.git/hooks` rather than adding to it.
+
+**Installed on this machine, and live now:** a copy at `.git/hooks/pre-commit`.
+`.git/hooks` lives in the **common** directory, so one file covers the
+canonical checkout and every linked worktree at once, it works no matter
+which branch a worktree is on, and it never appears in `git status`. This is
+what protects the repository today, including on branches that predate this
+policy.
+
+```sh
+cp .githooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+```
+
+**The tracked route, once this policy is on `main`:** point git at the
+tracked copy instead, so the hook travels with the repository and a fresh
+clone gets it.
 
 ```sh
 git -C C:/Users/<you>/Projects/Glasses config core.hooksPath .githooks
 ```
 
-`core.hooksPath` lives in the shared config, so one command covers the
-canonical checkout and every worktree. The path is relative and git resolves
-it against each worktree's own top level, so each lane runs its own tracked
-copy of the hook. Verify it is live:
+`core.hooksPath` lives in the shared config, so one command covers every
+worktree. The path is relative and git resolves it against each worktree's
+own top level, so each lane runs its own tracked copy. **The catch:** a
+worktree sitting on a branch that predates this commit has no
+`.githooks/pre-commit`, and git skips a missing hook silently — so until
+every live branch carries it, the `.git/hooks` copy above is the one doing
+the work. Do not set `core.hooksPath` without checking that.
+
+Verify whichever route is active:
 
 ```sh
-git config --get core.hooksPath      # => .githooks
+git config --get core.hooksPath          # .githooks, or empty
+ls .git/hooks/pre-commit                 # the always-on copy
 ```
 
 The hook detects the canonical checkout by comparing `--git-dir` with
