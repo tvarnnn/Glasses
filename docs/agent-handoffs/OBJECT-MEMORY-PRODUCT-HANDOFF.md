@@ -582,6 +582,23 @@ swift-format. Nothing in `ios/` has been compiled or run.
 brackets and strings balance in all 73 `.swift` files. **A green run
 there is not a build.**
 
+With `--no-prose` it also enforces the rule that the Object Memory
+workspace view writes no user-facing sentences of its own. That rule was
+stated three times in doc comments and enforced by nothing until an
+independent reviewer pointed it out; the sentence it exists to stop is
+one that escapes `ObjectMemoryCopyTests` entirely.
+
+```
+.venv\Scripts\python.exe ios\scripts\swift-structure-check.py --no-prose ^
+    ios\Glasses\Workspaces\ObjectMemory\ObjectMemoryWorkspaceView.swift
+```
+
+It flags any string literal containing a space outside a comment, which
+catches a sentence and ignores an SF Symbol name. It is deliberately
+pointed at named files rather than the whole tree: World Builder's and
+Home's views hold prose legitimately, and a checker that shouted at them
+would be turned off within a week.
+
 ---
 
 ## 6A. The next physical test

@@ -416,6 +416,18 @@ class _StopRequest:
     def bounded(self, frames):
         """`frames`, ending at the next frame after a stop was asked for.
 
+        THE SECOND OF TWO CHECKS, AND THE ONLY ONE ON A REPLAY.
+
+        The primary check is inside `CaptureFollower.follow`'s poll loop,
+        which is where a live producer spends a quiet walk. This one is
+        the only check a `--frames` replay has: a replay reads a
+        directory, never polls, and would otherwise run to the end of the
+        corpus after being asked to stop.
+
+        It is also the reason a stop during a LIVE run cannot be missed
+        by one frame -- the follower may already have yielded before the
+        flag was set.
+
         Wrapping the generator rather than checking inside the loop body
         keeps the check on ONE path: the loop already has a `--limit`
         break and a `finally`, and a second `break` in the body is a
