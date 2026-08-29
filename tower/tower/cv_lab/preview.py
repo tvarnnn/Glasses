@@ -21,13 +21,26 @@ shaped by that and by nothing else.
                                           on a worker thread, and only
                                           when somebody actually asked
 
-The frame path does no image work at all. `capture()` takes the array the
-experiment computed -- by reference, no copy, no resize, no encode -- and
-puts it in a slot. Everything expensive happens later, in `render()`,
-which Starlette runs in its thread pool because the route that calls it
-is a plain `def`. That is the same reason every disk-touching route in
-this Tower is a `def`, and it is the whole answer to "can the viewer
-backpressure the pipeline": the event loop never runs the encoder.
+`capture()` does no image work at all: it takes the array the experiment
+computed -- by reference, no copy, no resize, no encode -- and puts it in
+a slot. Everything expensive happens later, in `render()`, which
+Starlette runs in its thread pool because the route that calls it is a
+plain `def`. That is the same reason every disk-touching route in this
+Tower is a `def`, and it is the whole answer to "can the viewer
+backpressure the pipeline": **the event loop never runs the encoder.**
+
+The frame path is not, however, entirely free, and the honest version is
+worth stating rather than rounding to zero. Two experiments hand over an
+array they had already built for their own metric and cost nothing:
+`edge_detection`'s Canny map and `depth`'s inference output. The other
+five have no such array and derive one -- a line drawing, a thinned
+keypoint set, boxes pulled off a tensor -- inside `run()`, on the loop.
+Measured, per captured frame: `frame_quality` 0.17 ms, `optical_flow`
+0.27 ms, `feature_detection` 0.74 ms, `redaction_impact` 1.07 ms. It
+happens only on frames the 20 Hz throttle allowed, it appears as a named
+`preview` stage in `stage_ms`, and it is therefore visible and
+subtractable rather than hidden inside a total. At the throttle ceiling
+that is 3-21 ms of loop time per second of wall clock, worst case.
 
 If nobody ever fetches, nothing is ever encoded. The work is not queued
 for later -- it simply does not happen.
@@ -79,7 +92,8 @@ is atomic in CPython and needs no lock -- the same technique
 `_stats_guard` covers only the counters the serving side writes and the
 status document reads; the frame path never touches it, because a lock
 on the measured path to make a diagnostic one frame fresher is paying in
-the wrong currency.
+the wrong currency. The one piece of genuinely shared MUTABLE state is
+`_DepthNormaliser`, which carries its own lock and explains why.
 """
 
 import functools
@@ -254,7 +268,7 @@ class _DepthNormaliser:
     far look like.
     """
 
-    __slots__ = ("_low", "_high")
+    __slots__ = ("_low", "_high", "_guard")
 
     # Chosen rather than tuned by eye: 2/98 is the conventional robust
     # stretch, and 0.2 is about a five-frame time constant, which settles
@@ -272,8 +286,36 @@ class _DepthNormaliser:
     def __init__(self) -> None:
         self._low: float | None = None
         self._high: float | None = None
+        # THE one piece of mutable state this module shares between
+        # threads, and it needs a lock where nothing else here does.
+        #
+        # Everything else crossing the loop/worker boundary is an
+        # immutable object handed over by a single atomic assignment, so
+        # a reader sees the old one or the new one and never half of
+        # either. This is different: `to_uint8` READS `_low`/`_high`,
+        # computes from them, and WRITES them back, and two `render()`
+        # calls can be inside it at once -- a phone polling while
+        # somebody runs `curl`, or one retried request -- because the
+        # encoded-bytes cache that would normally make the second call
+        # free is not populated until the first one finishes.
+        #
+        # Measured with the window widened: two threads on one fresh
+        # capture both read the same bounds and one update was silently
+        # lost. The damage is cosmetic -- a slightly wrong brightness on
+        # one frame of a scale that re-converges within about five --
+        # and it never reaches `mean_relative_depth` or decides which
+        # bytes are served under which run. It is still a lost write,
+        # and the argument that made a lock unnecessary everywhere else
+        # simply does not apply here.
+        self._guard = threading.Lock()
 
     def to_uint8(self, depth):
+        if getattr(depth, "size", 0) == 0:
+            # `np.percentile` on an empty array raises `IndexError: index -1
+            # is out of bounds`, which is contained but tells a reader
+            # nothing. The NaN path below was hardened for the same reason
+            # and this is the same failure with a worse message.
+            raise ValueError("depth frame is empty")
         low, high = np.percentile(depth, (self.LOW_PCT, self.HIGH_PCT))
         low = float(low)
         high = float(high)
@@ -285,20 +327,41 @@ class _DepthNormaliser:
             raise ValueError("depth frame has no finite percentiles")
         if high - low < self.EPS:
             high = low + self.EPS
-        if self._low is None or self._high is None:
-            # The first frame of a run has no history to average against,
-            # and seeding the average with a zero would spend the first
-            # second of every run fading up from black.
-            self._low, self._high = low, high
-        else:
-            self._low = (1.0 - self.ALPHA) * self._low + self.ALPHA * low
-            self._high = (1.0 - self.ALPHA) * self._high + self.ALPHA * high
-            if self._high - self._low < self.EPS:
-                # A long run of degenerate frames can collapse the
-                # smoothed span even though no single frame did.
-                self._high = self._low + self.EPS
-        span = self._high - self._low
-        scaled = (np.clip(depth, self._low, self._high) - self._low) / span
+        with self._guard:
+            # Read, fold, write and re-read the span as ONE critical
+            # section. Splitting it is the race: two threads that both
+            # read the old bounds both write a fold of the old bounds,
+            # and one of the two updates is gone.
+            if self._low is None or self._high is None:
+                # The first frame of a run has no history to average
+                # against, and seeding the average with a zero would
+                # spend the first second of every run fading up from
+                # black.
+                self._low, self._high = low, high
+            else:
+                self._low = (1.0 - self.ALPHA) * self._low + self.ALPHA * low
+                self._high = (1.0 - self.ALPHA) * self._high + self.ALPHA * high
+                if self._high - self._low < self.EPS:
+                    # A long run of degenerate frames can collapse the
+                    # smoothed span even though no single frame did.
+                    self._high = self._low + self.EPS
+            low_bound, high_bound = self._low, self._high
+        span = high_bound - low_bound
+        if span <= self.EPS * 2.0:
+            # A frame with no relief at all -- a blank wall at the model's
+            # resolution, a lens cap. The arithmetic below would divide by
+            # the widened epsilon and clip every pixel to the LOW end,
+            # rendering solid black. Black in this colour map means "very
+            # far away", which is a confident statement about a frame that
+            # contains no depth information at all. Mid-grey says nothing,
+            # which is the honest answer.
+            return np.full(depth.shape, 128, np.uint8)
+        # The bounds read out of the critical section above, not
+        # `self._low`/`self._high` again: another thread may have folded
+        # a newer frame in between, and normalising against bounds that
+        # are not the ones this span was computed from is the same bug
+        # from the other end.
+        scaled = (np.clip(depth, low_bound, high_bound) - low_bound) / span
         return (scaled * 255.0).astype(np.uint8)
 
 
@@ -415,6 +478,13 @@ _INK_BGR = (245, 245, 245)
 
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 _CAPTION_SCALE = 0.34
+
+# Below this many pixels of displacement, a flow track is drawn as a dot
+# rather than as an arrow. Half of `optical_flow`'s own
+# `MAX_FORWARD_BACKWARD_PX` tolerance: a track the experiment accepts as
+# good can still have moved by a fraction of a pixel, and there is no
+# direction in a fraction of a pixel worth drawing an arrow for.
+_FLOW_MIN_DRAWN_PX = 0.5
 
 
 def _canvas(scene):
@@ -604,11 +674,19 @@ def _encode_detections(payload, *, policy: PreviewPolicy):
         )
 
     below = len(scores) - accepted
-    _caption(
-        canvas,
+    # `payload.accepted_total`, not a `getattr` with a fallback:
+    # `DetectionPreview` requires the field, so a payload without one is a
+    # TypeError at construction rather than a caption that quietly lies.
+    total = payload.accepted_total
+    shown = (
         f"{accepted} over {payload.threshold:.2f}"
-        + (f"  (+{below} below, faded)" if below else ""),
+        if total <= accepted
+        # The case that matters: say what was left out, in the picture, so
+        # it cannot silently disagree with the `detections` metric beside
+        # it.
+        else f"{accepted} of {total} over {payload.threshold:.2f} drawn"
     )
+    _caption(canvas, shown + (f"  (+{below} below, faded)" if below else ""))
     return _encode_canvas(canvas, policy)
 
 
@@ -656,7 +734,17 @@ def _encode_flow(payload, *, policy: PreviewPolicy):
         magnitude = float(np.hypot(displacement[0], displacement[1]))
         angle = float(np.arctan2(displacement[1], displacement[0])) + np.pi
         colour = tuple(int(c) for c in _FLOW_HUES[int(angle * 90.0 / np.pi) % 180])
-        if magnitude < 1e-6:
+        if magnitude < _FLOW_MIN_DRAWN_PX:
+            # A dot, not a floored arrow, and the threshold is not zero.
+            #
+            # Lucas-Kanade on a still camera returns sub-pixel jitter --
+            # measured around 0.02 to 0.3 px, well inside the 1.0 px
+            # forward-backward tolerance that already calls those tracks
+            # good -- with random directions. Floored to a five-pixel
+            # minimum those become a dense field of confident, colourful,
+            # contradictory arrows, which reads as a scene full of
+            # independent motion. The caption said "median 0.1px" and
+            # nobody was reading the caption.
             cv2.circle(canvas, (int(origin[0]), int(origin[1])), 1, colour, -1)
             continue
         drawn = float(min(max(magnitude, 5.0), 14.0))
@@ -763,7 +851,7 @@ def _encode_frame_quality(payload, *, policy: PreviewPolicy):
     cv2.rectangle(canvas, (0, top), (width, height), (16, 16, 16), -1)
     if peak > 0:
         for x in range(width):
-            level = int(x * 255 / max(width - 1, 1))
+            level = int(round(x * 255 / max(width - 1, 1)))
             bar = int(histogram[level] / peak * (strip_height - 3))
             if bar > 0:
                 cv2.line(canvas, (x, height - 1), (x, height - 1 - bar), (150, 150, 150), 1)
@@ -771,7 +859,11 @@ def _encode_frame_quality(payload, *, policy: PreviewPolicy):
         (payload.underexposed_level, _BOUNDARY_BGR),
         (payload.overexposed_level, _REJECTED_BGR),
     ):
-        x = int(level * (width - 1) / 255)
+        # `round`, matching the bar loop above. Two independent
+        # truncations put a marker up to a pixel off its own bar, which is
+        # imperceptible and is also the kind of thing somebody eventually
+        # spends an hour on.
+        x = int(round(level * (width - 1) / 255))
         cv2.line(canvas, (x, top), (x, height), colour, 1)
     cv2.line(canvas, (0, top), (width, top), (60, 60, 60), 1)
 
@@ -930,11 +1022,32 @@ class LivePreview:
         self._skipped_by_throttle = 0
         self._empty_takes = 0
         self._replaced_unread = 0
+        # NOT one of those, despite sitting with them. This one is
+        # written by `render()` on a WORKER thread and read by
+        # `capture()` on the loop, which is the reverse direction from
+        # every counter above it. A single int store is still atomic, so
+        # nothing tears -- but a `begin()` landing between a render's
+        # epoch check and its write here can leave a value from a run
+        # that `begin()` had just reset, which makes `replaced_unread`
+        # off by one for one frame. Tolerated, named, and confined to a
+        # diagnostic: no client ever sees a picture because of it.
         self._last_rendered_seq = -1
 
-        # Written by whichever worker thread is serving, read by the
-        # status document from another. Small enough to lock, and off the
-        # frame path entirely.
+        # Written by whichever worker thread is serving, and read when
+        # the status document is built -- which happens BOTH on a worker
+        # thread (the result channel's poller) and on the event loop (a
+        # `cv_lab_status` reply). So the loop can briefly wait on this.
+        #
+        # Held only for counter arithmetic: five scalar stores and two
+        # `Running.add`. NEVER around an encode, never around anything
+        # that touches a device or a file. The wait is microseconds, and
+        # the alternative -- unguarded reads of a `Running` mid-update --
+        # would publish a mean computed from a total and a count that do
+        # not belong to each other.
+        #
+        # The FRAME PATH never touches it, and that is the part that
+        # matters: a lock on the measured path to make a diagnostic one
+        # frame fresher would be paying in the wrong currency.
         self._stats_guard = threading.Lock()
         self._encoded = 0
         self._encode_failures = 0

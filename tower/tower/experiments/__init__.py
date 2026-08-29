@@ -292,6 +292,16 @@ def scene_structure(gray, max_edge_px: int = PREVIEW_STRUCTURE_MAX_EDGE_PX):
     Returns a uint8 array of {0, 255} at preview scale. Callers hold this
     and never the frame it came from, which is what lets the module go on
     declaring `retains_raw_imagery=False`.
+
+    **This is new work, and for five of the seven visual experiments it
+    is the whole of what a preview costs on the frame path.**
+    `edge_detection` and `depth` never call it -- they hand over an array
+    they had already built for their own metric, for free. ORB, SSD and
+    Lucas-Kanade produce no edge map at all, so four of the remaining
+    five have nothing to reuse. `frame_quality` does have one, at
+    100/200 and at full resolution, and re-derives anyway; the reasoning
+    is at its call site and it is about what the picture looks like, not
+    about the half-millisecond.
     """
     height, width = gray.shape[:2]
     longest = max(height, width)
@@ -367,6 +377,18 @@ class DetectionPreview:
     # that is a person" needs to see the near-misses, and a viewer that
     # silently hid them would be answering a different question.
     threshold: float
+    # How many the detector actually produced, before the picture kept the
+    # highest-scoring `PREVIEW_MAX_BOXES` of them.
+    #
+    # Here because the caption without them is a lie in exactly the case
+    # this view exists for. Physical testing produced 160 `person`
+    # detections in one scene; a picture drawing 24 of them and captioning
+    # itself "24 over 0.40" contradicts the `detections: 160` sitting
+    # beside it, and does so most confidently when the number is most
+    # surprising. `feature_detection` already reports "995 keypoints (54
+    # drawn)" for the same reason.
+    accepted_total: int
+    raw_total: int
 
 
 @dataclass(frozen=True)

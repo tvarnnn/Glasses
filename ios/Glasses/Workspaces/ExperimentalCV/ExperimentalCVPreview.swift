@@ -31,7 +31,9 @@ import UIKit
 /// - every request asks for `.reloadIgnoringLocalAndRemoteCacheData`, because
 ///   the first point is a default somebody outside this file can change;
 /// - `stop()` drops the image, and the view calls it `.onDisappear`, on pause,
-///   on stop, and when the run changes;
+///   on stop, when the run changes, and **when the app leaves the foreground**
+///   — iOS captures an app-switcher snapshot on the way out, and a snapshot is
+///   a copy on disk that nobody chose and no retention governs;
 /// - exactly one `UIImage` is held at a time, replaced rather than appended to.
 ///
 /// The Tower's half is `Cache-Control: no-store`, nothing written to disk, and
@@ -587,11 +589,16 @@ struct CVLivePreviewPanel: View {
     let experimentName: String
 
     @StateObject private var loader = CVLivePreviewLoader()
+    /// Watched so the picture goes away before iOS takes its app-switcher
+    /// snapshot. `.onDisappear` does not fire on backgrounding, so without
+    /// this the one moment a derived view of the wearer's room reaches
+    /// persistent storage is the moment they swipe up.
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
-            frame
+            previewFrame
             caption
         }
         .padding(16)
@@ -604,11 +611,17 @@ struct CVLivePreviewPanel: View {
         // are the only two things that should ever restart it.
         .onChange(of: runID) { _, _ in synchronise() }
         .onChange(of: isRunning) { _, _ in synchronise() }
+        // `.inactive` as well as `.background`: the snapshot is taken during
+        // the inactive phase, on the way out, so waiting for `.background`
+        // would be waiting until after the picture had already been copied.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { synchronise() } else { loader.stop() }
+        }
         .onDisappear { loader.stop() }
     }
 
     private func synchronise() {
-        if isRunning {
+        if isRunning, scenePhase == .active {
             loader.start(preview, runID: runID)
         } else {
             loader.stop()
@@ -619,14 +632,29 @@ struct CVLivePreviewPanel: View {
         HStack(spacing: 8) {
             SectionLabel("Live view")
             Spacer()
-            if case .showing = loader.phase {
+            // Gated on freshness, not merely on there being a picture. A frame
+            // 1.9 s old is still `.showing` -- the Tower serves up to 2 s --
+            // and a LIVE badge over a caption reading "1.9s behind" is the
+            // screen contradicting itself.
+            if case .showing(let shown) = loader.phase, isFresh(shown) {
                 CVTag(text: "LIVE")
             }
         }
     }
 
+    /// The one threshold on this screen, in one place. 0.35 s is about three
+    /// preview intervals at the rate the Tower suggests: long enough not to
+    /// flicker on a single missed poll, short enough that a stopped stream
+    /// stops claiming to be live within half a second.
+    private static let freshSeconds = 0.35
+
+    private func isFresh(_ shown: CVPreviewFrame) -> Bool {
+        guard let age = shown.ageSeconds else { return true }
+        return age < Self.freshSeconds
+    }
+
     @ViewBuilder
-    private var frame: some View {
+    private var previewFrame: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(Color(.tertiarySystemFill))
@@ -685,7 +713,10 @@ struct CVLivePreviewPanel: View {
             if case .showing(let shown) = loader.phase, let age = shown.ageSeconds {
                 // How old, rather than implying now. A picture is a statement
                 // about a moment and the moment has a timestamp.
-                Text(age < 0.35 ? "Live" : String(format: "%.1fs behind", age))
+                Text(
+                    age < Self.freshSeconds
+                        ? "Live" : String(format: "%.1fs behind", age)
+                )
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .monospacedDigit()

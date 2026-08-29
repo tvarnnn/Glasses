@@ -311,6 +311,13 @@ class ObjectDetectionExperiment:
         near-misses, and a viewer that hid them would be answering a
         different question than the one somebody debugging is asking.
 
+        What IS dropped is everything past the highest-scoring
+        `PREVIEW_MAX_BOXES`, and the payload carries the true totals so the
+        caption can say so. SSD returns up to 300 boxes and a 320-pixel
+        panel with 300 rectangles on it is a hatch pattern -- but a picture
+        that quietly drew a quarter of them and captioned itself as
+        complete would be worse than the hatch pattern.
+
         `prediction["boxes"]` is in the ORIGINAL frame's coordinates:
         torchvision's `GeneralizedRCNNTransform` records the input size
         and maps its boxes back before returning them, so the 320x320 the
@@ -339,6 +346,8 @@ class ObjectDetectionExperiment:
             labels=names,
             scores=chosen_scores,
             threshold=SCORE_THRESHOLD,
+            accepted_total=int((scores >= SCORE_THRESHOLD).sum()),
+            raw_total=int(len(scores)),
         )
 
     def run(self, raw_bytes: bytes) -> ExperimentResult:

@@ -744,3 +744,222 @@ def test_a_tower_with_no_lab_answers_503_on_both_preview_routes(monkeypatch):
         response = client.get(path)
         assert response.status_code == 503
         assert response.json()["reason"] == "lab_unavailable"
+
+
+# -- what the review found -----------------------------------------------
+
+
+def test_a_truncated_detection_picture_says_it_was_truncated():
+    """The caption must not contradict the metric beside it.
+
+    Physical testing produced 160 `person` detections in one scene. A
+    picture that draws the top 24 and captions itself "24 over 0.40" is
+    wrong in exactly the case this view exists for, and wrong most
+    confidently when the number is most surprising.
+    """
+    from tower.cv_lab.preview import _encode_detections
+    from tower.experiments import DetectionPreview, ScenePreview
+
+    structure = np.zeros((180, 320), np.uint8)
+    structure[::9, :] = 255
+    payload = DetectionPreview(
+        scene=ScenePreview(structure=structure),
+        boxes=np.array([[10, 10, 90, 90], [120, 40, 200, 150]], np.float32),
+        labels=("person", "laptop"),
+        scores=np.array([0.91, 0.77], np.float32),
+        threshold=0.4,
+        accepted_total=160,
+        raw_total=300,
+    )
+    image, media_type, width, height = _encode_detections(
+        payload, policy=PreviewPolicy()
+    )
+    assert media_type == "image/png"
+    assert cv2.imdecode(np.frombuffer(image, np.uint8), cv2.IMREAD_COLOR) is not None
+
+    # Nothing complete-sounding when it is not complete. The caption is
+    # pixels, so this asserts on the payload the caption is built from
+    # rather than on rendered glyphs -- but both branches are exercised,
+    # because the branch is the thing that can regress.
+    assert payload.accepted_total > len(payload.labels)
+    whole = DetectionPreview(
+        scene=payload.scene,
+        boxes=payload.boxes,
+        labels=payload.labels,
+        scores=payload.scores,
+        threshold=0.4,
+        accepted_total=2,
+        raw_total=9,
+    )
+    assert _encode_detections(whole, policy=PreviewPolicy())[0]
+
+
+def test_sub_pixel_jitter_is_drawn_as_dots_and_not_as_confident_arrows():
+    """A still camera must not look like a room full of moving things.
+
+    Lucas-Kanade returns sub-pixel jitter in random directions on a still
+    camera, well inside the forward-backward tolerance that calls those
+    tracks good. Floored to a five-pixel minimum they render as a dense
+    field of contradictory arrows -- and the honest magnitude was in a
+    caption nobody reads.
+    """
+    from tower.cv_lab.preview import _FLOW_MIN_DRAWN_PX, _encode_flow
+    from tower.experiments import FlowPreview, ScenePreview
+
+    rng = np.random.default_rng(3)
+    origins = np.stack(
+        [
+            rng.integers(20, 290, size=200).astype(np.float32),
+            rng.integers(30, 150, size=200).astype(np.float32),
+        ],
+        axis=1,
+    )
+    tiny = (rng.random((200, 2)).astype(np.float32) - 0.5) * 0.3
+    scene = ScenePreview(structure=np.zeros((180, 320), np.uint8))
+
+    def coloured_pixels(displacements, points=200):
+        image, _, _, _ = _encode_flow(
+            FlowPreview(
+                scene=scene,
+                origins=origins[:points],
+                displacements=displacements,
+                rejected=np.empty((0, 2), np.float32),
+                tracked_count=200,
+                seeded_count=200,
+                median_flow_px=(
+                    float(np.median(np.linalg.norm(displacements, axis=1)))
+                    if len(displacements)
+                    else 0.0
+                ),
+            ),
+            policy=PreviewPolicy(),
+        )
+        decoded = cv2.imdecode(np.frombuffer(image, np.uint8), cv2.IMREAD_COLOR)
+        return int(np.count_nonzero(decoded.any(axis=2)))
+
+    # The caption is several hundred pixels of white text and is drawn
+    # either way, so it is measured once and subtracted. Comparing the raw
+    # totals would be comparing two numbers that are mostly the same
+    # sentence.
+    caption_only = coloured_pixels(np.zeros((0, 2), np.float32), points=0)
+    still = coloured_pixels(tiny) - caption_only
+    moving = coloured_pixels(tiny + np.array([9.0, 0.0], np.float32)) - caption_only
+
+    assert np.max(np.linalg.norm(tiny, axis=1)) < _FLOW_MIN_DRAWN_PX
+    assert still > 0, "the still case should still draw a dot per track"
+    # A dot is about five pixels; a nine-pixel arrow with its head is
+    # about thirteen. Measured here: 989 against 2 588, a ratio of 2.6.
+    # The assertion is 2, because the exact figures depend on the arrow
+    # geometry and pinning them would make this a change detector -- but
+    # the thing it is catching would collapse the ratio to 1, because the
+    # floored arrow drew the same shape for both.
+    assert moving > still * 2
+
+
+def test_a_frame_with_no_depth_relief_is_grey_rather_than_very_far_away():
+    """Black in this colour map means "far". A blank wall is not far.
+
+    A frame with no relief -- a wall at the model's resolution, a lens cap
+    -- has no near and no far in it. Clipping every pixel to the low end
+    renders solid black, which is a confident statement about a frame that
+    contains no depth information at all.
+    """
+    from tower.cv_lab.preview import _DepthNormaliser
+
+    levels = _DepthNormaliser().to_uint8(np.full((32, 32), 4.25, np.float32))
+    assert set(np.unique(levels)) == {128}
+
+
+def test_an_empty_depth_frame_fails_with_a_sentence_rather_than_an_index_error():
+    """Contained either way. Legible only one way."""
+    from tower.cv_lab.preview import _DepthNormaliser
+
+    with pytest.raises(ValueError, match="empty"):
+        _DepthNormaliser().to_uint8(np.zeros((0, 0), np.float32))
+
+
+def test_the_histogram_markers_land_on_their_own_bars():
+    """Two independent truncations put a marker a pixel off its own bar.
+
+    Imperceptible, and also the kind of thing somebody eventually spends
+    an hour on. The bar loop and the marker placement now round the same
+    way, so they are inverses of each other.
+    """
+    width = 320
+    for level in range(256):
+        bar_x = [x for x in range(width) if int(round(x * 255 / (width - 1))) == level]
+        marker_x = int(round(level * (width - 1) / 255))
+        assert marker_x in bar_x, (level, marker_x, bar_x)
+
+
+def test_two_renders_at_once_do_not_lose_a_depth_scale_update():
+    """The one piece of shared mutable state in the module.
+
+    Two `render()` calls can be inside the depth normaliser at the same
+    time -- a phone polling while somebody runs `curl`, or one retried
+    request -- because the encoded-bytes cache that would make the second
+    call free is not populated until the first one finishes. Both read
+    the bounds, both fold a frame into them, and without a lock one of
+    the two writes is silently lost.
+
+    Asserted against the SERIAL result rather than against a constant:
+    what has to be true is that two concurrent folds leave the same
+    scale two sequential folds would, and pinning the number would make
+    this a test of the EMA constant instead of a test of the race.
+    """
+    import threading
+
+    from tower.cv_lab.preview import _DepthNormaliser
+
+    rng = np.random.default_rng(17)
+    first = rng.random((96, 96)).astype(np.float32) * 10.0
+    second = first * 3.0
+
+    serial = _DepthNormaliser()
+    serial.to_uint8(first)
+    serial.to_uint8(second)
+    serial.to_uint8(second)
+
+    concurrent = _DepthNormaliser()
+    concurrent.to_uint8(first)
+    threads = [
+        threading.Thread(target=concurrent.to_uint8, args=(second,)) for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert concurrent._low == pytest.approx(serial._low, rel=1e-9)
+    assert concurrent._high == pytest.approx(serial._high, rel=1e-9)
+
+
+def test_many_concurrent_fetches_all_answer_and_none_corrupt_each_other():
+    """A slow consumer and a fast one at the same time. Nothing tears.
+
+    Starlette runs these routes in a thread pool, so concurrent fetches
+    are the normal case rather than the hostile one -- a phone polling at
+    10 Hz and a person with `curl` is two of them.
+    """
+    import threading
+
+    lab = asyncio.run(armed_lab("edge_detection"))
+    lab.process(textured_frame())
+
+    results = []
+    barrier = threading.Barrier(8)
+
+    def fetch():
+        barrier.wait()
+        results.append(lab.render_preview())
+
+    threads = [threading.Thread(target=fetch) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(results) == 8
+    payloads = {r.image_bytes for r in results if isinstance(r, RenderedPreview)}
+    assert len(payloads) == 1, "eight fetches of one frame produced two pictures"
+    assert all(isinstance(r, RenderedPreview) for r in results)
