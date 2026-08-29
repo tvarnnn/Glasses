@@ -172,12 +172,36 @@ struct ObjectMemoryWorkspaceView: View {
             memory.startWatchingSession()
             // Set here rather than in `init` so the coordinator never holds a
             // reference to a view model built for a render that was discarded.
-            // Re-asking the reader's *own* question rather than asking for
-            // everything: a Stop must not silently widen a category they
-            // narrowed to.
-            recording.refreshRecords = { memory.askForEverything() }
+            //
+            // `askAgain()` and not `askForEverything()`. The comment here used
+            // to say it re-asked the reader's own question while the call
+            // asked for a listing, so a reader who had narrowed with
+            // `askWhenLastInView()` pressed Stop and silently got a different
+            // question's answer back. The behaviour was changed to match the
+            // comment rather than the other way round, because the comment was
+            // stating the rule `ObjectMemoryRecordingCoordinator.refreshRecords`
+            // exists to keep: the coordinator owns no question, the view does,
+            // and a Stop must not widen one.
+            recording.refreshRecords = { memory.askAgain() }
         }
-        .onDisappear { memory.stopWatchingSession() }
+        .onDisappear {
+            memory.stopWatchingSession()
+            // **The coordinator outlives this view.** It is built once on
+            // `ProjectManager` (see `recording` above) precisely so that a
+            // cartridge switch cannot lose the fact that this app started a
+            // capture — which means a closure left on it also survives the
+            // switch, holding the `@StateObject` view model of a screen that is
+            // gone. Every later Stop would then re-ask a question for a view
+            // nobody is looking at, and the view model would stay alive to
+            // answer it.
+            //
+            // Cleared here rather than made weak: the closure is a *decision*
+            // this view makes, and a view that is no longer on screen has no
+            // decision to contribute. `refreshRecords?()` is optional-chained
+            // on the coordinator, so `nil` is an ordinary, supported state and
+            // a Stop with no view attached simply refreshes nothing.
+            recording.refreshRecords = nil
+        }
     }
 
     // MARK: Header
@@ -668,34 +692,76 @@ struct ObjectMemorySessionPanel: View {
     /// no-op, `stop` is never refused, and disabling a control on this app's
     /// guess about what the Tower will accept would make this app's model of
     /// the state machine authoritative over the Tower's.
+    ///
+    /// ## The two verbs that are not drawn here, and why that is not the same
+    ///
+    /// `ObjectMemoryRecordingPanel.primaryControl`, immediately above this
+    /// panel, already renders one of `start` / `stop` prominently. Drawing the
+    /// whole vocabulary here put a **second prominent Start** and a **second
+    /// Stop** — labelled differently, because the composed one names the camera
+    /// and this one does not — under the first. Four primary-looking controls,
+    /// two of them the same verb twice, on the screen whose whole job is to say
+    /// plainly whether somebody is being recorded.
+    ///
+    /// The paragraph above argues against *disabling* a control on a guess, and
+    /// it still stands: this is not that. Nothing here is hidden because this
+    /// app thinks the Tower would refuse it — the Tower's answer is unchanged,
+    /// the verbs are still read off `actions`, `unofferedActions` still names
+    /// anything this build has no button for, and both verbs are still one tap
+    /// away in the control above. **Not drawing a second copy of a control that
+    /// is already on screen removes a duplicate, not a capability.**
+    ///
+    /// So the filter is on the *primary control's* vocabulary rather than on a
+    /// hard-coded pair: whatever the Tower offers that the composed control
+    /// does not already carry is drawn, which today is Pause and Resume and
+    /// tomorrow is a fifth verb nobody has written yet.
     private func controls(_ snapshot: CartridgeSessionSnapshot) -> some View {
-        HStack(spacing: 10) {
-            ForEach(snapshot.offeredActions, id: \.rawValue) { action in
-                // Written out rather than picked with a ternary: `buttonStyle`
-                // is generic over its argument, so the two concrete styles have
-                // no common type to choose between without erasing one, and an
-                // erasing wrapper here would be more machinery than the branch
-                // it replaces.
-                if action == .start {
-                    Button(ObjectMemoryCopy.actionButton(action)) {
-                        recording.apply(action)
-                    }
-                    .buttonStyle(.borderedProminent)
-                } else {
+        let secondary = snapshot.offeredActions.filter { !Self.primaryVerbs.contains($0) }
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                ForEach(secondary, id: \.rawValue) { action in
+                    // Every verb left after the filter is a secondary one, so
+                    // there is no longer a style to choose between — the
+                    // written-out `if action == .start` branch that used to
+                    // live here existed only because `buttonStyle` is generic
+                    // over its argument and the two concrete styles have no
+                    // common type. Keeping `.bordered` uniform is what makes
+                    // the control above unambiguously the primary one.
                     Button(ObjectMemoryCopy.actionButton(action)) {
                         recording.apply(action)
                     }
                     .buttonStyle(.bordered)
                 }
             }
+            // Unconditional, including when the filter left nothing to draw:
+            // an empty control row under a "Session" heading reads as a
+            // surface that failed to render, and this sentence is what says
+            // where the missing verbs went.
+            caption(ObjectMemoryCopy.sessionPrimaryVerbsLiveAbove)
         }
-        // `isActing` is a **local** fact — a sequence this screen started has
-        // not finished — and not a guess about what the Tower would accept, so
+        // `isActing` is a **local** fact — a mutating step this screen started
+        // is in flight — and not a guess about what the Tower would accept, so
         // gating on it does not make this app's model authoritative over the
         // Tower's. It is what stops a double tap starting two overlapping
         // sequences that would race over who owns the camera.
+        //
+        // It covers the `POST` and the camera call **only**. It used to cover a
+        // Start's whole sequence, including a convergence poll that runs to
+        // twelve seconds — so this row and the primary control above were both
+        // dead for twelve seconds after every Start, over a live session and a
+        // camera this screen had just turned on. See
+        // `ObjectMemoryRecordingCoordinator.isActing`.
         .disabled(!snapshot.supported || recording.isActing)
     }
+
+    /// The verbs the composed control above already carries, and which this
+    /// panel therefore does not draw a second copy of.
+    ///
+    /// A constant rather than an inline pair so that the filter and
+    /// `ObjectMemoryRecordingCoordinator.primaryAction` — which returns exactly
+    /// these two — cannot drift into a state where a verb is drawn twice or
+    /// not at all.
+    private static let primaryVerbs: Set<CartridgeSessionAction> = [.start, .stop]
 
     private func caption(_ text: String) -> some View {
         Text(text)
@@ -732,8 +798,16 @@ struct ObjectMemorySessionPanel: View {
 /// `start` from `active` is a legal idempotent no-op, `stop` is never refused,
 /// and disabling on a guess would make this app's model of the state machine
 /// authoritative over the Tower's. The two things it *is* disabled on are a
-/// Tower that has no producer at all, and a sequence this screen has already
-/// started — both local facts.
+/// Tower that has no producer at all, and a **mutating step** this screen has
+/// already started — both local facts, and the second one deliberately narrower
+/// than "a sequence", which is what it used to be. See `primaryControl`.
+///
+/// ## This panel's control is the primary one, and the only one
+///
+/// `ObjectMemorySessionPanel` below it draws the Tower's vocabulary and used to
+/// draw all of it, including a second prominent Start and a second Stop. It now
+/// draws everything except the verbs this control already carries, and says so
+/// in a sentence. See `ObjectMemorySessionPanel.controls`.
 ///
 /// ## This view writes no prose either
 ///
@@ -783,6 +857,21 @@ struct ObjectMemoryRecordingPanel: View {
         .fixedSize(horizontal: false, vertical: true)
     }
 
+    /// **The one control on this screen that must never be unreachable while a
+    /// capture is running.**
+    ///
+    /// The two things it is disabled on are both local facts: a Tower that has
+    /// no producer at all, and a *mutating* step this screen started that has
+    /// not returned.
+    ///
+    /// That second one used to be the whole sequence. A Start's sequence ends
+    /// with `converge()`, which runs to twelve seconds, so this button — the
+    /// Stop button, for those twelve seconds — was disabled over a Tower
+    /// session that was open and a glasses camera this very screen had just
+    /// started. A wearer who changed their mind could only leave the screen.
+    /// The gate now covers the `POST` and the camera call and nothing else, and
+    /// a Stop that lands during convergence cancels the poll and runs. See
+    /// `ObjectMemoryRecordingCoordinator.isActing` and `perform`.
     private func primaryControl(_ reading: ObjectMemoryRecordingReading) -> some View {
         let action = recording.primaryAction
         return Button(ObjectMemoryCopy.recordingPrimaryButton(action)) {
@@ -911,19 +1000,39 @@ struct ObjectMemoryPictureView: View {
             }
             caption(ObjectMemoryCopy.filterLine(description))
             caption(ObjectMemoryCopy.regionsFilledLine(description))
-            caption(ObjectMemoryCopy.pictureRetentionLine)
+            // Per source, because a picture this memory owns and a render out
+            // of the capture store now have opposite lifetimes. See
+            // `ObjectMemoryCopy.pictureRetentionLine`.
+            caption(ObjectMemoryCopy.pictureRetentionLine(description))
 
             // The other route, so a person who wants the context or the detail
             // can have it. Both come with the same caption.
-            Button(
-                loader.kind == .crop
-                    ? ObjectMemoryCopy.showTheWholeFrameButton
-                    : ObjectMemoryCopy.showTheDetectionButton
-            ) {
-                loader.show(loader.kind == .crop ? .frame : .crop)
+            //
+            // **Except when the Tower has said the context view is gone.**
+            // `/crop` can now be served from a keyframe this memory owns, which
+            // outlives the recording behind it, while `/frame` still comes from
+            // that recording and honestly 410s once it has been deleted. A
+            // "Show the whole frame" control in that state sends a tap to a
+            // route that will refuse, and the wearer reads "the memory is kept
+            // and the picture is gone" over a picture that is on their screen.
+            //
+            // Only an explicit `frame_available: false` closes it —
+            // `frameCanBeAskedFor` treats an absent or null field as unknown
+            // and keeps the control, because an older Tower has not said the
+            // frame is missing and this app must not decide that for it.
+            if loader.kind == .crop && !description.frameCanBeAskedFor {
+                caption(ObjectMemoryCopy.wholeFrameIsGoneLine)
+            } else {
+                Button(
+                    loader.kind == .crop
+                        ? ObjectMemoryCopy.showTheWholeFrameButton
+                        : ObjectMemoryCopy.showTheDetectionButton
+                ) {
+                    loader.show(loader.kind == .crop ? .frame : .crop)
+                }
+                .font(.caption)
+                .buttonStyle(.bordered)
             }
-            .font(.caption)
-            .buttonStyle(.bordered)
         }
     }
 

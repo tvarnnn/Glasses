@@ -290,12 +290,35 @@ nonisolated struct CartridgeSessionSnapshot: Equatable, Sendable {
     /// that exists rather than towards silence about one that does.
     var isFollowingACapture: Bool { !(followingThisSession ?? following).isEmpty }
 
-    /// Producers alive for this cartridge that this session did **not** start.
+    /// Recordings being written into that **the control on this screen did not
+    /// start**.
     ///
-    /// Empty on every ordinary reading. Non-empty means a Stop or a Pause did
-    /// not reach a producer and it is still recording — which is a sentence a
-    /// wearer needs, and is not the same sentence as "you are remembering".
-    var producersThisSessionDidNotStart: [String] {
+    /// Empty on every ordinary reading. Non-empty means a producer is writing
+    /// that a Stop from here does not reach — which is a sentence a wearer
+    /// needs, and is not the same sentence as "you are remembering".
+    ///
+    /// ## Named for what it knows, which is narrower than session ownership
+    ///
+    /// It was `producersThisSessionDidNotStart`, and that name was a claim the
+    /// field cannot support. The Tower scopes `following_this_session` by
+    /// *started at or after this session last went active*, and **re-takes that
+    /// mark on every Resume** — so a producer that survived a Pause is this
+    /// session's, from before the pause, and is still correctly outside the
+    /// scoped list. Calling it "this session did not start it" would be false
+    /// in exactly the case a wearer is most likely to hit.
+    ///
+    /// Renamed to match `ObjectMemoryCopy.leftoverProducerLine`, which is
+    /// worded from the same narrower fact, so the property name and the
+    /// sentence cannot drift apart again.
+    ///
+    /// **`nil` is not `[]`.** The three-valued field is the whole point:
+    /// a list scopes, `[]` is a positive claim that nothing this control
+    /// started is running, and `nil` (or an omitted key) means the Tower cannot
+    /// scope the question. The `guard` returns `[]` for `nil` because *nothing
+    /// can be called unreached when nothing is scoped* — an unscoped Tower must
+    /// draw no warning at all, rather than a warning about every capture it is
+    /// following.
+    var recordingsThisControlDidNotStart: [String] {
         guard let mine = followingThisSession else { return [] }
         return following.filter { !mine.contains($0) }
     }

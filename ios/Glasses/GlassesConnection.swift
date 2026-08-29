@@ -140,15 +140,29 @@ enum CaptureResolutionPreference: String, CaseIterable, Identifiable, Sendable {
 /// `guard deviceSession == nil` and does nothing observable at all: a silent
 /// no-op offered as the primary action.
 ///
-/// `.devicePaused` is not a state this app can leave. It is documented in
-/// `docs/05-DAT-INTEGRATION.md` §104-107 and `07-PLATFORM-CONSTRAINTS.md` §146
-/// as device-initiated — a temple or cap-touch press, or a thermal pause — and
-/// it **keeps the connection alive, stops delivery, and resumes to `.started`
-/// on its own**. `GlassesConnection` calls exactly four things on DAT for
-/// capture — `session.start()`, `session.stop()`, `stream.start()` and
-/// `camera.stop()` — and **none of them resumes a paused device**. There is no
-/// override to write, so nothing in this app offers one; a screen that finds
-/// `.devicePaused` says what it is and waits.
+/// `.devicePaused` is not a state **this app** can leave, and the difference
+/// between that and "the SDK has no such call" is one this comment used to
+/// blur. Two separate facts, kept separate on purpose:
+///
+/// 1. **What is documented.** `docs/05-DAT-INTEGRATION.md` §104-107 and
+///    `07-PLATFORM-CONSTRAINTS.md` §146 record the pause as *device-initiated*
+///    — a temple or cap-touch press, or a thermal pause — and as **keeping the
+///    connection alive, stopping delivery, and resuming to `.started` on its
+///    own**. That is the device's behaviour, from the vendor's own docs.
+///
+/// 2. **What this app calls.** `GlassesConnection` calls exactly four things on
+///    DAT for capture — `session.start()`, `session.stop()`, `stream.start()`
+///    and `camera.stop()` — and none of them resumes a paused device.
+///
+/// Together those support exactly one claim: **this app has no resume to
+/// offer**, which is what every screen here is written from. They do not
+/// support "DAT exposes none". The previous wording — "there is no override to
+/// write" — argued that from the list of calls this app happens to make, and a
+/// list of one's own calls proves nothing about somebody else's SDK. If a
+/// resume is ever found in DAT, what changes is this comment and the four calls
+/// above; the documented device behaviour and the sentences on screen today
+/// stay as they are. Until then a screen that finds `.devicePaused` says what
+/// it is and waits.
 ///
 /// Deliberately not an `Optional<Bool>` or a pair of flags: a caller that has
 /// to spell `.devicePaused` cannot fall into the `default` clause that
@@ -180,12 +194,39 @@ nonisolated enum CaptureClaim: Equatable, Sendable {
 ///
 /// The console logging is unchanged and still happens. This is carried
 /// alongside it, in `GlassesConnection.lastCaptureStartRefusal`.
+///
+/// ## Two of these are also written by a caller, not only by this file
+///
+/// `startCameraSession()` is not the only producer of these values.
+/// `ObjectMemoryRecordingCoordinator` reads `captureClaim` *before* it calls,
+/// and for two claims it can answer the question without calling at all —
+/// `.devicePaused` and `.ending`. That is deliberate: calling into a refusal
+/// and then translating the refusal back is a round trip that can only lose
+/// information, and for `.ending` it loses the one thing a person needs (see
+/// `captureIsShuttingDown`). So a case here means "why a capture did not
+/// start", **not** "what `startCameraSession()` returned".
 nonisolated enum CaptureStartRefusal: Equatable, Sendable {
     /// A device session already exists. Home or World Builder started one.
     case alreadyRunning
     /// A session exists and the **device** paused it. See `CaptureClaim`:
     /// there is no way to override this and none is offered.
     case deviceHasPausedCapture
+    /// A capture is being torn down, and a new one cannot be created until the
+    /// teardown finishes.
+    ///
+    /// **`startCameraSession()` never returns this**, and that is the reason
+    /// the case exists. Its `guard deviceSession == nil` reports
+    /// `.alreadyRunning` in this window, which is true of the `DeviceSession`
+    /// object and false of the situation a person is in: nobody owns a capture
+    /// that is dying, and "a capture was already under way, so this screen left
+    /// it alone" sends a wearer to look for a stream that is on its way out.
+    ///
+    /// A caller that reads `CaptureClaim.ending` before it calls can tell the
+    /// two apart, which is why this is synthesised there rather than returned
+    /// from here. `ObjectMemoryRecordingCoordinator` used to fold `.ending` in
+    /// with `.running` and record "somebody else owns it" — the wearer got no
+    /// camera, no refusal, and a Start that reported nothing at all.
+    case captureIsShuttingDown
     /// `AutoDeviceSelector` has not yielded an eligible device yet.
     case noActiveDevice
     /// The session started and the stream could not, because camera permission

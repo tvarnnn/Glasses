@@ -46,10 +46,23 @@ import Foundation
 ///
 /// Five members, all of which already existed or were added for this: there is
 /// no camera behaviour here that `GlassesConnection` does not already own, and
-/// there is deliberately no `pause`. **DAT exposes no way to pause a stream**
-/// — `GlassesConnection` only ever calls `session.start()`, `session.stop()`,
-/// `stream.start()` and `camera.stop()` — so a `pauseCapture()` on this
-/// protocol would be a method with nothing truthful to call.
+/// there is deliberately no `pause`.
+///
+/// **This app has no way to pause a stream.** `GlassesConnection` calls exactly
+/// four things on DAT for capture — `session.start()`, `session.stop()`,
+/// `stream.start()` and `camera.stop()` — and none of them pauses one, so a
+/// `pauseCapture()` here would be a method with nothing to call. That is a fact
+/// about this app's code, and it is the only fact needed: this protocol can
+/// only expose what `GlassesConnection` already owns.
+///
+/// It is **not** a claim that DAT exposes no pause, which an earlier version of
+/// this comment made and could not support — the evidence offered was the list
+/// of calls this app happens to make. What is separately documented, in
+/// `docs/05-DAT-INTEGRATION.md` §104-107, is the pause that does exist: a
+/// *device-initiated* one, from a temple or cap-touch press or heat, which
+/// stops delivery, keeps the connection, and resumes on its own. That is
+/// `CaptureClaim.devicePaused`, it is something this app observes rather than
+/// commands, and the copy beside Pause says so.
 @MainActor
 protocol ObjectMemoryCaptureOwner: AnyObject {
     /// What claim this app holds on the glasses camera right this moment.
@@ -70,9 +83,18 @@ protocol ObjectMemoryCaptureOwner: AnyObject {
 
 #if DEBUG
 /// `GlassesConnection` already satisfies every requirement, so the conformance
-/// is empty by construction — which is the point. If this extension ever needs
-/// a body, a second camera path is being written and the invariant that there
-/// is exactly one is being broken.
+/// is empty by construction — which is the point: the protocol was extracted
+/// from the type rather than invented beside it, so there is no adapter layer
+/// where a second camera path could grow.
+///
+/// An empty body is therefore the expected shape, not a guarantee. A rename on
+/// `GlassesConnection`, or a member added here with a slightly different
+/// signature, would legitimately need a one-line forwarding member and prove
+/// nothing bad. What would be the warning sign is a body that *decides*
+/// anything — branching on state, holding a flag, calling DAT — because that is
+/// capture behaviour living outside the one type that owns it. If you find
+/// yourself writing that here, the invariant "exactly one camera pipeline, in
+/// `GlassesConnection`" is the thing being broken.
 ///
 /// `#if DEBUG` because the members it conforms with are: the whole capture
 /// surface of `GlassesConnection` is DEBUG-only, exactly as Home's and World
@@ -271,10 +293,44 @@ final class ObjectMemoryRecordingCoordinator: ObservableObject {
     /// Whether the capture currently running was started by this screen.
     @Published private(set) var startedTheCamera = false
 
-    /// Whether an action asked for here has not finished yet. Drives the
-    /// controls' `disabled`, which is what makes a double tap a no-op rather
-    /// than two overlapping sequences.
+    /// Whether a **mutating** step asked for here is in flight: the `POST` to
+    /// the Tower, and the `startCameraSession()` / `stopCameraSession()` call
+    /// beside it. Drives the controls' `disabled`.
+    ///
+    /// ## Why this is the mutating step and not the whole sequence
+    ///
+    /// It used to be the whole sequence, and a Start's sequence ends with
+    /// `converge()`, which runs to `convergenceBudget` — **twelve seconds**.
+    /// For those twelve seconds both `.disabled` gates in
+    /// `ObjectMemoryWorkspaceView` were live, so every control on the screen,
+    /// **including Stop**, was dead while the Tower session was open and the
+    /// camera this screen had just started was streaming. The only way to stop
+    /// being recorded was to leave the screen. That is precisely the failure
+    /// this whole composed control was justified by removing, reintroduced by
+    /// the guard meant to protect it.
+    ///
+    /// The double tap worth protecting against is two `POST`s and two camera
+    /// calls racing over `startedTheCamera` — not two polls. So the gate covers
+    /// exactly the mutating part and is dropped the moment `converge()` begins;
+    /// a Stop that lands during convergence cancels the poll and runs. See
+    /// `perform`.
     @Published private(set) var isActing = false
+
+    /// Whether a sequence started here is running **at all**, convergence poll
+    /// included.
+    ///
+    /// Not what the controls gate on — see `isActing` — and deliberately a
+    /// second flag rather than a widening of it. It has one job in production:
+    /// `sessionChanged` must not adopt a reading pushed by the workspace's
+    /// watch loop while a sequence is reading the client directly and in order.
+    /// During a Start's convergence that matters more than ever, because the
+    /// watch loop polls the same session at the same cadence and `resting`
+    /// would turn a legal, expected "accepted, nothing attached yet" into
+    /// `notObserved` seconds before the deadline that word belongs to.
+    ///
+    /// Published because a test has to be able to wait for a sequence to
+    /// finish, and `isActing` no longer answers that question.
+    @Published private(set) var isSequenceRunning = false
 
     /// Called when a run of remembering ends, so the records list below can
     /// show what was just written.
@@ -290,9 +346,24 @@ final class ObjectMemoryRecordingCoordinator: ObservableObject {
     private let convergenceInterval: Duration
     private let convergenceBudget: Duration
     private var cancellables: Set<AnyCancellable> = []
-    /// The action currently in flight. Bounded by `convergenceBudget`, so the
+    /// The sequence currently running. Bounded by `convergenceBudget`, so the
     /// strong reference it holds to this object is bounded too.
+    ///
+    /// Cancelled — for real, and this is the only thing that cancels it — when
+    /// a later verb supersedes it in `perform`. A Stop pressed while a Start is
+    /// converging is the case that matters.
     private var work: Task<Void, Never>?
+
+    /// Which run `work` is. Incremented by every `perform`.
+    ///
+    /// Cancellation in Swift is cooperative, so a superseded run does not stop
+    /// where it was told to — it resumes on the main actor, unwinds, and
+    /// reaches the completion block *after* the run that replaced it has
+    /// already set its own flags. Without this it would clear `isActing` and
+    /// `isSequenceRunning` for a sequence that is still mutating things, and
+    /// the double-tap guard would be open during exactly the window it exists
+    /// to close.
+    private var run = 0
 
     /// - Parameters:
     ///   - camera: the app's single camera owner, or `nil` in a build or a
@@ -329,7 +400,26 @@ final class ObjectMemoryRecordingCoordinator: ObservableObject {
             .store(in: &cancellables)
     }
 
-    deinit { work?.cancel() }
+    // **There is deliberately no `deinit` cancelling `work`.** There used to
+    // be, and it was unreachable code that read as a safety net. `perform`
+    // builds its task around a closure that captures `self` strongly — it has
+    // to, because the body is a method call on this object — so a running
+    // sequence keeps the coordinator alive until it returns, and `deinit`
+    // cannot run while `work` is unfinished. A cancel there could never observe
+    // anything to cancel.
+    //
+    // The cancellation that is real happens in `perform`, where a later verb
+    // supersedes an earlier sequence's convergence poll. That is what makes
+    // `converge()`'s `Task.isCancelled` check and its `catch` around
+    // `Task.sleep` live branches rather than decoration, and it is the only
+    // thing that reaches them.
+    //
+    // The lifetime is bounded regardless: `converge()` runs to
+    // `convergenceBudget` and every other step is one request, so the strong
+    // reference a sequence holds is measured in seconds. And in this app the
+    // question is moot in the other direction too — `ProjectManager` owns this
+    // object for the life of the process, which is exactly why the view may not
+    // leave a closure on it (see `refreshRecords`).
 
     // MARK: What the screen reads
 
@@ -349,12 +439,30 @@ final class ObjectMemoryRecordingCoordinator: ObservableObject {
     /// `notObserved`, where a session exists on the Tower even though nothing
     /// has been observed following it. Offering Start there would leave no way
     /// to clear a session that is open and doing nothing.
+    ///
+    /// **`cameraRefused` is in the Stop list for that same reason, and it used
+    /// to be in the Start list against it.** Every branch that produces
+    /// `cameraRefused` leaves the Tower session `active` on purpose — the
+    /// session is a gate, not a recording, and tearing it down because the
+    /// camera half was refused would throw away correct work (see
+    /// `startSequence`). So `cameraRefused` *is* the shape the rule describes:
+    /// a session open on the Tower with nothing happening under it. Offering
+    /// Start there offered the one verb that changes nothing, and left the open
+    /// session with no control that could close it.
+    ///
+    /// The rule, stated once so the two lists cannot drift from it: **Stop is
+    /// offered wherever this app has reason to believe a session exists on the
+    /// Tower.** `idle` and `stopped` are the two phases where it does not.
+    /// `cannotTell`, `refused`, `unsupported` and `failed` are phases where
+    /// this app could not establish one, and Start is the honest offer there
+    /// because a Stop against a session that was never opened is a request with
+    /// nothing behind it.
     var primaryAction: CartridgeSessionAction {
         switch phase {
         case .starting, .waitingToBeFollowed, .notObserved, .remembering, .stillFollowing,
-            .pausing, .paused, .resuming, .stopping:
+            .pausing, .paused, .resuming, .stopping, .cameraRefused:
             return .stop
-        case .idle, .stopped, .cannotTell, .refused, .cameraRefused, .unsupported, .failed:
+        case .idle, .stopped, .cannotTell, .refused, .unsupported, .failed:
             return .start
         }
     }
@@ -452,15 +560,47 @@ final class ObjectMemoryRecordingCoordinator: ObservableObject {
                 // the glasses resume delivery on their own.
                 phase = .cameraRefused(.deviceHasPausedCapture)
                 return
-            case .running, .ending:
+            case .running:
                 // Home or World Builder owns it. Ownership is *not* claimed,
                 // so Stop below will leave their stream alone.
                 startedTheCamera = false
+            case .ending:
+                // **Nobody owns a capture that is dying.** This used to share
+                // the branch above and record "somebody else started it",
+                // which was false in both halves: the previous owner has
+                // already let go, and this screen got no camera and said
+                // nothing about it. `startCameraSession()` refuses in this
+                // window too — its `guard deviceSession == nil` sees a session
+                // that is still being torn down — so calling it would produce
+                // `.alreadyRunning`, a refusal whose sentence sends a wearer
+                // to look for a stream that is on its way out.
+                //
+                // Reported instead as what it is. Not retried: a retry would
+                // need a second deadline inside a sequence that already has
+                // one, and the teardown it is waiting on is DAT's, with no
+                // bound this app can state. The Tower's half stands, exactly as
+                // it does for every other camera refusal, so the next Start —
+                // a second or two later, when the claim has reached
+                // `.unclaimed` through `captureClaimUpdates` — is a real one.
+                phase = .cameraRefused(.captureIsShuttingDown)
+                return
             }
         }
 
         // 3. Converge on `following`, bounded.
-        await converge()
+        //
+        //    The gate comes off here, before the poll and not after it. From
+        //    this line on the sequence only *reads*: there is nothing left for
+        //    a second tap to race, and there is a camera streaming that a
+        //    person must be able to stop. See `isActing`.
+        isActing = false
+
+        // Whether the camera half of *this* run is the one being watched
+        // below. Captured now rather than read off `startedTheCamera` inside
+        // the loop, because `cameraClaimChanged` clears that flag as soon as
+        // the failed capture's teardown reaches the publisher — which is the
+        // same event that sets the refusal, and would race it away.
+        await converge(watchingACameraStartedHere: startedTheCamera)
     }
 
     private func stopSequence() async {
@@ -503,7 +643,17 @@ final class ObjectMemoryRecordingCoordinator: ObservableObject {
     /// without a single extra request. Every wait is a real `Task.sleep` with a
     /// deadline above it; there is no unbounded poll and no retry budget that
     /// can be refilled from inside.
-    private func converge() async {
+    ///
+    /// **Nothing here mutates anything**, which is why `isActing` is already
+    /// false by the time this runs and why a Stop may arrive in the middle of
+    /// it. A Stop cancels this task — `perform` does that — and the two exits
+    /// below (`Task.isCancelled`, and the `catch` around the sleep) are the
+    /// paths it takes out. Neither writes a phase: a cancelled wait produced no
+    /// verdict, and the sequence that superseded it is writing its own.
+    ///
+    /// - Parameter watchingACameraStartedHere: whether this run started a
+    ///   capture. See the camera re-check below.
+    private func converge(watchingACameraStartedHere: Bool) async {
         phase = .waitingToBeFollowed
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: convergenceBudget)
@@ -511,6 +661,35 @@ final class ObjectMemoryRecordingCoordinator: ObservableObject {
         while !Task.isCancelled {
             if let settled = self.settled(client.session) {
                 phase = settled
+                return
+            }
+            // **The camera can still refuse after `startCameraSession()` has
+            // returned, and one refusal only ever arrives that way.**
+            //
+            // `startCameraSession()` sets `lastCaptureStartRefusal`
+            // synchronously for `.alreadyRunning`, `.deviceHasPausedCapture`,
+            // `.noActiveDevice` and `.datRefused`. Camera permission is not in
+            // that list: the session starts, DAT's state observer fires,
+            // `beginCameraStream` finds the permission ungranted and
+            // `abandonSessionAfterFailedStart` writes the refusal — all of it
+            // after the call this sequence made had already returned `nil`.
+            //
+            // So the read at the call site claimed ownership, and twelve
+            // seconds later this loop reported `notObserved` — "asked for, and
+            // not observed" — while the true answer was known, specific,
+            // actionable and had a written sentence that could never be
+            // reached. Re-read here so it is.
+            //
+            // Only for a capture this run started. `lastCaptureStartRefusal`
+            // is cleared at the top of every `startCameraSession()` and
+            // survives until the next one, so on a run that started nothing it
+            // may hold Home's answer to Home's question.
+            if watchingACameraStartedHere, let camera,
+                let refusal = camera.lastCaptureStartRefusal {
+                // The capture this run believed it owned is gone with it.
+                startedTheCamera = false
+                cameraClaim = camera.captureClaim
+                phase = .cameraRefused(refusal)
                 return
             }
             guard clock.now < deadline else {
@@ -535,24 +714,59 @@ final class ObjectMemoryRecordingCoordinator: ObservableObject {
 
     // MARK: Reading a session into a phase
 
-    /// Runs one action at a time.
+    /// Runs one action at a time — with "at a time" meaning *one mutating step
+    /// at a time*, not one sequence.
     ///
-    /// **The double-tap guard, and it is a local fact rather than a guess about
-    /// the Tower.** A second tap while a sequence is in flight is dropped
-    /// entirely — not queued, not sent — because two overlapping Start
-    /// sequences would race over `startedTheCamera` and could leave this screen
-    /// believing it owns a capture it did not start. A tap *after* a sequence
+    /// ## The double-tap guard, narrowed to what it is actually protecting
+    ///
+    /// A second tap while a **mutating** step is in flight is dropped entirely
+    /// — not queued, not sent — because two overlapping Start sequences would
+    /// race over `startedTheCamera` and could leave this screen believing it
+    /// owns a capture it did not start. That is a local fact rather than a
+    /// guess about the Tower, which is why gating on it does not make this
+    /// app's model authoritative over the Tower's. A tap *after* a sequence
     /// finishes is sent normally, and the Tower answers a repeated verb 200
     /// with `changed: false`, which is not an error and is never drawn as one.
+    ///
+    /// ## Supersession, and why it is not the same as a dropped tap
+    ///
+    /// The gate used to cover the whole sequence, and a Start's sequence ends
+    /// with a twelve-second convergence poll. **Every control on the screen,
+    /// Stop included, was disabled for those twelve seconds** — over a live
+    /// Tower session and a camera this screen had just started. See `isActing`.
+    ///
+    /// So `converge()` runs with the gate down, and a verb that arrives during
+    /// it **cancels the poll and takes over**. That is right for all four:
+    /// Stop is the one that matters and must always be reachable; Pause and
+    /// Resume are answers about the same session and belong to the newer
+    /// intent; a second Start re-`POST`s a verb the Tower answers
+    /// `changed: false` and converges again. Nothing is queued, ever — a
+    /// person's most recent tap is the one this screen acts on.
+    ///
+    /// The cancelled run does not stop where it was told to; it unwinds
+    /// through the main actor and reaches its completion block afterwards,
+    /// which is what `run` is for.
     private func perform(_ body: @escaping @MainActor () async -> Void) {
         guard !isActing else {
             print("[Glasses][ObjectMemory] an action was already in flight; the second tap was dropped")
             return
         }
+        // Only ever a sequence that has reached its convergence poll — a
+        // mutating one would have been dropped by the guard above.
+        work?.cancel()
+
+        run &+= 1
+        let thisRun = run
         isActing = true
+        isSequenceRunning = true
+        // `body` captures `self` strongly, so this task keeps the coordinator
+        // alive until the sequence returns. Said out loud because it is the
+        // reason there is no `deinit` cancel — see the note above `reading`.
         work = Task { [weak self] in
             await body()
-            self?.isActing = false
+            guard let self, self.run == thisRun else { return }
+            self.isActing = false
+            self.isSequenceRunning = false
         }
     }
 
@@ -634,12 +848,24 @@ final class ObjectMemoryRecordingCoordinator: ObservableObject {
     /// screen that keeps saying "remembering" after it lost the ability to
     /// check is asserting something it does not know.
     private func sessionChanged(_ session: ObjectMemorySessionState) {
-        // While a sequence is in flight it is reading the client directly and
-        // in order. A pushed reading here would race that sequence — the
+        // While a sequence is running it is reading the client directly and in
+        // order. A pushed reading here would race that sequence — the
         // `.working` and post-`POST` states both arrive on this publisher —
         // and could put "remembering" back on screen between a Stop's `POST`
         // and its read-back.
-        guard !isActing else { return }
+        //
+        // `isSequenceRunning` and **not** `isActing`, which now covers only the
+        // mutating step. The difference is a Start's convergence, and it is not
+        // a corner case: the workspace's own watch loop polls this same session
+        // at `livenessRefreshInterval`, which is the same three seconds the
+        // convergence poll uses, so a reading lands here two or three times
+        // during every Start. `resting` turns an `active` session with nothing
+        // following into `notObserved` — the legal, expected, documented shape
+        // of the first seconds after a Start — and would print "asked for, and
+        // not observed" while the wait it describes was still running.
+        // `converge()` is reading the same field on the same cadence and owns
+        // the verdict.
+        guard !isSequenceRunning else { return }
         phase = resting(session)
     }
 
