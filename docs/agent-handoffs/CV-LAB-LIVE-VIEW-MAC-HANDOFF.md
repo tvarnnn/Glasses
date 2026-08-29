@@ -1,8 +1,8 @@
 # CV Lab live view — Mac and iPhone validation
 
 **Branch:** `feature/cv-lab-live-visualization-v1`
-**Commits:** `36e75ff` … `81d69ac`
-**Check out:** `feature/cv-lab-live-visualization-v1`
+**Check out:** the tip of `feature/cv-lab-live-visualization-v1` (five
+commits, `36e75ff` first)
 **Written:** 2026-08-29, from Windows. **No Xcode ran. No iPhone ran.**
 
 Everything below the line marked WINDOWS was verified by running it. Everything
@@ -65,7 +65,7 @@ Everything about whether it feels live, and both object-detection findings.
 cd ~/…/Glasses
 git fetch origin
 git checkout feature/cv-lab-live-visualization-v1
-git log --oneline -4        # newest should be 81d69ac
+git log --oneline -6        # oldest of the five should be 36e75ff
 ```
 
 Open `ios/Glasses.xcodeproj`, build for your device. **If it does not compile,
@@ -300,6 +300,23 @@ and both came from the reviewers who ran the code:
    up to a pixel apart.
 7. The iOS panel did not drop its picture on backgrounding, so iOS's
    app-switcher snapshot could capture it. It watches `scenePhase` now.
+
+Two more came from rendering the previews and looking at them, which is the
+check this whole feature exists to give a person:
+
+8. The detection view drew twenty-three refusals scoring 0.02-0.03 beneath one
+   accepted box, and their label chips covered the room. A near-miss got at
+   least halfway to the threshold; below that the detector had already said no.
+   The same scene now draws two boxes and 8.3 KB became 4.1 KB.
+9. `X-CV-Preview-Age` does not tick, so a phone getting `304 Not Modified` from
+   a Tower whose stream had stopped kept a `LIVE` badge over a frozen picture
+   for two seconds. The panel adds its own wait to the Tower's figure now.
+
+While rendering the detection case end to end against the real model on this
+machine: `device` resolved to **cuda**, the load-time warm-up worked (first
+frame 44 ms, median 36 ms, **no 500 ms first-inference spike**), and the
+`preview` stage cost 0.36 ms against 36 ms of inference. That is the change to
+compare against your 199 ms / 4 483 ms baseline.
 
 What the reviews **confirmed**, with measurement rather than agreement:
 

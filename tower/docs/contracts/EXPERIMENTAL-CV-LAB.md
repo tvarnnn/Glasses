@@ -483,7 +483,7 @@ exclusive and never both `null`.
 | `contract` | `experimental_cv.preview/2026-08-29`. Versioned separately from the status document: a client may read the whole document and never fetch an image, which is exactly what a Release iOS build with no camera does. |
 | `kind` | `live_preview`. What the artifact *is*, so a later kind is a new value rather than a client guessing from the media type. |
 | `visual_kind` | How to READ the picture, never what it means: `edge_map`, `relative_depth`, `keypoints`, `detections`, `flow_tracks`, `redaction_regions`, `frame_quality`. A client must not infer semantics from it — a `relative_depth` preview is **not** metres, and §4's rules about provenance and units are unchanged by there being a picture. |
-| `description` | The Tower's own sentence about what is drawn. Displayed verbatim. |
+| `description` | The Tower's own sentence about what is drawn. Displayed verbatim. It is also where a client that renders nothing else learns the one thing it must not get wrong — the depth preview's says the values are not metres. |
 | `treatment` | `raw_ephemeral`, always, on every preview. See §5.3. |
 | `face_filter` | `none`, always. A **process** claim: no face detector runs on this path. It never says the result is safe. |
 | `persistence` | `none`. Nothing reaches a disk and only the newest frame exists. |

@@ -906,9 +906,10 @@ _KIND_DESCRIPTIONS = {
         "coverage figure is measured on."
     ),
     PREVIEW_KIND_DETECTIONS: (
-        "Every box the detector produced, with its class and score, over a "
-        "line drawing of the frame. Boxes below the threshold the metrics "
-        "use are faded rather than hidden."
+        "What the detector found, with each box's class and score, over a "
+        "line drawing of the frame. Boxes that came at least halfway to the "
+        "threshold the metrics use are drawn faded rather than hidden; "
+        "anything below that the detector had already dismissed."
     ),
     PREVIEW_KIND_FLOW_TRACKS: (
         "One arrow per tracked point, coloured by direction, over a line "
