@@ -300,6 +300,22 @@ class Settings:
     # count with no geometry at all until the capture closed, and then
     # every figure appearing at once.
     world_rebuild_every: int = 4
+    # Whether the attached builder tries to place the walk's segments in
+    # one frame when the walk ends.
+    #
+    # On by default because off is what we shipped, and off is why every
+    # walk so far arrived on the phone as a heap of disconnected
+    # fragments: the registration pass existed, was tested, persisted and
+    # served, and nothing ever invoked it. Refusal is still the default
+    # answer for any individual pair, so this makes the world no more
+    # confident -- only less silent.
+    #
+    # The escape hatch is real and worth keeping: registration is the
+    # only step in the walk that costs tens of seconds, it runs once at
+    # the end in the builder subprocess, and a host that wants a walk
+    # finalised the instant it stops can turn it off without losing the
+    # reconstruction.
+    world_register: bool = True
 
 
 def get_settings() -> Settings:
@@ -331,6 +347,7 @@ def get_settings() -> Settings:
         world_rebuild_every=_non_negative_int(
             os.environ.get("TOWER_WORLD_REBUILD_EVERY"), default=4
         ),
+        world_register=_flag("TOWER_WORLD_REGISTER", default=True),
         scene_understanding=_flag("TOWER_SCENE_UNDERSTANDING", default=False),
         scene_device=os.environ.get("TOWER_SCENE_DEVICE", "cpu"),
         scene_orientation=_flag("TOWER_SCENE_ORIENTATION", default=False),
