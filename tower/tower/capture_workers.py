@@ -209,6 +209,20 @@ class _Worker:
     # chains into successors on its own, so one worker legitimately owns
     # a whole lineage.
     lineage: list[str] = field(default_factory=list)
+    # Whether this child understands being ASKED to stop, rather than
+    # only being terminated. Copied off its spec at spawn, because
+    # `_stop_worker` has a worker and not a spec.
+    #
+    # It gates the signal as well as the pipe, and that is the point. A
+    # `CTRL_BREAK_EVENT` reaches a child that has installed no handler as
+    # a request to die immediately -- so sending one to the world
+    # builder, which installs none, would have converted its ten-second
+    # grace into an instant kill and made the result channel report a
+    # world `failed` for a build that was seconds from finishing. That is
+    # exactly what the grace exists to prevent, and it was nearly
+    # destroyed by a change meant to make a DIFFERENT worker's grace
+    # useful.
+    handles_stop_request: bool = False
 
     def is_alive(self) -> bool:
         return self.process.poll() is None
@@ -812,6 +826,7 @@ class CaptureWorkerSupervisor:
             argv=argv,
             started_at=self._clock(),
             lineage=[capture_id],
+            handles_stop_request=bool(spec.stop_via_stdin),
         )
         registry.roots[capture_id] = capture_id
         logger.info(
@@ -834,14 +849,24 @@ class CaptureWorkerSupervisor:
         supervisor aware of one.
         """
         process = worker.process
-        # ASK FIRST. A grace window that waits without asking measures
-        # the whole window every time and then shoots the process
-        # anyway -- see `_ask_to_stop`. Only when there IS a window:
-        # `detach(grace_seconds=0)` means "gone now", and asking a
-        # process to stop and then immediately terminating it is worse
-        # than not asking, because a producer that had started its flush
-        # gets killed halfway through it.
-        if grace_seconds:
+        # ASK FIRST, IF THIS CHILD UNDERSTANDS BEING ASKED. A grace
+        # window that waits without asking measures the whole window
+        # every time and then shoots the process anyway -- see
+        # `_ask_to_stop`.
+        #
+        # Two conditions, and both are load-bearing:
+        #
+        # `grace_seconds` -- `detach(grace_seconds=0)` means "gone now",
+        # and asking a process to stop and then immediately terminating
+        # it is worse than not asking, because a producer that had begun
+        # its flush gets killed halfway through one.
+        #
+        # `handles_stop_request` -- a child that installed no handler
+        # dies on the signal instead of finishing. Sending one to a
+        # worker that never opted in would turn its grace into an instant
+        # kill, which is the opposite of what a grace is for. See
+        # `_Worker.handles_stop_request`.
+        if grace_seconds and worker.handles_stop_request:
             _ask_to_stop(process)
         try:
             process.wait(timeout=grace_seconds)

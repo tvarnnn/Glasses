@@ -248,6 +248,29 @@ class TestTheSupervisorAsksBeforeItShoots:
     @pytest.fixture
     def supervisor(self):
         return CaptureWorkerSupervisor(
+            [
+                WorkerSpec(
+                    argv=("python", "-c", "pass"),
+                    name="w",
+                    # OPTED IN. Without this the supervisor must not ask,
+                    # and the case below pins that.
+                    stop_via_stdin=True,
+                )
+            ]
+        )
+
+    @pytest.fixture
+    def unasked_supervisor(self):
+        """A spec that never said it understood being asked.
+
+        The world builder's spec is this one. It installs no signal
+        handler, so a `CTRL_BREAK_EVENT` reaches it as "die now" -- and
+        its ten-second grace exists precisely so a follower can finish
+        the build that releases its writer lock. Sending it a signal
+        would convert that grace into an instant kill and make the result
+        channel report a world `failed` for a build seconds from done.
+        """
+        return CaptureWorkerSupervisor(
             [WorkerSpec(argv=("python", "-c", "pass"), name="w")]
         )
 
@@ -306,6 +329,34 @@ class TestTheSupervisorAsksBeforeItShoots:
         supervisor.detach("w", grace_seconds=0.0)
 
         assert asks == []
+        assert process.terminated is True
+
+    def test_a_worker_that_never_opted_in_is_not_asked(
+        self, unasked_supervisor, tmp_path, monkeypatch
+    ):
+        """THE REGRESSION THIS GATE EXISTS FOR.
+
+        A first version of this change asked every worker. On a host with
+        a real console that would have delivered a `CTRL_BREAK_EVENT` to
+        the world builder, which handles none, at every shutdown -- and
+        its grace, the whole point of which is to let a final build
+        finish, would have become an immediate kill. It was measured as
+        harmless on THIS host only because a pseudoconsole swallows the
+        event, which is the worst possible reason for a bug to look fine.
+        """
+        process = self._Process()
+        asks = []
+        monkeypatch.setattr(
+            "tower.capture_workers._ask_to_stop", lambda p: asks.append(p)
+        )
+        self._attach(unasked_supervisor, process, tmp_path)
+
+        unasked_supervisor.detach("w", grace_seconds=0.01)
+
+        assert asks == [], (
+            "a child that installed no handler must be waited for and then "
+            "terminated, never signalled"
+        )
         assert process.terminated is True
 
     def test_asking_a_process_that_cannot_be_signalled_is_contained(self):

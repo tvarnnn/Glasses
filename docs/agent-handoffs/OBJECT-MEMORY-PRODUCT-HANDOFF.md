@@ -393,6 +393,24 @@ It fixes something adjacent for free: a producer orphaned by a Tower that
 died now gets its EOF from the operating system instead of polling for
 its full fifteen-minute idle bound.
 
+### 3.3 Only workers that opted in are asked, and that nearly went wrong
+
+The first version asked **every** worker. A `CTRL_BREAK_EVENT` reaches a
+child that installed no handler as "die now" — so on a host with a real
+console this would have signalled the **world builder** at every
+shutdown, and its ten-second grace, which exists precisely so a follower
+can finish the build that releases its writer lock, would have become an
+instant kill. The result channel would then have reported a world
+`failed` for a build seconds from finishing.
+
+It looked fine here for the worst possible reason: a pseudoconsole
+swallows the event, so the damage was invisible on the one machine it was
+tested on.
+
+`_Worker.handles_stop_request` is copied off `WorkerSpec.stop_via_stdin`
+at spawn and gates both channels. Object Memory's producer opted in;
+World Builder's did not and is signalled by nothing. A test pins it.
+
 ### 3.2 The check has to be inside the poll loop
 
 The first version wrapped the frame generator and checked between yields.
@@ -563,6 +581,158 @@ swift-format. Nothing in `ios/` has been compiled or run.
 `ios/scripts/swift-structure-check.py` is new and proves only that
 brackets and strings balance in all 73 `.swift` files. **A green run
 there is not a build.**
+
+---
+
+## 6A. The next physical test
+
+One run. It exercises the composed button, the verifier tier that has
+never been deliberately targeted, pause/resume, the flush on Stop, and
+the owned picture.
+
+**Before you start**, on the Mac: build and install this branch. Nothing
+under `ios/` in it has ever been compiled.
+
+### The run
+
+1. **Start Tower with no environment setup at all.**
+
+   ```powershell
+   cd C:\Users\tvllo\Projects\Glasses\tower
+   .\scripts\start_tower.ps1
+   ```
+
+   Do **not** set `TOWER_OBSERVATION_VERIFIER` or
+   `TOWER_OBSERVATION_VERIFIER_DEVICE`. That is the thing being tested.
+   (`.\scripts\start_tower.ps1 -CheckOnly` prints the configuration and
+   exits, if you want to read it before binding a port.)
+
+   **Expect in the console**, before it binds:
+
+   ```
+   Object Memory
+     TOWER_OBSERVATION_ROOT     <unset, defaults to data\object_memory>
+     TOWER_OBSERVATION_VERIFIER <unset, defaults to owlv2>
+       ...VERIFIER_DEVICE       <unset, defaults to auto>
+     TOWER_OBSERVATION_DEVICE   <unset, defaults to auto>
+   ```
+
+   and then, from the app:
+
+   ```
+   [Tower][Config] ... verifier owlv2 on auto -- recording laptop, cell
+     phone, remote, mouse, cup, bottle, keyboard, backpack, handbag,
+     suitcase, book, umbrella, scissors, toothbrush.
+   [Tower][Config] an object-memory producer will be attached to each
+     capture WHILE A SESSION IS ACTIVE.
+   ```
+
+   **Fourteen classes, not two.** Two means the verifier did not load,
+   and the producer will say why on its first line.
+
+2. **On the phone: open Object Memory. Do not visit Home.** Going to Home
+   first would test the old workflow.
+
+3. **Press Start remembering.** Once.
+
+   **Expect in the Tower console:**
+
+   ```
+   [Tower][Session] object_memory start -> state=active changed=True
+     session=<hex> attached=None following=[]
+   [Tower][Worker] started object-memory-session pid <n> for capture <id>
+   [Tower][ObjectMemory] detector=ssdlite320 device=cuda verifier=owlv2
+     verifier_device=cuda root=...
+   ```
+
+   `attached=None` on the Start line is **correct** — the gate opens
+   before the camera does. The worker line follows when the phone's
+   capture opens.
+
+   **Expect on the phone:** the panel moves *starting* → *waiting* →
+   **remembering**, and the record dot fills only at the last step. If it
+   sits on "asked to remember, and not observed", the producer did not
+   attach and the Tower console will say why.
+
+4. **Walk for about two minutes with these in view**, a few seconds each:
+
+   | Object | Tier | What it proves |
+   |---|---|---|
+   | a **laptop** | remembered | the detector-only path, and the class the last run produced |
+   | a **cell phone** | remembered | the same |
+   | a **bottle** | **verify** | **the semantic verifier accepting** |
+   | a **cup** | **verify** | the same, second class |
+   | a **book** or **backpack** | **verify** | the same, third class |
+
+   Hold each still for **at least three seconds** — a sighting needs
+   three frames to mature, and the gate at `min_score = 0.5` drops a
+   glance.
+
+   **The bottle, cup and book are the point of this run.** The last
+   physical test produced only `laptop` and `cell phone`, which are the
+   only two classes that bypass the verifier entirely, so the second
+   opinion was configured and never exercised. Two records in the store
+   now carry real OWLv2 verdicts (`keyboard`, `mouse`), so *acceptance*
+   has since happened — but **no record anywhere carries `agrees:
+   false`**, so the verifier *rejecting* a wrong label is still unproven
+   on hardware.
+
+   For the reject path, keep a **laptop open in view**. The corpus
+   measurement found a laptop keyboard detected as `remote` at 0.87, and
+   `remote` is a verify-tier class — so OWLv2 should be asked and should
+   refuse. A `declined: {unverified: N}` in the final report with N > 0 is
+   that path firing.
+
+5. **Press Pause.** Expect `[Tower][Session] object_memory pause ->
+   state=paused` and the producer to disappear from the process table.
+   The phone should say paused **and**, if the camera is still running,
+   say that too — the two are separate facts.
+
+6. **Press Resume**, walk another twenty seconds, then **press Stop.**
+
+   **Expect in the Tower console**, from the producer, at Stop:
+
+   ```
+   stopped_because        stdin-closed
+   frames_observed        <a few thousand>
+   observations_recorded  <> 0
+   verifier               owlv2
+   verifier_requested     owlv2
+   verification           {"requested": N, "accepted": ..., "rejected": ...}
+   keyframes_written      <equal to observations_recorded>
+   keyframes_refused      {}
+   ```
+
+   **`stopped_because: stdin-closed` and a printed report at all** are
+   the flush working. Before this branch, Stop killed the producer
+   outright and it printed nothing — and every sighting still open, which
+   is every object you were looking at when you pressed the button, was
+   discarded.
+
+   **`keyframes_refused` must be empty.** Anything in it means the
+   display filter refused, and the reason is the key.
+
+7. **Look at the new records.** Tap one and show its picture.
+
+   **Expect a picture**, not "the memory is kept, the picture is gone".
+   Then tap through to the whole frame and back.
+
+### What would count as a failure
+
+- Two recordable classes instead of fourteen at startup.
+- The phone saying "remembering" while the Tower console shows no worker.
+- A `[Tower][ObjectMemory] ... POINTER defect rather than retention`
+  WARNING — that is this branch's own diagnostic firing, and it means a
+  record points at a frame in a recording that is still on disk. It
+  should not happen any more.
+- `keyframes_refused` non-empty.
+- Any picture that appears without the display filter having run — the
+  payload's `filter` field must read `display-filter/yunet-2023mar@0.30`.
+
+### The one thing this run cannot prove
+
+That the app compiles. If it does not, nothing above happens, and the
+compile errors are the result.
 
 ---
 
