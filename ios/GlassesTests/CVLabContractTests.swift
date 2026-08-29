@@ -19,6 +19,7 @@
 //  instead of a property of today's payload.
 //
 
+import UIKit
 import XCTest
 
 @testable import Glasses
@@ -1073,3 +1074,234 @@ final class CVLabContractTests: XCTestCase {
     }
 }
 
+
+// MARK: - The bytes, not the descriptor
+
+/// Answers every request from a script, so the preview client's real decode
+/// path can be exercised without a Tower.
+///
+/// `nonisolated(unsafe)` because `URLProtocol` calls `startLoading()` off the
+/// main actor and this project defaults types to `@MainActor`. Test-only, and
+/// each test sets the script before it makes its one request.
+private final class CVPreviewStubProtocol: URLProtocol {
+    struct Answer {
+        var status = 200
+        var headers: [String: String] = [:]
+        var body = Data()
+    }
+
+    nonisolated(unsafe) static var answer = Answer()
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let scripted = Self.answer
+        let response = HTTPURLResponse(
+            url: request.url ?? URL(string: "http://stub.invalid")!,
+            statusCode: scripted.status,
+            httpVersion: "HTTP/1.1",
+            headerFields: scripted.headers
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: scripted.body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+/// **The privacy gate that governs pixels, and the run identity that governs
+/// which pixels.**
+///
+/// Everything in `CVLabContractTests` above asserts against the *descriptor* —
+/// the status document's account of what a preview would be. Nothing there
+/// touches the path that actually carries an image, which is where the
+/// treatment header is read and where a frame is accepted or discarded. These
+/// do.
+@MainActor
+final class CVLabPreviewBytesTests: XCTestCase {
+
+    private func makeClient() -> CVLivePreviewHTTPClient {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CVPreviewStubProtocol.self]
+        return CVLivePreviewHTTPClient(
+            baseURL: URL(string: "http://tower.invalid")!,
+            session: URLSession(configuration: configuration),
+            timeout: 2.0
+        )
+    }
+
+    /// A 2x2 PNG. Real bytes, so `UIImage(data:)` genuinely decodes.
+    private func tinyPNG() -> Data {
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 2, height: 2))
+        return renderer.image { context in
+            UIColor.white.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+        }.pngData()!
+    }
+
+    private func serve(headers: [String: String]) {
+        CVPreviewStubProtocol.answer = .init(
+            status: 200, headers: headers, body: tinyPNG()
+        )
+    }
+
+    private var drawablePreview: CVLivePreview {
+        CVLivePreview(json: [
+            "contract": ExperimentalCVContract.preview,
+            "visual_kind": "edge_map",
+            "path": "/cv-lab/preview",
+            "treatment": "raw_ephemeral",
+            "poll_interval_s": 0.05,
+        ])!
+    }
+
+    // MARK: The gate
+
+    /// **Bytes that state no treatment are not drawn.** The descriptor saying
+    /// `raw_ephemeral` is not permission: the treatment travels on the image
+    /// as well, and an image whose treatment arrives separately is an image
+    /// whose treatment can be lost.
+    func testBytesWithNoStatedTreatmentAreNotDrawn() async {
+        serve(headers: ["ETag": "e1"])
+        let outcome = await makeClient().fetch(
+            path: "/cv-lab/preview", runID: "r1", ifNoneMatch: nil
+        )
+        guard case .waiting = outcome else {
+            return XCTFail("an unstated treatment must not be drawn: \(outcome)")
+        }
+    }
+
+    /// A treatment word this build has never heard of is refused as strictly
+    /// as raw, on the bytes exactly as in the descriptor.
+    func testBytesWithAnUnknownTreatmentAreNotDrawn() async {
+        serve(headers: ["X-CV-Preview-Treatment": "probably_safe", "ETag": "e1"])
+        let outcome = await makeClient().fetch(
+            path: "/cv-lab/preview", runID: "r1", ifNoneMatch: nil
+        )
+        guard case .waiting = outcome else {
+            return XCTFail("an unknown treatment must fail closed: \(outcome)")
+        }
+    }
+
+    /// The permitted case, so the gate is not merely refusing everything.
+    func testRawEphemeralBytesAreDrawn() async {
+        serve(headers: [
+            "X-CV-Preview-Treatment": "raw_ephemeral",
+            "X-CV-Preview-Run": "r1",
+            "X-CV-Preview-Seq": "7",
+            "ETag": "e1",
+        ])
+        let outcome = await makeClient().fetch(
+            path: "/cv-lab/preview", runID: "r1", ifNoneMatch: nil
+        )
+        guard case .frame(let frame) = outcome else {
+            return XCTFail("raw_ephemeral is the live view's whole purpose: \(outcome)")
+        }
+        XCTAssertEqual(frame.treatment, .rawEphemeral)
+        XCTAssertEqual(frame.runID, "r1")
+        XCTAssertEqual(frame.resultSeq, 7)
+    }
+
+    // MARK: Run identity
+
+    /// **An unstamped run is "no id", not a run named "".**
+    ///
+    /// `routes/cv_lab_preview.py` sends `rendered.run_id or ""`, and `lab.py`
+    /// builds a preview with `run_id=None` whenever it has no run object. So
+    /// "the Tower did not say" reaches this app as `Optional("")` and never as
+    /// `nil`. Comparing it raw discarded every frame of such a run — silently,
+    /// and at full polling rate, because the discard path never set the
+    /// `ETag`, so each rejected frame was a fresh full-body JPEG.
+    func testAFrameTheTowerLeftUnstampedIsStillDrawn() async {
+        serve(headers: [
+            "X-CV-Preview-Treatment": "raw_ephemeral",
+            "X-CV-Preview-Run": "",
+            "ETag": "e1",
+        ])
+        let loader = CVLivePreviewLoader(client: makeClient())
+        loader.start(drawablePreview, runID: "a-run-the-tower-did-not-stamp")
+        await settle { if case .showing = loader.phase { return true } else { return false } }
+
+        guard case .showing = loader.phase else {
+            return XCTFail("an empty run header is not a mismatch: \(loader.phase)")
+        }
+        XCTAssertEqual(loader.framesShown, 1)
+        loader.stop()
+    }
+
+    /// A frame stamped with a run this loader is not watching is discarded.
+    /// The other half of the same guard, so the fix above did not open it.
+    func testAFrameFromAnotherRunIsNotDrawn() async {
+        serve(headers: [
+            "X-CV-Preview-Treatment": "raw_ephemeral",
+            "X-CV-Preview-Run": "edge-detection-run",
+            "ETag": "e1",
+        ])
+        let loader = CVLivePreviewLoader(client: makeClient())
+        loader.start(drawablePreview, runID: "depth-run")
+        await settle { loader.unchangedResponses > 0 || loader.framesShown > 0 }
+
+        XCTAssertEqual(
+            loader.framesShown, 0,
+            "Depth must never display a frame Edge produced"
+        )
+        if case .showing = loader.phase {
+            XCTFail("a frame from another run reached the screen")
+        }
+        loader.stop()
+    }
+
+    // MARK: Release
+
+    /// **Stop drops the picture, not merely the polling.** A frozen last frame
+    /// under a stopped label is still a picture of the wearer's room on
+    /// screen, and `raw_ephemeral` is live-view-only in both directions.
+    func testStopDropsThePicture() async {
+        serve(headers: [
+            "X-CV-Preview-Treatment": "raw_ephemeral",
+            "X-CV-Preview-Run": "r1",
+            "ETag": "e1",
+        ])
+        let loader = CVLivePreviewLoader(client: makeClient())
+        loader.start(drawablePreview, runID: "r1")
+        await settle { if case .showing = loader.phase { return true } else { return false } }
+        guard case .showing = loader.phase else {
+            return XCTFail("nothing was showing, so the release is untested")
+        }
+
+        loader.stop()
+        XCTAssertEqual(loader.phase, .idle, "the image goes with the loop")
+        XCTAssertEqual(loader.framesShown, 0)
+    }
+
+    /// A preview whose treatment this build does not understand is withheld
+    /// with a sentence, and no request is made at all.
+    func testAnUndrawablePreviewIsWithheldWithoutFetching() async {
+        let untreated = CVLivePreview(json: [
+            "contract": ExperimentalCVContract.preview,
+            "visual_kind": "edge_map",
+            "path": "/cv-lab/preview",
+        ])!
+        let loader = CVLivePreviewLoader(client: makeClient())
+        loader.start(untreated, runID: "r1")
+
+        guard case .withheld = loader.phase else {
+            return XCTFail("an unstated treatment must be withheld: \(loader.phase)")
+        }
+        XCTAssertEqual(loader.framesShown, 0)
+        loader.stop()
+    }
+
+    /// Waits for a condition, or gives up. The loader polls on its own task.
+    private func settle(
+        timeout: TimeInterval = 3.0, until condition: () -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+}

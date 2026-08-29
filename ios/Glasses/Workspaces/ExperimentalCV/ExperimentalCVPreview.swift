@@ -51,7 +51,7 @@ import UIKit
 ///
 /// Read off `run.annotation.artifact`, which was `null` on every previous
 /// version of this contract. See `EXPERIMENTAL-CV-LAB.md` §5.
-struct CVLivePreview: Equatable, Sendable {
+nonisolated struct CVLivePreview: Equatable, Sendable {
     /// `experimental_cv.preview/2026-08-29`. Opaque, compared for equality.
     /// A mismatch means this build cannot read what the Tower is offering, and
     /// the honest response is to draw nothing rather than to guess.
@@ -534,11 +534,25 @@ final class CVLivePreviewLoader: ObservableObject {
 
         switch outcome {
         case .frame(let frame):
-            guard frame.runID == nil || frame.runID == watchedRunID else {
+            // An empty header is the Tower saying "no run id", not the Tower
+            // naming a run called "". `routes/cv_lab_preview.py` sends
+            // `rendered.run_id or ""`, and `lab.py` builds a preview with
+            // `run_id=None` whenever it has no run object — so "unstated"
+            // arrives here as `Optional("")` and never as `nil`. Comparing it
+            // raw rejected every frame of such a run.
+            let stamped = frame.runID.flatMap { $0.isEmpty ? nil : $0 }
+            // Either side may be without an identity to compare. When this
+            // loader has none it sent no `run_id`, so the Tower never had the
+            // chance to refuse and whatever it served is the run in progress.
+            guard stamped == nil || watchedRunID == nil || stamped == watchedRunID
+            else {
                 // The Tower answered about a run this loader is not watching.
                 // It should have refused; this is what happens if one ever
                 // does not, and it is why the guard exists on both sides.
-                return idleMultiplier
+                // Backed off rather than retried at full rate: a mismatch that
+                // persists is a disagreement, and asking five times a second
+                // for a full JPEG this loader will discard helps nobody.
+                return min(idleMultiplier * 1.5, 8.0)
             }
             etag = frame.etag
             framesShown += 1
@@ -571,6 +585,13 @@ final class CVLivePreviewLoader: ObservableObject {
             phase = .noVisualOutput(message)
             return 0
         case .failed(let failure):
+            // The picture goes with it, and so does the `ETag`. Keeping the
+            // tag after dropping the frame asks the next poll to say "still
+            // the one you have" about a frame this loader no longer holds:
+            // the Tower answers `304`, `.unchanged` leaves `phase` alone, and
+            // the panel stays on a stale error message over a healthy link
+            // until the Tower happens to produce a new frame.
+            etag = nil
             phase = .failed(failure)
             return min(idleMultiplier * 1.5, 8.0)
         }
@@ -671,8 +692,12 @@ struct CVLivePreviewPanel: View {
     /// stops claiming to be live within half a second.
     private static let freshSeconds = 0.35
 
+    /// An age this app could not establish is not evidence of freshness.
+    /// `displayedAge` is `nil` whenever `X-CV-Preview-Age` was missing or
+    /// unparseable, and answering `true` there put the strongest claim on
+    /// screen — "Live" — on the strength of a header that never arrived.
     private func isFresh(_ shown: CVPreviewFrame) -> Bool {
-        guard let age = shown.displayedAge else { return true }
+        guard let age = shown.displayedAge else { return false }
         return age < Self.freshSeconds
     }
 
@@ -721,6 +746,12 @@ struct CVLivePreviewPanel: View {
             .padding(20)
     }
 
+    /// The treatment of what is actually on screen.
+    private var shownTreatment: RedactionState {
+        if case .showing(let shown) = loader.phase { return shown.treatment }
+        return preview.redaction
+    }
+
     @ViewBuilder
     private var caption: some View {
         // The Tower's own sentence about what is drawn. Verbatim, and this is
@@ -750,7 +781,16 @@ struct CVLivePreviewPanel: View {
             }
             // What this app does with the pixels, in `RedactionState`'s own
             // words: "A live view. This app does not store it."
-            Text(preview.redaction.explanation)
+            //
+            // Taken from the FRAME while one is on screen, and from the
+            // descriptor only when there is nothing drawn. The treatment
+            // travels on the bytes as well as in the status document, and
+            // `decode` already gates on the header for exactly the reason
+            // this sentence has to follow it: a caption sourced from the
+            // descriptor describes an image the descriptor did not carry,
+            // and would keep saying "the producer states this image was
+            // redacted" over bytes that arrived labelled otherwise.
+            Text(shownTreatment.explanation)
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             Spacer(minLength: 0)
