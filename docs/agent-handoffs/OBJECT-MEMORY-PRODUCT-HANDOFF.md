@@ -759,7 +759,7 @@ only machine it was tested on.
 
 ## 6. What is proven, and what is not
 
-**Proven by test, offline: the Tower half — §2, §2A, §3, §4, §5.** 2340
+**Proven by test, offline: the Tower half — §2, §2A, §3, §4, §5.** 2369
 tests, plus the numbers in §2.2 and §2A.3, which were measured by running
 the shipped code against this host's real store rather than asserted.
 
@@ -1050,7 +1050,7 @@ shipped code over it read-only.
 - **The verifier's reject path is unproven physically.** §6.
 - The suite grew because tests were added, not because behaviour is
   asserted twice. **Before this branch: 2217 passed, 68 skipped, ~430 s.
-  After: 2340 passed, 68 skipped, 374 s.** Zero failures either side, and
+  After: 2369 passed, 68 skipped, 390 s.** Zero failures either side, and
   `pip check` clean. The 68 skips are the same opt-in gates as before
   (`TOWER_RUN_MODEL_TESTS`, a machine-local corpus, a vendored face
   model); none of them was added or widened here.
