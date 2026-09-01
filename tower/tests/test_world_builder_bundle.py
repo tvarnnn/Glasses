@@ -158,21 +158,49 @@ def test_it_never_returns_a_worse_estimate():
         ), f"sigma={sigma}: {report}"
 
 
-def test_two_view_landmarks_are_not_adjusted():
-    """A point seen twice is exactly determined -- it can always be moved
-    so both residuals vanish -- so it adds three parameters and no
-    constraint. Including them is what made an earlier bundle attempt
-    measure 0.00% improvement on a map that was two-thirds two-view.
+def test_two_view_landmarks_move_with_their_cameras():
+    """The bug this branch shipped and then found, pinned as a test.
+
+    A point seen twice is exactly determined and tells the optimiser
+    nothing about the cameras, which is a real argument for excluding it
+    -- and excluding it is WRONG, because a third of the real map is
+    two-view and those landmarks still have published support rows. Drop
+    their observations and the cameras move out from under them, and
+    every row they published stops reprojecting. Measured on the drawer
+    walk: published p99 3.97 px with no adjustment at all, 13.70 px with
+    the adjustment excluding two-view landmarks, 2.76 px including them.
+
+    So this asserts the consistency property, not an information one: a
+    landmark whose cameras moved must have moved too.
     """
     camera_matrix, rotations, translations, xyz, rows = _rig(cameras=2)
     started = _perturb(rotations, translations, xyz)
     _, _, adjusted_p, report = bundle.optimise(
-        *started, rows, camera_matrix, iterations=10)
+        *started, rows, camera_matrix, iterations=10, fixed_cameras=(0,))
 
-    assert report.get("landmarks_adjusted", 0) == 0
-    assert np.array_equal(adjusted_p, started[2]), (
-        "nothing was adjustable, so nothing should have moved"
-    )
+    assert report.get("landmarks_adjusted", 0) > 0
+    assert not np.array_equal(adjusted_p, started[2])
+
+
+def test_a_landmark_the_window_cannot_hold_is_not_moved():
+    """`fixed_points` is how a caller says "this landmark has observers
+    you cannot see". The optimiser must leave it exactly where it is
+    while still letting its observations constrain the cameras --
+    otherwise a windowed adjustment silently rewrites geometry whose
+    other half is already on disk."""
+    camera_matrix, rotations, translations, xyz, rows = _rig()
+    started_rotations, started_translations, started_xyz = _perturb(
+        rotations, translations, xyz)
+    fixed = np.zeros(len(xyz), dtype=bool)
+    fixed[::3] = True
+
+    _, _, adjusted_p, report = bundle.optimise(
+        started_rotations, started_translations, started_xyz, rows,
+        camera_matrix, iterations=15, fixed_cameras=(0,), fixed_points=fixed)
+
+    assert np.array_equal(adjusted_p[fixed], started_xyz[fixed])
+    assert not np.array_equal(adjusted_p[~fixed], started_xyz[~fixed])
+    assert report["landmarks_fixed"] == int(fixed.sum())
 
 
 def test_it_refuses_rather_than_raises_on_degenerate_input():

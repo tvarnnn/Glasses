@@ -379,7 +379,8 @@ def _rewrite_poses(poses, absolute):
     return rewritten
 
 
-def _local_adjust(camera_matrix, absolute, landmarks, observations, newest):
+def _local_adjust(camera_matrix, absolute, landmarks, first_frame,
+                  observations, newest):
     """Bundle-adjust the newest cameras of a chain, in place.
 
     The window is the cameras with indices greater than
@@ -387,6 +388,22 @@ def _local_adjust(camera_matrix, absolute, landmarks, observations, newest):
     BUNDLE_ANCHOR_CAMERAS of them are held fixed so the adjustment cannot
     slide geometry that has already been published, and so the seven
     free parameters of a monocular reconstruction stay pinned.
+
+    A landmark that was FIRST SEEN before the window is held fixed. Its
+    older observers are outside the window and cannot move to follow it,
+    so adjusting it to fit only its recent observers silently breaks
+    every support row those cameras published -- measured on the drawer
+    walk, before this rule existed, as published reprojection p99 3.97 ->
+    12.40 px and rows over the 3 px gate 1.8% -> 10.4%, while the pose
+    error genuinely improved at the same time. It is the exact shape of
+    the failure this whole branch exists to avoid: a number that looks
+    better bought with geometry that is worse.
+
+    Held fixed, those landmarks are not dead weight. They are the anchor
+    that ties this window to the geometry already on disk, which is what
+    makes a WINDOWED adjustment control drift rather than merely
+    redistribute it -- the same job ORB-SLAM gives the keyframes that
+    observe a local map point without being local themselves.
 
     Returns the report `bundle.optimise` produced, or None if there was
     not enough of a window to adjust. `absolute` and `landmarks` are
@@ -431,11 +448,15 @@ def _local_adjust(camera_matrix, absolute, landmarks, observations, newest):
     rotations = np.array([absolute[index][0] for index in window])
     translations = np.array([absolute[index][1] for index in window])
     points = np.asarray([landmarks[index] for index in used], dtype=np.float64)
+    fixed = np.asarray(
+        [first_frame[index] < lowest for index in used], dtype=bool
+    )
 
     rotations, translations, points, report = bundle.optimise(
         rotations, translations, points, packed, camera_matrix,
         iterations=BUNDLE_ITERATIONS,
         fixed_cameras=tuple(range(min(BUNDLE_ANCHOR_CAMERAS, len(window)))),
+        fixed_points=fixed,
     )
     report["window_cameras"] = len(window)
     report["window_landmarks"] = len(used)
@@ -529,6 +550,10 @@ class ClassicalTwoViewBackend(GeometryBackend):
         landmarks: list = []
         # Publishability, index-aligned with `landmarks`.
         landmark_ok: list = []
+        # The frame each landmark was FIRST seen from, index-aligned with
+        # `landmarks`. `_local_adjust` holds a landmark fixed once that
+        # frame falls out of the bundle window -- see its docstring.
+        landmark_frame: list = []
         # (frame index, feature index) -> landmark index, so a later frame
         # can find 3-D correspondences for the features it matched.
         observed: dict[tuple[int, int], int] = {}
@@ -584,6 +609,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                     absolute[current] = (estimate.rotation, estimate.translation)
                     landmarks.extend(pair.points)
                     landmark_ok.extend(pair.quality)
+                    landmark_frame.extend([anchor_index] * len(pair.points))
                     seed: list[tuple[int, int, int]] = []
                     for offset, (index_a, index_b) in enumerate(
                         pair.inlier_index_pairs
@@ -643,6 +669,9 @@ class ClassicalTwoViewBackend(GeometryBackend):
                     base = len(landmarks)
                     landmarks.extend(new_points)
                     landmark_ok.extend(extend_quality)
+                    landmark_frame.extend(
+                        [references[0][0]] * len(new_points)
+                    )
                     for key, offset in new_observed.items():
                         observed[key] = base + offset
                     created_rows = [
@@ -670,7 +699,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 observations = _prune_observations(observations, current)
                 if BUNDLE_WINDOW and solved_count % BUNDLE_EVERY == 0:
                     _local_adjust(self._camera_matrix, absolute, landmarks,
-                                  observations, current)
+                                  landmark_frame, observations, current)
                     poses = _rewrite_poses(poses, absolute)
             else:
                 failures += 1
@@ -772,6 +801,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 chain.absolute[index] = (pose.rotation, pose.translation)
                 chain.landmarks.extend(pair.points)
                 chain.landmark_ok.extend(pair.quality)
+                chain.landmark_frame.extend([anchor_index] * len(pair.points))
                 new_points = pair.points
                 new_points_ok = list(pair.quality)
                 for offset, (index_a, index_b) in enumerate(
@@ -825,6 +855,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 base = len(chain.landmarks)
                 chain.landmarks.extend(triangulated)
                 chain.landmark_ok.extend(extend_quality)
+                chain.landmark_frame.extend([nearest_index] * len(triangulated))
                 new_points_ok = list(extend_quality)
                 new_points = triangulated
                 for key, offset in new_observed.items():
@@ -888,7 +919,7 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 # the segment less placeable rather than more.
                 chain.bundle = _local_adjust(
                     self._camera_matrix, chain.absolute, chain.landmarks,
-                    chain.observations, index,
+                    chain.landmark_frame, chain.observations, index,
                 )
                 chain.poses = _rewrite_poses(chain.poses, chain.absolute)
         else:
@@ -1652,6 +1683,7 @@ class _Chain:
         "count",
         "discarded",
         "failures",
+        "landmark_frame",
         "landmark_ok",
         "landmarks",
         "observations",
@@ -1688,6 +1720,11 @@ class _Chain:
         # The last adjustment's report, or None. Diagnostics only.
         self.bundle = None
         self.landmark_ok = []
+        # The frame each landmark was FIRST seen from, index-aligned with
+        # `landmarks`. Not pruned: it is one int per landmark, and it is
+        # what decides whether an adjustment may move a landmark whose
+        # older observers have left the window.
+        self.landmark_frame = []
         # Discards accumulate for the LIFE of the chain, so the snapshot
         # reports the whole segment rather than the last window.
         self.discarded = {

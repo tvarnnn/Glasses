@@ -56,6 +56,21 @@ all in forming it, which is vectorised.
 NumPy and OpenCV only. scipy is not a Tower dependency and this must run
 where the rest of the world builder runs.
 
+THE INVARIANT THAT BIT TWICE, stated once so it does not bite again:
+
+    EVERY OBSERVATION OF A CAMERA THAT IS ALLOWED TO MOVE MUST
+    PARTICIPATE IN THE OPTIMISATION.
+
+Drop an observation for any reason -- too few views on its landmark, a
+per-landmark view cap, a sampling shortcut -- and its landmark stays put
+while its camera moves out from under it. The trajectory gets better and
+the SUPPORT TABLE, which is what cross-segment registration and the
+viewer actually consume, gets worse. Both `MIN_VIEWS_FOR_ADJUSTMENT` and
+`MAX_VIEWS_PER_LANDMARK` shipped values that violated this and each
+carries the measurement that caught it. A landmark that must not MOVE is
+expressed with `fixed_points`, which keeps its observations in the
+problem; it is never expressed by removing its rows.
+
 GAUGE. A monocular reconstruction is free up to a similarity: 3 rotation,
 3 translation, 1 scale. The Jacobian is therefore rank-deficient by 7 and
 an undamped Gauss-Newton step is not unique. LM's damping term makes the
@@ -80,22 +95,74 @@ import numpy as np
 # would already have rejected. Deliberately not a new number.
 HUBER_DELTA_PX = 3.0
 
-# A landmark seen from fewer views than this is not adjusted and does not
-# constrain anything. Two views determine a point exactly -- it can always
-# be moved to make both residuals zero -- so including two-view landmarks
-# adds parameters and no information, which is precisely the condition the
-# earlier 0.00% measurement was made under.
-MIN_VIEWS_FOR_ADJUSTMENT = 3
+# A landmark seen from fewer views than this is dropped: neither adjusted
+# nor allowed to constrain a camera.
+#
+# 2, NOT 3, and the difference is not academic -- it was the single worst
+# bug on this branch.
+#
+# The tempting argument for 3 is about INFORMATION, and it is correct as
+# far as it goes: two views determine a point exactly, so a two-view
+# landmark can always be moved to make both its residuals zero and it
+# tells the optimiser nothing about the cameras. Excluding it saves three
+# parameters and loses no information.
+#
+# It loses CONSISTENCY, which is a different property and the one that
+# ships. A third of this map is two-view. Drop those observations and the
+# cameras move out from under landmarks that are not allowed to follow,
+# so every support row those landmarks already published stops
+# reprojecting -- and `support.json` is what cross-segment registration
+# solves PnP against. Measured on the drawer walk, adjustment ON,
+# identical in every other respect:
+#
+#     min_views   published reproj median / p99   rows over the 3 px gate
+#         3            0.723 / 13.698 px                  9.55%
+#         2            0.522 /  2.761 px                  0.57%
+#
+# The baseline with no adjustment at all is 0.543 / 3.974 px and 1.79%.
+# So at 3 the adjustment made the published map markedly WORSE than not
+# adjusting at all; at 2 it makes it better on every statistic. That is
+# the exact shape this branch exists to avoid -- a trajectory that
+# genuinely improved while the artifact everybody consumes got worse --
+# and it is visible only if you measure the support table rather than the
+# trajectory.
+MIN_VIEWS_FOR_ADJUSTMENT = 2
 
 # Cameras whose observations are too few to pose. Below this the camera
 # would be moved by noise.
 MIN_OBSERVATIONS_PER_CAMERA = 12
 
-# Views of one landmark that may enter the reduced camera system. See the
-# cap's use below: the Schur complement is quadratic in views per
-# landmark, so this bounds the worst case without touching the common
-# one. 0 disables it.
-MAX_VIEWS_PER_LANDMARK = 8
+# Views of one landmark that may enter the reduced camera system. The
+# Schur complement is quadratic in views per landmark, so this bounds a
+# worst case; 0 disables it.
+#
+# 16, and it was 8, and 8 was wrong for THE SAME REASON `min_views = 3`
+# was wrong. Both dropped observations from the optimisation while
+# leaving the cameras that made them free to move. The landmark then
+# stays where it was, the camera does not, and every support row between
+# them stops reprojecting -- so the published map degrades while the
+# trajectory improves.
+#
+# MEASURED on the 2026-09-01 long-loop walk, adjustment ON, nothing else
+# changed:
+#
+#   cap    published reproj median / p99   over 3 px   dominant component
+#     8          0.726 / 15.800 px            9.51%      7,521 pts (24.1%)
+#    16          0.546 /  2.781 px            0.69%     16,340 pts (53.5%)
+#
+# The baseline with no adjustment at all is 0.587 / 4.732 px, 2.54%, and
+# 8,285 points (27.3%). So the cap was not a cost knob at all: at 8 it
+# was quietly destroying the artifact the whole pipeline exists to
+# produce, and at 16 the same adjustment doubles the dominant component
+# AND halves the reprojection tail.
+#
+# 16 rather than uncapped because uncapped changes the SOLVE: measured
+# 194 solved poses against 323, as a stronger adjustment moves poses
+# enough to change which later keyframes their PnP can place. The
+# dominant component is larger (64.7%) and 129 fewer cameras are posed,
+# which is not obviously a better world and is certainly a different
+# one. 16 keeps the solve where it was and takes the coherence.
+MAX_VIEWS_PER_LANDMARK = 16
 
 
 def _skew(vectors: np.ndarray) -> np.ndarray:
@@ -203,8 +270,9 @@ def optimise(
     *,
     iterations: int = 10,
     fixed_cameras=(),
-    huber_delta: float = HUBER_DELTA_PX,
-    min_views: int = MIN_VIEWS_FOR_ADJUSTMENT,
+    fixed_points=None,
+    huber_delta: float | None = None,
+    min_views: int | None = None,
 ):
     """Refine poses and landmarks against their observations.
 
@@ -223,6 +291,20 @@ def optimise(
                     already published a pose downstream passes it here, so
                     an adjustment cannot rewrite geometry someone is
                     holding.
+      fixed_points  boolean mask over `points`, or None. A landmark whose
+                    observations are not ALL in this window must be
+                    passed here. Its older observers are outside the
+                    window and cannot move to follow it, so adjusting it
+                    to fit only its recent observers silently breaks
+                    every support row those older cameras published --
+                    measured on the drawer walk as published reprojection
+                    p99 3.97 -> 12.40 px, with the pose error genuinely
+                    improving at the same time. Its observations STILL
+                    constrain the cameras: a landmark held where the
+                    older map put it is an anchor tying this window to
+                    geometry already on disk, which is most of what makes
+                    a windowed adjustment control drift rather than
+                    merely redistribute it.
 
     Returns (rotations, translations, points, report). `report` carries
     the reprojection RMS before and after, the iteration count, and
@@ -234,6 +316,15 @@ def optimise(
     the module docstring) so without this the whole window would drift in
     a way no consumer expects.
     """
+    # Resolved in the body, not as a default argument: a default is
+    # bound at definition time, so a sweep that monkeypatches the module
+    # constant would silently measure the same thing every time. That
+    # happened, and cost a round of measurements that all came back
+    # identical.
+    if huber_delta is None:
+        huber_delta = HUBER_DELTA_PX
+    if min_views is None:
+        min_views = MIN_VIEWS_FOR_ADJUSTMENT
     rotations = np.array(rotations, dtype=np.float64, copy=True)
     translations = np.array(translations, dtype=np.float64, copy=True)
     points = np.array(points, dtype=np.float64, copy=True)
@@ -255,7 +346,15 @@ def optimise(
     # bias the robustifier's scale without informing a single pose.
     views = np.bincount(point_index, minlength=n_pt)
     usable_point = views >= min_views
-    keep = usable_point[point_index]
+    if fixed_points is not None:
+        # A fixed landmark is kept whatever its view count: it is not a
+        # parameter, so "too few views to determine it" does not apply,
+        # and its observations are exactly the anchor this window needs.
+        keep = usable_point[point_index] | np.asarray(
+            fixed_points, dtype=bool
+        )[point_index]
+    else:
+        keep = usable_point[point_index]
     if not keep.any():
         return rotations, translations, points, {
             "iterations": 0,
@@ -302,6 +401,21 @@ def optimise(
         point_index = point_index[within]
         observed = observed[within]
 
+    # A fixed landmark keeps its observations -- they constrain the
+    # cameras -- but is not a parameter, so it is excluded from V, W and
+    # the Schur elimination.
+    if fixed_points is None:
+        point_is_fixed = np.zeros(n_pt, dtype=bool)
+    else:
+        point_is_fixed = np.asarray(fixed_points, dtype=bool)
+        if point_is_fixed.shape != (n_pt,):
+            raise ValueError(
+                f"fixed_points must be a mask over {n_pt} points, got "
+                f"{point_is_fixed.shape}"
+            )
+    usable_point = usable_point & ~point_is_fixed
+    free_obs = ~point_is_fixed[point_index]
+
     # And cameras with too few surviving observations to be posed by them.
     per_camera = np.bincount(camera_index, minlength=n_cam)
     frozen = np.zeros(n_cam, dtype=bool)
@@ -327,7 +441,7 @@ def optimise(
     # landmark per attempt, profiled at 140,000 calls over a 30-keyframe
     # walk. Everything below is index arithmetic on the FIXED structure,
     # and only the numbers flowing through it are recomputed.
-    live_rows = np.nonzero(~frozen[camera_index])[0]
+    live_rows = np.nonzero((~frozen[camera_index]) & free_obs)[0]
     if len(live_rows) == 0:
         return rotations, translations, points, {
             "iterations": 0, "reason": "no observation by a free camera",
@@ -396,8 +510,14 @@ def optimise(
             np.bincount(camera_index, weights=AA[:, i, j], minlength=n_cam)
             for i in range(6) for j in range(6)
         ], axis=1).reshape(n_cam, 6, 6)
+        # V and g_pt see only FREE points. A fixed landmark has no
+        # parameter block, so accumulating one would produce a diagonal
+        # entry that is inverted and back-substituted into a point
+        # nothing is allowed to move.
+        free_weight = free_obs.astype(np.float64)
         V = np.stack([
-            np.bincount(point_index, weights=BB[:, i, j], minlength=n_pt)
+            np.bincount(point_index, weights=BB[:, i, j] * free_weight,
+                        minlength=n_pt)
             for i in range(3) for j in range(3)
         ], axis=1).reshape(n_pt, 3, 3)
         g_cam = np.stack([
@@ -405,7 +525,8 @@ def optimise(
             for i in range(6)
         ], axis=1)
         g_pt = np.stack([
-            np.bincount(point_index, weights=eb[:, i], minlength=n_pt)
+            np.bincount(point_index, weights=eb[:, i] * free_weight,
+                        minlength=n_pt)
             for i in range(3)
         ], axis=1)
 
@@ -455,10 +576,12 @@ def optimise(
             # Back-substitute the landmarks.
             pushed = np.einsum("mij,mi->mj", W, full_delta[camera_index])
             correction = np.stack([
-                np.bincount(point_index, weights=pushed[:, i], minlength=n_pt)
+                np.bincount(point_index, weights=pushed[:, i] * free_weight,
+                            minlength=n_pt)
                 for i in range(3)
             ], axis=1)
             delta_pt = np.einsum("nij,nj->ni", full_Vinv, g_pt - correction)
+            delta_pt[point_is_fixed] = 0.0
 
             trial_rotations = rotations.copy()
             trial_translations = translations.copy()
@@ -496,6 +619,7 @@ def optimise(
         "reprojection_rms_after": round(after, 5),
         "improved": bool(after < before),
         "landmarks_adjusted": int(usable_point.sum()),
+        "landmarks_fixed": int(point_is_fixed.sum()),
         "cameras_free": int((~frozen).sum()),
         "observations": int(len(observed)),
     }
