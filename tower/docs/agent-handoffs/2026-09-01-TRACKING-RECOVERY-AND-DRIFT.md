@@ -140,3 +140,41 @@ check out `world-builder/tracking-recovery-v1` on the Tower.
 4. Expect on the phone: fewer fragments, and a dominant fragment holding
    substantially more of the room. Report the fragment count and which
    fragment is largest — that is the number this branch moved.
+
+---
+
+## 7. Temporary resources this run created
+
+Recorded per the repository's filesystem policy. **Nothing was deleted**,
+and nothing was written to `C:\`, to the user home, or into
+`tower/data/`.
+
+**Git worktrees** (both created with an explicit destination):
+
+- `C:\Users\tvllo\Projects\Glasses-worktrees\wb-track` — this branch. Keep
+  while the branch is in review.
+- `C:\Users\tvllo\Projects\Glasses-worktrees\wb-phys` — detached at
+  `768cecf`, used to measure the physical-era baseline. Disposable;
+  `git worktree remove` when the numbers in §3 are no longer being
+  questioned.
+
+**Scratch** — all under `C:\Users\tvllo\Projects\Glasses-scratch\wbt\`:
+replayed worlds (`b_*`, `sw/`, `phys/`, `cb0`–`cb5`), benchmark result
+files (`cb_*.json`), pytest basetemps (`pt*`), and the experiment drivers
+(`sweep.py`, `grid*.sh`, `regcompare.py`, `physera.py`, `table.py`,
+`drift.py`, `localmap_proto.py`, `ba_probe.py`, `ba2.py`). Roughly 3 GB,
+all reproducible.
+
+**One file in the canonical checkout that is NOT ours to keep or remove:**
+`C:\Users\tvllo\Projects\Glasses\orb_vocab_stella.fbow`, untracked. It
+came from this run's relocalization research, which downloaded
+stella_vslam's ORB vocabulary to check its provenance. **Do not vendor
+it.** That research established, by parsing the binaries rather than
+reading the READMEs, that stella's `orb_vocab.fbow` is byte-identical to
+fbow's, which is Mur-Artal's ORB-SLAM2 vocabulary data redistributed
+under a third party's copyright — the same class of derivation that got
+OpenVSLAM withdrawn in 2020. **No independently trained, permissively
+licensed pretrained ORB vocabulary exists.** If retrieval is ever built
+here, train a vocabulary from our own footage: measured, K=4096 from
+60k of our own descriptors builds in 7.6 s, quantizes a keyframe in
+18 ms, and recovers most of the full vocabulary's discriminative margin.
