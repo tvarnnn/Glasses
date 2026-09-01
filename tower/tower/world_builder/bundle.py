@@ -503,6 +503,13 @@ def optimise(
     weight = _huber_weights(residual, huber_delta)
     cost = float((weight[:, None] * residual ** 2).sum())
 
+    # The estimate as it arrived, kept so the parallax test at the end can
+    # ask what THIS adjustment changed rather than re-judging what the
+    # creation gate already ruled on.
+    points_before = points.copy()
+    rotations_before = rotations.copy()
+    translations_before = translations.copy()
+
     lam = 1e-3
     taken = 0
     for _ in range(iterations):
@@ -674,34 +681,60 @@ def optimise(
     # built from, so it costs one more pass over a list that already
     # exists.
     if min_parallax_deg is not None and total_pairs:
-        centres = np.einsum(
-            "nij,nj->ni", np.transpose(rotations, (0, 2, 1)), -translations
-        )
         point_of_pair = point_index[rows_a]
-        ray_a = points[point_of_pair] - centres[camera_index[rows_a]]
-        ray_b = points[point_of_pair] - centres[camera_index[rows_b]]
-        norm_a = np.linalg.norm(ray_a, axis=1)
-        norm_b = np.linalg.norm(ray_b, axis=1)
-        usable = (norm_a > 1e-12) & (norm_b > 1e-12)
-        cosine = np.ones(len(ray_a))
-        cosine[usable] = np.clip(
-            np.einsum("ij,ij->i", ray_a[usable], ray_b[usable])
-            / (norm_a[usable] * norm_b[usable]),
-            -1.0, 1.0,
-        )
-        angle = np.degrees(np.arccos(cosine))
-        widest = np.zeros(n_pt)
-        np.maximum.at(widest, point_of_pair, angle)
         seen = np.zeros(n_pt, dtype=bool)
         seen[point_of_pair] = True
-        parallax_ok = ~seen | (widest >= min_parallax_deg)
+
+        def widest_angle(where, poses_rotations, poses_translations):
+            centres = np.einsum(
+                "nij,nj->ni",
+                np.transpose(poses_rotations, (0, 2, 1)),
+                -poses_translations,
+            )
+            ray_a = where[point_of_pair] - centres[camera_index[rows_a]]
+            ray_b = where[point_of_pair] - centres[camera_index[rows_b]]
+            norm_a = np.linalg.norm(ray_a, axis=1)
+            norm_b = np.linalg.norm(ray_b, axis=1)
+            usable = (norm_a > 1e-12) & (norm_b > 1e-12)
+            cosine = np.ones(len(ray_a))
+            cosine[usable] = np.clip(
+                np.einsum("ij,ij->i", ray_a[usable], ray_b[usable])
+                / (norm_a[usable] * norm_b[usable]),
+                -1.0, 1.0,
+            )
+            widest = np.zeros(n_pt)
+            np.maximum.at(widest, point_of_pair, np.degrees(np.arccos(cosine)))
+            return widest
+
+        # BEFORE AND AFTER, and only the DIFFERENCE is actionable.
+        #
+        # Demoting on the absolute angle was measured and refused: it
+        # removes 29% of the corpus's points, because plenty of landmarks
+        # sit below this bound honestly and `landmark_gate` already ruled
+        # on them at creation with the same number. An adjustment has no
+        # standing to re-litigate that.
+        #
+        # What it does have standing to revoke is what IT broke: a
+        # landmark whose observing rays subtended a usable angle before
+        # this adjustment and do not after has been slid along its own
+        # ray, which is the failure this test exists for and the one
+        # reprojection cannot see.
+        before_angle = widest_angle(
+            np.array(points_before, dtype=np.float64), rotations_before,
+            translations_before)
+        after_angle = widest_angle(points, rotations, translations)
+        broke_it = (
+            seen
+            & (before_angle >= min_parallax_deg)
+            & (after_angle < min_parallax_deg)
+        )
         # Counted BEFORE the merge, and only for points reprojection had
         # not already refused, so a point that fails both is attributed
         # once. The engine folds these into the SAME two buckets
         # `landmark_gate` uses, which is what keeps the manifest's
         # `published + refused == triangulated` identity closing.
-        demoted_parallax = int((point_ok & ~parallax_ok).sum())
-        point_ok &= parallax_ok
+        demoted_parallax = int((point_ok & broke_it).sum())
+        point_ok &= ~broke_it
 
     return rotations, translations, points, {
         "iterations": taken,
