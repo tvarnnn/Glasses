@@ -174,6 +174,24 @@ MIN_OBSERVATIONS_PER_CAMERA = 12
 # than to raise this number again.
 MAX_VIEWS_PER_LANDMARK = 16
 
+# How far an adjustment must COLLAPSE a landmark's parallax before the
+# landmark is retired, as a fraction of what it had.
+#
+# The bound alone was not enough. Demoting every landmark whose angle
+# crossed `min_parallax_deg` retires one whose parallax went 0.200 to
+# 0.198 degrees exactly as readily as one that was slid along its ray,
+# and a map this full of marginal two-view landmarks has a great many of
+# the first kind: measured, 29% of the 2026-08-29 normal walk's published
+# points, against a handful of landmarks actually responsible for the
+# bbox blowup.
+#
+# A point that genuinely slid does not lose a few percent of its
+# parallax, it loses most of it. Requiring the angle to at least HALVE
+# separates the two without inventing a second bound -- the floor is
+# still `min_parallax_deg`, and this only asks that the adjustment be
+# the cause rather than the occasion.
+PARALLAX_COLLAPSE_RATIO = 0.5
+
 
 def _skew(vectors: np.ndarray) -> np.ndarray:
     """(n, 3) -> (n, 3, 3) cross-product matrices."""
@@ -723,9 +741,11 @@ def optimise(
         #
         # What it does have standing to revoke is what IT broke: a
         # landmark whose observing rays subtended a usable angle before
-        # this adjustment and do not after has been slid along its own
-        # ray, which is the failure this test exists for and the one
-        # reprojection cannot see.
+        # this adjustment, do not after, AND lost most of that angle in
+        # the process has been slid along its own ray -- which is the
+        # failure this test exists for and the one reprojection cannot
+        # see. See PARALLAX_COLLAPSE_RATIO for why the crossing alone is
+        # not enough.
         before_angle = widest_angle(
             np.array(points_before, dtype=np.float64), rotations_before,
             translations_before)
@@ -734,6 +754,7 @@ def optimise(
             seen
             & (before_angle >= min_parallax_deg)
             & (after_angle < min_parallax_deg)
+            & (after_angle < before_angle * PARALLAX_COLLAPSE_RATIO)
         )
         # Counted BEFORE the merge, and only for points reprojection had
         # not already refused, so a point that fails both is attributed
