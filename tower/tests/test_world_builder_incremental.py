@@ -365,7 +365,8 @@ class TestSegmentIsolation:
         assert chain.absolute == {}
         assert chain.poses == []
         assert chain.broken is None
-        assert chain.previous_features is None
+        assert chain.references == []
+        assert chain.failures == 0
 
 
 # -- the refusal to invent intrinsics survives the new entry point -----
