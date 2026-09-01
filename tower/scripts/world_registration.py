@@ -1626,7 +1626,117 @@ def pair_is_hopeless(source, target, thresholds) -> str | None:
 # smallest sample that preserved every verdict, and the next step down
 # lost all of them. It is deliberately NOT lowered for speed -- the whole
 # value of this function is the verdicts.
+#
+# IT IS ALSO A PER-SIDE CAP, AND THAT IS THE PART THAT BROKE.
+#
+# Read the corpus it was measured on, quoted above: "one segment carries
+# 89 keyframes against a median of 10". A cap of 8 covers 80% of a median
+# segment. Once tracking stopped cutting a segment at the first refused
+# pose, segments of 51, 54 and 170 keyframes became ordinary -- and 8
+# evenly spread frames cover 4.7% of a 170-keyframe segment. The verdict
+# "no visual link" then stops being a statement about two segments and
+# becomes a statement about the sample.
+#
+# MEASURED over six on-disk worlds, 708 candidate pairs. Running the FULL
+# cross-product on the pairs involving the 170-keyframe segment of the
+# 2026-09-01 walk:
+#
+#   pair            reachable at k=8      full cross-product
+#   seg31 x seg28   3 frame pairs         172 frame pairs / 2,985 inliers
+#   seg31 x seg25   0                     117 / 1,997
+#   seg31 x seg21   0                     104 / 1,767
+#   seg31 x seg18   0                      87 / 1,450
+#
+# In 16 of that segment's 17 pairs, the number of genuinely matching
+# frame pairs reachable from the sample is ZERO.
+#
+# WHY A PRODUCT BUDGET AND NOT A BIGGER PER-SIDE CAP. Cost is the product
+# |A| x |B|, so a per-side cap of k prices every pair at k^2 whether the
+# segments hold 10 keyframes or 170. Budgeting the product and splitting
+# it in proportion to the two lengths spends the same money where it buys
+# something. Measured at matched budgets:
+#
+#   world    per-side k=8      product P<=64    per-side k=16     product P<=256
+#   b_new    6 adm / 34.8 s    9 adm / 34.1 s   8 adm / 60.6 s    10 adm / 67.0 s
+#   r8_new   1 adm / 25.7 s    3 adm / 19.6 s   4 adm / 45.0 s     6 adm / 46.6 s
+#
+# The decisive row is the last: the product budget reaches at P<=256 the
+# exact result -- 6 admitted pairs, 135 keyframes of dominant component
+# -- that the per-side cap needs k=32 and 78.9 s to reach, in 46.6 s.
+#
+# AND THE PAIRS IT ADDS ARE BETTER, which is the part that matters.
+# Comparing the 13 pairs admitted at k=8 with the 16 admitted only at a
+# wider sample: scale reciprocity median 0.0555 -> 0.0447, rotation
+# disagreement 1.13 -> 0.94 deg, reprojection 2.59 -> 2.11 px, cameras
+# 4 -> 5. NO GATE WAS TOUCHED to obtain them. They were always
+# admissible and were never offered.
+#
+# The independent check settles it. At k=8 the admitted graph of that
+# walk is a TREE, so `cycles_checked` is 0 and no placement in it has any
+# independent verification at all. With the wider sample the cluster
+# {17,18,19,23,28} closes six independent cycles, every one inside
+# MAX_CYCLE_ROTATION_DEG and MAX_CYCLE_SCALE_RATIO with room to spare
+# (worst 4.58 deg, 1.11x). Widening retrieval turned an unverifiable
+# spanning tree into a cycle-verified cluster. That is a safety
+# improvement, not a recall trade.
 MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING = 8
+
+# The budget, in FRAME PAIRS, that one segment pair may spend on
+# matching. 256 is the per-side cap's own price at k=16, and corpus-wide
+# it reaches 21 of the 23 admissions a per-side cap of 32 finds, and 309
+# of its 322 dominant-component keyframes, in 72% of the time.
+MAX_MATCH_FRAME_PAIRS = 256
+
+
+def match_budget(count_a: int, count_b: int,
+                 budget: int | None = None,
+                 ceiling: int | None = None):
+    """How many keyframes each side of a pair contributes.
+
+    Proportional to the two segments' lengths, with their PRODUCT held
+    inside `budget`, so a 170-keyframe segment matched against a
+    10-keyframe one is sampled 25 x 10 rather than 8 x 8. See
+    MAX_MATCH_FRAME_PAIRS for the measurement that put this here.
+
+    Two bounds, and the second is what makes the change safe to reason
+    about:
+
+      - the product never exceeds `budget`;
+      - NEITHER SIDE IS EVER SAMPLED MORE SPARSELY THAN THE PER-SIDE CAP
+        IT REPLACES. `min(count, ceiling)` is a floor, not a target, so
+        every verdict the old sampling could reach is still reachable and
+        this can only ever offer `admit()` more evidence, never less.
+        Those floors always fit -- ceiling^2 is 64 against a budget of
+        256 -- which is also why the loop below cannot fail to terminate.
+
+    Deterministic and total: same inputs, same answer, no clock, no RNG.
+    """
+    # Resolved in the body, not as default arguments. A default binds at
+    # definition time, so a sweep that monkeypatches the module constant
+    # would silently measure the same thing every time -- which happened
+    # once already on this branch, in `bundle.optimise`, and cost a round
+    # of measurements that all came back identical.
+    if budget is None:
+        budget = MAX_MATCH_FRAME_PAIRS
+    if ceiling is None:
+        ceiling = MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING
+    count_a = max(int(count_a), 0)
+    count_b = max(int(count_b), 0)
+    if count_a == 0 or count_b == 0:
+        return count_a, count_b
+    least_a = min(count_a, ceiling)
+    least_b = min(count_b, ceiling)
+    take_a, take_b = count_a, count_b
+    while take_a * take_b > budget:
+        if take_a > least_a and take_a >= take_b:
+            take_a -= 1
+        elif take_b > least_b:
+            take_b -= 1
+        elif take_a > least_a:
+            take_a -= 1
+        else:
+            break
+    return take_a, take_b
 
 
 def sampled_frames(count: int, limit: int) -> list:
@@ -1655,19 +1765,20 @@ def cross_matches(source, target, *, min_inliers: int = MIN_INLIERS) -> list:
     An unverified descriptor match is a guess, and on repetitive indoor
     texture it is often a confident one.
 
-    Only a sample of each segment's keyframes takes part -- see
-    MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING for the measurement that fixed
-    the sample size. Returned frame indices are the segment's OWN indices,
-    so poses and the observation index still line up.
+    Only a sample of each segment's keyframes takes part, sized by
+    `match_budget` -- see MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING for why
+    a fixed per-side cap stopped working once segments got long, and
+    MAX_MATCH_FRAME_PAIRS for what replaced it. Returned frame indices
+    are the segment's OWN indices, so poses and the observation index
+    still line up.
     """
     matches = []
     intrinsics = source.intrinsics
-    frames_a = sampled_frames(
-        len(source.descriptors), MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING
+    take_a, take_b = match_budget(
+        len(source.descriptors), len(target.descriptors)
     )
-    frames_b = sampled_frames(
-        len(target.descriptors), MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING
-    )
+    frames_a = sampled_frames(len(source.descriptors), take_a)
+    frames_b = sampled_frames(len(target.descriptors), take_b)
     for frame_a in frames_a:
         for frame_b in frames_b:
             pairs = match_indices(source.descriptors[frame_a],
