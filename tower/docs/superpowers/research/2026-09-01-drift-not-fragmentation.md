@@ -477,11 +477,46 @@ third of the map.
 The publication gate that would have refused those points -- `landmark_gate`,
 with its parallax floor and its 3 px reprojection bar -- runs at landmark
 CREATION and was never re-run after an adjustment moved the landmark. So
-`bundle.optimise` now returns `point_ok`, a per-point mask of which
-adjusted landmarks still have every observation in front of the camera
-and within the same `huber_delta` the pose solve admitted them by, and
-`_local_adjust` uses it to DEMOTE. It can never promote: a landmark the
-creation gate already refused stays refused.
+`bundle.optimise` now returns `point_ok` and `_local_adjust` uses it to
+DEMOTE. It can never promote: a landmark the creation gate already
+refused stays refused.
+
+Getting the test right took three attempts, and the two that failed are
+worth recording because both looked correct.
+
+**Reprojection alone** -- every observation in front of the camera and
+within the same `huber_delta` the pose solve admitted it by. This fixed
+22e9d428 completely (within-segment blowup 219.1 to 5.08, below the
+parent's 6.16) and left e1c52b9f at 87.4, because a point sliding along
+its ray keeps its pixel error and is invisible to a pixel test by
+construction.
+
+**Absolute parallax** -- demote any adjusted landmark whose observing
+rays subtend less than `geometry.min_parallax_deg`, the same
+focal-length-derived bound `landmark_gate` uses. It fixes the blowup
+(9.23, below parent) and **removes 29% of the pinned corpus's points and
+45% of the 2026-09-01 walk's**. Plenty of landmarks sit below that bound
+honestly; the creation gate already ruled on them with the same number,
+and an adjustment has no standing to re-litigate that ruling.
+
+**Parallax DELTA** -- demote only a landmark whose rays subtended a
+usable angle BEFORE this adjustment and do not after. That is exactly
+"the adjustment slid this point along its ray", and it is the shipped
+form.
+
+| pinned eight-capture corpus | worst bbox blowup | points | mean largest share |
+|---|---|---|---|
+| parent | 11.01 | 71,122 | 0.3758 |
+| adjustment, no re-check | **35.15** | 70,662 | 0.3919 |
+| + reprojection | 25.59 | 69,972 | 0.3921 |
+| + absolute parallax | 9.23 | **50,422** | 0.3740 |
+| **+ parallax delta (shipped)** | **10.52** | 62,843 | **0.3936** |
+
+The shipped row has the blowup back below the parent's and the best
+largest-share of the five. The 12% of points it costs against the parent
+are landmarks the adjustment moved into the regime where, in
+`min_parallax_deg`'s own words, "a landmark is not a measurement, and its
+distance is set by pixel noise".
 
 That has a visible consequence and it is worth stating plainly rather
 than hiding: the sum of `Extension.new_points` deltas no longer equals

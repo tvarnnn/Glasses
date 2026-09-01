@@ -657,8 +657,15 @@ def optimise(
     ok_row = valid & (distance <= huber_delta)
     point_ok = np.ones(n_pt, dtype=bool)
     np.logical_and.at(point_ok, point_index, ok_row)
-    demoted_reprojection = int((~point_ok).sum())
-    demoted_parallax = 0
+    # The two reasons are reported as MASKS, not counts. A count here
+    # would be over the whole window and would include landmarks that
+    # were already unpublishable, so the caller -- which is the only
+    # thing that knows what was publishable a moment ago -- could not
+    # tell an actual demotion from a restatement. Counting the wrong one
+    # broke the manifest's `published + refused == triangulated` identity
+    # by 3,069 points on the 2026-08-29 normal walk.
+    failed_reprojection = ~point_ok
+    failed_parallax = np.zeros(n_pt, dtype=bool)
 
     # AND THE PARALLAX, WHICH IS THE HALF REPROJECTION CANNOT SEE.
     #
@@ -733,7 +740,7 @@ def optimise(
         # once. The engine folds these into the SAME two buckets
         # `landmark_gate` uses, which is what keeps the manifest's
         # `published + refused == triangulated` identity closing.
-        demoted_parallax = int((point_ok & broke_it).sum())
+        failed_parallax = broke_it & ~failed_reprojection
         point_ok &= ~broke_it
 
     return rotations, translations, points, {
@@ -746,6 +753,6 @@ def optimise(
         "cameras_free": int((~frozen).sum()),
         "observations": int(len(observed)),
         "point_ok": point_ok,
-        "demoted_high_reprojection": demoted_reprojection,
-        "demoted_low_parallax": demoted_parallax,
+        "failed_reprojection": failed_reprojection,
+        "failed_parallax": failed_parallax,
     }

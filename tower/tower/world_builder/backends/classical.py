@@ -531,7 +531,11 @@ def _local_adjust(camera_matrix, absolute, landmarks, landmark_ok,
     for position, index in enumerate(window):
         absolute[index] = (rotations[position], translations[position])
     point_ok = report.get("point_ok")
+    failed_reprojection = report.get("failed_reprojection")
+    failed_parallax = report.get("failed_parallax")
     demoted = 0
+    by_reprojection = 0
+    by_parallax = 0
     for position, index in enumerate(used):
         index = int(index)
         landmarks[index] = points[position]
@@ -539,10 +543,22 @@ def _local_adjust(camera_matrix, absolute, landmarks, landmark_ok,
         # stays refused; one the adjustment moved out of its own
         # observations' reach stops being publishable. Nothing here can
         # promote, so an adjustment cannot talk a point into a world.
-        if point_ok is not None and not point_ok[position] and landmark_ok[index]:
-            landmark_ok[index] = False
-            demoted += 1
+        #
+        # `landmark_ok[index]` is what makes the count a DEMOTION rather
+        # than a restatement: a landmark that was already unpublishable
+        # is not refused twice, and counting it twice is what broke the
+        # manifest's accounting identity.
+        if point_ok is None or point_ok[position] or not landmark_ok[index]:
+            continue
+        landmark_ok[index] = False
+        demoted += 1
+        if failed_reprojection is not None and failed_reprojection[position]:
+            by_reprojection += 1
+        elif failed_parallax is not None and failed_parallax[position]:
+            by_parallax += 1
     report["landmarks_demoted"] = demoted
+    report["demoted_high_reprojection"] = by_reprojection
+    report["demoted_low_parallax"] = by_parallax
     return report
 
 
