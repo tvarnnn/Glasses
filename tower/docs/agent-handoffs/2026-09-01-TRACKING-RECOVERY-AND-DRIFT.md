@@ -82,6 +82,16 @@ depth is set by pixel noise, and they are counted in the manifest under
 `low_parallax`. On every walk the dominant component still covers the
 same keyframes or more.
 
+**What it does NOT fix: the 12 unreconstructed areas.** The phone
+reported 12 areas seen but not reconstructed; that is the 12 of 30
+segments which got keyframes and triangulated nothing, and it is still
+12. A bundle adjustment cannot help a segment with no geometry to
+adjust. The mechanism that would — holding the anchor and retrying a
+refused seed pair on the next keyframe, which gives it a WIDER baseline —
+is built, tested, and inert at `MAX_RECOVERY_KEYFRAMES = 1`. At 8 it
+takes that walk from 12 unreconstructed segments to 8, and §4 is why we
+will not have it at 8.
+
 ---
 
 ## 4. The thing to be careful about: `MAX_RECOVERY_KEYFRAMES`

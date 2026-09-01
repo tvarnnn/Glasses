@@ -868,31 +868,51 @@ never seed a map so no threshold could matter. The new safety suite fails
    matcher, because appearance is precisely what lies over repeating
    texture.
 
-2. **The dominant component is 41.1% of the 2026-09-01 walk, not 90%.**
-   The walk is still four fragments and some orphans, not one world.
+2. **The dominant component is 74.9% of the 2026-09-01 walk, not 100%.**
+   That walk is now one joined component plus eight orphan fragments.
 
-3. **Registration's second wall is untouched.** Only 2–12% of verified
+3. **THE 12 UNRECONSTRUCTED AREAS ARE UNCHANGED.** The phone reported 12
+   areas seen but not reconstructed. That is exactly the 12 of 30
+   segments which received keyframes and triangulated nothing, and it is
+   **still 12** on this branch: 30 segments, 18 with geometry, before and
+   after. Bundle adjustment cannot help a segment that produced no
+   geometry to adjust.
+
+   What would help is the seed-anchor retry — a segment whose seed pair
+   refuses currently dies, where holding the anchor and retrying on the
+   next keyframe gives the pair a WIDER baseline, which is the direction
+   that fixes a parallax refusal. That mechanism is built and tested. It
+   is inert at `MAX_RECOVERY_KEYFRAMES = 1`, and at 8 it takes the same
+   walk from 12 unreconstructed segments to 8 — which is exactly the
+   trade §3.3 refuses, because the same budget is what lets a solve
+   publish a metre and a half of walking as a millimetre.
+
+   **This is the clearest thing the missing instrument would buy.** A
+   displacement-consistency check would let the seed retry run without
+   the risk that currently rides with it.
+
+4. **Registration's second wall is untouched.** Only 2–12% of verified
    cross-segment correspondences name a feature the source segment
    triangulated into a point, so even with the full cross-product the
    biggest segments cannot reach `MIN_PNP_CORRESPONDENCES` on enough
    target frames. Widening retrieval does not reach this.
 
-4. **`span_over_depth` has no upper bound**, so a diverged segment
+5. **`span_over_depth` has no upper bound**, so a diverged segment
    reports "plenty of parallax" rather than "this solve blew up". The
    drift control makes that far less reachable; it does not make it
    detectable.
 
-5. **`span_over_depth` also mismeasures its most common refusal.** All 27
+6. **`span_over_depth` also mismeasures its most common refusal.** All 27
    two-pose segments in the corpus have a span numerator of exactly
    1.0000 — the seed pair's normalised baseline — so the ratio reports
    scene depth, not wearer motion, and "the wearer stood still" is
    factually wrong for 18 of the 32 segments it is printed about.
 
-6. **No loop closure inside a segment.** A revisit within one segment
+7. **No loop closure inside a segment.** A revisit within one segment
    becomes drift the bundle window cannot see across; only a revisit that
    crosses a segment boundary can be closed, and only by registration.
 
-7. **Reciprocity is not identity evidence.** `admit()`'s strongest clause
+8. **Reciprocity is not identity evidence.** `admit()`'s strongest clause
    is the agreement of two independent Sim3 fits, but both are computed
    over ONE reconstruction, so removing that reconstruction's internal
    warp improves the agreement whether or not the two segments are the
@@ -900,13 +920,13 @@ never seed a map so no threshold could matter. The new safety suite fails
    verifies only the segments it passes through — on the 2026-09-01 walk
    some newly placed segments sit on tree edges no cycle touches.
 
-8. **`cycle_refusal_for` computes a translation residual and never tests
+9. **`cycle_refusal_for` computes a translation residual and never tests
    it.** It gates rotation and scale only. On this corpus the
    translation residuals are 0.6–1.7% of the placed cloud's diagonal so
    it does not fire, but a loop can close in rotation and scale while
    sitting a room's width out of place and nothing would notice.
 
-9. **Every drift and safety number here is SYNTHETIC.** Rendered rooms
+10. **Every drift and safety number here is SYNTHETIC.** Rendered rooms
    with perfect optics, no rolling shutter and no compression say nothing
    about the Ray-Ban camera. Their value is that the poses are inputs, so
    the answers are exact rather than plausible. The corpus numbers are
