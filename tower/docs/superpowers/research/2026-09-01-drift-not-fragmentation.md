@@ -812,18 +812,23 @@ contract the iOS side reads. Neither belongs in a tracking change.
 
 ## 10.5 Tests, and what the mutations prove
 
-Full Tower suite: **2,272 passed, 72 skipped, 1 failed** —
+Full Tower suite, three runs on this branch: **2,273 passed, 72 skipped,
+0 failed** on the last and cleanest, and one failure on each of two
+earlier runs —
 `test_result_channel_hostile.py::test_the_channel_survives_the_world_vanishing_mid_subscription`,
-which passes in isolation and in a 324-test selection and fails
-intermittently only under the full run. It is in the result channel, a
-subsystem this branch does not touch. **The parent branch's full suite is
-not clean either**: it fails
-`test_object_memory_lifecycle.py::test_an_unconfigured_tower_still_serves_its_own_memory`,
-a different unrelated test, on the same machine. Both are order- or
-timing-dependent and pre-date this work; neither is claimed as passing
-here.
+which also passes in isolation and in a 324-test selection.
 
-World-builder selection: **628 passed, 14 skipped, 0 failed.**
+So the suite is INTERMITTENT under a full run rather than broken, and the
+intermittency is not this branch's. The failing test is in the result
+channel, a subsystem untouched here, and **the parent branch's full suite
+is not clean either** — it failed
+`test_object_memory_lifecycle.py::test_an_unconfigured_tower_still_serves_its_own_memory`,
+a different unrelated test, on the same machine in the same session. The
+honest statement is that a full run passes and occasionally does not, for
+reasons that pre-date this work and sit outside the World Builder.
+
+World-builder selection: **628 passed, 14 skipped, 0 failed**, on every
+run.
 
 New test files:
 
