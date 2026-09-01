@@ -300,7 +300,24 @@ class TestBitIdenticalEquivalence:
     def test_extend_reports_only_the_structure_that_keyframe_added(
         self, sequences, intrinsics
     ):
-        """`new_points` is a delta, and the deltas must sum to the map."""
+        """`new_points` is a delta, and the deltas account for the map.
+
+        The sum used to EQUAL the snapshot. It no longer can, and the
+        difference is a real contract change worth stating rather than
+        papering over: the local bundle adjustment can move a landmark
+        somewhere its own observations no longer support, and
+        `_local_adjust` then retires it from publication. A delta is
+        therefore what the backend believed when it emitted it, and
+        `snapshot()` is what it believes now.
+
+        The shortfall is not slack. It is EXACTLY the number of
+        landmarks the adjustment retired, which is what this asserts --
+        a delta that vanished for any other reason would fail here.
+
+        A live viewer must consequently re-read `snapshot()` rather than
+        append deltas forever. Nothing in production does either today:
+        `Extension.new_points` is read by no code outside this test.
+        """
         window = sequences["strafe"]
         backend = ClassicalTwoViewBackend()
         backend.begin(intrinsics)
@@ -312,7 +329,12 @@ class TestBitIdenticalEquivalence:
             if step.new_points is not None:
                 added += len(step.new_points)
 
-        assert added == len(backend.snapshot().points)
+        published = len(backend.snapshot().points)
+        assert added - published == backend._chain.demoted, (
+            f"deltas summed to {added}, snapshot publishes {published}, and "
+            f"the adjustment retired {backend._chain.demoted} -- those three "
+            f"must reconcile exactly"
+        )
 
 
 # -- segments are independent windows, and must stay so ----------------

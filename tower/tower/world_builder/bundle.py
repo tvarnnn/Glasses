@@ -283,6 +283,7 @@ def optimise(
     fixed_points=None,
     huber_delta: float | None = None,
     min_views: int | None = None,
+    min_parallax_deg: float | None = None,
 ):
     """Refine poses and landmarks against their observations.
 
@@ -317,9 +318,13 @@ def optimise(
                     merely redistribute it.
 
     Returns (rotations, translations, points, report). `report` carries
-    the reprojection RMS before and after, the iteration count, and
-    whether the optimiser actually improved anything -- a caller must be
-    able to DISCARD the result, and this is what tells it to.
+    the reprojection RMS before and after, the iteration count, whether
+    the optimiser actually improved anything -- a caller must be able to
+    DISCARD the result, and this is what tells it to -- and `point_ok`, a
+    per-point mask of which adjusted landmarks a world may still
+    publish. See its construction at the end of this function for why a
+    caller that ignores it ships points the creation-time gate would have
+    refused.
 
     The returned poses are re-anchored so that the first camera in
     `rotations` is exactly where it was. The optimiser is gauge-free (see
@@ -623,6 +628,81 @@ def optimise(
             break
 
     after = rms(residual, valid)
+
+    # WHICH ADJUSTED LANDMARKS A WORLD MAY STILL PUBLISH.
+    #
+    # An under-constrained landmark slides along its viewing ray at
+    # almost no cost in reprojection -- that is the classic degenerate
+    # direction of a bundle problem, and it is exactly what a two-view
+    # point has. So the optimiser can leave a point reprojecting
+    # beautifully and sitting a hundred metres behind the wall, and the
+    # publication gate that would have caught it ran at CREATION time and
+    # is not re-run. Measured on the pinned eight-capture corpus, that
+    # took the worst bbox blowup -- full extent over the p2-p98 core --
+    # from 11.0 to 35.2 while every reprojection statistic improved.
+    #
+    # So the caller is told which landmarks still pass, on exactly the
+    # terms they were admitted by: every observation in front of the
+    # camera and within the same `huber_delta` the pose solve used. A
+    # landmark with no observations here is reported True and left alone;
+    # this can only ever DEMOTE, never promote.
+    distance = np.linalg.norm(residual, axis=1)
+    ok_row = valid & (distance <= huber_delta)
+    point_ok = np.ones(n_pt, dtype=bool)
+    np.logical_and.at(point_ok, point_index, ok_row)
+    demoted_reprojection = int((~point_ok).sum())
+    demoted_parallax = 0
+
+    # AND THE PARALLAX, WHICH IS THE HALF REPROJECTION CANNOT SEE.
+    #
+    # A landmark's degenerate direction is along its own viewing ray, so
+    # it can slide arbitrarily far out at almost no cost in reprojection.
+    # Demoting on pixel error alone therefore catches only some of it:
+    # measured on the pinned corpus, the reprojection test took one
+    # capture's worst within-segment bbox blowup from 219.1 to 5.1 and
+    # left another at 87.4.
+    #
+    # The angle the observing camera centres subtend AT the landmark is
+    # the quantity that does see it, and the floor is not a new number --
+    # `geometry.min_parallax_deg` is the same bound `landmark_gate`
+    # already applies at creation, derived from the focal length as
+    # sigma_px / f. Below it a landmark's distance is set by pixel noise
+    # rather than by geometry, which is exactly what a point that slid
+    # along its ray now is.
+    #
+    # Computed over the same observation PAIRS the Schur complement is
+    # built from, so it costs one more pass over a list that already
+    # exists.
+    if min_parallax_deg is not None and total_pairs:
+        centres = np.einsum(
+            "nij,nj->ni", np.transpose(rotations, (0, 2, 1)), -translations
+        )
+        point_of_pair = point_index[rows_a]
+        ray_a = points[point_of_pair] - centres[camera_index[rows_a]]
+        ray_b = points[point_of_pair] - centres[camera_index[rows_b]]
+        norm_a = np.linalg.norm(ray_a, axis=1)
+        norm_b = np.linalg.norm(ray_b, axis=1)
+        usable = (norm_a > 1e-12) & (norm_b > 1e-12)
+        cosine = np.ones(len(ray_a))
+        cosine[usable] = np.clip(
+            np.einsum("ij,ij->i", ray_a[usable], ray_b[usable])
+            / (norm_a[usable] * norm_b[usable]),
+            -1.0, 1.0,
+        )
+        angle = np.degrees(np.arccos(cosine))
+        widest = np.zeros(n_pt)
+        np.maximum.at(widest, point_of_pair, angle)
+        seen = np.zeros(n_pt, dtype=bool)
+        seen[point_of_pair] = True
+        parallax_ok = ~seen | (widest >= min_parallax_deg)
+        # Counted BEFORE the merge, and only for points reprojection had
+        # not already refused, so a point that fails both is attributed
+        # once. The engine folds these into the SAME two buckets
+        # `landmark_gate` uses, which is what keeps the manifest's
+        # `published + refused == triangulated` identity closing.
+        demoted_parallax = int((point_ok & ~parallax_ok).sum())
+        point_ok &= parallax_ok
+
     return rotations, translations, points, {
         "iterations": taken,
         "reprojection_rms_before": round(before, 5),
@@ -632,4 +712,7 @@ def optimise(
         "landmarks_fixed": int(point_is_fixed.sum()),
         "cameras_free": int((~frozen).sum()),
         "observations": int(len(observed)),
+        "point_ok": point_ok,
+        "demoted_high_reprojection": demoted_reprojection,
+        "demoted_low_parallax": demoted_parallax,
     }

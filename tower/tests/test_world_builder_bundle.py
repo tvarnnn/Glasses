@@ -249,7 +249,14 @@ def test_the_result_is_deterministic():
                              fixed_cameras=(0,))
     for a, b in zip(first[:3], second[:3]):
         assert np.array_equal(a, b)
-    assert first[3] == second[3]
+    # `point_ok` is an array, so the reports are compared field by field
+    # rather than with ==, which numpy makes ambiguous.
+    assert set(first[3]) == set(second[3])
+    for key in first[3]:
+        if isinstance(first[3][key], np.ndarray):
+            assert np.array_equal(first[3][key], second[3][key]), key
+        else:
+            assert first[3][key] == second[3][key], key
 
 
 @pytest.mark.parametrize("cap", [0, 4, 8])

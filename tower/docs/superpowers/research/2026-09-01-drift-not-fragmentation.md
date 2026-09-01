@@ -438,6 +438,181 @@ The shipped budget is **1**.
 
 ---
 
-## 8. Remaining limitations
+## 7.5 The anti-overfitting corpus, and what it caught
 
-*(filled in at completion)*
+`scripts/world_builder_corpus_benchmark.py` runs a PINNED eight-capture
+set through the journal path. It is deliberately not the five replay
+walks, and running it is what stopped this branch shipping a defect the
+replay corpus was structurally blind to.
+
+It reported `bbox_blowup_max` -- the full point bounding box over its
+p2-p98 core -- rising **11.0 to 35.2** while every reprojection statistic
+improved.
+
+The first thing to rule out was the metric itself, whose docstring warns
+that it is computed over all segments at once and that between-segment
+offsets contribute to the numerator. A bundle adjustment changes each
+segment's arbitrary scale, so the metric's own "both runs see the same
+offsets" caveat no longer held. Recomputing it strictly WITHIN each
+segment:
+
+| capture | | all-segment | within-segment median | within-segment max |
+|---|---|---|---|---|
+| 22e9d428 | parent | 2.74 | 1.63 | 6.16 |
+| | branch | 35.15 | 1.69 | **219.10** |
+| e1c52b9f | parent | 11.01 | 2.86 | 10.97 |
+| | branch | 25.42 | 3.35 | **86.39** |
+
+The median is untouched and the maximum explodes. It is real, it is
+inside a segment, and it is a handful of landmarks.
+
+**The mechanism, and it is one this project should have expected.** An
+under-constrained landmark's degenerate direction is along its own
+viewing ray, and moving along that ray costs almost nothing in
+reprojection -- which is exactly why every reprojection statistic
+improved while the geometry got worse in a way reprojection cannot see. A
+two-view point has precisely that freedom, and two-view points are a
+third of the map.
+
+The publication gate that would have refused those points -- `landmark_gate`,
+with its parallax floor and its 3 px reprojection bar -- runs at landmark
+CREATION and was never re-run after an adjustment moved the landmark. So
+`bundle.optimise` now returns `point_ok`, a per-point mask of which
+adjusted landmarks still have every observation in front of the camera
+and within the same `huber_delta` the pose solve admitted them by, and
+`_local_adjust` uses it to DEMOTE. It can never promote: a landmark the
+creation gate already refused stays refused.
+
+That has a visible consequence and it is worth stating plainly rather
+than hiding: the sum of `Extension.new_points` deltas no longer equals
+`snapshot()`, because a delta is what the backend believed when it
+emitted it. The shortfall is exactly the number of retired landmarks,
+which `test_extend_reports_only_the_structure_that_keyframe_added` now
+asserts. No production code reads `Extension.new_points` today; a live
+viewer that appends deltas forever would have to re-read `snapshot()`.
+
+## 8. Determinism
+
+The reconstruction is deterministic. Two runs of the shipped
+configuration over the 2026-09-01 walk agree on every reported figure:
+30 segments, 323 solved poses, 30,538 points, 10 fragments, a
+12,558-point dominant component, reprojection median 0.5458 / p99 2.781
+and 0.69% of rows over the gate. `cv2.setRNGSeed(0)` is set once at the
+start of each run; `findEssentialMat(USAC_MAGSAC)` and
+`solvePnPRansac(SQPNP)` are not individually seeded, so this is an
+empirical result on this OpenCV build rather than a guarantee.
+
+Registration is deterministic given a built world — six repeated runs,
+three with a reseed and three without, produce the identical admitted
+set. That is what made §6.1's isolation possible.
+
+One caveat, found by the adversarial pass and worth carrying: OpenCV's
+ORB/USAC output is **not bit-stable across processes** for every input.
+One draft assertion in the safety suite passed in file order and failed
+in isolation. Assertions in that file were rebuilt on quantities that are
+stable cold and warm.
+
+---
+
+## 9. Performance
+
+The bundle adjustment runs on the KEYFRAME path, never the frame path,
+and its cost is bounded by the window rather than by the length of the
+segment — `_local_adjust` compacts the landmark set to the ones the
+window can see before calling the optimiser, which is what stops a
+170-keyframe segment paying for its whole map on every adjustment.
+
+Measured over the 2026-09-01 walk (2,613 frames, 434 keyframes), per
+`observe()` call, replay on this host:
+
+| | median | p95 | p99 | walk total |
+|---|---|---|---|---|
+| bundle off | 4.14 ms | 43.7 ms | 51.8 ms | 45.3 s |
+| bundle on | **4.09 ms** | 47.8 ms | **128.3 ms** | 53.9 s |
+
+The median is UNCHANGED -- the common path does not run the adjustment.
+The p99 is the adjustment firing: it lands on one solved keyframe in
+three, which is about one frame in twenty. Across the whole walk it costs
+8.7 s over 2,613 frames, i.e. **3.3 ms per frame amortised and about
+60 ms per adjustment**.
+
+That is the shape the mission asked for -- an expensive step that is
+bounded, exceptional, and off the frame path -- but the p99 is real and
+the Tower's own per-frame budget is ~92 ms at the delivered 10.9 fps. On
+a host where the common path already costs 96 ms, a 60 ms adjustment
+every twentieth frame is the number to watch, and `BUNDLE_EVERY` is the
+knob that trades it against drift.
+
+Two honest notes. This host is not the Tower — the same walk reports
+96.4 ms per frame in the physical record against ~4 ms here, so these
+numbers compare configurations, not deployments. And the largest single
+cost this change adds is not the bundle at all: registration went from
+34.1 s to 65.7 s on that walk, which is §10.
+
+---
+
+## 10. Shutdown and finalisation
+
+The risk flagged before this work is real, is now larger, and is not
+fixed here.
+
+`CaptureWorkerSupervisor.shutdown` gives each worker
+`DEFAULT_GRACE_SECONDS = 10.0`. Registration measured 1.6–34 s on the
+corpus before this change and 4.9–66 s after. Every substantial walk
+exceeds the grace.
+
+What a kill costs, precisely: `register()` writes nothing while it runs.
+`write_placements` is its only write and happens once, at the end, after
+`placements_from_report` has validated every transform. So a worker
+killed mid-registration loses `placements.json` and **never** the
+reconstruction — the world is left exactly as the physical era left it,
+built and unplaced. That is a degraded outcome, not data loss.
+
+Why it is not fixed here rather than merely deferred: on Windows
+`Popen.terminate()` is `TerminateProcess`, which the child cannot catch,
+so no handler or checkpoint inside `world_build_session.py` can help. The
+available fixes are a longer grace for this worker specifically, or
+writing placements incrementally. The first is a product decision about
+how long a Stop may take, and the second is a change to a persisted
+contract the iOS side reads. Neither belongs in a tracking change.
+
+---
+
+## 11. Remaining limitations
+
+1. **`MAX_RECOVERY_KEYFRAMES` is 1 because nothing can check a wider
+   gap.** The mechanism is built, tested and shipped inert. What unlocks
+   it is an instrument that compares the displacement a recovered pose
+   implies against the number of keyframes it skipped — not a better
+   matcher, because appearance is precisely what lies over repeating
+   texture.
+
+2. **The dominant component is 41.1% of the 2026-09-01 walk, not 90%.**
+   The walk is still four fragments and some orphans, not one world.
+
+3. **Registration's second wall is untouched.** Only 2–12% of verified
+   cross-segment correspondences name a feature the source segment
+   triangulated into a point, so even with the full cross-product the
+   biggest segments cannot reach `MIN_PNP_CORRESPONDENCES` on enough
+   target frames. Widening retrieval does not reach this.
+
+4. **`span_over_depth` has no upper bound**, so a diverged segment
+   reports "plenty of parallax" rather than "this solve blew up". The
+   drift control makes that far less reachable; it does not make it
+   detectable.
+
+5. **`span_over_depth` also mismeasures its most common refusal.** All 27
+   two-pose segments in the corpus have a span numerator of exactly
+   1.0000 — the seed pair's normalised baseline — so the ratio reports
+   scene depth, not wearer motion, and "the wearer stood still" is
+   factually wrong for 18 of the 32 segments it is printed about.
+
+6. **No loop closure inside a segment.** A revisit within one segment
+   becomes drift the bundle window cannot see across; only a revisit that
+   crosses a segment boundary can be closed, and only by registration.
+
+7. **Every drift and safety number here is SYNTHETIC.** Rendered rooms
+   with perfect optics, no rolling shutter and no compression say nothing
+   about the Ray-Ban camera. Their value is that the poses are inputs, so
+   the answers are exact rather than plausible. The corpus numbers are
+   physical; the causal ones are not.

@@ -98,6 +98,7 @@ from tower.world_builder.geometry import (
     match_indices,
     median_triangulation_angle_deg,
     landmark_gate,
+    min_parallax_deg,
     triangulate_points,
 )
 from tower.world_builder import bundle
@@ -432,8 +433,8 @@ def _rewrite_poses(poses, absolute):
     return rewritten
 
 
-def _local_adjust(camera_matrix, absolute, landmarks, first_frame,
-                  observations, newest):
+def _local_adjust(camera_matrix, absolute, landmarks, landmark_ok,
+                  first_frame, observations, newest):
     """Bundle-adjust the newest cameras of a chain, in place.
 
     The window is the cameras with indices greater than
@@ -457,6 +458,17 @@ def _local_adjust(camera_matrix, absolute, landmarks, first_frame,
     makes a WINDOWED adjustment control drift rather than merely
     redistribute it -- the same job ORB-SLAM gives the keyframes that
     observe a local map point without being local themselves.
+
+    `landmark_ok` is DEMOTED for any landmark the adjustment moved
+    somewhere a world may no longer state a coordinate for. An
+    under-constrained landmark slides along its viewing ray at almost no
+    cost in reprojection -- a two-view point has exactly that degenerate
+    direction -- and the publication gate that would have caught it ran
+    at creation time. Measured on the pinned eight-capture corpus before
+    this demotion existed: the worst bbox blowup, full extent over the
+    p2-p98 core, went 11.0 to 35.2 while every reprojection statistic
+    improved. Points reprojecting perfectly from a hundred metres behind
+    the wall is precisely the failure this branch exists not to ship.
 
     Returns the report `bundle.optimise` produced, or None if there was
     not enough of a window to adjust. `absolute` and `landmarks` are
@@ -510,6 +522,7 @@ def _local_adjust(camera_matrix, absolute, landmarks, first_frame,
         iterations=BUNDLE_ITERATIONS,
         fixed_cameras=tuple(range(min(BUNDLE_ANCHOR_CAMERAS, len(window)))),
         fixed_points=fixed,
+        min_parallax_deg=min_parallax_deg(camera_matrix),
     )
     report["window_cameras"] = len(window)
     report["window_landmarks"] = len(used)
@@ -517,9 +530,43 @@ def _local_adjust(camera_matrix, absolute, landmarks, first_frame,
         return report
     for position, index in enumerate(window):
         absolute[index] = (rotations[position], translations[position])
+    point_ok = report.get("point_ok")
+    demoted = 0
     for position, index in enumerate(used):
-        landmarks[int(index)] = points[position]
+        index = int(index)
+        landmarks[index] = points[position]
+        # DEMOTE ONLY. A landmark the creation-time gate already refused
+        # stays refused; one the adjustment moved out of its own
+        # observations' reach stops being publishable. Nothing here can
+        # promote, so an adjustment cannot talk a point into a world.
+        if point_ok is not None and not point_ok[position] and landmark_ok[index]:
+            landmark_ok[index] = False
+            demoted += 1
+    report["landmarks_demoted"] = demoted
     return report
+
+
+def _account_for_demotions(tally, report):
+    """Fold an adjustment's demotions into the discard tally.
+
+    Into the SAME two buckets `landmark_gate` uses at creation, because
+    they are the same two refusals: a landmark the adjustment moved out
+    of its observations' reprojection reach is a high-reprojection
+    refusal, and one whose observing rays no longer subtend
+    `min_parallax_deg` is a low-parallax refusal. Nothing about the
+    reason changed; only when it was noticed did.
+
+    This is not bookkeeping for its own sake. The manifest states
+    `published + refused == triangulated` so a consumer can tell a sparse
+    world from a heavily filtered one, and a demotion that reduced
+    `published` without appearing in `refused` would break that identity
+    silently -- which is how a filtered world starts reading as an empty
+    room.
+    """
+    if not report:
+        return
+    tally["high_reprojection"] += report.get("demoted_high_reprojection", 0)
+    tally["low_parallax"] += report.get("demoted_low_parallax", 0)
 
 
 def _support_block(rows) -> np.ndarray:
@@ -751,8 +798,14 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 solved_count += 1
                 observations = _prune_observations(observations, current)
                 if BUNDLE_WINDOW and solved_count % BUNDLE_EVERY == 0:
-                    _local_adjust(self._camera_matrix, absolute, landmarks,
-                                  landmark_frame, observations, current)
+                    _account_for_demotions(
+                        tally,
+                        _local_adjust(
+                            self._camera_matrix, absolute, landmarks,
+                            landmark_ok, landmark_frame, observations,
+                            current,
+                        ),
+                    )
                     poses = _rewrite_poses(poses, absolute)
             else:
                 failures += 1
@@ -972,9 +1025,13 @@ class ClassicalTwoViewBackend(GeometryBackend):
                 # the segment less placeable rather than more.
                 chain.bundle = _local_adjust(
                     self._camera_matrix, chain.absolute, chain.landmarks,
-                    chain.landmark_frame, chain.observations, index,
+                    chain.landmark_ok, chain.landmark_frame,
+                    chain.observations, index,
                 )
                 chain.poses = _rewrite_poses(chain.poses, chain.absolute)
+                if chain.bundle:
+                    chain.demoted += chain.bundle.get("landmarks_demoted", 0)
+                    _account_for_demotions(chain.discarded, chain.bundle)
         else:
             chain.failures += 1
             if chain.failures >= MAX_RECOVERY_KEYFRAMES:
@@ -1734,6 +1791,7 @@ class _Chain:
         "broken",
         "bundle",
         "count",
+        "demoted",
         "discarded",
         "failures",
         "landmark_frame",
@@ -1772,6 +1830,12 @@ class _Chain:
         self.observations = np.zeros((0, 4), dtype=np.float64)
         # The last adjustment's report, or None. Diagnostics only.
         self.bundle = None
+        # Landmarks an adjustment retired since the chain began. Exactly
+        # the shortfall between "every delta appended" and what
+        # snapshot() publishes, which is the invariant
+        # test_extend_reports_only_the_structure_that_keyframe_added
+        # now asserts.
+        self.demoted = 0
         self.landmark_ok = []
         # The frame each landmark was FIRST seen from, index-aligned with
         # `landmarks`. Not pruned: it is one int per landmark, and it is
