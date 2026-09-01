@@ -325,6 +325,103 @@ def synthetic_frames(count: int, width: int, height: int):
     return frames, intrinsics
 
 
+def register_session(store: WorldStore, world_id: str, session_id: str) -> dict:
+    """Place what can be placed, and say so. Never raises.
+
+    Registration is the step that turns a bag of independently
+    reconstructed fragments into a world. It was implemented, tested,
+    persisted and served long before anything called it, so every walk
+    up to now finalised with `placements.json` absent and iOS drew every
+    segment as its own disconnected island -- not because the pairs were
+    refused, but because the question was never asked. On the 2026-08-29
+    drawer walk asking it places 5 of 36 segments and 4,704 of 13,050
+    points; the recorded session shipped 0 of both.
+
+    Three properties make this safe to run automatically:
+
+    - It is NON-DESTRUCTIVE. `register()` writes nothing; poses, points
+      and support are untouched, and a segment's own geometry never
+      moves. Only `transform_to_world` is added, in a separate file.
+    - It is REFUSAL-BY-DEFAULT. A pair is admitted only on two
+      independent solves that agree; an unplaced segment is served
+      exactly as it is served today.
+    - It is DIGEST-BOUND. The placement records the build it was solved
+      against, and the serving layer refuses any placement whose digest
+      does not match, so a later rebuild cannot resurrect a stale
+      transform.
+
+    It runs HERE -- in the builder subprocess, after the last build --
+    and not in the web process, for the same reason `build()` does: this
+    is seconds of work, and the frame path must never pay for it. It is
+    also why failure is swallowed. A world that reconstructed is worth
+    keeping even if it could not be placed, so a registration that
+    raises is reported and does not take the session down with it.
+    """
+    from scripts.world_registration import (  # noqa: PLC0415
+        SupportMissingError,
+        placements_from_report,
+        register,
+    )
+
+    started = time.perf_counter()
+    try:
+        report = register(store, world_id, session_id)
+        # Inside the guard, not after it. Persisting is not the safe part
+        # of this: `placements_from_report` runs every placement through
+        # `SegmentPlacement.__post_init__`, which raises ValueError on a
+        # NaN scale or a non-unit quaternion -- precisely what a
+        # degenerate Sim3 produces, and precisely the failure this guard
+        # exists for. Measured with these three lines outside the try: a
+        # raising `write_placements` gave exit code 1 and zero bytes of
+        # report, losing a walk that had reconstructed perfectly well.
+        manifest = store.read_derived_manifest(world_id) or {}
+        placements = placements_from_report(
+            report, input_digest=manifest.get("input_digest")
+        )
+        store.write_placements(world_id, session_id, placements)
+    except SupportMissingError as error:
+        return {"attempted": True, "wrote_placements": False, "refusal": str(error)}
+    except Exception as error:  # noqa: BLE001 -- see the docstring
+        logger.warning(
+            "[Tower][WorldBuilder] registration failed for session %s: %s",
+            session_id,
+            error,
+        )
+        return {
+            "attempted": True,
+            "wrote_placements": False,
+            "error": f"{type(error).__name__}: {error}",
+        }
+
+    elapsed = time.perf_counter() - started
+
+    logger.info(
+        "[Tower][WorldBuilder] registration: %s of %s segments placed, "
+        "%s of %s points, %s admitted pairs of %s candidates, in %.2fs",
+        report["segments_registered"],
+        report["segments_with_geometry"],
+        report["points_registered"],
+        report["points_total"],
+        len(report["admitted_pairs"]),
+        report["candidate_pairs"],
+        elapsed,
+    )
+    return {
+        "attempted": True,
+        "wrote_placements": True,
+        "reference_segment": report["reference_segment"],
+        "segments_registered": report["segments_registered"],
+        "segments_with_geometry": report["segments_with_geometry"],
+        "points_registered": report["points_registered"],
+        "points_total": report["points_total"],
+        "candidate_pairs": report["candidate_pairs"],
+        "admitted_pairs": report["admitted_pairs"],
+        "cycles_checked": report["cycles_checked"],
+        "cycle_refusal": report["cycle_refusal"],
+        "seconds": round(elapsed, 3),
+    }
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Run a World Builder mapping session over frames on disk."
@@ -385,6 +482,18 @@ def main(argv=None) -> int:
         help=(
             "Give up after N quiet polls on a capture that never closes. "
             "Unset waits for the recorder to close it."
+        ),
+    )
+    parser.add_argument(
+        "--register",
+        action="store_true",
+        help=(
+            "After the final build, try to place the session's segments in "
+            "one coordinate frame and persist the result as placements.json. "
+            "Runs once, at the end, in this process -- never on the frame "
+            "path. A segment's own geometry is never moved and a refusal is "
+            "the default, so the worst case is the unregistered world you "
+            "would have had anyway."
         ),
     )
     args = parser.parse_args(argv)
@@ -678,6 +787,13 @@ def main(argv=None) -> int:
         ),
         "build_seconds": round(build_seconds, 3),
     }
+
+    # After the final build, never between rebuilds: registration reads
+    # the derived tree and binds its answer to that build's digest, so a
+    # mid-walk run would solve against geometry the next rebuild
+    # replaces and be discarded at serve time anyway.
+    if args.register:
+        report["registration"] = register_session(store, world_id, session_id)
 
     if args.format == "json":
         print(json.dumps(report, indent=2))
