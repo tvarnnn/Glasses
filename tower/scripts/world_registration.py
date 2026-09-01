@@ -1704,10 +1704,23 @@ def match_budget(count_a: int, count_b: int,
       - the product never exceeds `budget`;
       - NEITHER SIDE IS EVER SAMPLED MORE SPARSELY THAN THE PER-SIDE CAP
         IT REPLACES. `min(count, ceiling)` is a floor, not a target, so
-        every verdict the old sampling could reach is still reachable and
-        this can only ever offer `admit()` more evidence, never less.
-        Those floors always fit -- ceiling^2 is 64 against a budget of
-        256 -- which is also why the loop below cannot fail to terminate.
+        `admit()` is always offered a SUPERSET of the evidence it used to
+        get. Those floors always fit -- ceiling^2 is 64 against a budget
+        of 256 -- which is also why the loop below cannot fail to
+        terminate.
+
+    MORE EVIDENCE IS NOT A MONOTONE MORE ADMISSIONS, and it would be
+    dishonest to imply otherwise. A wider sample changes which frame
+    pairs `fit_direction` solves from, so a pair admitted before can be
+    refused after -- measured on the drawer walk, where a budget of 64
+    admits 3 pairs where the per-side cap admitted 5. The claim this
+    function supports is that no verdict is reached on LESS evidence than
+    before, not that no verdict changes. Corpus-wide at the shipped
+    budget the direction is strongly positive (13 admitted pairs -> 23,
+    dominant-component coverage 232 -> 322 keyframes), and the pairs
+    gained agree better on scale, orientation and reprojection than the
+    ones already there -- but that is a measured aggregate, not a
+    guarantee about any single pair.
 
     Deterministic and total: same inputs, same answer, no clock, no RNG.
     """

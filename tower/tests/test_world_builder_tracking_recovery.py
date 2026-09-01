@@ -98,13 +98,43 @@ def _noise_frame(keyframe_id, seed=7):
     )
 
 
+# The SHIPPED budget is 1 -- see MAX_RECOVERY_KEYFRAMES for the
+# adversarial measurement that put it there. Every test below that
+# exercises the recovery MECHANISM therefore raises it explicitly, so
+# that what is being tested is the mechanism and not the policy, and so
+# that changing the policy cannot silently make these tests vacuous.
+MECHANISM_BUDGET = 6
+
+
+@pytest.fixture
+def recovery_enabled(monkeypatch):
+    monkeypatch.setattr(classical, "MAX_RECOVERY_KEYFRAMES", MECHANISM_BUDGET)
+    return MECHANISM_BUDGET
+
+
 def _run(frames, camera):
     backend = ClassicalTwoViewBackend()
     backend.begin(_intrinsics(camera))
     return [backend.extend(frame) for frame in frames], backend
 
 
-def test_one_unsolvable_keyframe_does_not_end_the_segment():
+def test_the_shipped_budget_is_one():
+    """A policy, pinned with its reason, so a later change is deliberate.
+
+    1 is the largest reference gap the adversarial measurement supports.
+    Over texture that repeats -- an ordinary room -- a gap of 2 already
+    loses 20 cm of real walking in six of nine samples, and a gap of 8
+    publishes 1 mm for 1.500 m with 169 PnP inliers and support
+    reprojecting at 0.22 px. Nothing in this backend refuses that, which
+    is why the bound and not a gate has to carry it.
+
+    See tests/test_world_builder_recovery_safety.py for the tables, and
+    MAX_RECOVERY_KEYFRAMES for what would earn a larger value.
+    """
+    assert classical.MAX_RECOVERY_KEYFRAMES == 1
+
+
+def test_one_unsolvable_keyframe_does_not_end_the_segment(recovery_enabled):
     """The regression. On the parent branch every pose after index 5 is
     `unavailable`; the chain latched on the noise frame and no solver ran
     again."""
@@ -128,7 +158,7 @@ def test_one_unsolvable_keyframe_does_not_end_the_segment():
     )
 
 
-def test_the_map_keeps_growing_across_a_refused_keyframe():
+def test_the_map_keeps_growing_across_a_refused_keyframe(recovery_enabled):
     """Recovery that produced no structure would be recovery in name only."""
     camera, frames = _walk(12)
     frames[5] = _noise_frame("kf5")
@@ -143,11 +173,11 @@ def test_the_map_keeps_growing_across_a_refused_keyframe():
     assert snapshot.points is not None and len(snapshot.points) > 0
 
 
-def test_a_sustained_run_of_failures_still_breaks_the_chain(monkeypatch):
+def test_a_sustained_run_of_failures_still_breaks_the_chain(recovery_enabled):
     """Honest refusal survives. Recovery is BOUNDED, and the bound is what
     keeps a genuinely untrackable stretch from being carried forward on a
     coordinate frame nothing supports."""
-    camera, frames = _walk(16)
+    camera, frames = _walk(4 + MECHANISM_BUDGET + 4)
     steps = []
     backend = ClassicalTwoViewBackend()
     backend.begin(_intrinsics(camera))
@@ -161,9 +191,9 @@ def test_a_sustained_run_of_failures_still_breaks_the_chain(monkeypatch):
         "the break is an EDGE: exactly one keyframe reports it"
     )
     broke_at = next(i for i, step in enumerate(steps) if step.chain_broken)
-    assert broke_at == 4 + classical.MAX_RECOVERY_KEYFRAMES - 1, (
+    assert broke_at == 4 + recovery_enabled - 1, (
         f"the chain broke at {broke_at}; the bound says it should break on "
-        f"the {classical.MAX_RECOVERY_KEYFRAMES}th consecutive failure"
+        f"the {recovery_enabled}th consecutive failure"
     )
 
 
@@ -184,7 +214,7 @@ def test_recovery_still_refuses_when_the_geometry_is_absent():
     )
 
 
-def test_the_seed_pair_retries_against_the_same_anchor():
+def test_the_seed_pair_retries_against_the_same_anchor(recovery_enabled):
     """A failed seed pair must not throw the anchor away.
 
     Restarting the segment resets the baseline to zero, so a pair refused

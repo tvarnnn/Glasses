@@ -162,6 +162,16 @@ MIN_OBSERVATIONS_PER_CAMERA = 12
 # dominant component is larger (64.7%) and 129 fewer cameras are posed,
 # which is not obviously a better world and is certainly a different
 # one. 16 keeps the solve where it was and takes the coherence.
+#
+# HONESTLY: 16 still violates the invariant above, for the rare landmark
+# that exceeds it. A bundle window holds at most BUNDLE_WINDOW = 12
+# cameras, so a landmark can only pass 16 ROWS by being claimed twice in
+# one frame -- which `_extend` explicitly allows and which the support
+# table records as two rows. The cap therefore binds on a small tail
+# rather than on ordinary landmarks, which is why 16 measures clean where
+# 8 did not. It is a residual risk, not a resolved one, and the right
+# eventual fix is to stop publishing two rows for one image point rather
+# than to raise this number again.
 MAX_VIEWS_PER_LANDMARK = 16
 
 

@@ -176,12 +176,65 @@ EXTEND_REFERENCE_DEPTH = 3
 # before it will consider the map lost; COLMAP retries a failed image
 # max_reg_trials = 3 times and re-queues it behind fresher candidates.
 #
-# WHY THIS NUMBER. Our budget is counted in KEYFRAMES, not frames,
-# because that is what this backend steps on. The 2026-09-01 walk
-# accepted 434 keyframes in 129 s -- 3.4 keyframes a second -- so
-# ORB-SLAM3's 3.0 s is about 10 keyframes here. Swept over the whole
-# replay corpus; see reports/2026-09-01-world-builder-tracking-recovery.md.
-MAX_RECOVERY_KEYFRAMES = 8
+# WHY 1, WHICH IS THE VALUE THE ADVERSARIAL MEASUREMENT SUPPORTS AND
+# NOTHING LARGER IS.
+#
+# This constant is exactly the largest REFERENCE GAP a solve may be
+# admitted at: skip k refused keyframes and the next pose is solved
+# against a keyframe k+1 back. That gap is the whole risk, and no
+# acceptance gate in this backend is a function of it.
+#
+# MEASURED against exact synthetic ground truth, target keyframe and its
+# image held FIXED, only the reference moved. Median relative rotation
+# error of that one solve over six scene seeds:
+#
+#   gap      1     2     3     4     6     8    10    12
+#   forward  0.78  0.86  1.33  2.48  3.04  3.38  4.47  6.09  deg
+#   strafe   1.57  2.71  4.55  5.86  9.10 11.89 14.91 19.41  deg
+#
+# ZERO refusals at any gap, 22-250 PnP inliers throughout. The
+# 12-correspondence / 3 px gate is not a function of the gap and cannot
+# be made into one.
+#
+# AND OVER REPEATING TEXTURE A GAP IS NOT DRIFT, IT IS A LIE. A room
+# tiled at 1.5 m, a continuous walk at 0.1875 m per keyframe, no
+# teleport, no occlusion, no adversary -- only the gap varied, nine
+# samples each:
+#
+#   gap            1      2      3      4      6      8
+#   walked      0.188  0.375  0.562  0.750  1.125  1.500   m
+#   median err  0.007  0.207  0.241  0.411  0.766  1.499   m
+#   over 10 cm    0/9    6/9    9/9    6/6    9/9    9/9
+#
+# Read the two rows together: whatever the gap, the solve publishes
+# roughly ONE keyframe of motion. It is not drifting, it is matching the
+# wrong repetition, and the keyframes the camera crossed simply cease to
+# have happened. At gap 8 the camera moved 1.500 m and the pose reports
+# 0.001 m -- with 169 PnP inliers, 0.14 deg of rotation error, and
+# published support reprojecting at 0.22 px median. Every instrument this
+# pipeline owns says that pose is excellent.
+#
+# The corpus agrees from the other direction. At 8, with the bundle
+# adjustment running, the 2026-09-01 walk's dominant connected component
+# falls from 53.5% of the geometry to 30.5%, and the drawer walk's from
+# 55.8% to 27.2%. Recovery makes the world tidier -- 30 segments to 23 --
+# and less true, which is exactly the trade this project refuses.
+#
+# So the mechanism stays and the budget is 1. That is NOT the latch it
+# replaced: references are still only keyframes that HAVE poses, a
+# refused keyframe still never becomes one, and the seed still holds its
+# anchor. What 1 says is that a keyframe which refuses ends the
+# coordinate frame, honestly, rather than being stepped over on evidence
+# nothing in this pipeline can check.
+#
+# WHAT WOULD EARN A LARGER VALUE. Not a better matcher -- appearance is
+# precisely what lies here. An instrument that checks the displacement a
+# recovered pose implies against the number of keyframes it skipped. A
+# gap of 8 reporting one keyframe of motion is detectable without any new
+# appearance model, and it works exactly where a relocaliser would not.
+# See tests/test_world_builder_recovery_safety.py, which carries the full
+# tables and is the thing to re-point when that instrument exists.
+MAX_RECOVERY_KEYFRAMES = 1
 
 # -- drift control ----------------------------------------------------
 #
