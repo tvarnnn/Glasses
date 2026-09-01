@@ -19,6 +19,7 @@
 //  instead of a property of today's payload.
 //
 
+import UIKit
 import XCTest
 
 @testable import Glasses
@@ -181,8 +182,23 @@ final class CVLabContractTests: XCTestCase {
             "annotation": {
               "count": null,
               "count_unavailable_reason": "this experiment reports no annotation count",
-              "artifact": null,
-              "artifact_unavailable_reason": "this Tower serves no imagery for CV Lab results. Every image must arrive stating its redaction treatment, and no artifact fetch contract exists on either side yet"
+              "artifact": {
+                "contract": "experimental_cv.preview/2026-08-29",
+                "kind": "live_preview",
+                "visual_kind": "flow_tracks",
+                "description": "One arrow per tracked point, coloured by direction, over a line drawing of the frame. Red dots are seeds the forward-backward check rejected.",
+                "treatment": "raw_ephemeral",
+                "face_filter": "none",
+                "persistence": "none",
+                "derived_from": "one frame, transiently, in memory",
+                "path": "/cv-lab/preview",
+                "media_type": "image/png",
+                "run_id": "5a4a5f01ac52-2",
+                "max_age_s": 2.0,
+                "poll_interval_s": 0.1,
+                "max_edge_px": 320
+              },
+              "artifact_unavailable_reason": null
             },
             "timings": {
               "processing_ms": 18.4667,
@@ -490,21 +506,195 @@ final class CVLabContractTests: XCTestCase {
     }
 
     /// `0` annotations is "found nothing" and must not merge with "did not
-    /// say" — and the artifact is null on this contract *with a stated reason*,
-    /// which is why the reason is read rather than the absence assumed.
+    /// say" — and the artifact carries a descriptor whose treatment is stated,
+    /// which is why the treatment is read rather than the presence assumed.
     func testTheAnnotationBlockKeepsSilenceAndZeroApart() throws {
         let annotation = try XCTUnwrap(liveStatus().run?.annotation)
         XCTAssertNil(annotation.count)
         XCTAssertEqual(
             annotation.countUnavailableReason, "this experiment reports no annotation count"
         )
-        XCTAssertEqual(annotation.artifact, .absent)
-        XCTAssertNotNil(
-            annotation.artifactUnavailableReason,
-            "the Tower's reason for serving no imagery was dropped"
-        )
+        // A descriptor, and therefore no reason: the two are mutually
+        // exclusive and a document with both would be a Tower disagreeing with
+        // itself.
+        XCTAssertEqual(annotation.artifact, .notFetched(.rawEphemeral))
+        XCTAssertNil(annotation.artifactUnavailableReason)
         XCTAssertTrue(CVAnnotationReport(count: 0).hasReport)
         XCTAssertFalse(CVAnnotationReport().hasReport)
+    }
+
+    // MARK: - 4a. The live preview
+
+    /// The descriptor is read, and the treatment governs whether it is drawn.
+    func testThePreviewDescriptorIsReadOffTheArtifactBlock() throws {
+        let preview = try XCTUnwrap(liveStatus().run?.annotation.preview)
+        XCTAssertEqual(preview.contract, ExperimentalCVContract.preview)
+        XCTAssertEqual(preview.visualKind, "flow_tracks")
+        XCTAssertEqual(preview.redaction, .rawEphemeral)
+        XCTAssertEqual(preview.faceFilter, "none")
+        XCTAssertEqual(preview.path, "/cv-lab/preview")
+        XCTAssertEqual(preview.runID, "5a4a5f01ac52-2")
+        XCTAssertEqual(preview.maxAgeSeconds, 2.0)
+        XCTAssertEqual(preview.pollIntervalSeconds, 0.1)
+        XCTAssertTrue(preview.isDrawable)
+        XCTAssertNil(preview.withheldReason)
+        XCTAssertNotNil(try liveStatus().run?.annotation.drawablePreview)
+    }
+
+    /// **The privacy gate, from the strict side.** An unstated treatment is
+    /// not a treatment, and the picture is not drawn.
+    func testAPreviewWithNoStatedTreatmentIsNotDrawn() throws {
+        let preview = try XCTUnwrap(
+            CVLivePreview(json: [
+                "contract": ExperimentalCVContract.preview,
+                "visual_kind": "edge_map",
+                "path": "/cv-lab/preview",
+            ])
+        )
+        XCTAssertEqual(preview.redaction, .unknown)
+        XCTAssertFalse(preview.isDrawable)
+        XCTAssertNotNil(preview.withheldReason)
+    }
+
+    /// A treatment word this build has never heard of is `.unknown`, not a
+    /// reason to guess. Same rule as `CVWireProvenance`.
+    func testAnUnrecognisedTreatmentIsHandledAsStrictlyAsRaw() {
+        XCTAssertEqual(CVWireRedaction.read("probably_safe"), .unknown)
+        XCTAssertEqual(CVWireRedaction.read(nil), .unknown)
+        XCTAssertEqual(CVWireRedaction.read("raw_ephemeral"), .rawEphemeral)
+        XCTAssertEqual(CVWireRedaction.read("redacted"), .redacted)
+        // `rawEphemeral` is live-displayable and NOT persisted-displayable.
+        // Both halves matter: the first is what makes this feature possible
+        // and the second is what keeps it from leaking onto a stored surface.
+        XCTAssertTrue(RedactionState.rawEphemeral.isDisplayableLive)
+        XCTAssertFalse(RedactionState.rawEphemeral.isDisplayableWhenPersisted)
+        XCTAssertFalse(RedactionState.unknown.isDisplayableLive)
+    }
+
+    /// A preview offered under a contract this build does not implement is
+    /// refused with a sentence, not drawn hopefully.
+    func testAPreviewFromAFutureContractIsNotDrawn() throws {
+        let preview = try XCTUnwrap(
+            CVLivePreview(json: [
+                "contract": "experimental_cv.preview/2099-01-01",
+                "visual_kind": "hologram",
+                "path": "/cv-lab/preview",
+                "treatment": "raw_ephemeral",
+            ])
+        )
+        XCTAssertFalse(preview.isDrawable)
+        XCTAssertTrue(try XCTUnwrap(preview.withheldReason).contains("Update the app"))
+    }
+
+    /// A block with no path cannot be fetched, so it is not a descriptor.
+    func testAnArtifactBlockWithNothingToFetchIsNotDecoded() {
+        XCTAssertNil(
+            CVLivePreview(json: [
+                "contract": ExperimentalCVContract.preview, "visual_kind": "edge_map",
+            ])
+        )
+        XCTAssertNil(CVLivePreview(json: [:]))
+    }
+
+    /// A run with no artifact at all reports the absence and its reason,
+    /// exactly as it did before this contract existed.
+    func testAnExperimentWithNoPictureStillSaysWhy() throws {
+        let annotation = CVAnnotationReport(json: [
+            "count": NSNull(),
+            "artifact": NSNull(),
+            "artifact_unavailable_reason":
+                "this experiment produces no visual output, so there is no picture to serve",
+        ])
+        XCTAssertEqual(annotation.artifact, .absent)
+        XCTAssertNil(annotation.preview)
+        XCTAssertNil(annotation.drawablePreview)
+        XCTAssertNotNil(annotation.artifactUnavailableReason)
+    }
+
+    /// The catalog says which experiments have one, before anything is armed.
+    func testTheCatalogSaysWhichExperimentsHaveALiveView() throws {
+        let available = try liveStatus().available
+        XCTAssertFalse(available.isEmpty)
+        // Not asserted per id: the Tower owns the registry and this app holds
+        // no list. What is asserted is that the field is READ rather than
+        // dropped, and that `nil` survives as `nil`.
+        let decoded = try XCTUnwrap(
+            CVExperiment(json: [
+                "id": "edge_detection", "name": "Edge detection",
+                "available": true, "preview_kind": "edge_map",
+            ])
+        )
+        XCTAssertEqual(decoded.previewKind, "edge_map")
+        XCTAssertTrue(decoded.hasLiveView)
+
+        let blind = try XCTUnwrap(
+            CVExperiment(json: ["id": "baseline", "name": "Baseline", "available": true])
+        )
+        XCTAssertNil(blind.previewKind)
+        XCTAssertFalse(blind.hasLiveView)
+    }
+
+    /// Where a number sits in this run's range, and never a verdict.
+    func testAMetricPlacesItselfInThisRunsRangeWithoutJudgingIt() throws {
+        let metric = try XCTUnwrap(
+            CVMetric(json: [
+                "label": "sharpness_laplacian_var", "value": 402.0,
+                "provenance": "measured", "aggregation": "rate", "frames": 767,
+                "latest": 1240.0, "observed_min": 79.0, "observed_max": 1309.0,
+            ])
+        )
+        let note = try XCTUnwrap(metric.rangeNote)
+        XCTAssertTrue(note.contains("this run's range"))
+        XCTAssertTrue(note.contains("near the high end of"))
+        // The words this app must never produce from an uncalibrated metric.
+        for verdict in ["Good", "Blurry", "Poor", "Sharp", "Bad"] {
+            XCTAssertFalse(note.contains(verdict), "\(verdict) is a verdict")
+        }
+    }
+
+    /// One frame is not a range, and a range of one value is not a placement.
+    func testAMetricWithNoRangeYetSaysNothingRatherThanSayingMiddle() throws {
+        let single = try XCTUnwrap(
+            CVMetric(json: [
+                "label": "x", "value": 1.0, "provenance": "measured",
+                "aggregation": "rate", "frames": 1,
+                "latest": 1.0, "observed_min": 1.0, "observed_max": 1.0,
+            ])
+        )
+        XCTAssertNil(single.rangeNote)
+
+        let counted = try XCTUnwrap(
+            CVMetric(json: [
+                "label": "y", "value": 5.0, "provenance": "measured",
+                "aggregation": "count", "frames": 9,
+            ])
+        )
+        XCTAssertNil(counted.latest)
+        XCTAssertNil(counted.rangeNote)
+    }
+
+    /// The preview's own cost is read, and kept apart from the experiment's.
+    func testThePreviewDiagnosticsAreReadAndKeptApartFromTheExperimentsTimings()
+        throws
+    {
+        let run = try XCTUnwrap(liveStatus().run)
+        // Absent on this fixture, which is itself the assertion worth making:
+        // a Tower that reports no preview block leaves this `nil` rather than
+        // producing zeros that would read as measurements.
+        XCTAssertNil(run.preview)
+
+        let stats = CVPreviewDiagnostics(json: [
+            "captured": 120, "skipped_by_throttle": 640, "replaced_unread": 108,
+            "encoded": 12, "encode_failures": 0, "served": 14, "not_modified": 2,
+            "render_ms": 1.8, "render_ms_max": 6.4, "payload_bytes": 9216,
+        ])
+        XCTAssertEqual(stats.captured, 120)
+        XCTAssertEqual(stats.skippedByThrottle, 640)
+        XCTAssertEqual(stats.renderMs, 1.8)
+        // The experiment's own timings are untouched by any of it.
+        XCTAssertEqual(run.timings.processingMs, 18.4667)
+        XCTAssertNotNil(stats.deliveryNote)
+        XCTAssertNil(CVPreviewDiagnostics(json: [:]).deliveryNote)
     }
 
     // MARK: - 5. Projection onto this app's state machine
@@ -884,3 +1074,234 @@ final class CVLabContractTests: XCTestCase {
     }
 }
 
+
+// MARK: - The bytes, not the descriptor
+
+/// Answers every request from a script, so the preview client's real decode
+/// path can be exercised without a Tower.
+///
+/// `nonisolated(unsafe)` because `URLProtocol` calls `startLoading()` off the
+/// main actor and this project defaults types to `@MainActor`. Test-only, and
+/// each test sets the script before it makes its one request.
+private final class CVPreviewStubProtocol: URLProtocol {
+    struct Answer {
+        var status = 200
+        var headers: [String: String] = [:]
+        var body = Data()
+    }
+
+    nonisolated(unsafe) static var answer = Answer()
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let scripted = Self.answer
+        let response = HTTPURLResponse(
+            url: request.url ?? URL(string: "http://stub.invalid")!,
+            statusCode: scripted.status,
+            httpVersion: "HTTP/1.1",
+            headerFields: scripted.headers
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: scripted.body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+/// **The privacy gate that governs pixels, and the run identity that governs
+/// which pixels.**
+///
+/// Everything in `CVLabContractTests` above asserts against the *descriptor* —
+/// the status document's account of what a preview would be. Nothing there
+/// touches the path that actually carries an image, which is where the
+/// treatment header is read and where a frame is accepted or discarded. These
+/// do.
+@MainActor
+final class CVLabPreviewBytesTests: XCTestCase {
+
+    private func makeClient() -> CVLivePreviewHTTPClient {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CVPreviewStubProtocol.self]
+        return CVLivePreviewHTTPClient(
+            baseURL: URL(string: "http://tower.invalid")!,
+            session: URLSession(configuration: configuration),
+            timeout: 2.0
+        )
+    }
+
+    /// A 2x2 PNG. Real bytes, so `UIImage(data:)` genuinely decodes.
+    private func tinyPNG() -> Data {
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 2, height: 2))
+        return renderer.image { context in
+            UIColor.white.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+        }.pngData()!
+    }
+
+    private func serve(headers: [String: String]) {
+        CVPreviewStubProtocol.answer = .init(
+            status: 200, headers: headers, body: tinyPNG()
+        )
+    }
+
+    private var drawablePreview: CVLivePreview {
+        CVLivePreview(json: [
+            "contract": ExperimentalCVContract.preview,
+            "visual_kind": "edge_map",
+            "path": "/cv-lab/preview",
+            "treatment": "raw_ephemeral",
+            "poll_interval_s": 0.05,
+        ])!
+    }
+
+    // MARK: The gate
+
+    /// **Bytes that state no treatment are not drawn.** The descriptor saying
+    /// `raw_ephemeral` is not permission: the treatment travels on the image
+    /// as well, and an image whose treatment arrives separately is an image
+    /// whose treatment can be lost.
+    func testBytesWithNoStatedTreatmentAreNotDrawn() async {
+        serve(headers: ["ETag": "e1"])
+        let outcome = await makeClient().fetch(
+            path: "/cv-lab/preview", runID: "r1", ifNoneMatch: nil
+        )
+        guard case .waiting = outcome else {
+            return XCTFail("an unstated treatment must not be drawn: \(outcome)")
+        }
+    }
+
+    /// A treatment word this build has never heard of is refused as strictly
+    /// as raw, on the bytes exactly as in the descriptor.
+    func testBytesWithAnUnknownTreatmentAreNotDrawn() async {
+        serve(headers: ["X-CV-Preview-Treatment": "probably_safe", "ETag": "e1"])
+        let outcome = await makeClient().fetch(
+            path: "/cv-lab/preview", runID: "r1", ifNoneMatch: nil
+        )
+        guard case .waiting = outcome else {
+            return XCTFail("an unknown treatment must fail closed: \(outcome)")
+        }
+    }
+
+    /// The permitted case, so the gate is not merely refusing everything.
+    func testRawEphemeralBytesAreDrawn() async {
+        serve(headers: [
+            "X-CV-Preview-Treatment": "raw_ephemeral",
+            "X-CV-Preview-Run": "r1",
+            "X-CV-Preview-Seq": "7",
+            "ETag": "e1",
+        ])
+        let outcome = await makeClient().fetch(
+            path: "/cv-lab/preview", runID: "r1", ifNoneMatch: nil
+        )
+        guard case .frame(let frame) = outcome else {
+            return XCTFail("raw_ephemeral is the live view's whole purpose: \(outcome)")
+        }
+        XCTAssertEqual(frame.treatment, .rawEphemeral)
+        XCTAssertEqual(frame.runID, "r1")
+        XCTAssertEqual(frame.resultSeq, 7)
+    }
+
+    // MARK: Run identity
+
+    /// **An unstamped run is "no id", not a run named "".**
+    ///
+    /// `routes/cv_lab_preview.py` sends `rendered.run_id or ""`, and `lab.py`
+    /// builds a preview with `run_id=None` whenever it has no run object. So
+    /// "the Tower did not say" reaches this app as `Optional("")` and never as
+    /// `nil`. Comparing it raw discarded every frame of such a run — silently,
+    /// and at full polling rate, because the discard path never set the
+    /// `ETag`, so each rejected frame was a fresh full-body JPEG.
+    func testAFrameTheTowerLeftUnstampedIsStillDrawn() async {
+        serve(headers: [
+            "X-CV-Preview-Treatment": "raw_ephemeral",
+            "X-CV-Preview-Run": "",
+            "ETag": "e1",
+        ])
+        let loader = CVLivePreviewLoader(client: makeClient())
+        loader.start(drawablePreview, runID: "a-run-the-tower-did-not-stamp")
+        await settle { if case .showing = loader.phase { return true } else { return false } }
+
+        guard case .showing = loader.phase else {
+            return XCTFail("an empty run header is not a mismatch: \(loader.phase)")
+        }
+        XCTAssertEqual(loader.framesShown, 1)
+        loader.stop()
+    }
+
+    /// A frame stamped with a run this loader is not watching is discarded.
+    /// The other half of the same guard, so the fix above did not open it.
+    func testAFrameFromAnotherRunIsNotDrawn() async {
+        serve(headers: [
+            "X-CV-Preview-Treatment": "raw_ephemeral",
+            "X-CV-Preview-Run": "edge-detection-run",
+            "ETag": "e1",
+        ])
+        let loader = CVLivePreviewLoader(client: makeClient())
+        loader.start(drawablePreview, runID: "depth-run")
+        await settle { loader.unchangedResponses > 0 || loader.framesShown > 0 }
+
+        XCTAssertEqual(
+            loader.framesShown, 0,
+            "Depth must never display a frame Edge produced"
+        )
+        if case .showing = loader.phase {
+            XCTFail("a frame from another run reached the screen")
+        }
+        loader.stop()
+    }
+
+    // MARK: Release
+
+    /// **Stop drops the picture, not merely the polling.** A frozen last frame
+    /// under a stopped label is still a picture of the wearer's room on
+    /// screen, and `raw_ephemeral` is live-view-only in both directions.
+    func testStopDropsThePicture() async {
+        serve(headers: [
+            "X-CV-Preview-Treatment": "raw_ephemeral",
+            "X-CV-Preview-Run": "r1",
+            "ETag": "e1",
+        ])
+        let loader = CVLivePreviewLoader(client: makeClient())
+        loader.start(drawablePreview, runID: "r1")
+        await settle { if case .showing = loader.phase { return true } else { return false } }
+        guard case .showing = loader.phase else {
+            return XCTFail("nothing was showing, so the release is untested")
+        }
+
+        loader.stop()
+        XCTAssertEqual(loader.phase, .idle, "the image goes with the loop")
+        XCTAssertEqual(loader.framesShown, 0)
+    }
+
+    /// A preview whose treatment this build does not understand is withheld
+    /// with a sentence, and no request is made at all.
+    func testAnUndrawablePreviewIsWithheldWithoutFetching() async {
+        let untreated = CVLivePreview(json: [
+            "contract": ExperimentalCVContract.preview,
+            "visual_kind": "edge_map",
+            "path": "/cv-lab/preview",
+        ])!
+        let loader = CVLivePreviewLoader(client: makeClient())
+        loader.start(untreated, runID: "r1")
+
+        guard case .withheld = loader.phase else {
+            return XCTFail("an unstated treatment must be withheld: \(loader.phase)")
+        }
+        XCTAssertEqual(loader.framesShown, 0)
+        loader.stop()
+    }
+
+    /// Waits for a condition, or gives up. The loader polls on its own task.
+    private func settle(
+        timeout: TimeInterval = 3.0, until condition: () -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+}
