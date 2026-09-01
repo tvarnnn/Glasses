@@ -61,15 +61,26 @@ purpose.
 
 | | physical era | this branch |
 |---|---|---|
-| fragments | 18 (no placements written at all) | **10** |
-| dominant component | 6,190 pts / 20.4% (one diverged segment) | **12,558 pts / 41.1%** |
-| admitted pairs | 0 | **14** |
-| cycles verified | — | **5** |
-| published reprojection p99 | 4.73 px | **2.78 px** |
-| rows over the 3 px gate | 2.54% | **0.69%** |
+| fragments | 18 (no placements written at all) | **9** |
+| dominant component | 6,190 pts / 20.4% (one diverged segment) | **18,817 pts / 74.9%** |
+| dominant component, in keyframes | 170 of 434 (a diverged segment) | **156 of 434, coherent** |
+| admitted pairs | 0 | **15** |
+| cycles verified | — | **6** |
+| published reprojection p99 | 4.73 px | **2.51 px** |
+| rows over the 3 px gate | 2.54% | **0.24%** |
+| rows whose landmark is behind its camera | 5 | **0** |
 
-**Reprojection improves on every walk in the five-walk corpus.** The
-dense 08-29 walk goes from 58.0% of its geometry in one frame to **92.9%**.
+**Reprojection improves on every walk in the five-walk corpus**, and the
+over-gate fraction by between 4× and 20×. The dense 08-29 walk goes from
+58.0% of its geometry in one frame to **84.1%**.
+
+**What it costs**, because this is the number to argue about: the branch
+publishes fewer points. 25,131 against 30,382 on this walk, and 6,762
+against 9,145 on the 2026-08-29 normal walk, which is the worst case.
+Those are landmarks the adjustment moved into the regime where their
+depth is set by pixel noise, and they are counted in the manifest under
+`low_parallax`. On every walk the dominant component still covers the
+same keyframes or more.
 
 ---
 

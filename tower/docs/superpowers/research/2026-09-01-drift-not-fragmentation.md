@@ -810,6 +810,55 @@ contract the iOS side reads. Neither belongs in a tracking change.
 
 ---
 
+## 10.5 Tests, and what the mutations prove
+
+Full Tower suite: **2,272 passed, 72 skipped, 1 failed** —
+`test_result_channel_hostile.py::test_the_channel_survives_the_world_vanishing_mid_subscription`,
+which passes in isolation and in a 324-test selection and fails
+intermittently only under the full run. It is in the result channel, a
+subsystem this branch does not touch. **The parent branch's full suite is
+not clean either**: it fails
+`test_object_memory_lifecycle.py::test_an_unconfigured_tower_still_serves_its_own_memory`,
+a different unrelated test, on the same machine. Both are order- or
+timing-dependent and pre-date this work; neither is claimed as passing
+here.
+
+World-builder selection: **628 passed, 14 skipped, 0 failed.**
+
+New test files:
+
+- `test_world_builder_bundle.py` (12) — the optimiser against geometry it
+  cannot see. Nothing checks that the cost went down; every test compares
+  against a rig whose answer is known independently.
+- `test_world_builder_tracking_recovery.py` (7) — the recovery mechanism,
+  exercised at a raised budget so the tests pin the MECHANISM and not the
+  policy, plus one test pinning the shipped policy at 1 with its reason.
+- `test_world_builder_recovery_safety.py` (14) — the adversarial suite,
+  which is the evidence for the bound.
+
+**Mutation testing.** Every protection was removed and a test had to
+notice:
+
+| mutation | caught by |
+|---|---|
+| `BUNDLE_WINDOW = 0` (drift control off) | 3 drift tests, including both shape assertions |
+| `MAX_RECOVERY_KEYFRAMES = 1` applied to the mechanism tests | 3 recovery tests |
+| `MIN_VIEWS_FOR_ADJUSTMENT = 3` | `test_two_view_landmarks_move_with_their_cameras` |
+| `fixed_points` ignored | `test_a_landmark_the_window_cannot_hold_is_not_moved` |
+| refused keyframes promoted to references | recovery collapses 8 solved to 0 |
+
+And the mutation that mattered most, because it was a finding rather than
+a confirmation: with the threshold-equality assertion deselected,
+**mutating `PNP_REPROJECTION_ERROR_PX` from 3.0 to 30.0 broke no test in
+the pre-existing suite**, nor did loosening `MIN_INLIERS`,
+`MIN_TRIANGULATION_ANGLE_DEG` or `MIN_INLIER_RATIO`. Every acceptance
+threshold was guarded only by an assertion that the constant equals a
+literal — including the test whose own docstring called itself the guard
+against "recovery implemented by lowering a threshold", whose frames
+never seed a map so no threshold could matter. The new safety suite fails
+5 tests under the 30 px mutation.
+
+
 ## 11. Remaining limitations
 
 1. **`MAX_RECOVERY_KEYFRAMES` is 1 because nothing can check a wider
