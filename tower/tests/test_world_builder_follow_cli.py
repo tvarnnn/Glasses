@@ -140,11 +140,58 @@ class TestFollowCapture:
         assert result.returncode != 0
 
     def test_a_missing_capture_directory_exits_nonzero(self, tmp_path):
+        # `--root` is not decoration. Without it this CLI defaults to a
+        # RELATIVE `data/world_builder`, which resolves against pytest's
+        # working directory -- so this one test minted a world into the
+        # developer's real store on every full-suite run.
         result = _run(
-            "world_build_session.py", "--follow-capture", str(tmp_path / "absent")
+            "world_build_session.py",
+            "--root",
+            str(tmp_path / "root"),
+            "--follow-capture",
+            str(tmp_path / "absent"),
         )
 
         assert result.returncode != 0
+
+    def test_a_session_that_cannot_start_mints_no_world(self, tmp_path):
+        """A session that never begins must leave nothing behind.
+
+        This is the mechanism behind the stub worlds: 86 of the 123
+        worlds in the corpus on this host hold a `world.json` and no
+        sessions at all, and they accumulate with install age.
+
+        `world_build_session.py` creates the world BEFORE the first
+        frame, deliberately -- "a Tower whose phone has connected but
+        not yet sent a frame reports a world that exists and is empty
+        rather than no world at all". That claim is about a session that
+        CAN start. This one cannot: there is no capture directory, and
+        the process is about to exit nonzero.
+
+        It minted anyway because `follow_capture` is a GENERATOR. Its
+        `if not directory.exists(): raise SystemExit` does not run when
+        the function is called -- only when the generator is first
+        advanced, which happens AFTER `engine.create_world()`. The guard
+        fired one statement too late, every time, and left a permanent
+        world to prove it.
+        """
+        root = tmp_path / "root"
+
+        result = _run(
+            "world_build_session.py",
+            "--root",
+            str(root),
+            "--follow-capture",
+            str(tmp_path / "absent"),
+        )
+
+        assert result.returncode != 0
+        assert "no capture directory" in (result.stderr + result.stdout)
+        minted = sorted((root / "worlds").glob("*/world.json"))
+        assert not minted, (
+            f"a session that could not start minted {len(minted)} world(s): "
+            f"{[path.parent.name for path in minted]}"
+        )
 
 
 class TestIncrementalRebuild:

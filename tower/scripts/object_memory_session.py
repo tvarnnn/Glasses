@@ -146,9 +146,28 @@ def journal_frames(directory: Path):
 
 
 def loose_frames(directory: Path):
+    """Frames from a directory of jpegs. Validates EAGERLY -- see below.
+
+    The split is the same one `world_build_session.py: follow_capture`
+    needed, and for the same reason. A `def` containing `yield` is a
+    generator function: calling it runs none of the body, so a check
+    written as the first statement does not fire until something advances
+    the generator -- which, in `main()`, is after the store and the model
+    have been built. There the equivalent ordering minted a permanent
+    empty world on every failed session.
+
+    Latent rather than live here: `ObservationStore.__init__` and
+    `engine.load()` create nothing on disk, so today this only wastes a
+    model load. Fixed anyway, because "it is harmless because of what two
+    other functions happen not to do" is not a property anyone maintains.
+    """
     paths = sorted(directory.glob("*.jpg"))
     if not paths:
         raise SystemExit(f"no .jpg frames found under {directory}")
+    return _loose_frames(paths)
+
+
+def _loose_frames(paths):
     for index, path in enumerate(paths):
         # received_at None, not a fabricated interval: this source has no
         # clock, and the records must not pretend otherwise (Rule 3).
