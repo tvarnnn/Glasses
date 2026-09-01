@@ -149,10 +149,15 @@ consecutive refusals and only `MAX_RECOVERY_KEYFRAMES` of them in a row set
 and `MIN_TRIANGULATION_ANGLE_DEG = 0.5` are the values they were, and a test
 pins them.
 
-Setting `MAX_RECOVERY_KEYFRAMES = 1` reproduces the parent branch exactly —
-`worldB` returns 36 segments, 108 solved, 13,050 points, dominant component
-7,821 points — so the recovery budget is the only variable in every comparison
-below.
+With the bundle adjustment switched OFF, setting
+`MAX_RECOVERY_KEYFRAMES = 1` reproduces the parent branch exactly — `worldB`
+returns 36 segments, 108 solved poses, 13,050 points and a 7,821-point dominant
+component, figure for figure. That is what makes the recovery budget an isolated
+variable, and it is why every recovery comparison in §6.3 is trustworthy: the
+restructured references, the failure counter and the seed-anchor retry are all
+present at 1 and all inert.
+
+**1 is also the shipped value**, for reasons that are the subject of §3.3.
 
 ### 3.2 What was implemented, measured, and REJECTED
 
@@ -184,10 +189,70 @@ what pointed at §4.
 
 ---
 
+### 3.3 Why the shipped budget is 1
+
+`MAX_RECOVERY_KEYFRAMES` is exactly the largest reference gap a solve may be
+admitted at, and **no acceptance gate in this backend is a function of that
+gap**. An adversarial pass measured what that costs, against exact synthetic
+ground truth, holding the target keyframe and its image FIXED and moving only
+the reference. Median relative rotation error of that one solve, six scene
+seeds:
+
+```
+gap      1     2     3     4     6     8    10    12
+forward  0.78  0.86  1.33  2.48  3.04  3.38  4.47  6.09   deg
+strafe   1.57  2.71  4.55  5.86  9.10 11.89 14.91 19.41   deg
+```
+
+Zero refusals at any gap, 22–250 PnP inliers throughout.
+
+Over REPEATING texture — an ordinary room — it is not drift at all. A room
+tiled at 1.5 m, a continuous walk at 0.1875 m per keyframe, no teleport, no
+occlusion, no adversary, nine samples per gap:
+
+```
+gap            1      2      3      4      6      8
+walked      0.188  0.375  0.562  0.750  1.125  1.500   m
+median err  0.007  0.207  0.241  0.411  0.766  1.499   m
+over 10 cm    0/9    6/9    9/9    6/6    9/9    9/9
+```
+
+Read the two rows together. Whatever the gap, the solve publishes roughly ONE
+keyframe of motion: it matches the wrong repetition, and the keyframes the
+camera crossed cease to have happened. **At gap 8 the camera moved 1.500 m and
+the pose reports 0.001 m — with 169 PnP inliers, 0.14° of rotation error, and
+published support reprojecting at 0.22 px median.** Every instrument this
+pipeline owns says that pose is excellent.
+
+The physical corpus agrees the bound is not free coherence either; see §6.3.
+
+That is not an argument for restoring the latch, which was wrong for 1,812
+keyframes. It is an argument that the mechanism is right, the bound is the only
+thing carrying the risk, and the value the evidence supports is 1. What would
+earn a larger value is not a better matcher — appearance is precisely what lies
+here — but an instrument that checks the displacement a recovered pose implies
+against the number of keyframes it skipped. That instrument does not exist yet.
+
+The adversarial pass found one more thing worth recording: with the
+threshold-equality assertion deselected, mutating `PNP_REPROJECTION_ERROR_PX`
+from 3.0 to 30.0 broke **no test in the pre-existing suite**, nor did loosening
+`MIN_INLIERS`, `MIN_TRIANGULATION_ANGLE_DEG` or `MIN_INLIER_RATIO`. Every
+acceptance threshold was guarded only by an assertion that the constant equals a
+literal. `tests/test_world_builder_recovery_safety.py` fixes that.
+
 ## 4. The finding: the chain drifts
 
-Measured on `tests/synthetic_scene.py`'s furnished room, a lateral strafe kept
-inside the room envelope, **no refusals, no blur, no injected damage**:
+Measured on `tests/synthetic_scene.py`'s furnished room, with **no refusals, no
+blur and no injected damage**. The generator is recorded exactly, because an
+adversarial review reconstructed it wrongly and got numbers up to 2× apart — and
+because guessing a slightly larger step walks the camera into a wall, which is
+the confound `poses_outside_room` exists to prevent and which produced a wrong
+diagnosis in this project once already:
+
+```python
+poses = ss.strafe(n, step=0.10, start=(-2.0, -1.6, 0.6))
+assert ss.poses_outside_room(poses) == []       # holds for every n below
+```
 
 | keyframes | rotation error median / max | max drift ÷ path | per-step scale ratio, first third → last |
 |---|---|---|---|
@@ -198,9 +263,17 @@ inside the room envelope, **no refusals, no blur, no injected damage**:
 | 40 | 9.21° / 33.98° | 18.2% | 7.63 → **2.43** |
 
 The last column is the ratio of recovered to true camera motion per step. It is
-flat for twenty keyframes and then falls by a factor of three: **the
-reconstruction contracts.** The pipeline is trustworthy for roughly 15–20
-keyframes and progressively falsifies beyond that.
+flat for twenty keyframes and then moves by a factor of three. The pipeline is
+trustworthy for roughly 15–20 keyframes and progressively falsifies beyond that.
+
+**The DIRECTION of that scale error is walk-dependent and an earlier draft of
+this report overgeneralised it.** On this walk the reconstruction contracts; the
+review measured a step of 0.08 where the same chain EXPANDS by 15× over the same
+forty keyframes. What is invariant is that the scale drifts without bound, not
+that it shrinks. The review's independent reconstruction at that step measured
+36.1% drift and 40.7° of rotation error at forty keyframes — worse than the row
+below, on a walk fully inside the room — so the finding is not a wall artifact
+and is if anything understated here.
 
 That number matters because the physical walk's segments averaged 14 keyframes.
 The fragmentation everybody was trying to remove was, accidentally, holding
@@ -310,7 +383,13 @@ This shipped twice on this branch and was caught twice by the corpus:
 | `MAX_VIEWS_PER_LANDMARK` | 8 | 0.726 / **15.800** px | 9.51% | 7,521 pts (24.1%) |
 | `MAX_VIEWS_PER_LANDMARK` | 16 | 0.546 / **2.781** px | **0.69%** | **16,340 pts (53.5%)** |
 
-(2026-09-01 walk, adjustment on, nothing else changed)
+(2026-09-01 walk, adjustment on, nothing else changed. **These rows use
+the PARENT's per-side-8 sampler**, not the shipped product budget, which
+is why the dominant-component figures here differ from §6's — review
+found the two tables reporting different numbers for nominally the same
+build, and this is the reconciliation. The cap-8 row is the only figure
+in this report not recoverable from a retained sweep record; it is the
+build that motivated the change and was overwritten by it.)
 
 The argument for `min_views = 3` is about **information** and is correct as far
 as it goes — a two-view point is exactly determined and constrains nothing. It
@@ -331,40 +410,61 @@ segment.
 |---|---|---|---|---|---|---|---|---|---|---|
 | **2026-09-01 loop** | A physical era | 30 | 323 | 30,382 | 18 | 6,190 | 20.4% | 170 | 39.2% | 0 |
 | | B registration-v1 | 30 | 323 | 30,382 | 13 | 8,285 | 27.3% | 56 | 12.9% | 6 |
-| | **C this branch** | 30 | 323 | 30,538 | **10** | **12,558** | **41.1%** | **84** | **19.4%** | **14** |
+| | **C this branch** | 30 | 323 | 25,131 | **9** | **18,817** | **74.9%** | **156** | **35.9%** | **15** |
 | **drawer walk** | A physical era | 36 | 108 | 13,050 | 23 | 3,117 | 23.9% | 23 | 10.5% | 0 |
 | | B registration-v1 | 36 | 108 | 13,050 | 18 | 7,821 | 59.9% | 61 | 28.0% | 5 |
-| | **C this branch** | 33 | **137** | 13,667 | 17 | 7,632 | 55.8% | 61 | 28.0% | **7** |
+| | **C this branch** | 33 | **137** | 12,686 | 17 | 7,371 | 58.1% | 61 | 28.0% | **6** |
 | **normal walk** | A physical era | 23 | 100 | 9,145 | 8 | 4,311 | 47.1% | 51 | 22.3% | 0 |
 | | B registration-v1 | 23 | 100 | 9,145 | 8 | 4,311 | 47.1% | 51 | 22.3% | 0 |
-| | C this branch | 23 | 100 | 8,589 | 8 | 3,812 | 44.4% | 51 | 22.3% | 0 |
+| | C this branch | 23 | 100 | 6,762 | 8 | 2,790 | 41.3% | 51 | 22.3% | 0 |
 | **dense 08-29** | B sampler | 6 | 68 | 11,009 | 6 | 6,386 | 58.0% | 42 | 54.5% | 0 |
-| | **C this branch** | 6 | 68 | 10,730 | **4** | **9,970** | **92.9%** | **67** | **87.0%** | **2** |
+| | **C this branch** | 6 | 68 | 10,266 | **5** | **8,638** | **84.1%** | **59** | **76.6%** | **1** |
 | **long 08-27** | B sampler | 40 | 129 | 18,977 | 20 | 3,739 | 19.7% | 27 | 8.0% | 3 |
-| | **C this branch** | 40 | 129 | 19,628 | 19 | **4,332** | **22.1%** | 27 | 8.0% | **4** |
+| | **C this branch** | 40 | 129 | 18,708 | **19** | 3,682 | 19.7% | 27 | 8.0% | **4** |
+
+The headline row is the 2026-09-01 walk: the geometry sitting in ONE
+coordinate frame goes from 8,285 points across 56 keyframes to **18,817
+points across 156 keyframes** — from an eighth of the walk to better than
+a third of it, and from a quarter of the geometry to three quarters.
+Fragments 13 to 9, admitted pairs 6 to 15.
 
 And the quantity this whole line of work is really about — does the
-published geometry still reproject:
+published geometry still reproject. **Percentiles alone would hide the
+failure this branch had to find**, so the worst row and the count of rows
+whose landmark ended up BEHIND its camera are reported beside them:
 
-| walk | B: median / p99 | over 3 px | C: median / p99 | over 3 px |
-|---|---|---|---|---|
-| 2026-09-01 loop | 0.587 / 4.732 px | 2.54% | **0.546 / 2.781 px** | **0.69%** |
-| drawer walk | 0.543 / 3.974 px | 1.79% | **0.521 / 2.780 px** | **0.64%** |
-| normal walk | 0.693 / 5.316 px | 3.27% | **0.584 / 3.117 px** | **1.03%** |
-| dense 08-29 | 0.648 / 3.100 px | 1.16% | **0.547 / 2.666 px** | **0.56%** |
-| long 08-27 | 0.572 / 4.270 px | 2.10% | **0.566 / 2.957 px** | **0.96%** |
+| walk | | median | p99 | max | over 3 px | behind camera |
+|---|---|---|---|---|---|---|
+| 2026-09-01 loop | B | 0.587 | 4.732 | 774.3 | 2.54% | 5 |
+| | **C** | **0.541** | **2.509** | **58.1** | **0.24%** | **0** |
+| drawer walk | B | 0.543 | 3.974 | 26.0 | 1.79% | 0 |
+| | **C** | **0.510** | **2.565** | **13.5** | **0.25%** | 0 |
+| normal walk | B | 0.693 | 5.316 | **33.4** | 3.27% | 0 |
+| | **C** | **0.558** | **2.457** | 99.2 | **0.16%** | 0 |
+| dense 08-29 | B | 0.648 | 3.100 | 23.2 | 1.16% | 0 |
+| | **C** | **0.537** | **2.476** | **19.0** | **0.25%** | 0 |
+| long 08-27 | B | 0.572 | 4.269 | 42.7 | 2.10% | 0 |
+| | **C** | **0.555** | **2.672** | **35.0** | **0.52%** | 0 |
 
-**Reprojection improves on every walk in the corpus**, tail and body, and
-the fraction of published rows above the gate that admitted them roughly
-halves or better. That is the number that says the coherence gained is
-not bought with poses a consumer cannot check.
+Median, p99 and the over-gate fraction improve on **every walk**, the
+over-gate fraction by between 4× and 20×. `behind_camera` is zero
+everywhere; an intermediate build of this branch had it rising 5 → 36 on
+this walk, which is what §7.5 is about. The single regression is the
+normal walk's worst row, 33.4 → 99.2 px — one row of 18,415.
 
-Where C does NOT improve: the normal walk's dominant component loses 499
-points while covering the identical 51 keyframes -- that is landmark
-de-duplication under a better pose chain, not lost structure -- and the
-drawer walk's share falls from 59.9% to 55.8% while its absolute
-keyframe coverage is unchanged at 61 and its solved poses rise 27%. On
-neither walk does the coherent PART of the world get smaller.
+Where C does NOT improve, stated in the terms it actually loses: the
+normal walk's dominant component falls from 4,311 points to 2,790 and
+the drawer walk's from 7,821 to 7,371. **Those are real point losses,
+not a re-normalisation**, and an earlier draft of this section claimed
+"on neither walk does the coherent PART of the world get smaller", which
+is false in points and was corrected by review.
+
+What IS true, and is the reason to accept them: on both walks the
+dominant component covers the IDENTICAL set of keyframes as before — 51
+and 61 — so no part of the room left the coherent piece. What left is
+landmarks the adjustment moved into the noise-dominated regime, counted
+in the manifest under `low_parallax`. The normal walk is the worst case
+in the corpus for that trade and is discussed as such in §7.5.
 
 ### 6.1 Isolating the registration sampler
 
@@ -392,17 +492,39 @@ pair admitted before can be refused after. The claim the change supports
 is that no verdict is reached on less evidence than before, not that no
 verdict changes.
 
-### 6.2 What each change is worth, separately
+### 6.2 What each change is worth — as a 2x2, not a ladder
 
-Measured on the 2026-09-01 walk, dominant component as a share of
-geometry, each step adding to the one above it:
+An earlier draft presented this as an additive ladder, each step adding
+to the one above. **That was wrong and review caught it**: the two
+changes are not independent, and on an intermediate build the wider
+sampler measured NEGATIVE on the adjusted reconstruction while positive
+on the parent's, so the decomposition did not survive reordering.
 
-```
-A  physical era, registration never invoked        20.4%  (one diverged segment)
-B  + registration invoked                          27.3%
-   + registration sampler widened                  34.1%
-C  + local bundle adjustment                       41.1%
-```
+Run as an actual 2x2 on the 2026-09-01 walk — reconstruction on one
+axis, registration sampler on the other, dominant component as a share
+of published geometry:
+
+| | parent sampler (per-side 8) | product budget ≤256 |
+|---|---|---|
+| **parent reconstruction** | 8,285 pts / **27.3%** | 10,372 pts / **34.1%** |
+| **this branch's reconstruction** | 14,842 pts / **59.1%** | 18,817 pts / **74.9%** |
+
+Both factors are positive on the shipped build and they reinforce:
++6.8 pp from the sampler on the parent's geometry, +15.8 pp on the
+adjusted geometry, and +31.8 / +40.8 pp from the reconstruction at either
+sampler. The interaction has a mechanism rather than being a curiosity —
+a drifted segment presents a warped shape to `fit_direction` no amount of
+extra retrieval can reconcile, so widening retrieval pays more once the
+geometry it retrieves is true.
+
+The physical-era row is outside this table because registration never
+ran at all: 6,190 points, 20.4%, which is a single un-placed segment and
+not a component in any meaningful sense.
+
+**The cells above are not directly comparable in absolute points** — the
+branch publishes 25,131 where the parent publishes 30,382, for the
+reasons in §7.5 — which is why the share is the honest column and why
+the keyframe counts in §6 are the better one still.
 
 ### 6.3 Recovery, measured across the corpus
 
@@ -504,19 +626,35 @@ usable angle BEFORE this adjustment and do not after. That is exactly
 "the adjustment slid this point along its ray", and it is the shipped
 form.
 
-| pinned eight-capture corpus | worst bbox blowup | points | mean largest share |
-|---|---|---|---|
-| parent | 11.01 | 71,122 | 0.3758 |
-| adjustment, no re-check | **35.15** | 70,662 | 0.3919 |
-| + reprojection | 25.59 | 69,972 | 0.3921 |
-| + absolute parallax | 9.23 | **50,422** | 0.3740 |
-| **+ parallax delta (shipped)** | **10.52** | 62,843 | **0.3936** |
+A fourth attempt was needed even then. Demoting on the parallax
+CROSSING alone still retires a landmark whose angle went 0.200° to
+0.198° exactly as readily as one that was slid along its ray, and a map
+this full of marginal two-view points has a great many of the first
+kind. `PARALLAX_COLLAPSE_RATIO = 0.5` asks that the adjustment at least
+HALVE the angle -- that it be the cause rather than the occasion.
 
-The shipped row has the blowup back below the parent's and the best
-largest-share of the five. The 12% of points it costs against the parent
-are landmarks the adjustment moved into the regime where, in
-`min_parallax_deg`'s own words, "a landmark is not a measurement, and its
-distance is set by pixel noise".
+| pinned eight-capture corpus | worst bbox blowup | points | solved | mean largest share |
+|---|---|---|---|---|
+| parent | 11.01 | 71,122 | 620 | 0.3758 |
+| adjustment, no re-check | **35.15** | 70,662 | 603 | 0.3919 |
+| + reprojection | 25.59 | 69,972 | 603 | 0.3921 |
+| + absolute parallax | 9.23 | **50,422** | 603 | 0.3740 |
+| + parallax crossing | 10.52 | 62,843 | 603 | 0.3936 |
+| **+ collapse ratio (SHIPPED)** | **11.67** | 65,174 | 603 | **0.3964** |
+
+The shipped row has the blowup back at parity with the parent and **the
+best largest-share of all six**, which is the coherence number this whole
+line of work is about.
+
+**It costs 8.4% of the corpus's published points, and that is not a
+rounding error.** Those are landmarks the adjustment moved into the
+regime where, in `min_parallax_deg`'s own words, "a landmark is not a
+measurement, and its distance is set by pixel noise". The alternative is
+publishing a coordinate the pipeline's own gate would refuse. On the
+2026-08-29 normal walk -- 23 segments, only three of which reconstruct
+anything -- the cost is worst, 9,145 points to 6,762, and that walk is
+the honest worst case for this trade rather than an outlier to be
+explained away.
 
 That has a visible consequence and it is worth stating plainly rather
 than hiding: the sum of `Extension.new_points` deltas no longer equals
@@ -525,6 +663,65 @@ emitted it. The shortfall is exactly the number of retired landmarks,
 which `test_extend_reports_only_the_structure_that_keyframe_added` now
 asserts. No production code reads `Extension.new_points` today; a live
 viewer that appends deltas forever would have to re-read `snapshot()`.
+
+---
+
+## 7.9 Independent review
+
+An adversarial reviewer was asked to disprove the claim, with the built
+worlds, the sweep records and both checkouts. It could not dent the
+causal result and did dent the reporting. What it verified independently:
+
+- **No acceptance threshold moved.** Not taken on trust from this
+  branch's own pinning test: an AST comparison across `e847339..HEAD`
+  found `geometry.py` with zero changed definitions, `world_registration.py`
+  changed in exactly `cross_matches` plus a new `match_budget`, and
+  `Thresholds`, `admit()` and `pair_is_hopeless` untouched.
+- **The parent and `BUNDLE_WINDOW = 0` are identical to three decimals on
+  every metric across eight configurations**, so the drift A/B is clean
+  and the mutation really does reproduce the parent.
+- **The drift result is larger than reported**: 16.46° → 0.43° median
+  rotation error and 36.1% → 1.1% drift at forty keyframes on a walk
+  fully inside the room.
+- **The bundle's invariant holds on real data.** Instrumented replay of
+  the drawer walk, 108,510 observations: `MIN_VIEWS_FOR_ADJUSTMENT`
+  dropped **zero** rows belonging to a free camera, and
+  `MAX_VIEWS_PER_LANDMARK` dropped **25 of 108,510 (0.023%)** — the
+  residual risk the constant documents, now quantified.
+- **Cost is bounded by the window, not by segment length.** Median
+  adjustment cost is flat across segment-length buckets from 0–9 up to
+  50–59 keyframes, with `window_landmarks` steady at 1,200–1,650.
+- **The shutdown claim is exact**: `register()` contains no write at all.
+- **The mechanism behind the new admissions is real**, not a correlation:
+  the adjustment raises one segment's own `span_over_depth` from 0.057 to
+  0.139, giving it a camera baseline the drifted chain had collapsed.
+- **The branch REFUSES a pair the parent admitted.** `(29,30)`, admitted
+  by the parent at reciprocity 0.967, measures reciprocity 2.80, scale
+  ambiguity 4.15 and 13.5 px once the wider sample is used. That looks
+  like a false merge the parent shipped and this branch catches.
+
+What it found wrong, all of it fixed here or above:
+
+| finding | what was wrong | disposition |
+|---|---|---|
+| the §6 numbers were stale | measured before the publishability re-check, on a build with points behind the wall | **re-measured**; `behind_camera` is now 0 on all five walks |
+| the additive ladder | the two changes interact; the decomposition did not survive reordering | **replaced by the 2x2 in §6.2** |
+| "cycles verified 0 → 5" | a cycle verifies only the segments it passes through, and two newly placed segments sat on unverified tree edges | **claim corrected** here and in `world_registration.py` |
+| `match_budget`'s "SUPERSET" | `sampled_frames` spreads evenly, so a larger sample is not a superset | **docstring corrected** |
+| `optimise` "re-anchors" | it does not; with no fixed camera, camera 0 moves | **claim removed** |
+| the delta/snapshot comment | poses in the delta are stale too, not just points | **comment corrected**; no production consumer |
+| the multi-reference table | confounded reference depth with the recovery budget | **numbers withdrawn**, argument kept |
+| "the coherent PART never gets smaller" | false in points on two walks | **corrected in §6** |
+| the drift generator | unrecorded, and the reviewer's guess walks into a wall | **recorded exactly in §4** |
+| "contracts by a factor of three" | direction is walk-dependent; another step expands 15× | **corrected in §4** |
+| a stale comment in `classical.py` | said there is no bundle adjustment | **corrected** |
+
+Two of its cautions are not fixable here and are carried into §11
+instead: reciprocity is self-consistency between two fits over one
+reconstruction, so removing internal warp improves it whether or not a
+pair is the same place; and `cycle_refusal_for` computes a translation
+residual it never tests, so a loop can close in rotation and scale while
+sitting a room's width out of position.
 
 ## 8. Determinism
 
@@ -646,7 +843,21 @@ contract the iOS side reads. Neither belongs in a tracking change.
    becomes drift the bundle window cannot see across; only a revisit that
    crosses a segment boundary can be closed, and only by registration.
 
-7. **Every drift and safety number here is SYNTHETIC.** Rendered rooms
+7. **Reciprocity is not identity evidence.** `admit()`'s strongest clause
+   is the agreement of two independent Sim3 fits, but both are computed
+   over ONE reconstruction, so removing that reconstruction's internal
+   warp improves the agreement whether or not the two segments are the
+   same place. The independent evidence is the cycle check, and a cycle
+   verifies only the segments it passes through — on the 2026-09-01 walk
+   some newly placed segments sit on tree edges no cycle touches.
+
+8. **`cycle_refusal_for` computes a translation residual and never tests
+   it.** It gates rotation and scale only. On this corpus the
+   translation residuals are 0.6–1.7% of the placed cloud's diagonal so
+   it does not fire, but a loop can close in rotation and scale while
+   sitting a room's width out of place and nothing would notice.
+
+9. **Every drift and safety number here is SYNTHETIC.** Rendered rooms
    with perfect optics, no rolling shutter and no compression say nothing
    about the Ray-Ban camera. Their value is that the poses are inputs, so
    the answers are exact rather than plausible. The corpus numbers are

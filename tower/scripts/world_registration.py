@@ -1671,14 +1671,22 @@ def pair_is_hopeless(source, target, thresholds) -> str | None:
 # 4 -> 5. NO GATE WAS TOUCHED to obtain them. They were always
 # admissible and were never offered.
 #
-# The independent check settles it. At k=8 the admitted graph of that
-# walk is a TREE, so `cycles_checked` is 0 and no placement in it has any
-# independent verification at all. With the wider sample the cluster
-# {17,18,19,23,28} closes six independent cycles, every one inside
-# MAX_CYCLE_ROTATION_DEG and MAX_CYCLE_SCALE_RATIO with room to spare
-# (worst 4.58 deg, 1.11x). Widening retrieval turned an unverifiable
-# spanning tree into a cycle-verified cluster. That is a safety
-# improvement, not a recall trade.
+# The independent check is the strongest evidence for it, with one
+# caveat that has to travel with it. At k=8 the admitted graph of that
+# walk is a TREE: `cycles_checked` is 0, so NO placement in it has any
+# independent verification at all. The wider sample closes cycles, every
+# one inside MAX_CYCLE_ROTATION_DEG and MAX_CYCLE_SCALE_RATIO with room
+# to spare.
+#
+# THE CAVEAT. A cycle verifies only the segments it passes through. An
+# adversarial review of an earlier build found the closures concentrated
+# in one sub-cluster while two newly placed segments sat on TREE edges
+# and were verified by nothing -- including the weakest admitted pair in
+# the set. So "the cluster is cycle-verified" is the wrong reading;
+# "some of its edges now have a second opinion, and `cycles_checked`
+# says how many" is the right one. Widening retrieval is still a safety
+# improvement rather than a recall trade, because it can only add
+# opinions -- it just does not distribute them evenly.
 MAX_KEYFRAMES_PER_SEGMENT_FOR_MATCHING = 8
 
 # The budget, in FRAME PAIRS, that one segment pair may spend on
@@ -1703,11 +1711,18 @@ def match_budget(count_a: int, count_b: int,
 
       - the product never exceeds `budget`;
       - NEITHER SIDE IS EVER SAMPLED MORE SPARSELY THAN THE PER-SIDE CAP
-        IT REPLACES. `min(count, ceiling)` is a floor, not a target, so
-        `admit()` is always offered a SUPERSET of the evidence it used to
-        get. Those floors always fit -- ceiling^2 is 64 against a budget
-        of 256 -- which is also why the loop below cannot fail to
+        IT REPLACES. `min(count, ceiling)` is a floor, not a target.
+        Those floors always fit -- ceiling^2 is 64 against a budget of
+        256 -- which is also why the loop below cannot fail to
         terminate.
+
+    NOT A SUPERSET, and an earlier draft of this docstring said it was.
+    `sampled_frames` spreads evenly, so a larger sample is not a
+    superset of a smaller one: at count=51, k=8 takes
+    [0, 7, 14, 21, 29, 36, 43, 50] and k=16 takes a different grid that
+    MISSES 14, 21, 29 and 36. What holds is the weaker, still useful
+    statement below -- more frames, never fewer -- and not set
+    containment.
 
     MORE EVIDENCE IS NOT A MONOTONE MORE ADMISSIONS, and it would be
     dishonest to imply otherwise. A wider sample changes which frame

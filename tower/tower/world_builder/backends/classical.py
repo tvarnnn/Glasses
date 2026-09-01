@@ -51,17 +51,12 @@ nothing else did:
    a row set `broken`. One refused keyframe stays refused -- honestly,
    with no pose -- and the walk carries on in the same frame.
 
-WHAT WAS TRIED AND REJECTED, because it is the obvious next move and it
-is worse: feeding all DEPTH references' correspondences into one PnP.
-Measured on the 2026-09-01 walk, against identical recovery behaviour,
-it left solved poses flat (329 -> 327) and doubled the reprojection tail
-(p99 4.37 -> 8.87 px, 2.21% -> 5.19% of published rows above the 3 px
-gate), and the dominant connected component fell from 38.8% of the
-geometry to 19.8%. See `_extend` for why: ORB-SLAM's TrackLocalMap
-searches a radius around a PREDICTED pose, so appearance only ever
-chooses among geometrically plausible candidates. We have no prediction
-at that point, so a wider reference set is pure appearance matching over
-a wider baseline -- where ORB is weakest.
+WHAT WAS TRIED AND ABANDONED, because it is the obvious next move:
+feeding all DEPTH references' correspondences into one PnP. It made the
+reconstruction worse. The numbers that comparison produced are
+WITHDRAWN -- an adversarial review found the two runs differed in the
+recovery budget as well, so nothing was isolated -- but the argument for
+not retrying it casually stands, and `_extend` carries it.
 
 NO ACCEPTANCE THRESHOLD MOVED. `MIN_PNP_CORRESPONDENCES`,
 `PNP_REPROJECTION_ERROR_PX`, `MIN_INLIERS`, `MIN_INLIER_RATIO` and
@@ -840,11 +835,15 @@ class ClassicalTwoViewBackend(GeometryBackend):
     # estimate_window() above is already strictly forward-only: frame i is
     # solved by _extend() against the last EXTEND_REFERENCE_DEPTH keyframes
     # that HAVE poses plus the accumulated landmarks, and never looks
-    # forward. There is no bundle adjustment
-    # and no loop closure -- BA was implemented and measured at 0.00%
-    # drift improvement at 16, 32 and 104 keyframes, because the
-    # observation graph is a chain whose median covisibility span is 1
-    # (docs/agent-handoffs/WORLD-BUILDER.md section 10).
+    # forward. There is no LOOP CLOSURE. There IS now a bundle
+    # adjustment -- see BUNDLE_WINDOW -- and the record that one was
+    # "measured at 0.00% drift improvement at 16, 32 and 104 keyframes"
+    # was true of the engine it was measured on, whose observation graph
+    # was a chain with a median covisibility span of 1
+    # (docs/agent-handoffs/WORLD-BUILDER.md section 10). At HEAD that
+    # graph is mean 4.67 views a landmark with 67.2% at three or more,
+    # and the adjustment takes a forty-keyframe chain's rotation error
+    # from 9.21 deg to 0.15 deg.
     #
     # So `absolute`, `landmarks` and `observed` really are the entire
     # carried state, and the only reason a rebuild re-paid for all of it
@@ -1052,9 +1051,23 @@ class ClassicalTwoViewBackend(GeometryBackend):
             chain.failures += 1
             if chain.failures >= MAX_RECOVERY_KEYFRAMES:
                 chain.broken = pose.degeneracy
-        # The delta is filtered exactly as the snapshot is, so a viewer
-        # that appends every delta ends up holding what snapshot() says --
-        # an invariant the incremental suite asserts directly.
+        # THE DELTA IS WHAT THIS KEYFRAME BELIEVED, NOT WHAT THE MAP
+        # NOW SAYS, and that distinction arrived with the bundle
+        # adjustment. `pose` and `new_points` are captured before
+        # `_local_adjust` moves `chain.absolute` and `chain.landmarks`
+        # and before `_rewrite_poses` rebuilds `chain.poses`, so on a
+        # forty-keyframe synthetic strafe every solved delta pose
+        # differs from the snapshot's (worst 0.684 deg) and nearly every
+        # delta landmark coordinate does too.
+        #
+        # `snapshot()` is authoritative -- the Extension docstring
+        # already said so about poses -- and a viewer that appends
+        # deltas forever would drift away from it. NOTHING IN
+        # PRODUCTION DOES: the engine reads only `pose.status` and
+        # `chain_broken`, and `_LiveSolve` freezes and serves
+        # `snapshot()`. The incremental suite asserts the reconciliation
+        # that does still hold: deltas minus retired landmarks equals
+        # the snapshot's count.
         return Extension(
             pose=pose,
             # An EDGE. extend() returns early above when the chain is
@@ -1329,27 +1342,30 @@ class ClassicalTwoViewBackend(GeometryBackend):
         PnP itself draws correspondences from: ONE.
 
         Feeding all DEPTH references into a single PnP was implemented
-        and MEASURED, because it is the obvious widening and because
+        and tried, because it is the obvious widening and because
         ORB-SLAM's TrackLocalMap is exactly that idea done properly. It
-        made the reconstruction WORSE, on the 2026-09-01 walk, against
-        the same recovery behaviour:
+        made the reconstruction worse and was abandoned.
 
-            references into PnP   solved   reproj p99   over 3 px   dominant
-                1                    329       4.37 px      2.21%      38.8%
-                3                    327       8.87 px      5.19%      19.8%
+        THE NUMBERS THAT COMPARISON PRODUCED ARE WITHDRAWN. An
+        adversarial review found the two runs differed in the RECOVERY
+        BUDGET as well as in the reference count, and the recovery
+        budget is worth tens of points of dominant-component share on
+        its own, so the comparison isolated nothing. The variant is no
+        longer in the tree and has not been re-measured cleanly. What
+        remains is the argument, which stands on its own and is the
+        reason not to try it again casually:
 
-        The reason is that TrackLocalMap is not "match more keyframes".
-        It projects landmarks through a PREDICTED pose and searches a
-        small radius around the prediction, so appearance is only ever
-        asked to choose among candidates that are already geometrically
+        TrackLocalMap is not "match more keyframes". It projects
+        landmarks through a PREDICTED pose and searches a small radius
+        around the prediction, so appearance is only ever asked to
+        choose among candidates that are already geometrically
         plausible. We have no pose prediction at this point -- that is
         what we are solving for -- so an older reference contributes
         pure descriptor matches over a wider baseline, where ORB's
-        appearance assumption is weakest. RANSAC then has more outliers
-        to survive and sometimes does not, and the poses that come out
-        reproject twice as badly. Widening the correspondence set is not
-        the same act as widening the local map, and only the second one
-        is what ORB-SLAM does.
+        appearance assumption is weakest. Widening the correspondence
+        set is not the same act as widening the local map, and only the
+        second is what ORB-SLAM does. Anyone re-attempting this should
+        build the pose prediction FIRST.
 
         So the older references keep the job they were measured doing:
         re-observation after the pose exists, gated on reprojecting

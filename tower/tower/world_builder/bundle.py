@@ -75,10 +75,13 @@ GAUGE. A monocular reconstruction is free up to a similarity: 3 rotation,
 3 translation, 1 scale. The Jacobian is therefore rank-deficient by 7 and
 an undamped Gauss-Newton step is not unique. LM's damping term makes the
 system positive definite, which is the standard resolution and the one
-used here -- no parameters are held fixed, so the optimiser is free to
-move the whole window and the caller must not assume camera 0 stays at
-the origin. `optimise` re-anchors before returning, so that assumption
-stays true for everything upstream.
+used here -- no parameters are held fixed, so with `fixed_cameras`
+empty the optimiser is free to move the whole window and the caller must
+NOT assume camera 0 stays where it was. Measured with no fixed camera,
+camera 0 moves 0.095 deg and 1.15e-2. Nothing re-anchors afterwards, and
+an earlier draft of this docstring claimed it did; a caller that needs an
+anchor must say so, which is why `_local_adjust` always passes
+`fixed_cameras=(0, 1)`.
 
 CONVENTION. Poses are T_camera_world: `x_camera = R @ x_world + t`, the
 same convention `backends/classical.py` publishes and `_triangulate_new`
@@ -343,6 +346,9 @@ def optimise(
     publish. See its construction at the end of this function for why a
     caller that ignores it ships points the creation-time gate would have
     refused.
+
+    Nothing is re-anchored on the way out. Whatever is not named in
+    `fixed_cameras` may move, including camera 0.
 
     The returned poses are re-anchored so that the first camera in
     `rotations` is exactly where it was. The optimiser is gauge-free (see
